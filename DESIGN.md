@@ -39,3 +39,7 @@ Flow: `world` (state) → `systems` (change state each tick) → `render` (draw 
 - Renderer choice (Bevy vs a hand-rolled stack like wgpu/macroquad + an ECS crate).
 - Tick rate (starting assumption: 30 ticks/sec).
 - Networking, persistence, and multi-zone server architecture — designed at a high level for the target game, but not yet engine code.
+
+## Implemented so far
+
+- **Fixed-timestep tick loop** (`core` concern, currently in `main.rs`): an accumulator-based loop running at a fixed `TICK_RATE` (currently 30 ticks/sec). Decouples simulation speed from hardware speed — every tick advances the sim by an identical slice of time, so behaviour is deterministic across machines. Real simulation systems will run inside the tick step.

@@ -6,7 +6,7 @@ Frame Engine advances a world state forward in fixed, deterministic time steps. 
 
 ## Status
 
-Early development. Building the core tick loop first.
+Early development. The core fixed-timestep tick loop is working — the engine runs at a steady, deterministic tick rate. Next: building out the world state that the loop simulates.
 
 ## Principles
 
