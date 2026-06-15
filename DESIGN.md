@@ -17,12 +17,6 @@ A custom **simulation engine** written in Rust. Its job is to advance a world st
 
 ## Architecture / folder layout
 
-- **Architecture pattern:** Hand-rolled ECS-style data layout (component data
-  stored in parallel lists indexed by entity ID, rather than as objects that
-  own their data) — pleasant in Rust and fast for many-entity simulation. Built
-  by hand rather than using an ECS crate, to keep the data layout under our own
-  control and understand it fully.
-
 Workspace layout (`crates/` holds Rust packages; the engine is one crate, a game would be another):
 
 - `core/` — the heartbeat: the tick loop and fixed-timestep clock that drives everything.
@@ -37,7 +31,7 @@ Flow: `world` (state) → `systems` (change state each tick) → `render` (draw 
 ## Tech decisions
 
 - **Language:** Rust, for both engine and game (one language, no FFI seam; compile-time safety lands on the riskiest code — the long-lived server simulation).
-- **Architecture pattern:** ECS-style data layout (flat columns of component data processed in bulk) — both pleasant in Rust and fast for many-entity simulation.
+- **Architecture pattern:** Hand-rolled ECS-style data layout — component data stored in parallel lists indexed by entity ID, rather than as objects that own their data. An entity is just an index; its data lives in per-component lists, and systems sweep those lists in bulk each tick. Built by hand rather than using an ECS crate, to keep the data layout under our own control and understand it fully.
 - **Editor:** Zed.
 
 ## Open questions / not yet decided
@@ -48,6 +42,8 @@ Flow: `world` (state) → `systems` (change state each tick) → `render` (draw 
 
 ## Implemented so far
 
-- **Fixed-timestep tick loop** (`core` concern, currently in `main.rs`): an accumulator-based loop running at a fixed `TICK_RATE` (currently 30 ticks/sec). Decouples simulation speed from hardware speed — every tick advances the sim by an identical slice of time, so behaviour is deterministic across machines. Real simulation systems will run inside the tick step.
+- **Fixed-timestep tick loop** (`core` concern, currently in `main.rs`): an accumulator-based loop running at a fixed `TICK_RATE` (currently 30 ticks/sec). Decouples simulation speed from hardware speed — every tick advances the sim by an identical slice of time, so behaviour is deterministic across machines. A catch-up cap (`MAX_CATCHUP_TICKS`) prevents the spiral of death: after a hard stall, excess owed time is dropped rather than replayed.
 
--**Minimal hand-rolled ECS world** (`world/`): the world stores components in parallel lists indexed by entity ID — an entity is just an index, and its data lives in per-component lists (currently `positions: Vec<Option<Position>>`,where `Some` means the entity has that component and `None` means it doesn't).Deliberately minimal for now — one component type (position), one entity — to be grown as the game needs more. The `Vec<Option<T>>` (index-is-ID) storage is the simple, clear version; a sparser layout can replace it later if scale demands, without the rest of the engine caring.
+- **Minimal hand-rolled ECS world** (`world/`): the world stores components in parallel lists indexed by entity ID — an entity is just an index, and its data lives in per-component lists (currently `positions: Vec<Option<Position>>`, where `Some` means the entity has that component and `None` means it doesn't). The `Vec<Option<T>>` (index-is-ID) storage is the simple, clear version; a sparser layout can replace it later if scale demands, without the rest of the engine caring. `Position` carries x/y/z — the z axis is included from the start so verticality (floors, bunkers, mining) is native rather than bolted on later.
+
+- **First system, in its own module** (`systems/`): simulation logic lives in named functions in the `systems` module, not inline in the tick loop. The movement system (`systems::movement`) sweeps the world's component lists each tick and advances every entity. The tick loop *calls* systems (`systems::movement(&mut world)`) rather than spelling out the logic itself — so adding new behaviour (AI, etc.) means adding a system and a call, not touching the loop. With this, the ECS shape is complete: entities (indices), components (the lists), and systems (the logic that sweeps them).

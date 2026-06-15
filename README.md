@@ -1,4 +1,4 @@
- Frame Engine
+# Frame Engine
 
 A custom **simulation engine** written in Rust.
 
@@ -6,7 +6,7 @@ Frame Engine advances a world state forward in fixed, deterministic time steps. 
 
 ## Status
 
-Early development. The fixed-timestep tick loop runs at a steady, deterministic rate, and the world is now a minimal hand-rolled ECS — entities are indices into component lists, and the tick advances their state. Next: many entities, and pulling simulation logic into dedicated systems.
+Early development. The fixed-timestep tick loop runs at a steady, deterministic rate with spiral-of-death protection, the world is a minimal hand-rolled ECS (entities are indices into component lists), and the first system — movement — runs each tick from its own module. The core ECS shape is in place: entities, components, and systems. Next: a debug renderer to *see* the simulation, and more components and systems.
 
 ## Principles
 
@@ -20,7 +20,7 @@ crates/frame-engine/src/
 
 ├── core/      tick loop and fixed-timestep clock
 
-├── world/     simulation state (grid, entities)
+├── world/     simulation state (entities, components)
 
 ├── systems/   logic that runs each tick
 
