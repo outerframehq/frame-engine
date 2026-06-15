@@ -1,4 +1,7 @@
-use std::time::{Duration, Instant};
+use std::{
+    time::{Duration, Instant},
+    vec,
+};
 
 mod world;
 use world::{Position, World};
@@ -17,11 +20,23 @@ fn main() {
     let mut accumulator = Duration::ZERO;
 
     let mut world = World {
-        positions: vec![Some(Position {
-            x: 0.0,
-            y: 0.0,
-            z: 0.0,
-        })],
+        positions: vec![
+            Some(Position {
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+            }),
+            Some(Position {
+                x: 10.0,
+                y: 5.0,
+                z: 1.0,
+            }),
+            Some(Position {
+                x: -3.0,
+                y: 2.0,
+                z: 1.0,
+            }),
+        ],
     };
 
     loop {
@@ -39,13 +54,13 @@ fn main() {
             accumulator -= tick_duration;
             tick += 1; // add on to tick count
 
-            if let Some(position) = &mut world.positions[0] {
-                position.x += 1.0; // moves enity 0 along x
-                println!(
-                    "Tick {} - entity 0 at ({}, {}, {})",
-                    tick, position.x, position.y, position.z
-                );
+            for slot in &mut world.positions {
+                if let Some(position) = slot {
+                    position.x += 1.0; // moves every entity along x
+                }
             }
+
+            println!("Tick {} - {} entities", tick, world.positions.len());
         }
     }
 }
