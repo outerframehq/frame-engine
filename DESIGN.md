@@ -17,6 +17,12 @@ A custom **simulation engine** written in Rust. Its job is to advance a world st
 
 ## Architecture / folder layout
 
+- **Architecture pattern:** Hand-rolled ECS-style data layout (component data
+  stored in parallel lists indexed by entity ID, rather than as objects that
+  own their data) — pleasant in Rust and fast for many-entity simulation. Built
+  by hand rather than using an ECS crate, to keep the data layout under our own
+  control and understand it fully.
+
 Workspace layout (`crates/` holds Rust packages; the engine is one crate, a game would be another):
 
 - `core/` — the heartbeat: the tick loop and fixed-timestep clock that drives everything.
@@ -43,3 +49,5 @@ Flow: `world` (state) → `systems` (change state each tick) → `render` (draw 
 ## Implemented so far
 
 - **Fixed-timestep tick loop** (`core` concern, currently in `main.rs`): an accumulator-based loop running at a fixed `TICK_RATE` (currently 30 ticks/sec). Decouples simulation speed from hardware speed — every tick advances the sim by an identical slice of time, so behaviour is deterministic across machines. Real simulation systems will run inside the tick step.
+
+-**Minimal hand-rolled ECS world** (`world/`): the world stores components in parallel lists indexed by entity ID — an entity is just an index, and its data lives in per-component lists (currently `positions: Vec<Option<Position>>`,where `Some` means the entity has that component and `None` means it doesn't).Deliberately minimal for now — one component type (position), one entity — to be grown as the game needs more. The `Vec<Option<T>>` (index-is-ID) storage is the simple, clear version; a sparser layout can replace it later if scale demands, without the rest of the engine caring.
