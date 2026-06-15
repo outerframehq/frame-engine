@@ -3,6 +3,7 @@ use std::{
     vec,
 };
 
+mod systems;
 mod world;
 use world::{Position, World};
 
@@ -53,12 +54,7 @@ fn main() {
         while accumulator >= tick_duration {
             accumulator -= tick_duration;
             tick += 1; // add on to tick count
-
-            for slot in &mut world.positions {
-                if let Some(position) = slot {
-                    position.x += 1.0; // moves every entity along x
-                }
-            }
+            systems::movement(&mut world); //run the movement system
 
             println!("Tick {} - {} entities", tick, world.positions.len());
         }
