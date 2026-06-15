@@ -1,7 +1,7 @@
 use std::time::{Duration, Instant};
 
 mod world;
-use world::{Entity, Position, World};
+use world::{Position, World};
 
 const TICK_RATE: u32 = 30;
 const MAX_CATCHUP_TICKS: u32 = 5;
@@ -17,13 +17,11 @@ fn main() {
     let mut accumulator = Duration::ZERO;
 
     let mut world = World {
-        entity: Entity {
-            position: Position {
-                x: 0.0,
-                y: 0.0,
-                z: 0.0,
-            },
-        },
+        positions: vec![Some(Position {
+            x: 0.0,
+            y: 0.0,
+            z: 0.0,
+        })],
     };
 
     loop {
@@ -40,14 +38,14 @@ fn main() {
         while accumulator >= tick_duration {
             accumulator -= tick_duration;
             tick += 1; // add on to tick count
-            world.entity.position.x += 1.0; // move entity along x axis
-            println!(
-                "Tick {} - entity position: ({}, {}, {})",
-                tick, // real simulation will run here
-                world.entity.position.x,
-                world.entity.position.y,
-                world.entity.position.z
-            );
+
+            if let Some(position) = &mut world.positions[0] {
+                position.x += 1.0; // moves enity 0 along x
+                println!(
+                    "Tick {} - entity 0 at ({}, {}, {})",
+                    tick, position.x, position.y, position.z
+                );
+            }
         }
     }
 }

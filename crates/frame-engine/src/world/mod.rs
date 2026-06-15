@@ -4,10 +4,6 @@ pub struct Position {
     pub z: f32,
 }
 
-pub struct Entity {
-    pub position: Position,
-}
-
 pub struct World {
-    pub entity: Entity,
+    pub positions: Vec<Option<Position>>, //one slot per entity
 }
