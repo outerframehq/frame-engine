@@ -3,6 +3,7 @@ use std::{
     vec,
 };
 
+mod render;
 mod systems;
 mod world;
 use world::{Position, World};
@@ -55,8 +56,8 @@ fn main() {
             accumulator -= tick_duration;
             tick += 1; // add on to tick count
             systems::movement(&mut world); //run the movement system
-
-            println!("Tick {} - {} entities", tick, world.positions.len());
+            println!("Tick {}:", tick);
+            render::debug_print(&world);
         }
     }
 }
