@@ -24,42 +24,59 @@ fn main() {
     let mut accumulator = Duration::ZERO;
 
     let mut world = World {
-        positions: vec![
-            Some(Position {
-                x: 0.0,
-                y: 0.0,
-                z: 0.0,
-            }),
-            Some(Position {
-                x: 10.0,
-                y: 5.0,
-                z: 1.0,
-            }),
-            Some(Position {
-                x: -3.0,
-                y: 2.0,
-                z: 1.0,
-            }),
-        ],
-
-        velocities: vec![
-            Some(Velocity {
-                dx: 1.0,
-                dy: 0.0,
-                dz: 0.0,
-            }), // moves entity 0: right
-            Some(Velocity {
-                dx: 0.0,
-                dy: 1.0,
-                dz: 0.0,
-            }), // moves entity 1: down
-            Some(Velocity {
-                dx: 1.0,
-                dy: 1.0,
-                dz: 0.0,
-            }), // moves entity 2: diagonally
-        ],
+        positions: vec![],
+        velocities: vec![],
     };
+
+    world.spawn(
+        Position {
+            x: 0.0,
+            y: 0.0,
+            z: 0.0,
+        },
+        Velocity {
+            dx: 1.0,
+            dy: 0.0,
+            dz: 0.0,
+        },
+    );
+    world.spawn(
+        Position {
+            x: 10.0,
+            y: 5.0,
+            z: 1.0,
+        },
+        Velocity {
+            dx: 0.0,
+            dy: 1.0,
+            dz: 0.0,
+        },
+    );
+    world.spawn(
+        Position {
+            x: -3.0,
+            y: 2.0,
+            z: 1.0,
+        },
+        Velocity {
+            dx: 1.0,
+            dy: 1.0,
+            dz: 0.0,
+        },
+    );
+
+    world.spawn(
+        Position {
+            x: 5.0,
+            y: 2.0,
+            z: 2.0,
+        },
+        Velocity {
+            dx: 1.0,
+            dy: 1.0,
+            dz: 0.0,
+        },
+    );
 
     loop {
         let now = Instant::now();
