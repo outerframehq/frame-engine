@@ -20,7 +20,7 @@ A custom **simulation engine** written in Rust. Its job is to advance a world st
 Workspace layout (`crates/` holds Rust packages; the engine is one crate, a game would be another):
 
 - `core/` — the heartbeat: the tick loop and fixed-timestep clock that drives everything.
-- `world/` — simulation *state*: the world grid, entities, their data. Numbers, no logic, no drawing.
+- `world/` — simulation *state*: entities, their components, and the storage that holds them. Numbers, no logic, no drawing.
 - `systems/` — logic that runs each tick and *changes* world state (movement, AI, etc.).
 - `render/` — reads world state and draws it. Deliberately separated so it can be replaced freely.
 
@@ -36,14 +36,18 @@ Flow: `world` (state) → `systems` (change state each tick) → `render` (draw 
 
 ## Open questions / not yet decided
 
-- Renderer choice (Bevy vs a hand-rolled stack like wgpu/macroquad + an ECS crate).
-- Tick rate (starting assumption: 30 ticks/sec).
+- Renderer choice for the eventual *real* renderer (Bevy vs a hand-rolled stack like wgpu/macroquad). The current renderer is a headless ASCII debug view only.
 - Networking, persistence, and multi-zone server architecture — designed at a high level for the target game, but not yet engine code.
+- How far to take generic component storage — a fixed set of named component fields on `World` (current direction) vs. fully generic runtime component registration (a later, larger step).
 
 ## Implemented so far
 
 - **Fixed-timestep tick loop** (`core` concern, currently in `main.rs`): an accumulator-based loop running at a fixed `TICK_RATE` (currently 30 ticks/sec). Decouples simulation speed from hardware speed — every tick advances the sim by an identical slice of time, so behaviour is deterministic across machines. A catch-up cap (`MAX_CATCHUP_TICKS`) prevents the spiral of death: after a hard stall, excess owed time is dropped rather than replayed.
 
-- **Minimal hand-rolled ECS world** (`world/`): the world stores components in parallel lists indexed by entity ID — an entity is just an index, and its data lives in per-component lists (currently `positions: Vec<Option<Position>>`, where `Some` means the entity has that component and `None` means it doesn't). The `Vec<Option<T>>` (index-is-ID) storage is the simple, clear version; a sparser layout can replace it later if scale demands, without the rest of the engine caring. `Position` carries x/y/z — the z axis is included from the start so verticality (floors, bunkers, mining) is native rather than bolted on later.
+- **Hand-rolled ECS world** (`world/`): entities are indices; component data lives in per-component lists indexed by entity ID (`Some` = entity has that component, `None` = it doesn't). Currently two component types — `Position` (x/y/z; the z axis is included from the start so verticality like floors, bunkers, and mining is native rather than bolted on later) and `Velocity` (dx/dy/dz). The world supports runtime **spawn** (create an entity, reusing freed slots where possible) and **despawn** (clear an entity's slots; the index stays valid, preserving stable IDs).
 
-- **First system, in its own module** (`systems/`): simulation logic lives in named functions in the `systems` module, not inline in the tick loop. The movement system (`systems::movement`) sweeps the world's component lists each tick and advances every entity. The tick loop *calls* systems (`systems::movement(&mut world)`) rather than spelling out the logic itself — so adding new behaviour (AI, etc.) means adding a system and a call, not touching the loop. With this, the ECS shape is complete: entities (indices), components (the lists), and systems (the logic that sweeps them).
+- **Systems, in their own module** (`systems/`): simulation logic lives in named functions, not inline in the tick loop. The movement system (`systems::movement`) reads each entity's velocity and applies it to its position, advancing every entity each tick. The tick loop *calls* systems (`systems::movement(&mut world)`) rather than spelling out the logic — so adding behaviour means adding a system and a call, not touching the loop. With this, the ECS shape is complete: entities (indices), components (the lists), and systems (the logic that sweeps them).
+
+- **Debug renderer** (`render/`): a read-only ASCII view that draws the world as a grid each frame, mapping entity x/y onto grid cells. Read-only by design (takes `&World`, never `&mut`), enforcing the simulation/rendering separation. Render rate is decoupled from tick rate (the sim ticks every step; the view redraws every Nth tick) — a small first instance of the principle that simulation rate and render rate are independent.
+
+- **Generic component storage** (`world/storage.rs`) — *in progress*: a reusable `ComponentStorage<T>` type (a `Vec<Option<T>>` plus `insert`/`get`/`remove`) so each component type uses the same tested storage code instead of a hand-written `Vec<Option<...>>` per type. Built and compiling; not yet wired into `World` (next step). Once wired in, adding a new component type becomes adding one storage field rather than repeating the storage pattern by hand.
