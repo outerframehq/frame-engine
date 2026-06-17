@@ -1,4 +1,5 @@
 use crate::world::World;
+use std::io::Write;
 
 // Grid Size for render
 
@@ -6,6 +7,9 @@ const GRID_WIDTH: usize = 20;
 const GRID_HIGHT: usize = 10;
 
 pub fn debug_print(world: &World) {
+    print!("\x1B[2J\x1B[H"); // Clears screen and move cursor
+    std::io::stdout().flush().unwrap();
+
     let mut grid = [['.'; GRID_WIDTH]; GRID_HIGHT];
 
     for slot in world.positions.iter() {
