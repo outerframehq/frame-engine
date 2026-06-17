@@ -1,3 +1,7 @@
+mod storage;
+
+pub use storage::ComponentStorage;
+
 pub struct Position {
     pub x: f32,
     pub y: f32,
