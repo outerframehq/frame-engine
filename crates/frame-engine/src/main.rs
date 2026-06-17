@@ -8,6 +8,8 @@ mod systems;
 mod world;
 use world::{Position, World};
 
+use crate::world::Velocity;
+
 const TICK_RATE: u32 = 30;
 const MAX_CATCHUP_TICKS: u32 = 5;
 
@@ -38,6 +40,24 @@ fn main() {
                 y: 2.0,
                 z: 1.0,
             }),
+        ],
+
+        velocities: vec![
+            Some(Velocity {
+                dx: 1.0,
+                dy: 0.0,
+                dz: 0.0,
+            }), // moves entity 0: right
+            Some(Velocity {
+                dx: 0.0,
+                dy: 1.0,
+                dz: 0.0,
+            }), // moves entity 1: down
+            Some(Velocity {
+                dx: 1.0,
+                dy: 1.0,
+                dz: 0.0,
+            }), // moves entity 2: diagonally
         ],
     };
 
