@@ -6,9 +6,8 @@ use std::{
 mod render;
 mod systems;
 mod world;
-use world::{Position, World};
 
-use crate::world::Velocity;
+use world::{ComponentStorage, Position, Velocity, World};
 
 const TICK_RATE: u32 = 30;
 const MAX_CATCHUP_TICKS: u32 = 5;
@@ -24,8 +23,8 @@ fn main() {
     let mut accumulator = Duration::ZERO;
 
     let mut world = World {
-        positions: vec![],
-        velocities: vec![],
+        positions: ComponentStorage::new(),
+        velocities: ComponentStorage::new(),
     };
 
     world.spawn(

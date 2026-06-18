@@ -15,8 +15,9 @@ pub struct Velocity {
 }
 
 pub struct World {
-    pub positions: Vec<Option<Position>>, //one slot per entity
-    pub velocities: Vec<Option<Velocity>>,
+    //one slot per entity, indexed by entity ID
+    pub positions: ComponentStorage<Position>,
+    pub velocities: ComponentStorage<Velocity>,
 }
 
 impl World {
@@ -24,25 +25,18 @@ impl World {
 
     pub fn spawn(&mut self, position: Position, velocity: Velocity) -> usize {
         // looking for a freed slot
-        for id in 0..self.positions.len() {
-            if self.positions[id].is_none() {
-                self.positions[id] = Some(position);
-                self.velocities[id] = Some(velocity);
-                return id;
-            }
-        }
+        let id = self.positions.len();
         // no free slot , grow both list by one
-
-        self.positions.push(Some(position));
-        self.velocities.push(Some(velocity));
-        self.positions.len() - 1
+        self.positions.insert(id, position);
+        self.velocities.insert(id, velocity);
+        id
     }
 
     // removes an entity by clearing its slots, will make the index stay valid now Empty
     pub fn despawn(&mut self, id: usize) {
         if id < self.positions.len() {
-            self.positions[id] = None;
-            self.velocities[id] = None;
+            self.positions.remove(id);
+            self.velocities.remove(id);
         }
     }
 }

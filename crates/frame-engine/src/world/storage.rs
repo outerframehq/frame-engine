@@ -11,6 +11,17 @@ impl<T> ComponentStorage<T> {
         ComponentStorage { items: Vec::new() }
     }
 
+    pub fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    pub fn iter(&self) -> std::slice::Iter<'_, Option<T>> {
+        self.items.iter()
+    }
+
+    pub fn iter_mut(&mut self) -> std::slice::IterMut<'_, Option<T>> {
+        self.items.iter_mut()
+    }
     //give entity "ID" this component growing the list if needed
 
     pub fn insert(&mut self, id: usize, value: T) {
