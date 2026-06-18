@@ -6,3 +6,4 @@ edition = "2024"
 [dependencies]
 
 frame-engine = { path = "../frame-engine" }
+winit = "0.30"
