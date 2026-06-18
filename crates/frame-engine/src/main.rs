@@ -1,13 +1,7 @@
-use std::{
-    time::{Duration, Instant},
-    vec,
-};
+use std::time::{Duration, Instant};
 
-mod render;
-mod systems;
-mod world;
-
-use world::{ComponentStorage, Position, Velocity, World};
+use frame_engine::world::{ComponentStorage, Position, Velocity, World};
+use frame_engine::{render, systems};
 
 const TICK_RATE: u32 = 30;
 const MAX_CATCHUP_TICKS: u32 = 5;
