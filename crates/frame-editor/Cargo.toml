@@ -7,3 +7,4 @@ edition = "2024"
 
 frame-engine = { path = "../frame-engine" }
 winit = "0.30"
+softbuffer = "0.4"
