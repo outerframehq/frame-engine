@@ -7,6 +7,7 @@ use std::time::{Duration, Instant};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
+use winit::keyboard::NamedKey::BrightnessDown;
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
 
@@ -137,7 +138,9 @@ impl ApplicationHandler for App {
                         }
 
                         // draw each entity as a bright dot
-                        let entity_color: u32 = (220 << 16) | (220 << 8) | 80; //warm yellow
+                        let base_r: f32 = 220.0;
+                        let base_g: f32 = 220.0;
+                        let base_b: f32 = 80.0;
                         let center_x = width_px as f32 / 2.0;
                         let center_y = height_px as f32 / 2.0;
 
@@ -146,7 +149,16 @@ impl ApplicationHandler for App {
                                 // project world position through the camera
                                 let px = (center_x + (position.x - self.cam_x) * self.zoom) as i32;
                                 let py = (center_y + (position.y - self.cam_y) * self.zoom) as i32;
-                                let size: i32 = 6; // entity dot size in pixels
+
+                                //fake z dpeth modulates size and brightness
+                                let depth = position.z;
+                                let size = (6.0 + depth * 0.6) as i32;
+
+                                let brightness = (1.0 + depth * 0.06).clamp(0.35, 1.4);
+                                let r = (base_r * brightness).min(255.0) as u32;
+                                let g = (base_g * brightness).min(255.0) as u32;
+                                let b = (base_b * brightness).min(255.0) as u32;
+                                let entity_color = (r << 16) | (g << 8) | b;
 
                                 // draw a sizexsize square centered at px, py
                                 for dy in -size / 2..size / 2 {
@@ -203,6 +215,7 @@ fn main() {
             z: 0.0,
         },
         Velocity {
+            // dirft near = Big & bright
             dx: 0.4,
             dy: 0.2,
             dz: 0.0,
@@ -210,6 +223,7 @@ fn main() {
     );
     world.spawn(
         Position {
+            //parked near = big & bright
             x: 40.0,
             y: 20.0,
             z: 0.0,
@@ -222,6 +236,7 @@ fn main() {
     );
     world.spawn(
         Position {
+            // parked far = small & dim
             x: -30.0,
             y: 50.0,
             z: 0.0,
