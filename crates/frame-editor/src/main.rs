@@ -5,7 +5,7 @@ use std::num::NonZeroU32;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, WindowEvent};
+use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
@@ -20,6 +20,13 @@ struct App {
     paused: bool,
     last_time: Instant,
     accumulator: Duration,
+    // camera: what world point sits at screen centre, and pixels-per-world-unit
+    cam_x: f32,
+    cam_y: f32,
+    zoom: f32,
+    // mouse-drag tracking
+    dragging: bool,
+    last_cursor: (f64, f64),
 }
 
 impl ApplicationHandler for App {
@@ -42,6 +49,38 @@ impl ApplicationHandler for App {
                 println!("Close requested; Shutting Down");
                 event_loop.exit();
             }
+
+            WindowEvent::MouseInput { state, button, .. } => {
+                if button == MouseButton::Left {
+                    // hold left button = dragging the view
+                    self.dragging = state == ElementState::Pressed;
+                }
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                if self.dragging {
+                    // how far the cursor moved, in pixels, since last report
+                    let dx = (position.x - self.last_cursor.0) as f32;
+                    let dy = (position.y - self.last_cursor.1) as f32;
+                    // move the camera opposite the drag, converting pixels -> world units.
+                    // grab-and-drag: the world follows the cursor.
+                    self.cam_x -= dx / self.zoom;
+                    self.cam_y -= dy / self.zoom;
+                }
+                self.last_cursor = (position.x, position.y);
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                // wheel reports line notches; trackpads report pixels — handle both
+                let scroll = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => y,
+                    MouseScrollDelta::PixelDelta(pos) => pos.y as f32,
+                };
+                if scroll > 0.0 {
+                    self.zoom *= 1.1; // scroll up = zoom in
+                } else if scroll < 0.0 {
+                    self.zoom /= 1.1; // scroll down = zoom out
+                }
+            }
+
             WindowEvent::KeyboardInput { event, .. } => {
                 // only react to the initial press — not auto-repeat, not release
                 if event.state == ElementState::Pressed && !event.repeat {
@@ -99,15 +138,14 @@ impl ApplicationHandler for App {
 
                         // draw each entity as a bright dot
                         let entity_color: u32 = (220 << 16) | (220 << 8) | 80; //warm yellow
-                        let orgin_x = width_px / 2;
-                        let orgin_y = height_px / 2;
+                        let center_x = width_px as f32 / 2.0;
+                        let center_y = height_px as f32 / 2.0;
 
                         for slot in self.world.positions.iter() {
                             if let Some(position) = slot {
-                                // map wold x/y to a pixel position
-                                let px = orgin_x as i32 + position.x as i32;
-                                let py = orgin_y as i32 + position.y as i32;
-
+                                // project world position through the camera
+                                let px = (center_x + (position.x - self.cam_x) * self.zoom) as i32;
+                                let py = (center_y + (position.y - self.cam_y) * self.zoom) as i32;
                                 let size: i32 = 6; // entity dot size in pixels
 
                                 // draw a sizexsize square centered at px, py
@@ -204,6 +242,11 @@ fn main() {
         paused: false,
         last_time: Instant::now(),
         accumulator: Duration::ZERO,
+        cam_x: 0.0,
+        cam_y: 0.0,
+        zoom: 1.0,
+        dragging: false,
+        last_cursor: (0.0, 0.0),
     };
 
     println!(
