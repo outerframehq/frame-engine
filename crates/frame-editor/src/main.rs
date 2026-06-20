@@ -7,7 +7,6 @@ use std::time::{Duration, Instant};
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
-use winit::keyboard::NamedKey::BrightnessDown;
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
 
@@ -21,13 +20,65 @@ struct App {
     paused: bool,
     last_time: Instant,
     accumulator: Duration,
-    // camera: what world point sits at screen centre, and pixels-per-world-unit
     cam_x: f32,
     cam_y: f32,
     zoom: f32,
-    // mouse-drag tracking
     dragging: bool,
     last_cursor: (f64, f64),
+    selected: Option<usize>,
+}
+
+impl App {
+    fn pick_entity(&mut self) {
+        // window centre, in physical pixels — same coordinate space as the cursor
+        let (center_x, center_y) = match &self.window {
+            Some(window) => {
+                let size = window.inner_size();
+                (size.width as f32 / 2.0, size.height as f32 / 2.0)
+            }
+            None => return,
+        };
+
+        let cursor_x = self.last_cursor.0 as f32;
+        let cursor_y = self.last_cursor.1 as f32;
+
+        let mut picked: Option<usize> = None;
+
+        for (id, slot) in self.world.positions.iter().enumerate() {
+            if let Some(position) = slot {
+                // identical projection + size to the renderer
+                let px = center_x + (position.x - self.cam_x) * self.zoom;
+                let py = center_y + (position.y - self.cam_y) * self.zoom;
+
+                let depth = position.z;
+                let side = (6.0 + depth * 0.6).max(2.0);
+                let half = side / 2.0;
+
+                // exact hit: is the cursor inside this entity's square?
+                if cursor_x >= px - half
+                    && cursor_x < px + half
+                    && cursor_y >= py - half
+                    && cursor_y < py + half
+                {
+                    picked = Some(id); // later entities draw on top, so last match wins
+                }
+            }
+        }
+
+        // Only change selection when we actually hit something. That way panning
+        // from empty space neither clears the selection nor spams the console.
+        if let Some(id) = picked {
+            self.selected = Some(id);
+            if let (Some(position), Some(velocity)) =
+                (self.world.positions.get(id), self.world.velocities.get(id))
+            {
+                println!(
+                    "Selected entity {} | pos ({:.1}, {:.1}, {:.1}) | vel ({:.2}, {:.2}, {:.2})",
+                    id, position.x, position.y, position.z, velocity.dx, velocity.dy, velocity.dz,
+                );
+            }
+        }
+    }
 }
 
 impl ApplicationHandler for App {
@@ -53,8 +104,10 @@ impl ApplicationHandler for App {
 
             WindowEvent::MouseInput { state, button, .. } => {
                 if button == MouseButton::Left {
-                    // hold left button = dragging the view
                     self.dragging = state == ElementState::Pressed;
+                    if state == ElementState::Pressed {
+                        self.pick_entity();
+                    }
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
@@ -100,6 +153,10 @@ impl ApplicationHandler for App {
                                 println!("Stepped one tick");
                             }
                         }
+                        PhysicalKey::Code(KeyCode::Escape) => {
+                            self.selected = None;
+                            println!("Selection cleared");
+                        }
                         _ => {}
                     }
                 }
@@ -144,7 +201,7 @@ impl ApplicationHandler for App {
                         let center_x = width_px as f32 / 2.0;
                         let center_y = height_px as f32 / 2.0;
 
-                        for slot in self.world.positions.iter() {
+                        for (id, slot) in self.world.positions.iter().enumerate() {
                             if let Some(position) = slot {
                                 // project world position through the camera
                                 let px = (center_x + (position.x - self.cam_x) * self.zoom) as i32;
@@ -152,7 +209,7 @@ impl ApplicationHandler for App {
 
                                 //fake z dpeth modulates size and brightness
                                 let depth = position.z;
-                                let size = (6.0 + depth * 0.6) as i32;
+                                let size = (6.0 + depth * 0.6).max(2.0) as i32;
 
                                 let brightness = (1.0 + depth * 0.06).clamp(0.35, 1.4);
                                 let r = (base_r * brightness).min(255.0) as u32;
@@ -184,6 +241,33 @@ impl ApplicationHandler for App {
                                 {
                                     let index = py as u32 * width_px + px as u32;
                                     buffer[index as usize] = entity_color;
+                                }
+
+                                // highlight the selected entity with a ring
+                                if Some(id) == self.selected {
+                                    let ring_color: u32 = (255 << 16) | (255 << 8) | 255; // white
+                                    let ring_half = size / 2 + 3; // sits a few px outside the square
+                                    for dy in -ring_half..=ring_half {
+                                        for dx in -ring_half..=ring_half {
+                                            // border only — skip the filled interior
+                                            if dx == -ring_half
+                                                || dx == ring_half
+                                                || dy == -ring_half
+                                                || dy == ring_half
+                                            {
+                                                let x = px + dx;
+                                                let y = py + dy;
+                                                if x >= 0
+                                                    && x < width_px as i32
+                                                    && y >= 0
+                                                    && y < height_px as i32
+                                                {
+                                                    let index = y as u32 * width_px + x as u32;
+                                                    buffer[index as usize] = ring_color;
+                                                }
+                                            }
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -262,6 +346,7 @@ fn main() {
         zoom: 1.0,
         dragging: false,
         last_cursor: (0.0, 0.0),
+        selected: None,
     };
 
     println!(
