@@ -1,3 +1,4 @@
+use frame_engine::systems;
 use frame_engine::world::World;
 use frame_engine::world::{ComponentStorage, Position, Velocity};
 use std::num::NonZeroU32;
@@ -34,6 +35,9 @@ impl ApplicationHandler for App {
                 event_loop.exit();
             }
             WindowEvent::RedrawRequested => {
+                //advances the simulation by on step,then draws the new state
+                systems::movement(&mut self.world);
+
                 if let (Some(window), Some(surface)) = (&self.window, &mut self.surface) {
                     let size = window.inner_size();
 
@@ -57,6 +61,8 @@ impl ApplicationHandler for App {
                         let entity_color: u32 = (220 << 16) | (220 << 8) | 80; //warm yellow
                         let orgin_x = width_px / 2;
                         let orgin_y = height_px / 2;
+
+                        window.request_redraw();
 
                         for slot in self.world.positions.iter() {
                             if let Some(position) = slot {
@@ -118,8 +124,8 @@ fn main() {
             z: 0.0,
         },
         Velocity {
-            dx: 0.0,
-            dy: 0.0,
+            dx: 0.4,
+            dy: 0.2,
             dz: 0.0,
         },
     );
@@ -130,8 +136,8 @@ fn main() {
             z: 0.0,
         },
         Velocity {
-            dx: 0.0,
-            dy: 0.0,
+            dx: -0.3,
+            dy: 0.3,
             dz: 0.0,
         },
     );
@@ -142,8 +148,8 @@ fn main() {
             z: 0.0,
         },
         Velocity {
-            dx: 0.0,
-            dy: 0.0,
+            dx: 0.5,
+            dy: -0.4,
             dz: 0.0,
         },
     );
