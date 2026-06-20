@@ -4,14 +4,16 @@ use frame_engine::world::{ComponentStorage, Position, Velocity};
 use std::num::NonZeroU32;
 use std::rc::Rc;
 use winit::application::ApplicationHandler;
-use winit::event::WindowEvent;
+use winit::event::{ElementState, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
+use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
 
 struct App {
     window: Option<Rc<Window>>,
     surface: Option<softbuffer::Surface<Rc<Window>, Rc<Window>>>,
     world: World,
+    paused: bool,
 }
 
 impl ApplicationHandler for App {
@@ -34,9 +36,34 @@ impl ApplicationHandler for App {
                 println!("Close requested; Shutting Down");
                 event_loop.exit();
             }
+            WindowEvent::KeyboardInput { event, .. } => {
+                // only react to the initial press — not auto-repeat, not release
+                if event.state == ElementState::Pressed && !event.repeat {
+                    match event.physical_key {
+                        PhysicalKey::Code(KeyCode::Space) => {
+                            self.paused = !self.paused;
+                            if self.paused {
+                                println!("Paused");
+                            } else {
+                                println!("Playing");
+                            }
+                        }
+                        PhysicalKey::Code(KeyCode::KeyS) => {
+                            if self.paused {
+                                systems::movement(&mut self.world);
+                                println!("Stepped one tick");
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
             WindowEvent::RedrawRequested => {
-                //advances the simulation by on step,then draws the new state
-                systems::movement(&mut self.world);
+                // advance the simulation by one step — but only when not paused.
+                // NOTE: only the tick is gated. Drawing always happens.
+                if !self.paused {
+                    systems::movement(&mut self.world);
+                }
 
                 if let (Some(window), Some(surface)) = (&self.window, &mut self.surface) {
                     let size = window.inner_size();
@@ -61,8 +88,6 @@ impl ApplicationHandler for App {
                         let entity_color: u32 = (220 << 16) | (220 << 8) | 80; //warm yellow
                         let orgin_x = width_px / 2;
                         let orgin_y = height_px / 2;
-
-                        window.request_redraw();
 
                         for slot in self.world.positions.iter() {
                             if let Some(position) = slot {
@@ -102,6 +127,9 @@ impl ApplicationHandler for App {
 
                         buffer.present().unwrap();
                     }
+
+                    // schedule the next frame so the loop keeps running
+                    window.request_redraw();
                 }
             }
             _ => {}
@@ -160,6 +188,7 @@ fn main() {
         window: None,
         surface: None,
         world,
+        paused: false,
     };
 
     println!(
