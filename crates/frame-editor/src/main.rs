@@ -3,6 +3,7 @@ use std::sync::Arc;
 use frame_engine::core::Clock;
 use frame_engine::systems;
 use frame_engine::world::{ComponentStorage, Position, Velocity, World};
+use wgpu::util::DeviceExt;
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
@@ -12,6 +13,18 @@ use winit::window::{Window, WindowId};
 const TICK_RATE: u32 = 30;
 const MAX_CATCHUP_TICKS: u32 = 5;
 
+// The camera data handed to the shader. repr(C) lays the fields out in a fixed,
+// predictable order; Pod + Zeroable (from bytemuck) let us copy it to the GPU as
+// raw bytes. It must match the `Camera` struct in shader.wgsl.
+//
+// For step 4a this holds the identity matrix (a no-op transform). Step 4b fills
+// it with a real perspective + view matrix.
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct CameraUniform {
+    view_proj: [[f32; 4]; 4],
+}
+
 // All the long-lived GPU objects, bundled so they travel together.
 struct GpuState {
     surface: wgpu::Surface<'static>,
@@ -19,6 +32,7 @@ struct GpuState {
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
     render_pipeline: wgpu::RenderPipeline,
+    camera_bind_group: wgpu::BindGroup,
 }
 
 impl GpuState {
@@ -29,6 +43,7 @@ impl GpuState {
 
         // 1. Instance: the entry point to wgpu.
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+
         // 2. Surface: the slice of the window we draw to. Owns an Arc of the
         //    window, so it's a 'static surface.
         let surface = instance.create_surface(window.clone()).unwrap();
@@ -53,17 +68,65 @@ impl GpuState {
             .unwrap();
         surface.configure(&device, &config);
 
-        // 6. Compile the shader (vertex + fragment stages, from shader.wgsl).
+        // 6. Camera uniform: the identity matrix for now (changes nothing).
+        let camera_uniform = CameraUniform {
+            view_proj: [
+                [1.0, 0.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0, 0.0],
+                [0.0, 0.0, 1.0, 0.0],
+                [0.0, 0.0, 0.0, 1.0],
+            ],
+        };
+
+        // 7. Upload it into a uniform buffer on the GPU. COPY_DST lets us
+        //    overwrite it later (step 4b, when the camera moves).
+        let camera_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("camera buffer"),
+            contents: bytemuck::cast_slice(&[camera_uniform]),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+
+        // 8. The contract: binding 0 is a uniform buffer the vertex shader reads.
+        let camera_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("camera bind group layout"),
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                }],
+            });
+
+        // 9. The wiring: this specific buffer fills binding 0 of that contract.
+        let camera_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("camera bind group"),
+            layout: &camera_bind_group_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: camera_buffer.as_entire_binding(),
+            }],
+        });
+
+        // 10. Compile the shader (vertex + fragment stages, from shader.wgsl).
         let shader = device.create_shader_module(wgpu::include_wgsl!("shader.wgsl"));
 
-        // 7. Build the render pipeline: the reusable "recipe" tying the shaders
-        //    to the surface's pixel format. layout: None lets wgpu derive an
-        //    (empty) layout from the shader — fine while the shader has no
-        //    bindings. We'll give it an explicit layout when the camera uniform
-        //    arrives in step 4.
+        // 11. Pipeline layout now lists the camera bind group layout — this is
+        //     the explicit layout that replaces step 2's `layout: None`.
+        let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("pipeline layout"),
+            bind_group_layouts: &[Some(&camera_bind_group_layout)],
+            immediate_size: 0,
+        });
+
+        // 12. Build the render pipeline.
         let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("entity pipeline"),
-            layout: None,
+            layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &shader,
                 entry_point: Some("vs_main"),
@@ -93,6 +156,7 @@ impl GpuState {
             queue,
             config,
             render_pipeline,
+            camera_bind_group,
         }
     }
 
@@ -155,8 +219,9 @@ impl GpuState {
                 multiview_mask: None,
             });
 
-            // Use our pipeline, then draw 6 vertices (the quad) as 1 instance.
+            // Bind the camera, use our pipeline, then draw the quad's 6 vertices.
             render_pass.set_pipeline(&self.render_pipeline);
+            render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
             render_pass.draw(0..6, 0..1);
         }
 

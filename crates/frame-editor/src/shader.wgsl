@@ -1,18 +1,28 @@
-// First shader for Frame Engine's wgpu renderer.
+// Frame Engine wgpu renderer shader.
 //
-// Two stages run on the GPU:
+// Stages:
 //   - vs_main  (vertex)   : runs once per corner, returns where that corner sits
 //   - fs_main  (fragment) : runs once per covered pixel, returns its colour
 //
-// For now the quad's six corners are hardcoded here, in clip space:
-// clip space runs -1..1 across the window, with (0,0) at the centre. So a
-// square from -0.5 to 0.5 sits centred, half the window wide. (It'll look
-// stretched on a non-square window until the perspective camera lands in
-// step 4 — that's expected.)
+// New in step 4a: a camera matrix arrives from Rust via a uniform buffer.
+// The vertex shader multiplies each corner by it. For now that matrix is the
+// identity (a do-nothing transform), so the quad looks unchanged — that's how
+// we prove the matrix actually reached the shader. Step 4b swaps in a real
+// perspective + view matrix.
+
+// The uniform: must match the CameraUniform struct on the Rust side.
+struct Camera {
+    view_proj: mat4x4<f32>,
+};
+
+// @group(0) @binding(0) lines up with the bind group layout in main.rs.
+@group(0) @binding(0)
+var<uniform> camera: Camera;
 
 @vertex
 fn vs_main(@builtin(vertex_index) index: u32) -> @builtin(position) vec4<f32> {
-    // A quad is two triangles. Six corners, wound as two tris:
+    // A quad is two triangles. Six corners, wound as two tris.
+    // Treat these as world-space positions on the z = 0 plane.
     var corners = array<vec2<f32>, 6>(
         vec2<f32>(-0.5, -0.5), // triangle 1
         vec2<f32>( 0.5, -0.5),
@@ -23,8 +33,8 @@ fn vs_main(@builtin(vertex_index) index: u32) -> @builtin(position) vec4<f32> {
     );
 
     let p = corners[index];
-    // x, y from the array; z = 0 (on the near plane); w = 1 (no perspective yet)
-    return vec4<f32>(p, 0.0, 1.0);
+    // Transform the corner by the camera matrix. With identity, this is a no-op.
+    return camera.view_proj * vec4<f32>(p, 0.0, 1.0);
 }
 
 @fragment
