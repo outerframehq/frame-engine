@@ -1,5 +1,4 @@
-use std::time::{Duration, Instant};
-
+use frame_engine::core::Clock;
 use frame_engine::world::{ComponentStorage, Position, Velocity, World};
 use frame_engine::{render, systems};
 
@@ -9,12 +8,8 @@ const MAX_CATCHUP_TICKS: u32 = 5;
 fn main() {
     println!("Frame Engine starting up.");
 
-    let tick_duration = Duration::from_secs(1) / TICK_RATE;
-    let max_accumulator = tick_duration * MAX_CATCHUP_TICKS;
-
+    let mut clock = Clock::new(TICK_RATE, MAX_CATCHUP_TICKS);
     let mut tick: u64 = 0;
-    let mut last_time = Instant::now();
-    let mut accumulator = Duration::ZERO;
 
     let mut world = World {
         positions: ComponentStorage::new(),
@@ -72,21 +67,12 @@ fn main() {
     );
 
     loop {
-        let now = Instant::now();
-        let delta = now.duration_since(last_time);
-        last_time = now; // so next loop measures the gap since this loop, not since startup
-
-        accumulator += delta; // pour that real time into the bucket
-        // cap the bucket so big stall cant make us replay endless ticks
-        if accumulator > max_accumulator {
-            accumulator = max_accumulator;
-        }
-
-        while accumulator >= tick_duration {
-            accumulator -= tick_duration;
+        // ask the shared clock how many fixed ticks are owed, then run each.
+        // the engine always runs, so we pass `true`.
+        let owed = clock.advance(true);
+        for _ in 0..owed {
             tick += 1; // add on to tick count
-            systems::movement(&mut world); //run the movement system
-
+            systems::movement(&mut world); // run the movement system
             if tick % 6 == 0 {
                 println!("Tick {}", tick);
                 render::debug_print(&world);

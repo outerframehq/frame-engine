@@ -1,10 +1,11 @@
 mod font;
+use frame_engine::core::Clock;
 use frame_engine::systems;
 use frame_engine::world::World;
 use frame_engine::world::{ComponentStorage, Position, Velocity};
 use std::num::NonZeroU32;
 use std::rc::Rc;
-use std::time::{Duration, Instant};
+
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
@@ -19,8 +20,7 @@ struct App {
     surface: Option<softbuffer::Surface<Rc<Window>, Rc<Window>>>,
     world: World,
     paused: bool,
-    last_time: Instant,
-    accumulator: Duration,
+    clock: Clock,
     cam_x: f32,
     cam_y: f32,
     zoom: f32,
@@ -163,16 +163,11 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::RedrawRequested => {
-                //fixed timestep clock
-                let tick_duration = Duration::from_secs(1) / TICK_RATE;
-                let max_accumulator = tick_duration * MAX_CATCHUP_TICKS;
-
-                let now = Instant::now();
-                let delta = now.duration_since(self.last_time);
-                self.last_time = now; // mesure the gap to the next frame
-                // advance the simulation by one step — but only when not paused.
-                // NOTE: only the tick is gated. Drawing always happens.
-                if !self.paused {
+                // ask the shared clock how many fixed ticks are owed since last
+                // frame, and run the simulation that many times. Passing `!self.paused`
+                // means a paused editor keeps its timing current but advances zero ticks.
+                let owed = self.clock.advance(!self.paused);
+                for _ in 0..owed {
                     systems::movement(&mut self.world);
                 }
 
@@ -369,8 +364,7 @@ fn main() {
         surface: None,
         world,
         paused: false,
-        last_time: Instant::now(),
-        accumulator: Duration::ZERO,
+        clock: Clock::new(TICK_RATE, MAX_CATCHUP_TICKS),
         cam_x: 0.0,
         cam_y: 0.0,
         zoom: 1.0,
