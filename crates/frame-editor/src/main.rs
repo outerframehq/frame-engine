@@ -6,13 +6,17 @@ use frame_engine::world::{ComponentStorage, Position, Velocity, World};
 use glam::{Mat4, Vec3};
 use wgpu::util::DeviceExt;
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, WindowEvent};
+use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
 
 const TICK_RATE: u32 = 30;
 const MAX_CATCHUP_TICKS: u32 = 5;
+
+// Vertical field of view, shared by the projection and the pan maths so they
+// stay in sync.
+const FOV_DEGREES: f32 = 45.0;
 
 // The camera data handed to the shader. repr(C) lays the fields out in a fixed,
 // predictable order; Pod + Zeroable (from bytemuck) let us copy it to the GPU as
@@ -51,23 +55,28 @@ impl InstanceRaw {
     }
 }
 
-// Build the combined view-projection matrix for the current window size.
+// Build the combined view-projection matrix for the camera's current state.
 //
-//   view  : where the camera sits and what it looks at
-//   proj  : how 3D flattens onto the 2D screen (perspective + aspect correction)
+//   focus_x/focus_y : the world point the camera looks at (on the z = 0 plane)
+//   distance        : how far back along +Z the eye sits (zoom)
 //
-// The camera is pulled well back (z = 150) so the entities — which live at
-// tens of world units — fit in frame, and the far plane is large enough not to
-// clip them. perspective_rh targets wgpu's [0,1] depth range directly.
-fn camera_view_proj(width: u32, height: u32) -> [[f32; 4]; 4] {
+// perspective_rh targets wgpu's [0,1] depth range directly. The far plane is
+// large enough to cover the full zoom-out range.
+fn camera_view_proj(
+    focus_x: f32,
+    focus_y: f32,
+    distance: f32,
+    width: u32,
+    height: u32,
+) -> [[f32; 4]; 4] {
     let aspect = width as f32 / height.max(1) as f32;
 
-    let eye = Vec3::new(0.0, 0.0, 150.0); // far back so the world fits
-    let target = Vec3::ZERO; // looking at the origin
-    let up = Vec3::Y; // +Y is up
+    let eye = Vec3::new(focus_x, focus_y, distance);
+    let target = Vec3::new(focus_x, focus_y, 0.0);
+    let up = Vec3::Y;
 
     let view = Mat4::look_at_rh(eye, target, up);
-    let proj = Mat4::perspective_rh(45.0_f32.to_radians(), aspect, 0.1, 1000.0);
+    let proj = Mat4::perspective_rh(FOV_DEGREES.to_radians(), aspect, 0.1, 10000.0);
 
     (proj * view).to_cols_array_2d()
 }
@@ -116,13 +125,14 @@ impl GpuState {
             .unwrap();
         surface.configure(&device, &config);
 
-        // 6. Camera uniform: a real perspective + view matrix for the start size.
+        // 6. Camera uniform: start as identity; render() overwrites it every
+        //    frame from the live camera state.
         let camera_uniform = CameraUniform {
-            view_proj: camera_view_proj(config.width, config.height),
+            view_proj: Mat4::IDENTITY.to_cols_array_2d(),
         };
 
-        // 7. Upload it into a uniform buffer on the GPU. COPY_DST lets us
-        //    overwrite it later (on resize, and when the camera moves).
+        // 7. Upload it into a uniform buffer on the GPU. COPY_DST lets render()
+        //    overwrite it each frame.
         let camera_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("camera buffer"),
             contents: bytemuck::cast_slice(&[camera_uniform]),
@@ -165,8 +175,8 @@ impl GpuState {
             immediate_size: 0,
         });
 
-        // 12. Build the render pipeline. The vertex stage now reads one buffer:
-        //     the per-instance entity positions.
+        // 12. Build the render pipeline. The vertex stage reads one buffer: the
+        //     per-instance entity positions.
         let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("entity pipeline"),
             layout: Some(&pipeline_layout),
@@ -204,27 +214,27 @@ impl GpuState {
         }
     }
 
-    // Re-apply the config at a new size, and recompute the camera so the aspect
-    // ratio stays correct (otherwise the world would stretch).
+    // Re-apply the config at a new size. The camera matrix is rebuilt every
+    // frame in render(), so there's nothing camera-related to do here.
     fn resize(&mut self, width: u32, height: u32) {
         if width > 0 && height > 0 {
             self.config.width = width;
             self.config.height = height;
             self.surface.configure(&self.device, &self.config);
-
-            let camera_uniform = CameraUniform {
-                view_proj: camera_view_proj(width, height),
-            };
-            self.queue.write_buffer(
-                &self.camera_buffer,
-                0,
-                bytemuck::cast_slice(&[camera_uniform]),
-            );
         }
     }
 
-    // Draw one frame: clear the screen, then draw one quad per entity.
-    fn render(&mut self, instances: &[InstanceRaw]) {
+    // Draw one frame: upload the current camera matrix, clear, then draw one
+    // quad per entity.
+    fn render(&mut self, instances: &[InstanceRaw], view_proj: [[f32; 4]; 4]) {
+        // Upload this frame's camera matrix.
+        let camera_uniform = CameraUniform { view_proj };
+        self.queue.write_buffer(
+            &self.camera_buffer,
+            0,
+            bytemuck::cast_slice(&[camera_uniform]),
+        );
+
         // Acquire the texture we'll draw this frame onto. In wgpu 29 this is a
         // CurrentSurfaceTexture enum, not a Result.
         let frame = match self.surface.get_current_texture() {
@@ -312,6 +322,12 @@ struct App {
     world: World,
     paused: bool,
     clock: Clock,
+    // camera state (lives here because this is where the mouse events arrive)
+    cam_focus_x: f32,
+    cam_focus_y: f32,
+    cam_distance: f32,
+    dragging: bool,
+    last_cursor: (f64, f64),
 }
 
 impl ApplicationHandler for App {
@@ -336,6 +352,44 @@ impl ApplicationHandler for App {
                 if let Some(gpu) = &mut self.gpu {
                     gpu.resize(size.width, size.height);
                 }
+            }
+            WindowEvent::MouseInput { state, button, .. } => {
+                if button == MouseButton::Left {
+                    self.dragging = state == ElementState::Pressed;
+                }
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                if self.dragging {
+                    if let Some(window) = &self.window {
+                        // pixel delta since the last cursor report
+                        let dx = (position.x - self.last_cursor.0) as f32;
+                        let dy = (position.y - self.last_cursor.1) as f32;
+
+                        // how much world a pixel covers, at the current distance
+                        let height_px = window.inner_size().height.max(1) as f32;
+                        let visible_world_height =
+                            2.0 * self.cam_distance * (FOV_DEGREES.to_radians() * 0.5).tan();
+                        let world_per_px = visible_world_height / height_px;
+
+                        // grab-and-drag: move the focus so the world follows the cursor
+                        self.cam_focus_x -= dx * world_per_px;
+                        self.cam_focus_y += dy * world_per_px; // +Y is up on screen
+                    }
+                }
+                self.last_cursor = (position.x, position.y);
+            }
+            WindowEvent::MouseWheel { delta, .. } => {
+                // wheel reports line notches; trackpads report pixels — handle both
+                let scroll = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => y,
+                    MouseScrollDelta::PixelDelta(pos) => pos.y as f32,
+                };
+                if scroll > 0.0 {
+                    self.cam_distance /= 1.1; // scroll up = closer = zoom in
+                } else if scroll < 0.0 {
+                    self.cam_distance *= 1.1; // scroll down = further = zoom out
+                }
+                self.cam_distance = self.cam_distance.clamp(10.0, 2000.0);
             }
             WindowEvent::KeyboardInput { event, .. } => {
                 if event.state == ElementState::Pressed && !event.repeat {
@@ -372,8 +426,25 @@ impl ApplicationHandler for App {
                     })
                     .collect();
 
+                // window size, for the camera's aspect ratio
+                let (width, height) = match &self.window {
+                    Some(window) => {
+                        let size = window.inner_size();
+                        (size.width, size.height)
+                    }
+                    None => (1, 1),
+                };
+
+                let view_proj = camera_view_proj(
+                    self.cam_focus_x,
+                    self.cam_focus_y,
+                    self.cam_distance,
+                    width,
+                    height,
+                );
+
                 if let Some(gpu) = &mut self.gpu {
-                    gpu.render(&instances);
+                    gpu.render(&instances, view_proj);
                 }
                 if let Some(window) = &self.window {
                     window.request_redraw();
@@ -437,6 +508,11 @@ fn main() {
         world,
         paused: false,
         clock: Clock::new(TICK_RATE, MAX_CATCHUP_TICKS),
+        cam_focus_x: 0.0,
+        cam_focus_y: 0.0,
+        cam_distance: 150.0,
+        dragging: false,
+        last_cursor: (0.0, 0.0),
     };
 
     println!(
