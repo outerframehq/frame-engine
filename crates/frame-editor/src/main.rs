@@ -1,3 +1,4 @@
+mod font;
 use frame_engine::systems;
 use frame_engine::world::World;
 use frame_engine::world::{ComponentStorage, Position, Velocity};
@@ -269,6 +270,35 @@ impl ApplicationHandler for App {
                                         }
                                     }
                                 }
+                            }
+                        }
+
+                        // draw the selected entity's data as on-screen text
+                        if let Some(id) = self.selected {
+                            if let (Some(position), Some(velocity)) =
+                                (self.world.positions.get(id), self.world.velocities.get(id))
+                            {
+                                let text = format!(
+                                    "ID {}\nPOS {:.1}, {:.1}, {:.1}\nVEL {:.2}, {:.2}, {:.2}",
+                                    id,
+                                    position.x,
+                                    position.y,
+                                    position.z,
+                                    velocity.dx,
+                                    velocity.dy,
+                                    velocity.dz,
+                                );
+                                let text_color: u32 = (255 << 16) | (255 << 8) | 255; // white
+                                font::draw_text(
+                                    &mut buffer,
+                                    width_px,
+                                    height_px,
+                                    8,
+                                    8,
+                                    &text,
+                                    2,
+                                    text_color,
+                                );
                             }
                         }
 
