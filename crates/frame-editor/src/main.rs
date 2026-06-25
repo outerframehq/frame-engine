@@ -1,13 +1,10 @@
-mod font;
+use std::sync::Arc;
+
 use frame_engine::core::Clock;
 use frame_engine::systems;
-use frame_engine::world::World;
-use frame_engine::world::{ComponentStorage, Position, Velocity};
-use std::num::NonZeroU32;
-use std::rc::Rc;
-
+use frame_engine::world::{ComponentStorage, Position, Velocity, World};
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::event::{ElementState, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
@@ -15,85 +12,142 @@ use winit::window::{Window, WindowId};
 const TICK_RATE: u32 = 30;
 const MAX_CATCHUP_TICKS: u32 = 5;
 
+// All the long-lived GPU objects, bundled so they travel together.
+struct GpuState {
+    surface: wgpu::Surface<'static>,
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    config: wgpu::SurfaceConfiguration,
+}
+
+impl GpuState {
+    // wgpu's setup is async, but winit's `resumed` isn't — so we block on each
+    // async call with pollster::block_on.
+    fn new(window: Arc<Window>) -> GpuState {
+        let size = window.inner_size();
+
+        // 1. Instance: the entry point to wgpu.
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+
+        // 2. Surface: the slice of the window we draw to. Owns an Arc of the
+        //    window, so it's a 'static surface.
+        let surface = instance.create_surface(window.clone()).unwrap();
+
+        // 3. Adapter: a handle to a real GPU that can draw to our surface.
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::default(),
+            compatible_surface: Some(&surface),
+            force_fallback_adapter: false,
+        }))
+        .unwrap();
+
+        // 4. Device + Queue: the Device creates GPU resources; the Queue submits
+        //    work to the card.
+        let (device, queue) =
+            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).unwrap();
+
+        // 5. Configure the surface (format, size, present mode) — get_default_config
+        //    fills sensible defaults so we don't hand-pick every field.
+        let config = surface
+            .get_default_config(&adapter, size.width.max(1), size.height.max(1))
+            .unwrap();
+        surface.configure(&device, &config);
+
+        GpuState {
+            surface,
+            device,
+            queue,
+            config,
+        }
+    }
+
+    // Re-apply the config at a new size when the window is resized.
+    fn resize(&mut self, width: u32, height: u32) {
+        if width > 0 && height > 0 {
+            self.config.width = width;
+            self.config.height = height;
+            self.surface.configure(&self.device, &self.config);
+        }
+    }
+
+    // Draw one frame: for now, just clear the screen to a colour.
+    fn render(&mut self) {
+        // Acquire the texture we'll draw this frame onto. In wgpu 29 this is a
+        // CurrentSurfaceTexture enum, not a Result.
+        let frame = match self.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(frame)
+            | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
+            // surface lost/outdated/timed-out — reconfigure and skip this frame
+            _ => {
+                self.surface.configure(&self.device, &self.config);
+                return;
+            }
+        };
+
+        // A view is the handle a render pass uses to reach the texture's memory.
+        let view = frame
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+
+        // The encoder records GPU commands on the CPU side before submission.
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("frame encoder"),
+            });
+
+        {
+            // A render pass that loads by CLEARING to a colour, then stores the
+            // result. With no draw calls inside, the whole frame is just the
+            // clear colour. The clear happens when the pass is dropped (end of
+            // this block).
+            let _clear_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("clear pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: 0.12,
+                            g: 0.12,
+                            b: 0.16,
+                            a: 1.0,
+                        }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: None,
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+        }
+
+        // Submit the recorded commands to the GPU, then present the frame.
+        self.queue.submit(std::iter::once(encoder.finish()));
+        frame.present();
+    }
+}
+
 struct App {
-    window: Option<Rc<Window>>,
-    surface: Option<softbuffer::Surface<Rc<Window>, Rc<Window>>>,
+    window: Option<Arc<Window>>,
+    gpu: Option<GpuState>,
     world: World,
     paused: bool,
     clock: Clock,
-    cam_x: f32,
-    cam_y: f32,
-    zoom: f32,
-    dragging: bool,
-    last_cursor: (f64, f64),
-    selected: Option<usize>,
-}
-
-impl App {
-    fn pick_entity(&mut self) {
-        // window centre, in physical pixels — same coordinate space as the cursor
-        let (center_x, center_y) = match &self.window {
-            Some(window) => {
-                let size = window.inner_size();
-                (size.width as f32 / 2.0, size.height as f32 / 2.0)
-            }
-            None => return,
-        };
-
-        let cursor_x = self.last_cursor.0 as f32;
-        let cursor_y = self.last_cursor.1 as f32;
-
-        let mut picked: Option<usize> = None;
-
-        for (id, slot) in self.world.positions.iter().enumerate() {
-            if let Some(position) = slot {
-                // identical projection + size to the renderer
-                let px = center_x + (position.x - self.cam_x) * self.zoom;
-                let py = center_y + (position.y - self.cam_y) * self.zoom;
-
-                let depth = position.z;
-                let side = (6.0 + depth * 0.6).max(2.0);
-                let half = side / 2.0;
-
-                // exact hit: is the cursor inside this entity's square?
-                if cursor_x >= px - half
-                    && cursor_x < px + half
-                    && cursor_y >= py - half
-                    && cursor_y < py + half
-                {
-                    picked = Some(id); // later entities draw on top, so last match wins
-                }
-            }
-        }
-
-        // Only change selection when we actually hit something. That way panning
-        // from empty space neither clears the selection nor spams the console.
-        if let Some(id) = picked {
-            self.selected = Some(id);
-            if let (Some(position), Some(velocity)) =
-                (self.world.positions.get(id), self.world.velocities.get(id))
-            {
-                println!(
-                    "Selected entity {} | pos ({:.1}, {:.1}, {:.1}) | vel ({:.2}, {:.2}, {:.2})",
-                    id, position.x, position.y, position.z, velocity.dx, velocity.dy, velocity.dz,
-                );
-            }
-        }
-    }
 }
 
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         let attributes = Window::default_attributes().with_title("Frame Editor");
-        let window = Rc::new(event_loop.create_window(attributes).unwrap());
+        let window = Arc::new(event_loop.create_window(attributes).unwrap());
 
-        let context = softbuffer::Context::new(window.clone()).unwrap();
-        let surface = softbuffer::Surface::new(&context, window.clone()).unwrap();
+        // build all the GPU objects now that we have a window
+        self.gpu = Some(GpuState::new(window.clone()));
 
         window.request_redraw();
-
         self.window = Some(window);
-        self.surface = Some(surface);
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
@@ -102,67 +156,17 @@ impl ApplicationHandler for App {
                 println!("Close requested; Shutting Down");
                 event_loop.exit();
             }
-
-            WindowEvent::MouseInput { state, button, .. } => {
-                if button == MouseButton::Left {
-                    self.dragging = state == ElementState::Pressed;
-                    if state == ElementState::Pressed {
-                        self.pick_entity();
-                    }
+            WindowEvent::Resized(size) => {
+                if let Some(gpu) = &mut self.gpu {
+                    gpu.resize(size.width, size.height);
                 }
             }
-            WindowEvent::CursorMoved { position, .. } => {
-                if self.dragging {
-                    // how far the cursor moved, in pixels, since last report
-                    let dx = (position.x - self.last_cursor.0) as f32;
-                    let dy = (position.y - self.last_cursor.1) as f32;
-                    // move the camera opposite the drag, converting pixels -> world units.
-                    // grab-and-drag: the world follows the cursor.
-                    self.cam_x -= dx / self.zoom;
-                    self.cam_y -= dy / self.zoom;
-                }
-                self.last_cursor = (position.x, position.y);
-            }
-            WindowEvent::MouseWheel { delta, .. } => {
-                // wheel reports line notches; trackpads report pixels — handle both
-                let scroll = match delta {
-                    MouseScrollDelta::LineDelta(_, y) => y,
-                    MouseScrollDelta::PixelDelta(pos) => pos.y as f32,
-                };
-                if scroll > 0.0 {
-                    self.zoom *= 1.1; // scroll up = zoom in
-                } else if scroll < 0.0 {
-                    self.zoom /= 1.1; // scroll down = zoom out
-                }
-            }
-
             WindowEvent::KeyboardInput { event, .. } => {
-                // only react to the initial press — not auto-repeat, not release
                 if event.state == ElementState::Pressed && !event.repeat {
                     match event.physical_key {
-                        PhysicalKey::Code(KeyCode::F5) => {
-                            match self.world.save_to_file("scene.ron") {
-                                Ok(()) => println!("Saved scene to scene.ron"),
-                                Err(e) => println!("Save failed: {}", e),
-                            }
-                        }
-                        PhysicalKey::Code(KeyCode::F9) => {
-                            match World::load_from_file("scene.ron") {
-                                Ok(world) => {
-                                    self.world = world;
-                                    self.selected = None; // ids may differ in the loaded world
-                                    println!("Loaded scene from scene.ron");
-                                }
-                                Err(e) => println!("Load failed: {}", e),
-                            }
-                        }
                         PhysicalKey::Code(KeyCode::Space) => {
                             self.paused = !self.paused;
-                            if self.paused {
-                                println!("Paused");
-                            } else {
-                                println!("Playing");
-                            }
+                            println!("{}", if self.paused { "Paused" } else { "Playing" });
                         }
                         PhysicalKey::Code(KeyCode::KeyS) => {
                             if self.paused {
@@ -170,153 +174,21 @@ impl ApplicationHandler for App {
                                 println!("Stepped one tick");
                             }
                         }
-                        PhysicalKey::Code(KeyCode::Escape) => {
-                            self.selected = None;
-                            println!("Selection cleared");
-                        }
                         _ => {}
                     }
                 }
             }
             WindowEvent::RedrawRequested => {
-                // ask the shared clock how many fixed ticks are owed since last
-                // frame, and run the simulation that many times. Passing `!self.paused`
-                // means a paused editor keeps its timing current but advances zero ticks.
+                // advance the sim on the shared fixed-timestep clock
                 let owed = self.clock.advance(!self.paused);
                 for _ in 0..owed {
                     systems::movement(&mut self.world);
                 }
 
-                if let (Some(window), Some(surface)) = (&self.window, &mut self.surface) {
-                    let size = window.inner_size();
-
-                    if let (Some(width), Some(height)) =
-                        (NonZeroU32::new(size.width), NonZeroU32::new(size.height))
-                    {
-                        surface.resize(width, height).unwrap();
-
-                        let width_px = width.get();
-                        let height_px = height.get();
-
-                        let mut buffer = surface.buffer_mut().unwrap();
-
-                        // fill the background with dark blue grey
-                        let background: u32 = (30 << 16) | (30 << 8) | 40; //dark blue grey
-                        for pixel in buffer.iter_mut() {
-                            *pixel = background;
-                        }
-
-                        // draw each entity as a bright dot
-                        let base_r: f32 = 220.0;
-                        let base_g: f32 = 220.0;
-                        let base_b: f32 = 80.0;
-                        let center_x = width_px as f32 / 2.0;
-                        let center_y = height_px as f32 / 2.0;
-
-                        for (id, slot) in self.world.positions.iter().enumerate() {
-                            if let Some(position) = slot {
-                                // project world position through the camera
-                                let px = (center_x + (position.x - self.cam_x) * self.zoom) as i32;
-                                let py = (center_y + (position.y - self.cam_y) * self.zoom) as i32;
-
-                                //fake z dpeth modulates size and brightness
-                                let depth = position.z;
-                                let size = (6.0 + depth * 0.6).max(2.0) as i32;
-
-                                let brightness = (1.0 + depth * 0.06).clamp(0.35, 1.4);
-                                let r = (base_r * brightness).min(255.0) as u32;
-                                let g = (base_g * brightness).min(255.0) as u32;
-                                let b = (base_b * brightness).min(255.0) as u32;
-                                let entity_color = (r << 16) | (g << 8) | b;
-
-                                // draw a sizexsize square centered at px, py
-                                for dy in -size / 2..size / 2 {
-                                    for dx in -size / 2..size / 2 {
-                                        let x = px + dx;
-                                        let y = py + dy;
-
-                                        if x >= 0
-                                            && x < width_px as i32
-                                            && y >= 0
-                                            && y < height_px as i32
-                                        {
-                                            let index = y as u32 * width_px + x as u32;
-                                            buffer[index as usize] = entity_color;
-                                        }
-                                    }
-                                }
-                                //only draw if it's inside the window
-                                if px >= 0
-                                    && px < width_px as i32
-                                    && py >= 0
-                                    && py < height_px as i32
-                                {
-                                    let index = py as u32 * width_px + px as u32;
-                                    buffer[index as usize] = entity_color;
-                                }
-
-                                // highlight the selected entity with a ring
-                                if Some(id) == self.selected {
-                                    let ring_color: u32 = (255 << 16) | (255 << 8) | 255; // white
-                                    let ring_half = size / 2 + 3; // sits a few px outside the square
-                                    for dy in -ring_half..=ring_half {
-                                        for dx in -ring_half..=ring_half {
-                                            // border only — skip the filled interior
-                                            if dx == -ring_half
-                                                || dx == ring_half
-                                                || dy == -ring_half
-                                                || dy == ring_half
-                                            {
-                                                let x = px + dx;
-                                                let y = py + dy;
-                                                if x >= 0
-                                                    && x < width_px as i32
-                                                    && y >= 0
-                                                    && y < height_px as i32
-                                                {
-                                                    let index = y as u32 * width_px + x as u32;
-                                                    buffer[index as usize] = ring_color;
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-
-                        // draw the selected entity's data as on-screen text
-                        if let Some(id) = self.selected {
-                            if let (Some(position), Some(velocity)) =
-                                (self.world.positions.get(id), self.world.velocities.get(id))
-                            {
-                                let text = format!(
-                                    "ID {}\nPOS {:.1}, {:.1}, {:.1}\nVEL {:.2}, {:.2}, {:.2}",
-                                    id,
-                                    position.x,
-                                    position.y,
-                                    position.z,
-                                    velocity.dx,
-                                    velocity.dy,
-                                    velocity.dz,
-                                );
-                                let text_color: u32 = (255 << 16) | (255 << 8) | 255; // white
-                                font::draw_text(
-                                    &mut buffer,
-                                    width_px,
-                                    height_px,
-                                    8,
-                                    8,
-                                    &text,
-                                    2,
-                                    text_color,
-                                );
-                            }
-                        }
-
-                        buffer.present().unwrap();
-                    }
-
-                    // schedule the next frame so the loop keeps running
+                if let Some(gpu) = &mut self.gpu {
+                    gpu.render();
+                }
+                if let Some(window) = &self.window {
                     window.request_redraw();
                 }
             }
@@ -340,7 +212,6 @@ fn main() {
             z: 0.0,
         },
         Velocity {
-            // dirft near = Big & bright
             dx: 0.4,
             dy: 0.2,
             dz: 0.0,
@@ -348,7 +219,6 @@ fn main() {
     );
     world.spawn(
         Position {
-            //parked near = big & bright
             x: 40.0,
             y: 20.0,
             z: 0.0,
@@ -361,7 +231,6 @@ fn main() {
     );
     world.spawn(
         Position {
-            // parked far = small & dim
             x: -30.0,
             y: 50.0,
             z: 0.0,
@@ -377,16 +246,10 @@ fn main() {
 
     let mut app = App {
         window: None,
-        surface: None,
+        gpu: None,
         world,
         paused: false,
         clock: Clock::new(TICK_RATE, MAX_CATCHUP_TICKS),
-        cam_x: 0.0,
-        cam_y: 0.0,
-        zoom: 1.0,
-        dragging: false,
-        last_cursor: (0.0, 0.0),
-        selected: None,
     };
 
     println!(

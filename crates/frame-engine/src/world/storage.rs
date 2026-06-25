@@ -1,5 +1,7 @@
-// storage for one kind of component
+use serde::{Deserialize, Serialize};
 
+#[derive(Serialize, Deserialize)]
+#[serde(transparent)]
 pub struct ComponentStorage<T> {
     items: Vec<Option<T>>,
 }
