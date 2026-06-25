@@ -18,6 +18,7 @@ struct GpuState {
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
+    render_pipeline: wgpu::RenderPipeline,
 }
 
 impl GpuState {
@@ -28,7 +29,6 @@ impl GpuState {
 
         // 1. Instance: the entry point to wgpu.
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
-
         // 2. Surface: the slice of the window we draw to. Owns an Arc of the
         //    window, so it's a 'static surface.
         let surface = instance.create_surface(window.clone()).unwrap();
@@ -53,11 +53,46 @@ impl GpuState {
             .unwrap();
         surface.configure(&device, &config);
 
+        // 6. Compile the shader (vertex + fragment stages, from shader.wgsl).
+        let shader = device.create_shader_module(wgpu::include_wgsl!("shader.wgsl"));
+
+        // 7. Build the render pipeline: the reusable "recipe" tying the shaders
+        //    to the surface's pixel format. layout: None lets wgpu derive an
+        //    (empty) layout from the shader — fine while the shader has no
+        //    bindings. We'll give it an explicit layout when the camera uniform
+        //    arrives in step 4.
+        let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("entity pipeline"),
+            layout: None,
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: Some("vs_main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                buffers: &[], // no vertex buffer — corners are hardcoded in the shader
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: Some("fs_main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: config.format,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState::default(), // TriangleList, no culling
+            depth_stencil: None,                        // no depth buffer yet (step 5)
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+
         GpuState {
             surface,
             device,
             queue,
             config,
+            render_pipeline,
         }
     }
 
@@ -70,7 +105,7 @@ impl GpuState {
         }
     }
 
-    // Draw one frame: for now, just clear the screen to a colour.
+    // Draw one frame: clear the screen, then draw the quad on top.
     fn render(&mut self) {
         // Acquire the texture we'll draw this frame onto. In wgpu 29 this is a
         // CurrentSurfaceTexture enum, not a Result.
@@ -97,12 +132,9 @@ impl GpuState {
             });
 
         {
-            // A render pass that loads by CLEARING to a colour, then stores the
-            // result. With no draw calls inside, the whole frame is just the
-            // clear colour. The clear happens when the pass is dropped (end of
-            // this block).
-            let _clear_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: Some("clear pass"),
+            // The pass clears to the background colour, then we draw into it.
+            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("main pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &view,
                     resolve_target: None,
@@ -122,6 +154,10 @@ impl GpuState {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
+
+            // Use our pipeline, then draw 6 vertices (the quad) as 1 instance.
+            render_pass.set_pipeline(&self.render_pipeline);
+            render_pass.draw(0..6, 0..1);
         }
 
         // Submit the recorded commands to the GPU, then present the frame.
