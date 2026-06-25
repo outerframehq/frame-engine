@@ -11,3 +11,4 @@ softbuffer = "0.4"
 wgpu = "29.0.3"
 pollster = "0.4.0"
 bytemuck = { version = "1", features = ["derive"] }
+glam = "0.30"

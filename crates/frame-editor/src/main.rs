@@ -3,6 +3,7 @@ use std::sync::Arc;
 use frame_engine::core::Clock;
 use frame_engine::systems;
 use frame_engine::world::{ComponentStorage, Position, Velocity, World};
+use glam::{Mat4, Vec3};
 use wgpu::util::DeviceExt;
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, WindowEvent};
@@ -16,13 +17,31 @@ const MAX_CATCHUP_TICKS: u32 = 5;
 // The camera data handed to the shader. repr(C) lays the fields out in a fixed,
 // predictable order; Pod + Zeroable (from bytemuck) let us copy it to the GPU as
 // raw bytes. It must match the `Camera` struct in shader.wgsl.
-//
-// For step 4a this holds the identity matrix (a no-op transform). Step 4b fills
-// it with a real perspective + view matrix.
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 struct CameraUniform {
     view_proj: [[f32; 4]; 4],
+}
+
+// Build the combined view-projection matrix for the current window size.
+//
+//   view  : where the camera sits and what it looks at
+//   proj  : how 3D flattens onto the 2D screen (perspective + aspect correction)
+//
+// perspective_rh targets wgpu's [0,1] depth range directly, so no OpenGL
+// correction matrix is needed. glam and WGSL are both column-major, so
+// to_cols_array_2d() feeds straight into the shader.
+fn camera_view_proj(width: u32, height: u32) -> [[f32; 4]; 4] {
+    let aspect = width as f32 / height.max(1) as f32;
+
+    let eye = Vec3::new(0.0, 0.0, 2.0); // 2 units back along +Z
+    let target = Vec3::ZERO; // looking at the origin
+    let up = Vec3::Y; // +Y is up
+
+    let view = Mat4::look_at_rh(eye, target, up);
+    let proj = Mat4::perspective_rh(45.0_f32.to_radians(), aspect, 0.1, 100.0);
+
+    (proj * view).to_cols_array_2d()
 }
 
 // All the long-lived GPU objects, bundled so they travel together.
@@ -32,6 +51,7 @@ struct GpuState {
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
     render_pipeline: wgpu::RenderPipeline,
+    camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
 }
 
@@ -68,18 +88,13 @@ impl GpuState {
             .unwrap();
         surface.configure(&device, &config);
 
-        // 6. Camera uniform: the identity matrix for now (changes nothing).
+        // 6. Camera uniform: a real perspective + view matrix for the start size.
         let camera_uniform = CameraUniform {
-            view_proj: [
-                [1.0, 0.0, 0.0, 0.0],
-                [0.0, 1.0, 0.0, 0.0],
-                [0.0, 0.0, 1.0, 0.0],
-                [0.0, 0.0, 0.0, 1.0],
-            ],
+            view_proj: camera_view_proj(config.width, config.height),
         };
 
         // 7. Upload it into a uniform buffer on the GPU. COPY_DST lets us
-        //    overwrite it later (step 4b, when the camera moves).
+        //    overwrite it later (on resize, and when the camera moves).
         let camera_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("camera buffer"),
             contents: bytemuck::cast_slice(&[camera_uniform]),
@@ -115,8 +130,7 @@ impl GpuState {
         // 10. Compile the shader (vertex + fragment stages, from shader.wgsl).
         let shader = device.create_shader_module(wgpu::include_wgsl!("shader.wgsl"));
 
-        // 11. Pipeline layout now lists the camera bind group layout — this is
-        //     the explicit layout that replaces step 2's `layout: None`.
+        // 11. Pipeline layout lists the camera bind group layout.
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("pipeline layout"),
             bind_group_layouts: &[Some(&camera_bind_group_layout)],
@@ -156,16 +170,27 @@ impl GpuState {
             queue,
             config,
             render_pipeline,
+            camera_buffer,
             camera_bind_group,
         }
     }
 
-    // Re-apply the config at a new size when the window is resized.
+    // Re-apply the config at a new size, and recompute the camera so the aspect
+    // ratio stays correct (otherwise the square would stretch again).
     fn resize(&mut self, width: u32, height: u32) {
         if width > 0 && height > 0 {
             self.config.width = width;
             self.config.height = height;
             self.surface.configure(&self.device, &self.config);
+
+            let camera_uniform = CameraUniform {
+                view_proj: camera_view_proj(width, height),
+            };
+            self.queue.write_buffer(
+                &self.camera_buffer,
+                0,
+                bytemuck::cast_slice(&[camera_uniform]),
+            );
         }
     }
 
