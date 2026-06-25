@@ -140,6 +140,22 @@ impl ApplicationHandler for App {
                 // only react to the initial press — not auto-repeat, not release
                 if event.state == ElementState::Pressed && !event.repeat {
                     match event.physical_key {
+                        PhysicalKey::Code(KeyCode::F5) => {
+                            match self.world.save_to_file("scene.ron") {
+                                Ok(()) => println!("Saved scene to scene.ron"),
+                                Err(e) => println!("Save failed: {}", e),
+                            }
+                        }
+                        PhysicalKey::Code(KeyCode::F9) => {
+                            match World::load_from_file("scene.ron") {
+                                Ok(world) => {
+                                    self.world = world;
+                                    self.selected = None; // ids may differ in the loaded world
+                                    println!("Loaded scene from scene.ron");
+                                }
+                                Err(e) => println!("Load failed: {}", e),
+                            }
+                        }
                         PhysicalKey::Code(KeyCode::Space) => {
                             self.paused = !self.paused;
                             if self.paused {
