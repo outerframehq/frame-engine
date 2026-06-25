@@ -3,7 +3,7 @@ use std::sync::Arc;
 use frame_engine::core::Clock;
 use frame_engine::systems;
 use frame_engine::world::{ComponentStorage, Position, Velocity, World};
-use glam::{Mat4, Vec3};
+use glam::{Mat4, Vec3, Vec4};
 use wgpu::util::DeviceExt;
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
@@ -14,9 +14,12 @@ use winit::window::{Window, WindowId};
 const TICK_RATE: u32 = 30;
 const MAX_CATCHUP_TICKS: u32 = 5;
 
-// Vertical field of view, shared by the projection and the pan maths so they
-// stay in sync.
+// Vertical field of view, shared by the projection and the pan maths.
 const FOV_DEGREES: f32 = 45.0;
+
+// Size of each entity quad in world units.
+// NOTE: must match QUAD_SIZE in shader.wgsl (render and pick must agree).
+const QUAD_SIZE: f32 = 8.0;
 
 // The camera data handed to the shader. repr(C) lays the fields out in a fixed,
 // predictable order; Pod + Zeroable (from bytemuck) let us copy it to the GPU as
@@ -27,23 +30,30 @@ struct CameraUniform {
     view_proj: [[f32; 4]; 4],
 }
 
-// One entity's world position, uploaded as per-instance data. The vertex shader
-// reads it (at @location(0)) and offsets the quad's corners to put the quad
-// there. repr(C) + Pod so it copies to the GPU as raw bytes.
+// Per-instance data: one entity's world position plus a selected flag (0 or 1).
+// repr(C) + Pod so it copies to the GPU as raw bytes.
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 struct InstanceRaw {
     position: [f32; 3],
+    selected: f32,
 }
 
 impl InstanceRaw {
-    // The one attribute: a 3-float position at shader_location 0. Stored as an
-    // associated const so the layout below can hold a 'static reference to it.
-    const ATTRIBS: [wgpu::VertexAttribute; 1] = [wgpu::VertexAttribute {
-        format: wgpu::VertexFormat::Float32x3,
-        offset: 0,
-        shader_location: 0,
-    }];
+    // Two attributes: position at location 0, selected flag at location 1.
+    // Stored as an associated const so the layout can hold a 'static reference.
+    const ATTRIBS: [wgpu::VertexAttribute; 2] = [
+        wgpu::VertexAttribute {
+            format: wgpu::VertexFormat::Float32x3,
+            offset: 0,
+            shader_location: 0,
+        },
+        wgpu::VertexAttribute {
+            format: wgpu::VertexFormat::Float32,
+            offset: std::mem::size_of::<[f32; 3]>() as wgpu::BufferAddress, // 12
+            shader_location: 1,
+        },
+    ];
 
     fn layout() -> wgpu::VertexBufferLayout<'static> {
         wgpu::VertexBufferLayout {
@@ -55,20 +65,10 @@ impl InstanceRaw {
     }
 }
 
-// Build the combined view-projection matrix for the camera's current state.
-//
+// Build the camera's view-projection matrix from its current state.
 //   focus_x/focus_y : the world point the camera looks at (on the z = 0 plane)
 //   distance        : how far back along +Z the eye sits (zoom)
-//
-// perspective_rh targets wgpu's [0,1] depth range directly. The far plane is
-// large enough to cover the full zoom-out range.
-fn camera_view_proj(
-    focus_x: f32,
-    focus_y: f32,
-    distance: f32,
-    width: u32,
-    height: u32,
-) -> [[f32; 4]; 4] {
+fn camera_matrix(focus_x: f32, focus_y: f32, distance: f32, width: u32, height: u32) -> Mat4 {
     let aspect = width as f32 / height.max(1) as f32;
 
     let eye = Vec3::new(focus_x, focus_y, distance);
@@ -78,7 +78,26 @@ fn camera_view_proj(
     let view = Mat4::look_at_rh(eye, target, up);
     let proj = Mat4::perspective_rh(FOV_DEGREES.to_radians(), aspect, 0.1, 10000.0);
 
-    (proj * view).to_cols_array_2d()
+    proj * view
+}
+
+// Same matrix, flattened to the column-major array the shader uniform expects.
+fn camera_view_proj(focus_x: f32, focus_y: f32, distance: f32, width: u32, height: u32) -> [[f32; 4]; 4] {
+    camera_matrix(focus_x, focus_y, distance, width, height).to_cols_array_2d()
+}
+
+// Project a world point through the view-projection matrix to screen pixels.
+// Returns None if the point is behind the camera.
+fn project(vp: Mat4, x: f32, y: f32, z: f32, width: f32, height: f32) -> Option<(f32, f32)> {
+    let clip = vp * Vec4::new(x, y, z, 1.0);
+    if clip.w <= 0.0 {
+        return None;
+    }
+    let ndc_x = clip.x / clip.w;
+    let ndc_y = clip.y / clip.w;
+    let screen_x = (ndc_x * 0.5 + 0.5) * width;
+    let screen_y = (1.0 - (ndc_y * 0.5 + 0.5)) * height; // flip: NDC +y up -> screen +y down
+    Some((screen_x, screen_y))
 }
 
 // All the long-lived GPU objects, bundled so they travel together.
@@ -118,21 +137,18 @@ impl GpuState {
         let (device, queue) =
             pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).unwrap();
 
-        // 5. Configure the surface (format, size, present mode) — get_default_config
-        //    fills sensible defaults so we don't hand-pick every field.
+        // 5. Configure the surface (format, size, present mode).
         let config = surface
             .get_default_config(&adapter, size.width.max(1), size.height.max(1))
             .unwrap();
         surface.configure(&device, &config);
 
-        // 6. Camera uniform: start as identity; render() overwrites it every
-        //    frame from the live camera state.
+        // 6. Camera uniform: start as identity; render() overwrites it every frame.
         let camera_uniform = CameraUniform {
             view_proj: Mat4::IDENTITY.to_cols_array_2d(),
         };
 
-        // 7. Upload it into a uniform buffer on the GPU. COPY_DST lets render()
-        //    overwrite it each frame.
+        // 7. Upload it into a uniform buffer. COPY_DST lets render() overwrite it.
         let camera_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("camera buffer"),
             contents: bytemuck::cast_slice(&[camera_uniform]),
@@ -165,7 +181,7 @@ impl GpuState {
             }],
         });
 
-        // 10. Compile the shader (vertex + fragment stages, from shader.wgsl).
+        // 10. Compile the shader.
         let shader = device.create_shader_module(wgpu::include_wgsl!("shader.wgsl"));
 
         // 11. Pipeline layout lists the camera bind group layout.
@@ -175,8 +191,7 @@ impl GpuState {
             immediate_size: 0,
         });
 
-        // 12. Build the render pipeline. The vertex stage reads one buffer: the
-        //     per-instance entity positions.
+        // 12. Build the render pipeline.
         let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("entity pipeline"),
             layout: Some(&pipeline_layout),
@@ -184,7 +199,7 @@ impl GpuState {
                 module: &shader,
                 entry_point: Some("vs_main"),
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
-                buffers: &[InstanceRaw::layout()], // per-instance positions
+                buffers: &[InstanceRaw::layout()], // per-instance position + selected
             },
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
@@ -196,8 +211,8 @@ impl GpuState {
                     write_mask: wgpu::ColorWrites::ALL,
                 })],
             }),
-            primitive: wgpu::PrimitiveState::default(), // TriangleList, no culling
-            depth_stencil: None,                        // no depth buffer yet (step 5)
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
             multiview_mask: None,
             cache: None,
@@ -227,30 +242,19 @@ impl GpuState {
     // Draw one frame: upload the current camera matrix, clear, then draw one
     // quad per entity.
     fn render(&mut self, instances: &[InstanceRaw], view_proj: [[f32; 4]; 4]) {
-        // Upload this frame's camera matrix.
         let camera_uniform = CameraUniform { view_proj };
-        self.queue.write_buffer(
-            &self.camera_buffer,
-            0,
-            bytemuck::cast_slice(&[camera_uniform]),
-        );
+        self.queue
+            .write_buffer(&self.camera_buffer, 0, bytemuck::cast_slice(&[camera_uniform]));
 
-        // Acquire the texture we'll draw this frame onto. In wgpu 29 this is a
-        // CurrentSurfaceTexture enum, not a Result.
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame)
             | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
-            // surface lost/outdated/timed-out — reconfigure and skip this frame
             _ => {
                 self.surface.configure(&self.device, &self.config);
                 return;
             }
         };
 
-        // Rebuild the instance buffer from this frame's entity positions. At a
-        // few entities, recreating it each frame is trivially cheap; we'll switch
-        // to a persistent buffer when that cost is real. Skip it when empty —
-        // a zero-sized buffer is invalid.
         let instance_buffer = if instances.is_empty() {
             None
         } else {
@@ -264,12 +268,10 @@ impl GpuState {
             )
         };
 
-        // A view is the handle a render pass uses to reach the texture's memory.
         let view = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
 
-        // The encoder records GPU commands on the CPU side before submission.
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -277,7 +279,6 @@ impl GpuState {
             });
 
         {
-            // The pass clears to the background colour, then we draw into it.
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("main pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
@@ -303,14 +304,12 @@ impl GpuState {
             render_pass.set_pipeline(&self.render_pipeline);
             render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
 
-            // Draw the quad (6 vertices) once per entity instance.
             if let Some(buffer) = &instance_buffer {
                 render_pass.set_vertex_buffer(0, buffer.slice(..));
                 render_pass.draw(0..6, 0..instances.len() as u32);
             }
         }
 
-        // Submit the recorded commands to the GPU, then present the frame.
         self.queue.submit(std::iter::once(encoder.finish()));
         frame.present();
     }
@@ -322,12 +321,71 @@ struct App {
     world: World,
     paused: bool,
     clock: Clock,
-    // camera state (lives here because this is where the mouse events arrive)
+    // camera state
     cam_focus_x: f32,
     cam_focus_y: f32,
     cam_distance: f32,
     dragging: bool,
     last_cursor: (f64, f64),
+    // selected entity id (index into world.positions)
+    selected: Option<usize>,
+}
+
+impl App {
+    // Project every entity to screen space and select the one under the cursor.
+    fn pick(&mut self) {
+        let (width_u, height_u) = match &self.window {
+            Some(window) => {
+                let size = window.inner_size();
+                (size.width.max(1), size.height.max(1))
+            }
+            None => return,
+        };
+        let width = width_u as f32;
+        let height = height_u as f32;
+
+        let vp = camera_matrix(
+            self.cam_focus_x,
+            self.cam_focus_y,
+            self.cam_distance,
+            width_u,
+            height_u,
+        );
+
+        let cursor_x = self.last_cursor.0 as f32;
+        let cursor_y = self.last_cursor.1 as f32;
+        let half = QUAD_SIZE * 0.5;
+
+        let mut picked: Option<usize> = None;
+        for (id, slot) in self.world.positions.iter().enumerate() {
+            if let Some(p) = slot {
+                // project the centre and a corner; the gap gives the on-screen half-size
+                let center = project(vp, p.x, p.y, p.z, width, height);
+                let corner = project(vp, p.x + half, p.y + half, p.z, width, height);
+                if let (Some((cx, cy)), Some((ex, ey))) = (center, corner) {
+                    let half_w = (ex - cx).abs();
+                    let half_h = (ey - cy).abs();
+                    if (cursor_x - cx).abs() <= half_w && (cursor_y - cy).abs() <= half_h {
+                        picked = Some(id); // later entities draw on top, so last match wins
+                    }
+                }
+            }
+        }
+
+        // Only change selection when we actually hit something — so clicking
+        // empty space (or starting a pan) doesn't clear it.
+        if let Some(id) = picked {
+            self.selected = Some(id);
+            if let (Some(p), Some(v)) =
+                (self.world.positions.get(id), self.world.velocities.get(id))
+            {
+                println!(
+                    "Selected entity {} | pos ({:.1}, {:.1}, {:.1}) | vel ({:.2}, {:.2}, {:.2})",
+                    id, p.x, p.y, p.z, v.dx, v.dy, v.dz,
+                );
+            }
+        }
+    }
 }
 
 impl ApplicationHandler for App {
@@ -335,7 +393,6 @@ impl ApplicationHandler for App {
         let attributes = Window::default_attributes().with_title("Frame Editor");
         let window = Arc::new(event_loop.create_window(attributes).unwrap());
 
-        // build all the GPU objects now that we have a window
         self.gpu = Some(GpuState::new(window.clone()));
 
         window.request_redraw();
@@ -356,22 +413,23 @@ impl ApplicationHandler for App {
             WindowEvent::MouseInput { state, button, .. } => {
                 if button == MouseButton::Left {
                     self.dragging = state == ElementState::Pressed;
+                    // a press both selects (if it hits) and may begin a pan
+                    if state == ElementState::Pressed {
+                        self.pick();
+                    }
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
                 if self.dragging {
                     if let Some(window) = &self.window {
-                        // pixel delta since the last cursor report
                         let dx = (position.x - self.last_cursor.0) as f32;
                         let dy = (position.y - self.last_cursor.1) as f32;
 
-                        // how much world a pixel covers, at the current distance
                         let height_px = window.inner_size().height.max(1) as f32;
                         let visible_world_height =
                             2.0 * self.cam_distance * (FOV_DEGREES.to_radians() * 0.5).tan();
                         let world_per_px = visible_world_height / height_px;
 
-                        // grab-and-drag: move the focus so the world follows the cursor
                         self.cam_focus_x -= dx * world_per_px;
                         self.cam_focus_y += dy * world_per_px; // +Y is up on screen
                     }
@@ -379,15 +437,14 @@ impl ApplicationHandler for App {
                 self.last_cursor = (position.x, position.y);
             }
             WindowEvent::MouseWheel { delta, .. } => {
-                // wheel reports line notches; trackpads report pixels — handle both
                 let scroll = match delta {
                     MouseScrollDelta::LineDelta(_, y) => y,
                     MouseScrollDelta::PixelDelta(pos) => pos.y as f32,
                 };
                 if scroll > 0.0 {
-                    self.cam_distance /= 1.1; // scroll up = closer = zoom in
+                    self.cam_distance /= 1.1;
                 } else if scroll < 0.0 {
-                    self.cam_distance *= 1.1; // scroll down = further = zoom out
+                    self.cam_distance *= 1.1;
                 }
                 self.cam_distance = self.cam_distance.clamp(10.0, 2000.0);
             }
@@ -404,29 +461,34 @@ impl ApplicationHandler for App {
                                 println!("Stepped one tick");
                             }
                         }
+                        PhysicalKey::Code(KeyCode::Escape) => {
+                            self.selected = None;
+                            println!("Selection cleared");
+                        }
                         _ => {}
                     }
                 }
             }
             WindowEvent::RedrawRequested => {
-                // advance the sim on the shared fixed-timestep clock
                 let owed = self.clock.advance(!self.paused);
                 for _ in 0..owed {
                     systems::movement(&mut self.world);
                 }
 
-                // build per-entity instance data from the current world state
+                // build per-entity instance data, flagging the selected one
+                let selected = self.selected;
                 let instances: Vec<InstanceRaw> = self
                     .world
                     .positions
                     .iter()
-                    .filter_map(|slot| slot.as_ref())
-                    .map(|p| InstanceRaw {
+                    .enumerate()
+                    .filter_map(|(id, slot)| slot.as_ref().map(|p| (id, p)))
+                    .map(|(id, p)| InstanceRaw {
                         position: [p.x, p.y, p.z],
+                        selected: if Some(id) == selected { 1.0 } else { 0.0 },
                     })
                     .collect();
 
-                // window size, for the camera's aspect ratio
                 let (width, height) = match &self.window {
                     Some(window) => {
                         let size = window.inner_size();
@@ -464,40 +526,16 @@ fn main() {
     };
 
     world.spawn(
-        Position {
-            x: 0.0,
-            y: 0.0,
-            z: 0.0,
-        },
-        Velocity {
-            dx: 0.4,
-            dy: 0.2,
-            dz: 0.0,
-        },
+        Position { x: 0.0, y: 0.0, z: 0.0 },
+        Velocity { dx: 0.4, dy: 0.2, dz: 0.0 },
     );
     world.spawn(
-        Position {
-            x: 40.0,
-            y: 20.0,
-            z: 0.0,
-        },
-        Velocity {
-            dx: -0.3,
-            dy: 0.3,
-            dz: 0.0,
-        },
+        Position { x: 40.0, y: 20.0, z: 0.0 },
+        Velocity { dx: -0.3, dy: 0.3, dz: 0.0 },
     );
     world.spawn(
-        Position {
-            x: -30.0,
-            y: 50.0,
-            z: 0.0,
-        },
-        Velocity {
-            dx: 0.5,
-            dy: -0.4,
-            dz: 0.0,
-        },
+        Position { x: -30.0, y: 50.0, z: 0.0 },
+        Velocity { dx: 0.5, dy: -0.4, dz: 0.0 },
     );
 
     let entity_count = world.positions.len();
@@ -513,6 +551,7 @@ fn main() {
         cam_distance: 150.0,
         dragging: false,
         last_cursor: (0.0, 0.0),
+        selected: None,
     };
 
     println!(
