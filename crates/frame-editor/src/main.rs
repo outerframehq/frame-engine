@@ -23,23 +23,51 @@ struct CameraUniform {
     view_proj: [[f32; 4]; 4],
 }
 
+// One entity's world position, uploaded as per-instance data. The vertex shader
+// reads it (at @location(0)) and offsets the quad's corners to put the quad
+// there. repr(C) + Pod so it copies to the GPU as raw bytes.
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct InstanceRaw {
+    position: [f32; 3],
+}
+
+impl InstanceRaw {
+    // The one attribute: a 3-float position at shader_location 0. Stored as an
+    // associated const so the layout below can hold a 'static reference to it.
+    const ATTRIBS: [wgpu::VertexAttribute; 1] = [wgpu::VertexAttribute {
+        format: wgpu::VertexFormat::Float32x3,
+        offset: 0,
+        shader_location: 0,
+    }];
+
+    fn layout() -> wgpu::VertexBufferLayout<'static> {
+        wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<InstanceRaw>() as wgpu::BufferAddress,
+            // Instance (not Vertex): step forward once per instance, not per vertex.
+            step_mode: wgpu::VertexStepMode::Instance,
+            attributes: &Self::ATTRIBS,
+        }
+    }
+}
+
 // Build the combined view-projection matrix for the current window size.
 //
 //   view  : where the camera sits and what it looks at
 //   proj  : how 3D flattens onto the 2D screen (perspective + aspect correction)
 //
-// perspective_rh targets wgpu's [0,1] depth range directly, so no OpenGL
-// correction matrix is needed. glam and WGSL are both column-major, so
-// to_cols_array_2d() feeds straight into the shader.
+// The camera is pulled well back (z = 150) so the entities — which live at
+// tens of world units — fit in frame, and the far plane is large enough not to
+// clip them. perspective_rh targets wgpu's [0,1] depth range directly.
 fn camera_view_proj(width: u32, height: u32) -> [[f32; 4]; 4] {
     let aspect = width as f32 / height.max(1) as f32;
 
-    let eye = Vec3::new(0.0, 0.0, 2.0); // 2 units back along +Z
+    let eye = Vec3::new(0.0, 0.0, 150.0); // far back so the world fits
     let target = Vec3::ZERO; // looking at the origin
     let up = Vec3::Y; // +Y is up
 
     let view = Mat4::look_at_rh(eye, target, up);
-    let proj = Mat4::perspective_rh(45.0_f32.to_radians(), aspect, 0.1, 100.0);
+    let proj = Mat4::perspective_rh(45.0_f32.to_radians(), aspect, 0.1, 1000.0);
 
     (proj * view).to_cols_array_2d()
 }
@@ -137,7 +165,8 @@ impl GpuState {
             immediate_size: 0,
         });
 
-        // 12. Build the render pipeline.
+        // 12. Build the render pipeline. The vertex stage now reads one buffer:
+        //     the per-instance entity positions.
         let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("entity pipeline"),
             layout: Some(&pipeline_layout),
@@ -145,7 +174,7 @@ impl GpuState {
                 module: &shader,
                 entry_point: Some("vs_main"),
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
-                buffers: &[], // no vertex buffer — corners are hardcoded in the shader
+                buffers: &[InstanceRaw::layout()], // per-instance positions
             },
             fragment: Some(wgpu::FragmentState {
                 module: &shader,
@@ -176,7 +205,7 @@ impl GpuState {
     }
 
     // Re-apply the config at a new size, and recompute the camera so the aspect
-    // ratio stays correct (otherwise the square would stretch again).
+    // ratio stays correct (otherwise the world would stretch).
     fn resize(&mut self, width: u32, height: u32) {
         if width > 0 && height > 0 {
             self.config.width = width;
@@ -194,8 +223,8 @@ impl GpuState {
         }
     }
 
-    // Draw one frame: clear the screen, then draw the quad on top.
-    fn render(&mut self) {
+    // Draw one frame: clear the screen, then draw one quad per entity.
+    fn render(&mut self, instances: &[InstanceRaw]) {
         // Acquire the texture we'll draw this frame onto. In wgpu 29 this is a
         // CurrentSurfaceTexture enum, not a Result.
         let frame = match self.surface.get_current_texture() {
@@ -206,6 +235,23 @@ impl GpuState {
                 self.surface.configure(&self.device, &self.config);
                 return;
             }
+        };
+
+        // Rebuild the instance buffer from this frame's entity positions. At a
+        // few entities, recreating it each frame is trivially cheap; we'll switch
+        // to a persistent buffer when that cost is real. Skip it when empty —
+        // a zero-sized buffer is invalid.
+        let instance_buffer = if instances.is_empty() {
+            None
+        } else {
+            Some(
+                self.device
+                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("instance buffer"),
+                        contents: bytemuck::cast_slice(instances),
+                        usage: wgpu::BufferUsages::VERTEX,
+                    }),
+            )
         };
 
         // A view is the handle a render pass uses to reach the texture's memory.
@@ -244,10 +290,14 @@ impl GpuState {
                 multiview_mask: None,
             });
 
-            // Bind the camera, use our pipeline, then draw the quad's 6 vertices.
             render_pass.set_pipeline(&self.render_pipeline);
             render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
-            render_pass.draw(0..6, 0..1);
+
+            // Draw the quad (6 vertices) once per entity instance.
+            if let Some(buffer) = &instance_buffer {
+                render_pass.set_vertex_buffer(0, buffer.slice(..));
+                render_pass.draw(0..6, 0..instances.len() as u32);
+            }
         }
 
         // Submit the recorded commands to the GPU, then present the frame.
@@ -311,8 +361,19 @@ impl ApplicationHandler for App {
                     systems::movement(&mut self.world);
                 }
 
+                // build per-entity instance data from the current world state
+                let instances: Vec<InstanceRaw> = self
+                    .world
+                    .positions
+                    .iter()
+                    .filter_map(|slot| slot.as_ref())
+                    .map(|p| InstanceRaw {
+                        position: [p.x, p.y, p.z],
+                    })
+                    .collect();
+
                 if let Some(gpu) = &mut self.gpu {
-                    gpu.render();
+                    gpu.render(&instances);
                 }
                 if let Some(window) = &self.window {
                     window.request_redraw();
