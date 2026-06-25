@@ -1,18 +1,18 @@
-// A tiny hand-rolled bitmap font for drawing debug text into the pixel buffer.
+// A tiny hand-rolled bitmap font for the debug inspector overlay.
 //
-// Each glyph is a 5-wide x 7-tall grid, stored as 7 bytes (one byte per row).
-// In each byte we use only the low 5 bits: bit 4 (0b10000) is the LEFTMOST
-// column, bit 0 (0b00001) is the rightmost. A set bit = a lit pixel.
+// Each glyph is 5 wide x 7 tall, stored as 7 bytes (one byte per row). In each
+// byte only the low 5 bits are used: bit 4 (0b10000) is the LEFTMOST column,
+// bit 0 the rightmost. A set bit = a lit pixel. Unknown chars (including space)
+// render blank.
 //
-// We only define the characters the inspector actually prints (digits, a few
-// uppercase letters for the labels, and some punctuation). Anything else —
-// including space — renders blank.
+// We only define the characters the inspector prints: digits, the letters used
+// in the labels (ID / POS / VEL), and a little punctuation.
 
-const GLYPH_WIDTH: i32 = 5;
-const GLYPH_HEIGHT: i32 = 7;
+pub const GLYPH_WIDTH: i32 = 5;
+pub const GLYPH_HEIGHT: i32 = 7;
 
 // The 7-row bitmap for a character. Unknown chars render blank.
-fn glyph(c: char) -> [u8; 7] {
+pub fn glyph(c: char) -> [u8; 7] {
     match c {
         '0' => [0x0E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E],
         '1' => [0x04, 0x0C, 0x04, 0x04, 0x04, 0x04, 0x0E],
@@ -39,66 +39,5 @@ fn glyph(c: char) -> [u8; 7] {
         '-' => [0x00, 0x00, 0x00, 0x0E, 0x00, 0x00, 0x00],
 
         _ => [0x00; 7], // space and anything undefined: blank
-    }
-}
-
-// Draw one character with its top-left at (x, y); each font pixel becomes a
-// scale x scale block on screen.
-fn draw_char(
-    buffer: &mut [u32],
-    width_px: u32,
-    height_px: u32,
-    x: i32,
-    y: i32,
-    c: char,
-    scale: i32,
-    color: u32,
-) {
-    let rows = glyph(c);
-    for (row_index, &row_bits) in rows.iter().enumerate() {
-        for col in 0..GLYPH_WIDTH {
-            // bit 4 is the leftmost column, so shift down from the high end
-            let lit = (row_bits >> (GLYPH_WIDTH - 1 - col)) & 1 == 1;
-            if !lit {
-                continue;
-            }
-            // paint this font pixel as a scale x scale block
-            for sy in 0..scale {
-                for sx in 0..scale {
-                    let px = x + col * scale + sx;
-                    let py = y + row_index as i32 * scale + sy;
-                    if px >= 0 && px < width_px as i32 && py >= 0 && py < height_px as i32 {
-                        let index = py as u32 * width_px + px as u32;
-                        buffer[index as usize] = color;
-                    }
-                }
-            }
-        }
-    }
-}
-
-// Draw a string starting at (x, y). Supports '\n' for new lines.
-pub fn draw_text(
-    buffer: &mut [u32],
-    width_px: u32,
-    height_px: u32,
-    x: i32,
-    y: i32,
-    text: &str,
-    scale: i32,
-    color: u32,
-) {
-    let mut cursor_x = x;
-    let mut cursor_y = y;
-    for c in text.chars() {
-        if c == '\n' {
-            cursor_x = x;
-            cursor_y += (GLYPH_HEIGHT + 1) * scale; // one blank row between lines
-            continue;
-        }
-        draw_char(
-            buffer, width_px, height_px, cursor_x, cursor_y, c, scale, color,
-        );
-        cursor_x += (GLYPH_WIDTH + 1) * scale; // one blank column between chars
     }
 }

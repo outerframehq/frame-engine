@@ -11,15 +11,23 @@ use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Window, WindowId};
 
+mod font;
+
 const TICK_RATE: u32 = 30;
 const MAX_CATCHUP_TICKS: u32 = 5;
 
 // Vertical field of view, shared by the projection and the pan maths.
 const FOV_DEGREES: f32 = 45.0;
 
-// Size of each entity quad in world units.
-// NOTE: must match QUAD_SIZE in shader.wgsl (render and pick must agree).
+// Size of each entity cube in world units.
+// NOTE: must match CUBE_SIZE in shader.wgsl (render and pick must agree).
 const QUAD_SIZE: f32 = 8.0;
+
+// How fast middle-drag sweeps the orbit, in radians per pixel.
+const ORBIT_SENS: f32 = 0.005;
+
+// Format of the depth buffer. 32-bit float depth, no stencil.
+const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
 // The camera data handed to the shader. Must match the `Camera` struct in shader.wgsl.
 #[repr(C)]
@@ -90,12 +98,112 @@ impl TextInstance {
     }
 }
 
+// Create (or recreate) the depth texture's view, sized to match the surface.
+// Called once at startup and again on every resize.
+fn create_depth_view(
+    device: &wgpu::Device,
+    config: &wgpu::SurfaceConfiguration,
+) -> wgpu::TextureView {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("depth texture"),
+        size: wgpu::Extent3d {
+            width: config.width.max(1),
+            height: config.height.max(1),
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: DEPTH_FORMAT,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+    texture.create_view(&wgpu::TextureViewDescriptor::default())
+}
+
+// Turn a string into a pile of screen-space quads, one per lit font pixel.
+//
+// Coordinates flow: a font pixel lives at some screen pixel (x right, y DOWN
+// from the top-left), then we convert that pixel rectangle into NDC (x -1..1
+// left..right, y -1..1 bottom..TOP). The Y axis flips, same as project().
+//
+// Knobs:
+//   start_x / start_y : top-left of the text block, in screen pixels
+//   pixel             : how many screen pixels each font dot occupies
+fn build_text(
+    text: &str,
+    start_x: f32,
+    start_y: f32,
+    pixel: f32,
+    screen_w: f32,
+    screen_h: f32,
+) -> Vec<TextInstance> {
+    let mut out = Vec::new();
+    let mut cursor_x = start_x;
+    let mut cursor_y = start_y;
+
+    for c in text.chars() {
+        if c == '\n' {
+            cursor_x = start_x;
+            cursor_y += (font::GLYPH_HEIGHT as f32 + 1.0) * pixel;
+            continue;
+        }
+
+        let rows = font::glyph(c);
+        for (row_i, &bits) in rows.iter().enumerate() {
+            for col in 0..font::GLYPH_WIDTH {
+                // bit 4 is the leftmost column, bit 0 the rightmost.
+                let lit = (bits >> (font::GLYPH_WIDTH - 1 - col)) & 1 == 1;
+                if !lit {
+                    continue;
+                }
+
+                // This font dot's top-left, in screen pixels.
+                let sx = cursor_x + col as f32 * pixel;
+                let sy = cursor_y + row_i as f32 * pixel;
+
+                // Convert to an NDC rectangle. The quad's offset is its
+                // bottom-left corner and it grows +x (right) and +y (up), so we
+                // anchor at the dot's BOTTOM edge (sy + pixel) after the flip.
+                let ndc_x = sx / screen_w * 2.0 - 1.0;
+                let ndc_y_bottom = 1.0 - (sy + pixel) / screen_h * 2.0;
+
+                out.push(TextInstance {
+                    offset: [ndc_x, ndc_y_bottom],
+                    size: [pixel / screen_w * 2.0, pixel / screen_h * 2.0],
+                });
+            }
+        }
+
+        cursor_x += (font::GLYPH_WIDTH as f32 + 1.0) * pixel;
+    }
+
+    out
+}
+
 // Build the camera's view-projection matrix from its current state.
-fn camera_matrix(focus_x: f32, focus_y: f32, distance: f32, width: u32, height: u32) -> Mat4 {
+//
+// The eye orbits the focus point at `distance`, swung around by yaw (around the
+// world Y axis) and pitch (elevation). yaw = pitch = 0 puts the eye straight out
+// along +Z, i.e. looking down the -Z axis — the old fixed view.
+fn camera_matrix(
+    focus_x: f32,
+    focus_y: f32,
+    distance: f32,
+    yaw: f32,
+    pitch: f32,
+    width: u32,
+    height: u32,
+) -> Mat4 {
     let aspect = width as f32 / height.max(1) as f32;
 
-    let eye = Vec3::new(focus_x, focus_y, distance);
     let target = Vec3::new(focus_x, focus_y, 0.0);
+    let offset = Vec3::new(
+        pitch.cos() * yaw.sin(),
+        pitch.sin(),
+        pitch.cos() * yaw.cos(),
+    ) * distance;
+    let eye = target + offset;
     let up = Vec3::Y;
 
     let view = Mat4::look_at_rh(eye, target, up);
@@ -108,10 +216,12 @@ fn camera_view_proj(
     focus_x: f32,
     focus_y: f32,
     distance: f32,
+    yaw: f32,
+    pitch: f32,
     width: u32,
     height: u32,
 ) -> [[f32; 4]; 4] {
-    camera_matrix(focus_x, focus_y, distance, width, height).to_cols_array_2d()
+    camera_matrix(focus_x, focus_y, distance, yaw, pitch, width, height).to_cols_array_2d()
 }
 
 // Project a world point through the view-projection matrix to screen pixels.
@@ -137,6 +247,7 @@ struct GpuState {
     text_pipeline: wgpu::RenderPipeline,
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
+    depth_view: wgpu::TextureView,
 }
 
 impl GpuState {
@@ -160,6 +271,8 @@ impl GpuState {
             .get_default_config(&adapter, size.width.max(1), size.height.max(1))
             .unwrap();
         surface.configure(&device, &config);
+
+        let depth_view = create_depth_view(&device, &config);
 
         let camera_uniform = CameraUniform {
             view_proj: Mat4::IDENTITY.to_cols_array_2d(),
@@ -224,7 +337,16 @@ impl GpuState {
                 })],
             }),
             primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
+            // Entities test AND write depth: nearer fragments win and record
+            // their depth, so a later-drawn far fragment is correctly discarded.
+            // This is what makes a solid cube (front faces hide back faces).
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::Less),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
             multisample: wgpu::MultisampleState::default(),
             multiview_mask: None,
             cache: None,
@@ -259,7 +381,15 @@ impl GpuState {
                 })],
             }),
             primitive: wgpu::PrimitiveState::default(),
-            depth_stencil: None,
+            // The overlay is screen furniture: it must ALWAYS draw on top and
+            // never write depth (Always = ignore the test, write disabled).
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::Always),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
             multisample: wgpu::MultisampleState::default(),
             multiview_mask: None,
             cache: None,
@@ -274,6 +404,7 @@ impl GpuState {
             text_pipeline,
             camera_buffer,
             camera_bind_group,
+            depth_view,
         }
     }
 
@@ -282,10 +413,12 @@ impl GpuState {
             self.config.width = width;
             self.config.height = height;
             self.surface.configure(&self.device, &self.config);
+            // Depth buffer must track the window size, or the test reads garbage.
+            self.depth_view = create_depth_view(&self.device, &self.config);
         }
     }
 
-    // Draw one frame: entities (world-space) then text (screen-space overlay).
+    // Draw one frame: entities (world-space cubes) then text (screen overlay).
     fn render(
         &mut self,
         instances: &[InstanceRaw],
@@ -361,18 +494,26 @@ impl GpuState {
                         store: wgpu::StoreOp::Store,
                     },
                 })],
-                depth_stencil_attachment: None,
+                // Clear depth to 1.0 (farthest) at the start of every frame.
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
                 timestamp_writes: None,
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
 
-            // entities (world-space)
+            // entities — 36 vertices per cube (6 faces x 2 tris x 3 verts)
             render_pass.set_pipeline(&self.render_pipeline);
             render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
             if let Some(buffer) = &instance_buffer {
                 render_pass.set_vertex_buffer(0, buffer.slice(..));
-                render_pass.draw(0..6, 0..instances.len() as u32);
+                render_pass.draw(0..36, 0..instances.len() as u32);
             }
 
             // text overlay (screen-space, drawn on top, no camera)
@@ -397,7 +538,10 @@ struct App {
     cam_focus_x: f32,
     cam_focus_y: f32,
     cam_distance: f32,
+    cam_yaw: f32,
+    cam_pitch: f32,
     dragging: bool,
+    orbiting: bool,
     last_cursor: (f64, f64),
     selected: Option<usize>,
 }
@@ -418,6 +562,8 @@ impl App {
             self.cam_focus_x,
             self.cam_focus_y,
             self.cam_distance,
+            self.cam_yaw,
+            self.cam_pitch,
             width_u,
             height_u,
         );
@@ -476,19 +622,34 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::MouseInput { state, button, .. } => {
-                if button == MouseButton::Left {
-                    self.dragging = state == ElementState::Pressed;
-                    if state == ElementState::Pressed {
-                        self.pick();
+                let pressed = state == ElementState::Pressed;
+                match button {
+                    MouseButton::Left => {
+                        self.dragging = pressed;
+                        if pressed {
+                            self.pick();
+                        }
                     }
+                    // Middle button held = orbit the camera.
+                    MouseButton::Middle => {
+                        self.orbiting = pressed;
+                    }
+                    _ => {}
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
-                if self.dragging {
-                    if let Some(window) = &self.window {
-                        let dx = (position.x - self.last_cursor.0) as f32;
-                        let dy = (position.y - self.last_cursor.1) as f32;
+                let dx = (position.x - self.last_cursor.0) as f32;
+                let dy = (position.y - self.last_cursor.1) as f32;
 
+                if self.orbiting {
+                    // Sweep the orbit. Drag right -> swing around; drag up ->
+                    // rise over the top. Pitch is clamped just short of the
+                    // poles so the up vector never degenerates.
+                    self.cam_yaw += dx * ORBIT_SENS;
+                    self.cam_pitch -= dy * ORBIT_SENS;
+                    self.cam_pitch = self.cam_pitch.clamp(-1.4, 1.4);
+                } else if self.dragging {
+                    if let Some(window) = &self.window {
                         let height_px = window.inner_size().height.max(1) as f32;
                         let visible_world_height =
                             2.0 * self.cam_distance * (FOV_DEGREES.to_radians() * 0.5).tan();
@@ -552,14 +713,6 @@ impl ApplicationHandler for App {
                     })
                     .collect();
 
-                // Step 6c-i: one hardcoded white test quad near the top-left,
-                // in NDC (x -1..1 left..right, y -1..1 bottom..top). It should
-                // stay put when you pan/zoom — proving screen-space anchoring.
-                let text_instances: Vec<TextInstance> = vec![TextInstance {
-                    offset: [-0.95, 0.80],
-                    size: [0.08, 0.10],
-                }];
-
                 let (width, height) = match &self.window {
                     Some(window) => {
                         let size = window.inner_size();
@@ -568,10 +721,33 @@ impl ApplicationHandler for App {
                     None => (1, 1),
                 };
 
+                // Build the inspector overlay: when an entity is selected, spell
+                // out its id, position and velocity in screen-space pixel-font
+                // quads. Otherwise, no overlay.
+                // Knobs: start at (16, 16) px from the top-left, 3 px per font dot.
+                let text_instances: Vec<TextInstance> = match self.selected {
+                    Some(id) => {
+                        if let (Some(p), Some(v)) =
+                            (self.world.positions.get(id), self.world.velocities.get(id))
+                        {
+                            let text = format!(
+                                "ID {}\nPOS {:.1}, {:.1}, {:.1}\nVEL {:.2}, {:.2}, {:.2}",
+                                id, p.x, p.y, p.z, v.dx, v.dy, v.dz
+                            );
+                            build_text(&text, 16.0, 16.0, 3.0, width as f32, height as f32)
+                        } else {
+                            Vec::new()
+                        }
+                    }
+                    None => Vec::new(),
+                };
+
                 let view_proj = camera_view_proj(
                     self.cam_focus_x,
                     self.cam_focus_y,
                     self.cam_distance,
+                    self.cam_yaw,
+                    self.cam_pitch,
                     width,
                     height,
                 );
@@ -596,18 +772,20 @@ fn main() {
         velocities: ComponentStorage::new(),
     };
 
+    // Entity 0: near the camera, dead centre, stationary. The big "anchor".
     world.spawn(
         Position {
             x: 0.0,
             y: 0.0,
-            z: 0.0,
+            z: 40.0,
         },
         Velocity {
-            dx: 0.4,
-            dy: 0.2,
+            dx: 0.0,
+            dy: 0.0,
             dz: 0.0,
         },
     );
+    // Entity 1: off to the side, mid-depth, drifting — keeps the scene alive.
     world.spawn(
         Position {
             x: 40.0,
@@ -620,16 +798,17 @@ fn main() {
             dz: 0.0,
         },
     );
+    // Entity 2: behind entity 0, creeping toward the camera through depth.
     world.spawn(
         Position {
-            x: -30.0,
-            y: 50.0,
-            z: 0.0,
+            x: 0.0,
+            y: 0.0,
+            z: -50.0,
         },
         Velocity {
-            dx: 0.5,
-            dy: -0.4,
-            dz: 0.0,
+            dx: 0.0,
+            dy: 0.0,
+            dz: 0.6,
         },
     );
 
@@ -644,9 +823,14 @@ fn main() {
         cam_focus_x: 0.0,
         cam_focus_y: 0.0,
         cam_distance: 150.0,
+        // Gentle default tilt so the cubes read as 3D on launch. Zero both for
+        // the old straight-down-Z view.
+        cam_yaw: 0.5,
+        cam_pitch: 0.3,
         dragging: false,
+        orbiting: false,
         last_cursor: (0.0, 0.0),
-        selected: None,
+        selected: Some(2),
     };
 
     println!(
