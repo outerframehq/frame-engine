@@ -29,6 +29,10 @@ const ORBIT_SENS: f32 = 0.005;
 // Format of the depth buffer. 32-bit float depth, no stencil.
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 
+// Where scenes are saved to / loaded from. Relative to the working directory,
+// which is the workspace root when run via `cargo run`. Gitignored.
+const SCENE_PATH: &str = "scene.ron";
+
 // The camera data handed to the shader. Must match the `Camera` struct in shader.wgsl.
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
@@ -690,6 +694,22 @@ impl ApplicationHandler for App {
                             self.selected = None;
                             println!("Selection cleared");
                         }
+                        // F5: save the current world to disk.
+                        PhysicalKey::Code(KeyCode::F5) => {
+                            match self.world.save_to_file(SCENE_PATH) {
+                                Ok(()) => println!("Saved scene to {SCENE_PATH}"),
+                                Err(e) => println!("Save failed: {e}"),
+                            }
+                        }
+                        // F9: reload the world from disk, discarding the current one.
+                        PhysicalKey::Code(KeyCode::F9) => match World::load_from_file(SCENE_PATH) {
+                            Ok(world) => {
+                                self.world = world;
+                                self.selected = None;
+                                println!("Reloaded scene from {SCENE_PATH}");
+                            }
+                            Err(e) => println!("Reload failed: {e}"),
+                        },
                         _ => {}
                     }
                 }
@@ -764,15 +784,13 @@ impl ApplicationHandler for App {
     }
 }
 
-fn main() {
-    let event_loop = EventLoop::new().unwrap();
-
+// The fallback scene used when there's no scene.ron on disk yet.
+fn default_world() -> World {
     let mut world = World {
         positions: ComponentStorage::new(),
         velocities: ComponentStorage::new(),
     };
 
-    // Entity 0: near the camera, dead centre, stationary. The big "anchor".
     world.spawn(
         Position {
             x: 0.0,
@@ -785,7 +803,6 @@ fn main() {
             dz: 0.0,
         },
     );
-    // Entity 1: off to the side, mid-depth, drifting — keeps the scene alive.
     world.spawn(
         Position {
             x: 40.0,
@@ -798,7 +815,6 @@ fn main() {
             dz: 0.0,
         },
     );
-    // Entity 2: behind entity 0, creeping toward the camera through depth.
     world.spawn(
         Position {
             x: 0.0,
@@ -811,6 +827,26 @@ fn main() {
             dz: 0.6,
         },
     );
+
+    world
+}
+
+fn main() {
+    let event_loop = EventLoop::new().unwrap();
+
+    // Load the scene from disk if one exists; otherwise start from a default
+    // scene. The default is just a fallback for a fresh checkout — once you save
+    // (F5), that file is what loads next time.
+    let world = match World::load_from_file(SCENE_PATH) {
+        Ok(world) => {
+            println!("Loaded scene from {SCENE_PATH}");
+            world
+        }
+        Err(e) => {
+            println!("No scene loaded ({e}); starting from the default scene");
+            default_world()
+        }
+    };
 
     let entity_count = world.positions.len();
 
@@ -830,7 +866,7 @@ fn main() {
         dragging: false,
         orbiting: false,
         last_cursor: (0.0, 0.0),
-        selected: Some(2),
+        selected: None,
     };
 
     println!(
