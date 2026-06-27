@@ -6,9 +6,18 @@ pub struct ComponentStorage<T> {
     items: Vec<Option<T>>,
 }
 
+// The `Default` trait (separate from the inherent methods below) is what
+// `#[serde(default)]` looks for: it lets a missing field in a scene file fall
+// back to an empty storage. We implement it by hand rather than deriving it so
+// it works for any `T`, even ones that aren't themselves `Default`.
+impl<T> Default for ComponentStorage<T> {
+    fn default() -> Self {
+        ComponentStorage::new()
+    }
+}
+
 impl<T> ComponentStorage<T> {
     // make a new empty storage
-
     pub fn new() -> Self {
         ComponentStorage { items: Vec::new() }
     }
@@ -24,11 +33,10 @@ impl<T> ComponentStorage<T> {
     pub fn iter_mut(&mut self) -> std::slice::IterMut<'_, Option<T>> {
         self.items.iter_mut()
     }
-    //give entity "ID" this component growing the list if needed
 
+    //give entity "ID" this component growing the list if needed
     pub fn insert(&mut self, id: usize, value: T) {
         //grow the list with empty slots until its big enough to hold an index "ID"
-
         while self.items.len() <= id {
             self.items.push(None);
         }
@@ -37,7 +45,6 @@ impl<T> ComponentStorage<T> {
     }
 
     // Remove entity "ID'S" compent (Slot becomes empty)
-
     pub fn remove(&mut self, id: usize) {
         if id < self.items.len() {
             self.items[id] = None;
@@ -45,18 +52,14 @@ impl<T> ComponentStorage<T> {
     }
 
     // Borrow entity "ID'S" component for reading if it exists
-
     pub fn get(&self, id: usize) -> Option<&T> {
         //Returns none if "ID" is out of range or slot is empty
-
         self.items.get(id).and_then(|slot| slot.as_ref())
     }
 
     // Borrow entity "ID'S" component for writing if it exists
-
     pub fn get_mut(&mut self, id: usize) -> Option<&mut T> {
         //Returns none if "ID" is out of range or slot is empty
-
         self.items.get_mut(id).and_then(|slot| slot.as_mut())
     }
 }
