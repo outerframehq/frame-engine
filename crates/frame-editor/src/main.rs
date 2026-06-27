@@ -929,26 +929,10 @@ impl ApplicationHandler for App {
                     None => (1, 1),
                 };
 
-                // Build the inspector overlay: when an entity is selected, spell
-                // out its id, position and velocity in screen-space pixel-font
-                // quads. Otherwise, no overlay.
-                // Knobs: start at (16, 16) px from the top-left, 3 px per font dot.
-                let mut text_instances: Vec<TextInstance> = match self.selected {
-                    Some(id) => {
-                        if let (Some(p), Some(v)) =
-                            (self.world.positions.get(id), self.world.velocities.get(id))
-                        {
-                            let text = format!(
-                                "ID {}\nPOS {:.1}, {:.1}, {:.1}\nVEL {:.2}, {:.2}, {:.2}",
-                                id, p.x, p.y, p.z, v.dx, v.dy, v.dz
-                            );
-                            build_text(&text, 16.0, 16.0, 3.0, width as f32, height as f32)
-                        } else {
-                            Vec::new()
-                        }
-                    }
-                    None => Vec::new(),
-                };
+                // The selected entity's ID/POS/VEL now live in the Inspector
+                // panel, so the old top-left readout is retired. The controls
+                // legend below is the only remaining hand-rolled overlay.
+                let mut text_instances: Vec<TextInstance> = Vec::new();
 
                 // Controls overlay (toggle with H), anchored bottom-left. Drawn
                 // at a smaller pixel size than the inspector so it reads as
@@ -999,10 +983,28 @@ impl ApplicationHandler for App {
                 // tabs/content are still a mockup wired to nothing but text and
                 // the live log. We move state in/out via locals so the closure
                 // never has to borrow `self`.
-                let entity_count = instances.len();
                 let mut tab = self.current_tab;
                 let mut console_tab = self.console_tab;
                 let log_lines = std::mem::take(&mut self.log_lines);
+                // Live entity ids for the Scene list, plus the selected entity's
+                // position/velocity lifted into a local so the egui closure never
+                // touches `self`. Any edits get written back into the world after
+                // the pass; selection changes flow through `new_selection`.
+                let entity_ids: Vec<usize> = self
+                    .world
+                    .positions
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, slot)| slot.as_ref().map(|_| i))
+                    .collect();
+                let mut new_selection = self.selected;
+                let mut edited = self.selected.and_then(|id| {
+                    Some((
+                        id,
+                        *self.world.positions.get(id)?,
+                        *self.world.velocities.get(id)?,
+                    ))
+                });
                 let (egui_paint_jobs, egui_textures_delta, egui_ppp) =
                     if let (Some(state), Some(window)) =
                         (self.egui_state.as_mut(), self.window.as_ref())
@@ -1073,13 +1075,67 @@ impl ApplicationHandler for App {
                                     ui.separator();
                                     match tab {
                                         Tab::Scene => {
-                                            ui.label("Scene tree");
-                                            ui.label(format!("{entity_count} entities"));
+                                            ui.label(format!("{} entities", entity_ids.len()));
+                                            ui.separator();
+                                            egui::ScrollArea::vertical()
+                                                .auto_shrink([false, false])
+                                                .show(ui, |ui| {
+                                                    for &id in &entity_ids {
+                                                        ui.selectable_value(
+                                                            &mut new_selection,
+                                                            Some(id),
+                                                            format!("Entity {id}"),
+                                                        );
+                                                    }
+                                                });
                                         }
-                                        Tab::Inspector => {
-                                            ui.label("Selected entity");
-                                            ui.label("(properties go here)");
-                                        }
+                                        Tab::Inspector => match &mut edited {
+                                            Some((id, pos, vel)) => {
+                                                ui.label(format!("Entity {id}"));
+                                                ui.add_space(4.0);
+                                                ui.label("Position");
+                                                ui.horizontal(|ui| {
+                                                    ui.add(
+                                                        egui::DragValue::new(&mut pos.x)
+                                                            .speed(1.0)
+                                                            .prefix("x "),
+                                                    );
+                                                    ui.add(
+                                                        egui::DragValue::new(&mut pos.y)
+                                                            .speed(1.0)
+                                                            .prefix("y "),
+                                                    );
+                                                    ui.add(
+                                                        egui::DragValue::new(&mut pos.z)
+                                                            .speed(1.0)
+                                                            .prefix("z "),
+                                                    );
+                                                });
+                                                ui.add_space(4.0);
+                                                ui.label("Velocity");
+                                                ui.horizontal(|ui| {
+                                                    ui.add(
+                                                        egui::DragValue::new(&mut vel.dx)
+                                                            .speed(0.1)
+                                                            .prefix("dx "),
+                                                    );
+                                                    ui.add(
+                                                        egui::DragValue::new(&mut vel.dy)
+                                                            .speed(0.1)
+                                                            .prefix("dy "),
+                                                    );
+                                                    ui.add(
+                                                        egui::DragValue::new(&mut vel.dz)
+                                                            .speed(0.1)
+                                                            .prefix("dz "),
+                                                    );
+                                                });
+                                            }
+                                            None => {
+                                                ui.weak("No entity selected");
+                                                ui.weak("Click a cube, or pick one in Scene.");
+                                            }
+                                        },
                                     }
                                 });
                             // The space left in the middle is the 3D viewport —
@@ -1095,6 +1151,18 @@ impl ApplicationHandler for App {
                 self.current_tab = tab;
                 self.console_tab = console_tab;
                 self.log_lines = log_lines;
+                self.selected = new_selection;
+                // Push any inspector edits back into the world. The render this
+                // frame already used the old values; the change shows next frame
+                // (same one-frame path as the keyboard nudge).
+                if let Some((id, pos, vel)) = edited {
+                    if let Some(p) = self.world.positions.get_mut(id) {
+                        *p = pos;
+                    }
+                    if let Some(v) = self.world.velocities.get_mut(id) {
+                        *v = vel;
+                    }
+                }
 
                 if let Some(gpu) = &mut self.gpu {
                     gpu.render(

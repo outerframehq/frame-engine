@@ -2,14 +2,14 @@ mod storage;
 use serde::{Deserialize, Serialize};
 pub use storage::ComponentStorage;
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone, Copy)]
 pub struct Position {
     pub x: f32,
     pub y: f32,
     pub z: f32,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Clone, Copy)]
 pub struct Velocity {
     pub dx: f32,
     pub dy: f32,
