@@ -23,11 +23,11 @@ pub struct World {
 }
 
 impl World {
-    //reuse an empty slot if available, otherwise grow both lists by one
     pub fn spawn(&mut self, position: Position, velocity: Velocity) -> usize {
-        // looking for a freed slot
-        let id = self.positions.len();
-        // no free slot , grow both list by one
+        // reuse the first freed slot if there is one, otherwise grow the lists by one
+        let free_slot = self.positions.iter().position(|slot| slot.is_none());
+        let id = free_slot.unwrap_or_else(|| self.positions.len());
+
         self.positions.insert(id, position);
         self.velocities.insert(id, velocity);
         id
