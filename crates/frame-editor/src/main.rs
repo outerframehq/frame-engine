@@ -604,13 +604,18 @@ impl GpuState {
     }
 }
 
-/// Which tab is showing in the right-hand inspector dock. Purely a layout
-/// mockup for now — selecting a tab swaps placeholder content, nothing more.
+/// Which tab is showing in the right-hand inspector dock.
 #[derive(Clone, Copy, PartialEq)]
 enum Tab {
     Scene,
     Inspector,
-    Console,
+}
+
+/// Which tab is showing in the bottom console dock.
+#[derive(Clone, Copy, PartialEq)]
+enum ConsoleTab {
+    Output,
+    Terminal,
 }
 
 struct App {
@@ -633,9 +638,24 @@ struct App {
     egui_state: Option<egui_winit::State>,
     // Active tab in the right-hand inspector dock.
     current_tab: Tab,
+    // Active tab in the bottom console dock.
+    console_tab: ConsoleTab,
+    // Lines shown in the console Output tab (also echoed to the terminal).
+    log_lines: Vec<String>,
 }
 
 impl App {
+    /// Append a line to the in-editor log (shown in the console Output tab) and
+    /// echo it to the terminal. The buffer is capped so it can't grow forever.
+    fn log(&mut self, msg: impl Into<String>) {
+        let msg = msg.into();
+        println!("{msg}");
+        self.log_lines.push(msg);
+        if self.log_lines.len() > 500 {
+            self.log_lines.remove(0);
+        }
+    }
+
     fn pick(&mut self) {
         let (width_u, height_u) = match &self.window {
             Some(window) => {
@@ -821,17 +841,17 @@ impl ApplicationHandler for App {
                             match code {
                                 KeyCode::Space => {
                                     self.paused = !self.paused;
-                                    println!("{}", if self.paused { "Paused" } else { "Playing" });
+                                    self.log(if self.paused { "Paused" } else { "Playing" });
                                 }
                                 KeyCode::KeyS => {
                                     if self.paused {
                                         systems::movement(&mut self.world);
-                                        println!("Stepped one tick");
+                                        self.log("Stepped one tick");
                                     }
                                 }
                                 KeyCode::Escape => {
                                     self.selected = None;
-                                    println!("Selection cleared");
+                                    self.log("Selection cleared");
                                 }
                                 // H: toggle the controls overlay.
                                 KeyCode::KeyH => {
@@ -852,29 +872,29 @@ impl ApplicationHandler for App {
                                         },
                                     );
                                     self.selected = Some(id);
-                                    println!("Spawned entity {id}");
+                                    self.log(format!("Spawned entity {id}"));
                                 }
                                 // Delete: despawn the selected entity.
                                 KeyCode::Delete => {
                                     if let Some(id) = self.selected {
                                         self.world.despawn(id);
                                         self.selected = None;
-                                        println!("Despawned entity {id}");
+                                        self.log(format!("Despawned entity {id}"));
                                     }
                                 }
                                 // F5: save the current world to disk.
                                 KeyCode::F5 => match self.world.save_to_file(SCENE_PATH) {
-                                    Ok(()) => println!("Saved scene to {SCENE_PATH}"),
-                                    Err(e) => println!("Save failed: {e}"),
+                                    Ok(()) => self.log(format!("Saved scene to {SCENE_PATH}")),
+                                    Err(e) => self.log(format!("Save failed: {e}")),
                                 },
                                 // F9: reload the world from disk, discarding the current one.
                                 KeyCode::F9 => match World::load_from_file(SCENE_PATH) {
                                     Ok(world) => {
                                         self.world = world;
                                         self.selected = None;
-                                        println!("Reloaded scene from {SCENE_PATH}");
+                                        self.log(format!("Reloaded scene from {SCENE_PATH}"));
                                     }
-                                    Err(e) => println!("Reload failed: {e}"),
+                                    Err(e) => self.log(format!("Reload failed: {e}")),
                                 },
                                 _ => {}
                             }
@@ -974,18 +994,22 @@ impl ApplicationHandler for App {
                 // run_ui hands our closure a full-screen root Ui and runs the
                 // begin/end pass internally. Panels shown into that root dock to
                 // the window edges. In egui 0.35 the old SidePanel/TopBottomPanel
-                // types were merged into one `Panel` (Panel::top/right/left/...).
-                // For now these are a layout mockup: solid, non-resizable, and
-                // wired to nothing but placeholder text.
+                // types were merged into one `Panel` (Panel::top/right/bottom/...).
+                // Panels are solid but resizable (drag their inner edge); the
+                // tabs/content are still a mockup wired to nothing but text and
+                // the live log. We move state in/out via locals so the closure
+                // never has to borrow `self`.
                 let entity_count = instances.len();
                 let mut tab = self.current_tab;
+                let mut console_tab = self.console_tab;
+                let log_lines = std::mem::take(&mut self.log_lines);
                 let (egui_paint_jobs, egui_textures_delta, egui_ppp) =
                     if let (Some(state), Some(window)) =
                         (self.egui_state.as_mut(), self.window.as_ref())
                     {
                         let raw_input = state.take_egui_input(window);
                         let full_output = self.egui_ctx.run_ui(raw_input, |ui| {
-                            // Top toolbar strip — a placeholder menu row.
+                            // Top toolbar strip — fixed height, placeholder menu.
                             egui::Panel::top("toolbar").resizable(false).show(ui, |ui| {
                                 ui.horizontal(|ui| {
                                     ui.label("File");
@@ -997,16 +1021,54 @@ impl ApplicationHandler for App {
                                     ui.label("Help");
                                 });
                             });
-                            // Right inspector dock — a tab row over placeholder
-                            // content. Selecting a tab swaps what shows below.
+                            // Bottom console dock — Output (the live log) and a
+                            // Terminal placeholder. Full width; drag its top edge
+                            // to resize.
+                            egui::Panel::bottom("console")
+                                .resizable(true)
+                                .default_size(160.0)
+                                .show(ui, |ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.selectable_value(
+                                            &mut console_tab,
+                                            ConsoleTab::Output,
+                                            "Output",
+                                        );
+                                        ui.selectable_value(
+                                            &mut console_tab,
+                                            ConsoleTab::Terminal,
+                                            "Terminal",
+                                        );
+                                    });
+                                    ui.separator();
+                                    match console_tab {
+                                        ConsoleTab::Output => {
+                                            egui::ScrollArea::vertical()
+                                                .stick_to_bottom(true)
+                                                .auto_shrink([false, false])
+                                                .show(ui, |ui| {
+                                                    if log_lines.is_empty() {
+                                                        ui.weak("(no output yet)");
+                                                    }
+                                                    for line in &log_lines {
+                                                        ui.monospace(line);
+                                                    }
+                                                });
+                                        }
+                                        ConsoleTab::Terminal => {
+                                            ui.weak("(terminal goes here)");
+                                        }
+                                    }
+                                });
+                            // Right inspector dock — Scene / Inspector tabs.
+                            // Drag its left edge to resize.
                             egui::Panel::right("inspector")
-                                .resizable(false)
-                                .exact_size(260.0)
+                                .resizable(true)
+                                .default_size(260.0)
                                 .show(ui, |ui| {
                                     ui.horizontal(|ui| {
                                         ui.selectable_value(&mut tab, Tab::Scene, "Scene");
                                         ui.selectable_value(&mut tab, Tab::Inspector, "Inspector");
-                                        ui.selectable_value(&mut tab, Tab::Console, "Console");
                                     });
                                     ui.separator();
                                     match tab {
@@ -1017,9 +1079,6 @@ impl ApplicationHandler for App {
                                         Tab::Inspector => {
                                             ui.label("Selected entity");
                                             ui.label("(properties go here)");
-                                        }
-                                        Tab::Console => {
-                                            ui.label("Console / log output");
                                         }
                                     }
                                 });
@@ -1034,6 +1093,8 @@ impl ApplicationHandler for App {
                         (Vec::new(), egui::TexturesDelta::default(), 1.0)
                     };
                 self.current_tab = tab;
+                self.console_tab = console_tab;
+                self.log_lines = log_lines;
 
                 if let Some(gpu) = &mut self.gpu {
                     gpu.render(
@@ -1141,6 +1202,8 @@ fn main() {
         egui_ctx: egui::Context::default(),
         egui_state: None,
         current_tab: Tab::Scene,
+        console_tab: ConsoleTab::Output,
+        log_lines: vec!["Frame Editor started.".to_string()],
     };
 
     println!(
