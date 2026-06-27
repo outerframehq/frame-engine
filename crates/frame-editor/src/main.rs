@@ -551,6 +551,7 @@ struct App {
     orbiting: bool,
     last_cursor: (f64, f64),
     selected: Option<usize>,
+    show_help: bool,
 }
 
 impl App {
@@ -720,6 +721,10 @@ impl ApplicationHandler for App {
                                     self.selected = None;
                                     println!("Selection cleared");
                                 }
+                                // H: toggle the controls overlay.
+                                KeyCode::KeyH => {
+                                    self.show_help = !self.show_help;
+                                }
                                 // N: spawn a new entity at the camera focus, and select it.
                                 KeyCode::KeyN => {
                                     let id = self.world.spawn(
@@ -796,7 +801,7 @@ impl ApplicationHandler for App {
                 // out its id, position and velocity in screen-space pixel-font
                 // quads. Otherwise, no overlay.
                 // Knobs: start at (16, 16) px from the top-left, 3 px per font dot.
-                let text_instances: Vec<TextInstance> = match self.selected {
+                let mut text_instances: Vec<TextInstance> = match self.selected {
                     Some(id) => {
                         if let (Some(p), Some(v)) =
                             (self.world.positions.get(id), self.world.velocities.get(id))
@@ -812,6 +817,36 @@ impl ApplicationHandler for App {
                     }
                     None => Vec::new(),
                 };
+
+                // Controls overlay (toggle with H), anchored bottom-left. Drawn
+                // at a smaller pixel size than the inspector so it reads as
+                // secondary furniture.
+                if self.show_help {
+                    let help = "CONTROLS   H TO HIDE\n\n\
+                                SPACE  PLAY PAUSE\n\n\
+                                S  STEP WHEN PAUSED\n\n\
+                                N  SPAWN ENTITY\n\n\
+                                DEL  DESPAWN SELECTED\n\n\
+                                ARROWS  MOVE X Y\n\n\
+                                PGUP PGDN  MOVE Z\n\n\
+                                F5 SAVE   F9 LOAD\n\n\
+                                ESC  DESELECT\n\n\
+                                LMB  SELECT   DRAG PAN\n\n\
+                                MMB  DRAG ORBIT\n\n\
+                                WHEEL  ZOOM";
+                    let pixel = 2.0;
+                    let lines = help.lines().count() as f32;
+                    let line_h = (font::GLYPH_HEIGHT as f32 + 1.0) * pixel;
+                    let start_y = height as f32 - lines * line_h - 16.0;
+                    text_instances.extend(build_text(
+                        help,
+                        16.0,
+                        start_y,
+                        pixel,
+                        width as f32,
+                        height as f32,
+                    ));
+                }
 
                 let view_proj = camera_view_proj(
                     self.cam_focus_x,
@@ -918,6 +953,7 @@ fn main() {
         orbiting: false,
         last_cursor: (0.0, 0.0),
         selected: None,
+        show_help: true,
     };
 
     println!(
