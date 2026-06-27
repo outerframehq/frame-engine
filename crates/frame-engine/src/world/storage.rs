@@ -51,4 +51,12 @@ impl<T> ComponentStorage<T> {
 
         self.items.get(id).and_then(|slot| slot.as_ref())
     }
+
+    // Borrow entity "ID'S" component for writing if it exists
+
+    pub fn get_mut(&mut self, id: usize) -> Option<&mut T> {
+        //Returns none if "ID" is out of range or slot is empty
+
+        self.items.get_mut(id).and_then(|slot| slot.as_mut())
+    }
 }

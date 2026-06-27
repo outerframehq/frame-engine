@@ -33,6 +33,9 @@ const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 // which is the workspace root when run via `cargo run`. Gitignored.
 const SCENE_PATH: &str = "scene.ron";
 
+// How far a single nudge moves the selected entity, in world units.
+const EDIT_STEP: f32 = 5.0;
+
 // The camera data handed to the shader. Must match the `Camera` struct in shader.wgsl.
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
@@ -678,39 +681,87 @@ impl ApplicationHandler for App {
                 self.cam_distance = self.cam_distance.clamp(10.0, 2000.0);
             }
             WindowEvent::KeyboardInput { event, .. } => {
-                if event.state == ElementState::Pressed && !event.repeat {
-                    match event.physical_key {
-                        PhysicalKey::Code(KeyCode::Space) => {
-                            self.paused = !self.paused;
-                            println!("{}", if self.paused { "Paused" } else { "Playing" });
-                        }
-                        PhysicalKey::Code(KeyCode::KeyS) => {
-                            if self.paused {
-                                systems::movement(&mut self.world);
-                                println!("Stepped one tick");
+                if event.state == ElementState::Pressed {
+                    if let PhysicalKey::Code(code) = event.physical_key {
+                        // Position nudge — moves the selected entity along a world
+                        // axis. Runs on auto-repeat too, so holding a key glides.
+                        let nudge = match code {
+                            KeyCode::ArrowLeft => Some((-EDIT_STEP, 0.0, 0.0)),
+                            KeyCode::ArrowRight => Some((EDIT_STEP, 0.0, 0.0)),
+                            KeyCode::ArrowUp => Some((0.0, EDIT_STEP, 0.0)),
+                            KeyCode::ArrowDown => Some((0.0, -EDIT_STEP, 0.0)),
+                            KeyCode::PageUp => Some((0.0, 0.0, EDIT_STEP)),
+                            KeyCode::PageDown => Some((0.0, 0.0, -EDIT_STEP)),
+                            _ => None,
+                        };
+
+                        if let Some((dx, dy, dz)) = nudge {
+                            if let Some(id) = self.selected {
+                                if let Some(p) = self.world.positions.get_mut(id) {
+                                    p.x += dx;
+                                    p.y += dy;
+                                    p.z += dz;
+                                }
+                            }
+                        } else if !event.repeat {
+                            // One-shot actions — ignore auto-repeat.
+                            match code {
+                                KeyCode::Space => {
+                                    self.paused = !self.paused;
+                                    println!("{}", if self.paused { "Paused" } else { "Playing" });
+                                }
+                                KeyCode::KeyS => {
+                                    if self.paused {
+                                        systems::movement(&mut self.world);
+                                        println!("Stepped one tick");
+                                    }
+                                }
+                                KeyCode::Escape => {
+                                    self.selected = None;
+                                    println!("Selection cleared");
+                                }
+                                // N: spawn a new entity at the camera focus, and select it.
+                                KeyCode::KeyN => {
+                                    let id = self.world.spawn(
+                                        Position {
+                                            x: self.cam_focus_x,
+                                            y: self.cam_focus_y,
+                                            z: 0.0,
+                                        },
+                                        Velocity {
+                                            dx: 0.0,
+                                            dy: 0.0,
+                                            dz: 0.0,
+                                        },
+                                    );
+                                    self.selected = Some(id);
+                                    println!("Spawned entity {id}");
+                                }
+                                // Delete: despawn the selected entity.
+                                KeyCode::Delete => {
+                                    if let Some(id) = self.selected {
+                                        self.world.despawn(id);
+                                        self.selected = None;
+                                        println!("Despawned entity {id}");
+                                    }
+                                }
+                                // F5: save the current world to disk.
+                                KeyCode::F5 => match self.world.save_to_file(SCENE_PATH) {
+                                    Ok(()) => println!("Saved scene to {SCENE_PATH}"),
+                                    Err(e) => println!("Save failed: {e}"),
+                                },
+                                // F9: reload the world from disk, discarding the current one.
+                                KeyCode::F9 => match World::load_from_file(SCENE_PATH) {
+                                    Ok(world) => {
+                                        self.world = world;
+                                        self.selected = None;
+                                        println!("Reloaded scene from {SCENE_PATH}");
+                                    }
+                                    Err(e) => println!("Reload failed: {e}"),
+                                },
+                                _ => {}
                             }
                         }
-                        PhysicalKey::Code(KeyCode::Escape) => {
-                            self.selected = None;
-                            println!("Selection cleared");
-                        }
-                        // F5: save the current world to disk.
-                        PhysicalKey::Code(KeyCode::F5) => {
-                            match self.world.save_to_file(SCENE_PATH) {
-                                Ok(()) => println!("Saved scene to {SCENE_PATH}"),
-                                Err(e) => println!("Save failed: {e}"),
-                            }
-                        }
-                        // F9: reload the world from disk, discarding the current one.
-                        PhysicalKey::Code(KeyCode::F9) => match World::load_from_file(SCENE_PATH) {
-                            Ok(world) => {
-                                self.world = world;
-                                self.selected = None;
-                                println!("Reloaded scene from {SCENE_PATH}");
-                            }
-                            Err(e) => println!("Reload failed: {e}"),
-                        },
-                        _ => {}
                     }
                 }
             }
