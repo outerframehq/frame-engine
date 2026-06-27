@@ -9,7 +9,17 @@ lands and the patch version bumps for fixes and small additions.
 
 ## [Unreleased]
 
-Nothing yet.
+### Changed
+
+Engine:
+
+- Spawning now reuses the first freed entity slot instead of always allocating a new id, so ids stay stable and freed slots are reclaimed.
+
+### Fixed
+
+Editor (frame-editor):
+
+- The editor no longer segfaults on window close. GPU and window resources are now released while the platform connection is still alive, instead of being dropped after the event loop has already torn down.
 
 ## [0.1.0] - 2026-06-27
 
