@@ -604,6 +604,15 @@ impl GpuState {
     }
 }
 
+/// Which tab is showing in the right-hand inspector dock. Purely a layout
+/// mockup for now — selecting a tab swaps placeholder content, nothing more.
+#[derive(Clone, Copy, PartialEq)]
+enum Tab {
+    Scene,
+    Inspector,
+    Console,
+}
+
 struct App {
     window: Option<Arc<Window>>,
     gpu: Option<GpuState>,
@@ -622,9 +631,8 @@ struct App {
     show_help: bool,
     egui_ctx: egui::Context,
     egui_state: Option<egui_winit::State>,
-    // Panel rectangle from the last egui frame, in egui points. Used to gate
-    // viewport input so clicks on the UI don't also hit the 3D scene.
-    ui_rect: Option<egui::Rect>,
+    // Active tab in the right-hand inspector dock.
+    current_tab: Tab,
 }
 
 impl App {
@@ -715,21 +723,12 @@ impl ApplicationHandler for App {
             let _ = state.on_window_event(window, &event);
         }
 
-        // Pure spatial test: is the cursor inside the panel's rectangle? We
-        // convert the latest cursor (physical pixels) into egui points and check
-        // against the rect captured last frame. Press and release are decided
-        // identically (by location), so drag/orbit state can never get stuck.
-        let pointer_over_ui = match self.ui_rect {
-            Some(rect) => {
-                let ppp = self.egui_ctx.pixels_per_point();
-                let p = egui::pos2(
-                    self.last_cursor.0 as f32 / ppp,
-                    self.last_cursor.1 as f32 / ppp,
-                );
-                rect.contains(p)
-            }
-            None => false,
-        };
+        // Is the cursor over an egui panel? Because we now drive egui through
+        // run_ui — which establishes the root available-rect — egui's own test
+        // works: true over the toolbar/inspector, false over the 3D viewport.
+        // Press and release are judged identically (by location), so drag/orbit
+        // state can never get stuck.
+        let pointer_over_ui = self.egui_ctx.is_pointer_over_egui();
         let ui_wants_keys = self.egui_ctx.egui_wants_keyboard_input();
 
         match event {
@@ -972,36 +971,69 @@ impl ApplicationHandler for App {
                 );
 
                 // --- Run egui for this frame ---
-                // Build the UI, collect the shapes/textures it wants drawn.
-                // (Step A: one trivial panel to prove the pipeline. Real
-                // controls come next.)
+                // run_ui hands our closure a full-screen root Ui and runs the
+                // begin/end pass internally. Panels shown into that root dock to
+                // the window edges. In egui 0.35 the old SidePanel/TopBottomPanel
+                // types were merged into one `Panel` (Panel::top/right/left/...).
+                // For now these are a layout mockup: solid, non-resizable, and
+                // wired to nothing but placeholder text.
                 let entity_count = instances.len();
-                let (egui_paint_jobs, egui_textures_delta, egui_ppp, egui_ui_rect) =
+                let mut tab = self.current_tab;
+                let (egui_paint_jobs, egui_textures_delta, egui_ppp) =
                     if let (Some(state), Some(window)) =
                         (self.egui_state.as_mut(), self.window.as_ref())
                     {
                         let raw_input = state.take_egui_input(window);
-                        self.egui_ctx.begin_pass(raw_input);
-                        let win = egui::Window::new("Frame Editor").show(&self.egui_ctx, |ui| {
-                            ui.label("egui is wired in.");
-                            ui.label(format!("{entity_count} entities live"));
+                        let full_output = self.egui_ctx.run_ui(raw_input, |ui| {
+                            // Top toolbar strip — a placeholder menu row.
+                            egui::Panel::top("toolbar").resizable(false).show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label("File");
+                                    ui.separator();
+                                    ui.label("Edit");
+                                    ui.separator();
+                                    ui.label("View");
+                                    ui.separator();
+                                    ui.label("Help");
+                                });
+                            });
+                            // Right inspector dock — a tab row over placeholder
+                            // content. Selecting a tab swaps what shows below.
+                            egui::Panel::right("inspector")
+                                .resizable(false)
+                                .exact_size(260.0)
+                                .show(ui, |ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.selectable_value(&mut tab, Tab::Scene, "Scene");
+                                        ui.selectable_value(&mut tab, Tab::Inspector, "Inspector");
+                                        ui.selectable_value(&mut tab, Tab::Console, "Console");
+                                    });
+                                    ui.separator();
+                                    match tab {
+                                        Tab::Scene => {
+                                            ui.label("Scene tree");
+                                            ui.label(format!("{entity_count} entities"));
+                                        }
+                                        Tab::Inspector => {
+                                            ui.label("Selected entity");
+                                            ui.label("(properties go here)");
+                                        }
+                                        Tab::Console => {
+                                            ui.label("Console / log output");
+                                        }
+                                    }
+                                });
+                            // The space left in the middle is the 3D viewport —
+                            // we draw nothing there, so the scene shows through.
                         });
-                        // Remember the panel's rectangle (in egui points) so
-                        // window_event can hold back viewport input only when the
-                        // cursor is actually over it. egui 0.35's own
-                        // is_pointer_over_egui() needs a CentralPanel to define
-                        // the free area; rather than depend on that, we own the
-                        // test ourselves — one rect, one containment check.
-                        let ui_rect = win.map(|r| r.response.rect);
-                        let full_output = self.egui_ctx.end_pass();
                         state.handle_platform_output(window, full_output.platform_output);
                         let ppp = full_output.pixels_per_point;
                         let jobs = self.egui_ctx.tessellate(full_output.shapes, ppp);
-                        (jobs, full_output.textures_delta, ppp, ui_rect)
+                        (jobs, full_output.textures_delta, ppp)
                     } else {
-                        (Vec::new(), egui::TexturesDelta::default(), 1.0, None)
+                        (Vec::new(), egui::TexturesDelta::default(), 1.0)
                     };
-                self.ui_rect = egui_ui_rect;
+                self.current_tab = tab;
 
                 if let Some(gpu) = &mut self.gpu {
                     gpu.render(
@@ -1108,7 +1140,7 @@ fn main() {
         show_help: true,
         egui_ctx: egui::Context::default(),
         egui_state: None,
-        ui_rect: None,
+        current_tab: Tab::Scene,
     };
 
     println!(
