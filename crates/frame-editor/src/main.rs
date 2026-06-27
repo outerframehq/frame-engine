@@ -732,6 +732,18 @@ impl ApplicationHandler for App {
         self.window = Some(window);
     }
 
+    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        // Release GPU and window resources here, while winit's platform
+        // connection (the Wayland display) is still alive. If we let these drop
+        // later, after the event loop has torn down, the wgpu surface's
+        // destructor touches Wayland objects that are already gone, which is the
+        // segfault on exit. Order matters: GPU state first (its surface holds a
+        // handle to the window), then egui, then the window last.
+        self.gpu = None;
+        self.egui_state = None;
+        self.window = None;
+    }
+
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         // Feed every event to egui so its own widgets (dragging the panel,
         // future buttons/sliders) keep working. We deliberately ignore the
