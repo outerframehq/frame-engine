@@ -255,6 +255,7 @@ struct GpuState {
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
     depth_view: wgpu::TextureView,
+    egui_renderer: egui_wgpu::Renderer,
 }
 
 impl GpuState {
@@ -280,6 +281,14 @@ impl GpuState {
         surface.configure(&device, &config);
 
         let depth_view = create_depth_view(&device, &config);
+
+        // egui's renderer. It draws in its own pass with no depth attachment,
+        // so RendererOptions::default() (depth_stencil_format: None) is correct.
+        let egui_renderer = egui_wgpu::Renderer::new(
+            &device,
+            config.format,
+            egui_wgpu::RendererOptions::default(),
+        );
 
         let camera_uniform = CameraUniform {
             view_proj: Mat4::IDENTITY.to_cols_array_2d(),
@@ -412,6 +421,7 @@ impl GpuState {
             camera_buffer,
             camera_bind_group,
             depth_view,
+            egui_renderer,
         }
     }
 
@@ -431,6 +441,9 @@ impl GpuState {
         instances: &[InstanceRaw],
         text_instances: &[TextInstance],
         view_proj: [[f32; 4]; 4],
+        egui_paint_jobs: &[egui::epaint::ClippedPrimitive],
+        egui_textures_delta: &egui::TexturesDelta,
+        egui_ppp: f32,
     ) {
         let camera_uniform = CameraUniform { view_proj };
         self.queue.write_buffer(
@@ -438,6 +451,16 @@ impl GpuState {
             0,
             bytemuck::cast_slice(&[camera_uniform]),
         );
+
+        // egui: upload any new/changed textures before we start encoding.
+        for (id, image_delta) in &egui_textures_delta.set {
+            self.egui_renderer
+                .update_texture(&self.device, &self.queue, *id, image_delta);
+        }
+        let egui_screen = egui_wgpu::ScreenDescriptor {
+            size_in_pixels: [self.config.width, self.config.height],
+            pixels_per_point: egui_ppp,
+        };
 
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame)
@@ -483,6 +506,16 @@ impl GpuState {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("frame encoder"),
             });
+
+        // egui: record its vertex/index uploads into the encoder. Must happen
+        // before any render pass is active.
+        let egui_user_buffers = self.egui_renderer.update_buffers(
+            &self.device,
+            &self.queue,
+            &mut encoder,
+            egui_paint_jobs,
+            &egui_screen,
+        );
 
         {
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -531,7 +564,42 @@ impl GpuState {
             }
         }
 
-        self.queue.submit(std::iter::once(encoder.finish()));
+        // egui pass: layered over the scene (load, don't clear), no depth.
+        // egui's renderer requires a RenderPass<'static>, hence forget_lifetime.
+        {
+            let mut egui_pass = encoder
+                .begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("egui pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &view,
+                        resolve_target: None,
+                        depth_slice: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                })
+                .forget_lifetime();
+            self.egui_renderer
+                .render(&mut egui_pass, egui_paint_jobs, &egui_screen);
+        }
+
+        // egui: free textures it no longer needs, after this frame's draw.
+        for id in &egui_textures_delta.free {
+            self.egui_renderer.free_texture(id);
+        }
+
+        // egui's upload command buffers must be submitted before the main one.
+        self.queue.submit(
+            egui_user_buffers
+                .into_iter()
+                .chain(std::iter::once(encoder.finish())),
+        );
         frame.present();
     }
 }
@@ -552,6 +620,11 @@ struct App {
     last_cursor: (f64, f64),
     selected: Option<usize>,
     show_help: bool,
+    egui_ctx: egui::Context,
+    egui_state: Option<egui_winit::State>,
+    // Panel rectangle from the last egui frame, in egui points. Used to gate
+    // viewport input so clicks on the UI don't also hit the 3D scene.
+    ui_rect: Option<egui::Rect>,
 }
 
 impl App {
@@ -614,11 +687,51 @@ impl ApplicationHandler for App {
         let attributes = Window::default_attributes().with_title("Frame Editor");
         let window = Arc::new(event_loop.create_window(attributes).unwrap());
         self.gpu = Some(GpuState::new(window.clone()));
+
+        // egui input state. Lives here because it needs the window; the egui
+        // Context it shares already exists on App.
+        let egui_state = egui_winit::State::new(
+            self.egui_ctx.clone(),
+            egui::ViewportId::ROOT,
+            window.as_ref(),
+            None,
+            None,
+            None,
+        );
+        self.egui_state = Some(egui_state);
+
         window.request_redraw();
         self.window = Some(window);
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+        // Feed every event to egui so its own widgets (dragging the panel,
+        // future buttons/sliders) keep working. We deliberately ignore the
+        // returned `consumed` flag: in 0.35 it's driven by egui's *interaction*
+        // state, which is the wrong question for a viewport editor and gates
+        // press/release differently once a button goes down — that's what stuck
+        // our drag/orbit state and killed viewport input.
+        if let (Some(state), Some(window)) = (self.egui_state.as_mut(), self.window.as_ref()) {
+            let _ = state.on_window_event(window, &event);
+        }
+
+        // Pure spatial test: is the cursor inside the panel's rectangle? We
+        // convert the latest cursor (physical pixels) into egui points and check
+        // against the rect captured last frame. Press and release are decided
+        // identically (by location), so drag/orbit state can never get stuck.
+        let pointer_over_ui = match self.ui_rect {
+            Some(rect) => {
+                let ppp = self.egui_ctx.pixels_per_point();
+                let p = egui::pos2(
+                    self.last_cursor.0 as f32 / ppp,
+                    self.last_cursor.1 as f32 / ppp,
+                );
+                rect.contains(p)
+            }
+            None => false,
+        };
+        let ui_wants_keys = self.egui_ctx.egui_wants_keyboard_input();
+
         match event {
             WindowEvent::CloseRequested => {
                 println!("Close requested; Shutting Down");
@@ -629,7 +742,7 @@ impl ApplicationHandler for App {
                     gpu.resize(size.width, size.height);
                 }
             }
-            WindowEvent::MouseInput { state, button, .. } => {
+            WindowEvent::MouseInput { state, button, .. } if !pointer_over_ui => {
                 let pressed = state == ElementState::Pressed;
                 match button {
                     MouseButton::Left => {
@@ -669,7 +782,7 @@ impl ApplicationHandler for App {
                 }
                 self.last_cursor = (position.x, position.y);
             }
-            WindowEvent::MouseWheel { delta, .. } => {
+            WindowEvent::MouseWheel { delta, .. } if !pointer_over_ui => {
                 let scroll = match delta {
                     MouseScrollDelta::LineDelta(_, y) => y,
                     MouseScrollDelta::PixelDelta(pos) => pos.y as f32,
@@ -681,7 +794,7 @@ impl ApplicationHandler for App {
                 }
                 self.cam_distance = self.cam_distance.clamp(10.0, 2000.0);
             }
-            WindowEvent::KeyboardInput { event, .. } => {
+            WindowEvent::KeyboardInput { event, .. } if !ui_wants_keys => {
                 if event.state == ElementState::Pressed {
                     if let PhysicalKey::Code(code) = event.physical_key {
                         // Position nudge — moves the selected entity along a world
@@ -858,8 +971,47 @@ impl ApplicationHandler for App {
                     height,
                 );
 
+                // --- Run egui for this frame ---
+                // Build the UI, collect the shapes/textures it wants drawn.
+                // (Step A: one trivial panel to prove the pipeline. Real
+                // controls come next.)
+                let entity_count = instances.len();
+                let (egui_paint_jobs, egui_textures_delta, egui_ppp, egui_ui_rect) =
+                    if let (Some(state), Some(window)) =
+                        (self.egui_state.as_mut(), self.window.as_ref())
+                    {
+                        let raw_input = state.take_egui_input(window);
+                        self.egui_ctx.begin_pass(raw_input);
+                        let win = egui::Window::new("Frame Editor").show(&self.egui_ctx, |ui| {
+                            ui.label("egui is wired in.");
+                            ui.label(format!("{entity_count} entities live"));
+                        });
+                        // Remember the panel's rectangle (in egui points) so
+                        // window_event can hold back viewport input only when the
+                        // cursor is actually over it. egui 0.35's own
+                        // is_pointer_over_egui() needs a CentralPanel to define
+                        // the free area; rather than depend on that, we own the
+                        // test ourselves — one rect, one containment check.
+                        let ui_rect = win.map(|r| r.response.rect);
+                        let full_output = self.egui_ctx.end_pass();
+                        state.handle_platform_output(window, full_output.platform_output);
+                        let ppp = full_output.pixels_per_point;
+                        let jobs = self.egui_ctx.tessellate(full_output.shapes, ppp);
+                        (jobs, full_output.textures_delta, ppp, ui_rect)
+                    } else {
+                        (Vec::new(), egui::TexturesDelta::default(), 1.0, None)
+                    };
+                self.ui_rect = egui_ui_rect;
+
                 if let Some(gpu) = &mut self.gpu {
-                    gpu.render(&instances, &text_instances, view_proj);
+                    gpu.render(
+                        &instances,
+                        &text_instances,
+                        view_proj,
+                        &egui_paint_jobs,
+                        &egui_textures_delta,
+                        egui_ppp,
+                    );
                 }
                 if let Some(window) = &self.window {
                     window.request_redraw();
@@ -954,6 +1106,9 @@ fn main() {
         last_cursor: (0.0, 0.0),
         selected: None,
         show_help: true,
+        egui_ctx: egui::Context::default(),
+        egui_state: None,
+        ui_rect: None,
     };
 
     println!(
