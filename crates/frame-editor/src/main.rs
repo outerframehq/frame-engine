@@ -1,3 +1,5 @@
+const LOGO_PNG: &[u8] = include_bytes!("../assets/frame-editor.png");
+
 use std::sync::Arc;
 
 use frame_engine::core::Clock;
@@ -10,7 +12,7 @@ use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
-use winit::window::{Window, WindowId};
+use winit::window::{Icon, Window, WindowId};
 
 mod font;
 
@@ -651,6 +653,9 @@ struct App {
     log_lines: Vec<String>,
     // Which movement buttons (WASD) are currently held, read by the input system.
     input: InputState,
+
+    // GPU texture for the toolbar logo, uploaded once on the first frame.
+    logo_texture: Option<egui::TextureHandle>,
 }
 
 impl App {
@@ -719,9 +724,29 @@ impl App {
     }
 }
 
+// Decode the embedded logo into a winit window icon (shown in the title bar and
+// the OS taskbar). Returns None if it can't decode, so the window still opens.
+// NOTE: honoured on X11 and Windows; Wayland ignores it and takes the taskbar
+// icon from a matching .desktop file instead.
+fn load_window_icon() -> Option<Icon> {
+    let rgba = image::load_from_memory(LOGO_PNG).ok()?.to_rgba8();
+    let (width, height) = rgba.dimensions();
+    Icon::from_rgba(rgba.into_raw(), width, height).ok()
+}
+
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        let attributes = Window::default_attributes().with_title("Frame Editor");
+        #[allow(unused_mut)]
+        let mut attributes = Window::default_attributes()
+            .with_title("Frame Editor")
+            .with_window_icon(load_window_icon());
+        // Wayland ignores the in-process icon above; it matches this app-id to a
+        // frame-editor.desktop file and reads the taskbar icon from there.
+        #[cfg(target_os = "linux")]
+        {
+            use winit::platform::wayland::WindowAttributesExtWayland;
+            attributes = attributes.with_name("frame-editor", "frame-editor");
+        }
         let window = Arc::new(event_loop.create_window(attributes).unwrap());
         self.gpu = Some(GpuState::new(window.clone()));
 
@@ -1056,6 +1081,24 @@ impl ApplicationHandler for App {
                         self.world.controlled.get(id).is_some(),
                     ))
                 });
+
+                // Upload the logo to the GPU on the first frame, then reuse the handle.
+                if self.logo_texture.is_none() {
+                    let rgba = image::load_from_memory(LOGO_PNG)
+                        .expect("embedded logo PNG should decode")
+                        .to_rgba8();
+                    let (w, h) = rgba.dimensions();
+                    let color_image = egui::ColorImage::from_rgba_unmultiplied(
+                        [w as usize, h as usize],
+                        rgba.as_raw(),
+                    );
+                    self.logo_texture = Some(self.egui_ctx.load_texture(
+                        "frame-editor-logo",
+                        color_image,
+                        egui::TextureOptions::LINEAR,
+                    ));
+                }
+                let logo = self.logo_texture.clone();
                 let (egui_paint_jobs, egui_textures_delta, egui_ppp) =
                     if let (Some(state), Some(window)) =
                         (self.egui_state.as_mut(), self.window.as_ref())
@@ -1065,6 +1108,13 @@ impl ApplicationHandler for App {
                             // Top toolbar strip — fixed height, placeholder menu.
                             egui::Panel::top("toolbar").resizable(false).show(ui, |ui| {
                                 ui.horizontal(|ui| {
+                                    if let Some(logo) = &logo {
+                                        ui.add(
+                                            egui::Image::new(logo)
+                                                .fit_to_exact_size(egui::vec2(20.0, 20.0)),
+                                        );
+                                        ui.separator();
+                                    }
                                     ui.label("File");
                                     ui.separator();
                                     ui.label("Edit");
@@ -1348,6 +1398,8 @@ fn main() {
         console_tab: ConsoleTab::Output,
         log_lines: vec!["Frame Editor started.".to_string()],
         input: InputState::new(),
+
+        logo_texture: None,
     };
 
     println!(

@@ -5,6 +5,8 @@ edition = "2024"
 
 [dependencies]
 
+image = { version = "0.25", default-features = false, features = ["png"] }
+
 frame-engine = { path = "../frame-engine" }
 winit = "0.30"
 softbuffer = "0.4"

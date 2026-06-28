@@ -1,0 +1,22 @@
+<svg width="160" height="160" viewBox="0 0 160 160" xmlns="http://www.w3.org/2000/svg" role="img" aria-label="Frame Editor logo">
+  <title>Frame Editor</title>
+  <defs>
+    <pattern id="dither" width="6" height="6" patternUnits="userSpaceOnUse">
+      <rect x="0" y="0" width="3" height="3" fill="#111111"/>
+      <rect x="3" y="3" width="3" height="3" fill="#111111"/>
+    </pattern>
+  </defs>
+
+  <g fill="#111111">
+    <rect x="0" y="0" width="40" height="10"/><rect x="0" y="10" width="10" height="30"/>
+    <rect x="120" y="0" width="40" height="10"/><rect x="150" y="10" width="10" height="30"/>
+    <rect x="0" y="150" width="40" height="10"/><rect x="0" y="120" width="10" height="30"/>
+    <rect x="120" y="150" width="40" height="10"/><rect x="150" y="120" width="10" height="30"/>
+  </g>
+
+  <polygon points="80,42 115,60 80,78 45,60" fill="none" stroke="#111111" stroke-width="3" stroke-linejoin="miter"/>
+  <polygon points="45,60 80,78 80,113 45,95" fill="#111111" stroke="#111111" stroke-width="3" stroke-linejoin="miter"/>
+  <polygon points="80,78 115,60 115,95 80,113" fill="url(#dither)" stroke="#111111" stroke-width="3" stroke-linejoin="miter"/>
+
+  <polygon points="78,54 78,77 84,71 88,80 91,79 87,70 94,70" fill="#ffffff" stroke="#111111" stroke-width="2.5" stroke-linejoin="miter"/>
+</svg>

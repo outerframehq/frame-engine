@@ -798,6 +798,7 @@ dependencies = [
  "egui-winit",
  "frame-engine",
  "glam",
+ "image",
  "pollster",
  "softbuffer",
  "wgpu",
