@@ -14,10 +14,12 @@ lands and the patch version bumps for fixes and small additions.
 Engine:
 
 - A `Color` component, kept in lockstep with position and velocity and serialized with the scene.
+- An input system and a logical `InputState`, so entities can be driven by held buttons instead of only fixed velocity.
 
 Editor (frame-editor):
 
 - Entities now render in their own color, editable per entity from the Inspector. The selected entity is brightened rather than recolored, so its color stays visible while you edit it.
+- WASD drives the selected entity while the simulation is running.
 
 ### Changed
 
