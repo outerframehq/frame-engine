@@ -22,6 +22,8 @@ Editor (frame-editor):
 - Entities now render in their own color, editable per entity from the Inspector. The selected entity is brightened rather than recolored, so its color stays visible while you edit it.
 - WASD drives the selected entity while the simulation is running.
 - Mark an entity Controlled from the Inspector to drive it with WASD. Step moved to the period key so it no longer shares S with movement.
+- The Frame Editor logo now appears in the toolbar.
+- The editor now has its own application icon, shown by the desktop and taskbar.
 
 ### Changed
 
