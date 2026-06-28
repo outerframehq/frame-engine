@@ -16,20 +16,41 @@ pub struct Velocity {
     pub dz: f32,
 }
 
+#[derive(Serialize, Deserialize, Clone, Copy)]
+pub struct Color {
+    pub r: f32,
+    pub g: f32,
+    pub b: f32,
+}
+
 #[derive(Serialize, Deserialize)]
 pub struct World {
     pub positions: ComponentStorage<Position>,
     pub velocities: ComponentStorage<Velocity>,
+    #[serde(default)]
+    pub colors: ComponentStorage<Color>,
+}
+
+impl Default for Color {
+    fn default() -> Self {
+        // The same warm yellow the renderer used before colors existed, so
+        // entities look unchanged until you deliberately recolor them.
+        Color {
+            r: 0.95,
+            g: 0.85,
+            b: 0.35,
+        }
+    }
 }
 
 impl World {
     pub fn spawn(&mut self, position: Position, velocity: Velocity) -> usize {
-        // reuse the first freed slot if there is one, otherwise grow the lists by one
         let free_slot = self.positions.iter().position(|slot| slot.is_none());
         let id = free_slot.unwrap_or_else(|| self.positions.len());
 
         self.positions.insert(id, position);
         self.velocities.insert(id, velocity);
+        self.colors.insert(id, Color::default());
         id
     }
 
@@ -38,6 +59,7 @@ impl World {
         if id < self.positions.len() {
             self.positions.remove(id);
             self.velocities.remove(id);
+            self.colors.remove(id);
         }
     }
 
