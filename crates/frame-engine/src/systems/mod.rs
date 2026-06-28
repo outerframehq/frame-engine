@@ -14,27 +14,38 @@ pub fn movement(world: &mut World) {
 // How far a controlled entity moves per tick while a direction is held.
 const INPUT_SPEED: f32 = 1.0;
 
-/// Move the controlled entity according to the held input buttons. Runs once
-/// per tick, so motion is the same regardless of frame rate. Does nothing if no
-/// entity is controlled or the controlled id has no position.
-pub fn input_movement(world: &mut World, input: &InputState, controlled: Option<usize>) {
-    let Some(id) = controlled else {
-        return;
-    };
-    let Some(position) = world.positions.get_mut(id) else {
-        return;
-    };
-
+/// Move every controlled entity according to the held input buttons. Runs once
+/// per tick, so motion is the same regardless of frame rate. An entity is
+/// driven only if it has both a position and the Controlled marker.
+pub fn input_movement(world: &mut World, input: &InputState) {
+    // Work out this tick's movement once, from the held buttons.
+    let mut dx = 0.0;
+    let mut dy = 0.0;
     if input.is_held(Button::Left) {
-        position.x -= INPUT_SPEED;
+        dx -= INPUT_SPEED;
     }
     if input.is_held(Button::Right) {
-        position.x += INPUT_SPEED;
+        dx += INPUT_SPEED;
     }
     if input.is_held(Button::Up) {
-        position.y += INPUT_SPEED;
+        dy += INPUT_SPEED;
     }
     if input.is_held(Button::Down) {
-        position.y -= INPUT_SPEED;
+        dy -= INPUT_SPEED;
+    }
+    if dx == 0.0 && dy == 0.0 {
+        return;
+    }
+
+    // Apply it to every entity that has BOTH a position and the Controlled
+    // marker. Zipping the two storages and matching on (Some, Some) is the ECS
+    // query: act only where the required components co-exist. We ignore the
+    // marker's value with `Some(_)` because it has none, only presence matters.
+    for (position_slot, controlled_slot) in world.positions.iter_mut().zip(world.controlled.iter())
+    {
+        if let (Some(position), Some(_)) = (position_slot, controlled_slot) {
+            position.x += dx;
+            position.y += dy;
+        }
     }
 }

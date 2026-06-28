@@ -3,6 +3,9 @@ use serde::{Deserialize, Serialize};
 pub use storage::ComponentStorage;
 
 #[derive(Serialize, Deserialize, Clone, Copy)]
+pub struct Controlled;
+
+#[derive(Serialize, Deserialize, Clone, Copy)]
 pub struct Position {
     pub x: f32,
     pub y: f32,
@@ -29,6 +32,8 @@ pub struct World {
     pub velocities: ComponentStorage<Velocity>,
     #[serde(default)]
     pub colors: ComponentStorage<Color>,
+    #[serde(default)]
+    pub controlled: ComponentStorage<Controlled>,
 }
 
 impl Default for Color {
@@ -60,6 +65,7 @@ impl World {
             self.positions.remove(id);
             self.velocities.remove(id);
             self.colors.remove(id);
+            self.controlled.remove(id);
         }
     }
 

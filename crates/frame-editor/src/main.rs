@@ -941,7 +941,7 @@ impl ApplicationHandler for App {
             WindowEvent::RedrawRequested => {
                 let owed = self.clock.advance(!self.paused);
                 for _ in 0..owed {
-                    systems::input_movement(&mut self.world, &self.input, self.selected);
+                    systems::input_movement(&mut self.world, &self.input);
                     systems::movement(&mut self.world);
                 }
 
@@ -1246,6 +1246,7 @@ fn default_world() -> World {
         colors: ComponentStorage::new(),
         positions: ComponentStorage::new(),
         velocities: ComponentStorage::new(),
+        controlled: ComponentStorage::new(),
     };
 
     world.spawn(

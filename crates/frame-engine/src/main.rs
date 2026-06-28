@@ -15,6 +15,7 @@ fn main() {
         positions: ComponentStorage::new(),
         velocities: ComponentStorage::new(),
         colors: ComponentStorage::new(),
+        controlled: ComponentStorage::new(),
     };
 
     world.spawn(
