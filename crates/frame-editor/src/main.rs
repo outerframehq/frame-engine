@@ -3,7 +3,7 @@ use std::sync::Arc;
 use frame_engine::core::Clock;
 use frame_engine::input::{Button, InputState};
 use frame_engine::systems;
-use frame_engine::world::{ComponentStorage, Position, Velocity, World};
+use frame_engine::world::{Color, ComponentStorage, Controlled, Position, Velocity, World};
 use glam::{Mat4, Vec3, Vec4};
 use wgpu::util::DeviceExt;
 use winit::application::ApplicationHandler;
@@ -834,11 +834,14 @@ impl ApplicationHandler for App {
                 }
                 self.cam_distance = self.cam_distance.clamp(10.0, 2000.0);
             }
-            WindowEvent::KeyboardInput { event, .. } if !ui_wants_keys => {
+            WindowEvent::KeyboardInput { event, .. } => {
                 // Level-triggered movement input (WASD). Updated on both press
                 // and release so the input system always sees what is held right
-                // now. This is separate from the edge-triggered actions below,
-                // which only fire on press.
+                // now. Tracked even when egui holds keyboard focus — otherwise
+                // ticking the Controlled checkbox (which keeps focus) would
+                // silently swallow WASD and the entity could never be driven.
+                // The edge-triggered editor actions below still defer to egui
+                // via `ui_wants_keys`.
                 if let PhysicalKey::Code(code) = event.physical_key {
                     let pressed = event.state == ElementState::Pressed;
                     match code {
@@ -850,7 +853,7 @@ impl ApplicationHandler for App {
                     }
                 }
 
-                if event.state == ElementState::Pressed {
+                if !ui_wants_keys && event.state == ElementState::Pressed {
                     if let PhysicalKey::Code(code) = event.physical_key {
                         // Position nudge — moves the selected entity along a world
                         // axis. Runs on auto-repeat too, so holding a key glides.
@@ -879,7 +882,9 @@ impl ApplicationHandler for App {
                                     self.paused = !self.paused;
                                     self.log(if self.paused { "Paused" } else { "Playing" });
                                 }
-                                KeyCode::KeyS => {
+                                // Period steps the sim one tick while paused.
+                                // Kept off S so it doesn't collide with WASD.
+                                KeyCode::Period => {
                                     if self.paused {
                                         systems::movement(&mut self.world);
                                         self.log("Stepped one tick");
@@ -982,17 +987,18 @@ impl ApplicationHandler for App {
                 // secondary furniture.
                 if self.show_help {
                     let help = "CONTROLS   H TO HIDE\n\n\
-                                SPACE  PLAY PAUSE\n\n\
-                                S  STEP WHEN PAUSED\n\n\
-                                N  SPAWN ENTITY\n\n\
-                                DEL  DESPAWN SELECTED\n\n\
-                                ARROWS  MOVE X Y\n\n\
-                                PGUP PGDN  MOVE Z\n\n\
-                                F5 SAVE   F9 LOAD\n\n\
-                                ESC  DESELECT\n\n\
-                                LMB  SELECT   DRAG PAN\n\n\
-                                MMB  DRAG ORBIT\n\n\
-                                WHEEL  ZOOM";
+                                                    SPACE  PLAY PAUSE\n\n\
+                                                    .  STEP WHEN PAUSED\n\n\
+                                                    WASD  DRIVE CONTROLLED\n\n\
+                                                    N  SPAWN ENTITY\n\n\
+                                                    DEL  DESPAWN SELECTED\n\n\
+                                                    ARROWS  MOVE X Y\n\n\
+                                                    PGUP PGDN  MOVE Z\n\n\
+                                                    F5 SAVE   F9 LOAD\n\n\
+                                                    ESC  DESELECT\n\n\
+                                                    LMB  SELECT   DRAG PAN\n\n\
+                                                    MMB  DRAG ORBIT\n\n\
+                                                    WHEEL  ZOOM";
                     let pixel = 2.0;
                     let lines = help.lines().count() as f32;
                     let line_h = (font::GLYPH_HEIGHT as f32 + 1.0) * pixel;
@@ -1047,6 +1053,7 @@ impl ApplicationHandler for App {
                         *self.world.positions.get(id)?,
                         *self.world.velocities.get(id)?,
                         self.world.colors.get(id).copied().unwrap_or_default(),
+                        self.world.controlled.get(id).is_some(),
                     ))
                 });
                 let (egui_paint_jobs, egui_textures_delta, egui_ppp) =
@@ -1134,7 +1141,7 @@ impl ApplicationHandler for App {
                                                 });
                                         }
                                         Tab::Inspector => match &mut edited {
-                                            Some((id, pos, vel, color)) => {
+                                            Some((id, pos, vel, color, controlled)) => {
                                                 ui.label(format!("Entity {id}"));
                                                 ui.add_space(4.0);
                                                 ui.label("Position");
@@ -1184,6 +1191,8 @@ impl ApplicationHandler for App {
                                                     color.g = rgb[1];
                                                     color.b = rgb[2];
                                                 }
+                                                ui.add_space(4.0);
+                                                ui.checkbox(controlled, "Controlled (WASD)");
                                             }
                                             None => {
                                                 ui.weak("No entity selected");
@@ -1209,7 +1218,7 @@ impl ApplicationHandler for App {
                 // Push any inspector edits back into the world. The render this
                 // frame already used the old values; the change shows next frame
                 // (same one-frame path as the keyboard nudge).
-                if let Some((id, pos, vel, color)) = edited {
+                if let Some((id, pos, vel, color, controlled)) = edited {
                     if let Some(p) = self.world.positions.get_mut(id) {
                         *p = pos;
                     }
@@ -1219,6 +1228,13 @@ impl ApplicationHandler for App {
                     // insert rather than get_mut so editing also works for an entity whose
                     // colour slot is missing (a scene saved before colours existed).
                     self.world.colors.insert(id, color);
+                    // A marker is presence/absence: add it when the box is ticked, remove it
+                    // when it isn't.
+                    if controlled {
+                        self.world.controlled.insert(id, Controlled);
+                    } else {
+                        self.world.controlled.remove(id);
+                    }
                 }
 
                 if let Some(gpu) = &mut self.gpu {
