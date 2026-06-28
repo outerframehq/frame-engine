@@ -53,10 +53,11 @@ struct InstanceRaw {
     position: [f32; 3],
     color: [f32; 3],
     selected: f32,
+    scale: f32,
 }
 
 impl InstanceRaw {
-    const ATTRIBS: [wgpu::VertexAttribute; 3] = [
+    const ATTRIBS: [wgpu::VertexAttribute; 4] = [
         wgpu::VertexAttribute {
             format: wgpu::VertexFormat::Float32x3,
             offset: 0,
@@ -71,6 +72,11 @@ impl InstanceRaw {
             format: wgpu::VertexFormat::Float32,
             offset: std::mem::size_of::<[f32; 6]>() as wgpu::BufferAddress, // 24
             shader_location: 2,
+        },
+        wgpu::VertexAttribute {
+            format: wgpu::VertexFormat::Float32,
+            offset: std::mem::size_of::<[f32; 7]>() as wgpu::BufferAddress, // 28
+            shader_location: 3,
         },
     ];
 
@@ -693,11 +699,12 @@ impl App {
 
         let cursor_x = self.last_cursor.0 as f32;
         let cursor_y = self.last_cursor.1 as f32;
-        let half = QUAD_SIZE * 0.5;
-
         let mut picked: Option<usize> = None;
         for (id, slot) in self.world.positions.iter().enumerate() {
             if let Some(p) = slot {
+                // Hit-box grows with the entity's scale so picking matches what's drawn.
+                let scale = self.world.scales.get(id).copied().unwrap_or_default();
+                let half = QUAD_SIZE * 0.5 * scale.factor;
                 let center = project(vp, p.x, p.y, p.z, width, height);
                 let corner = project(vp, p.x + half, p.y + half, p.z, width, height);
                 if let (Some((cx, cy)), Some((ex, ey))) = (center, corner) {
@@ -986,10 +993,12 @@ impl ApplicationHandler for App {
                         // Falls back to the default colour if this entity has no colour slot,
                         // which only happens for scenes saved before colours existed.
                         let color = self.world.colors.get(id).copied().unwrap_or_default();
+                        let scale = self.world.scales.get(id).copied().unwrap_or_default();
                         InstanceRaw {
                             position: [p.x, p.y, p.z],
                             color: [color.r, color.g, color.b],
                             selected: if Some(id) == selected { 1.0 } else { 0.0 },
+                            scale: scale.factor,
                         }
                     })
                     .collect();
@@ -1079,6 +1088,7 @@ impl ApplicationHandler for App {
                         *self.world.velocities.get(id)?,
                         self.world.colors.get(id).copied().unwrap_or_default(),
                         self.world.controlled.get(id).is_some(),
+                        self.world.scales.get(id).copied().unwrap_or_default(),
                     ))
                 });
 
@@ -1191,7 +1201,7 @@ impl ApplicationHandler for App {
                                                 });
                                         }
                                         Tab::Inspector => match &mut edited {
-                                            Some((id, pos, vel, color, controlled)) => {
+                                            Some((id, pos, vel, color, controlled, scale)) => {
                                                 ui.label(format!("Entity {id}"));
                                                 ui.add_space(4.0);
                                                 ui.label("Position");
@@ -1233,14 +1243,21 @@ impl ApplicationHandler for App {
                                                 });
                                                 ui.add_space(4.0);
                                                 ui.label("Color");
-                                                // The widget wants a [f32; 3]; copy in, let the user edit, copy back
-                                                // into the Color struct only when it actually changed.
+                                                // The widget wants a [f32; 3]; copy in, let the user
+                                                // edit, copy back into Color only when it changed.
                                                 let mut rgb = [color.r, color.g, color.b];
                                                 if ui.color_edit_button_rgb(&mut rgb).changed() {
                                                     color.r = rgb[0];
                                                     color.g = rgb[1];
                                                     color.b = rgb[2];
                                                 }
+                                                ui.add_space(4.0);
+                                                ui.label("Scale");
+                                                ui.add(
+                                                    egui::DragValue::new(&mut scale.factor)
+                                                        .speed(0.05)
+                                                        .range(0.1..=100.0),
+                                                );
                                                 ui.add_space(4.0);
                                                 ui.checkbox(controlled, "Controlled (WASD)");
                                             }
@@ -1268,18 +1285,15 @@ impl ApplicationHandler for App {
                 // Push any inspector edits back into the world. The render this
                 // frame already used the old values; the change shows next frame
                 // (same one-frame path as the keyboard nudge).
-                if let Some((id, pos, vel, color, controlled)) = edited {
+                if let Some((id, pos, vel, color, controlled, scale)) = edited {
                     if let Some(p) = self.world.positions.get_mut(id) {
                         *p = pos;
                     }
                     if let Some(v) = self.world.velocities.get_mut(id) {
                         *v = vel;
                     }
-                    // insert rather than get_mut so editing also works for an entity whose
-                    // colour slot is missing (a scene saved before colours existed).
                     self.world.colors.insert(id, color);
-                    // A marker is presence/absence: add it when the box is ticked, remove it
-                    // when it isn't.
+                    self.world.scales.insert(id, scale);
                     if controlled {
                         self.world.controlled.insert(id, Controlled);
                     } else {

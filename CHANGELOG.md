@@ -16,6 +16,7 @@ Engine:
 - A `Color` component, kept in lockstep with position and velocity and serialized with the scene.
 - An input system and a logical `InputState`, so entities can be driven by held buttons instead of only fixed velocity.
 - A `Controlled` marker (tag) component; the input system now drives every entity that carries it.
+- A `Scale` component (uniform size factor), kept in lockstep with the other components and serialized with the scene.
 
 Editor (frame-editor):
 
@@ -24,6 +25,7 @@ Editor (frame-editor):
 - Mark an entity Controlled from the Inspector to drive it with WASD. Step moved to the period key so it no longer shares S with movement.
 - The Frame Editor logo now appears in the toolbar.
 - The editor now has its own application icon, shown by the desktop and taskbar.
+- Resize the selected entity from the Inspector. Picking grows the entity's hit-box with its scale, so a scaled-up cube stays clickable.
 
 ### Changed
 

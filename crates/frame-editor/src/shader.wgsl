@@ -9,6 +9,7 @@ struct InstanceInput {
     @location(0) position: vec3<f32>,
     @location(1) color: vec3<f32>,
     @location(2) selected: f32,
+    @location(3) scale: f32,
 };
 
 struct VertexOutput {
@@ -57,7 +58,7 @@ var<private> NORMALS: array<vec3<f32>, 6> = array<vec3<f32>, 6>(
 @vertex
 fn vs_main(@builtin(vertex_index) vi: u32, instance: InstanceInput) -> VertexOutput {
     let corner = CORNERS[INDICES[vi]];
-    let world_pos = instance.position + corner * CUBE_SIZE;
+    let world_pos = instance.position + corner * CUBE_SIZE * instance.scale;
 
     // Fixed-direction shading so the cube reads as 3D as you orbit.
     let normal = NORMALS[vi / 6u];

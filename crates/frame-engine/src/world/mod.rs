@@ -34,6 +34,20 @@ pub struct World {
     pub colors: ComponentStorage<Color>,
     #[serde(default)]
     pub controlled: ComponentStorage<Controlled>,
+    #[serde(default)]
+    pub scales: ComponentStorage<Scale>,
+}
+
+#[derive(Serialize, Deserialize, Clone, Copy)]
+pub struct Scale {
+    pub factor: f32,
+}
+
+impl Default for Scale {
+    fn default() -> Self {
+        // 1.0 = unsacaled , deriving Default would give 0.0, a zero size
+        Scale { factor: 1.0 }
+    }
 }
 
 impl Default for Color {
@@ -62,6 +76,7 @@ impl World {
         self.positions.insert(id, position);
         self.velocities.insert(id, velocity);
         self.colors.insert(id, Color::default());
+        self.scales.insert(id, Scale::default());
         id
     }
 
@@ -72,6 +87,7 @@ impl World {
             self.velocities.remove(id);
             self.colors.remove(id);
             self.controlled.remove(id);
+            self.scales.remove(id);
         }
     }
 
