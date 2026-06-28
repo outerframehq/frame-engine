@@ -1027,6 +1027,7 @@ impl ApplicationHandler for App {
                         id,
                         *self.world.positions.get(id)?,
                         *self.world.velocities.get(id)?,
+                        self.world.colors.get(id).copied().unwrap_or_default(),
                     ))
                 });
                 let (egui_paint_jobs, egui_textures_delta, egui_ppp) =
@@ -1114,7 +1115,7 @@ impl ApplicationHandler for App {
                                                 });
                                         }
                                         Tab::Inspector => match &mut edited {
-                                            Some((id, pos, vel)) => {
+                                            Some((id, pos, vel, color)) => {
                                                 ui.label(format!("Entity {id}"));
                                                 ui.add_space(4.0);
                                                 ui.label("Position");
@@ -1154,6 +1155,16 @@ impl ApplicationHandler for App {
                                                             .prefix("dz "),
                                                     );
                                                 });
+                                                ui.add_space(4.0);
+                                                ui.label("Color");
+                                                // The widget wants a [f32; 3]; copy in, let the user edit, copy back
+                                                // into the Color struct only when it actually changed.
+                                                let mut rgb = [color.r, color.g, color.b];
+                                                if ui.color_edit_button_rgb(&mut rgb).changed() {
+                                                    color.r = rgb[0];
+                                                    color.g = rgb[1];
+                                                    color.b = rgb[2];
+                                                }
                                             }
                                             None => {
                                                 ui.weak("No entity selected");
@@ -1179,13 +1190,16 @@ impl ApplicationHandler for App {
                 // Push any inspector edits back into the world. The render this
                 // frame already used the old values; the change shows next frame
                 // (same one-frame path as the keyboard nudge).
-                if let Some((id, pos, vel)) = edited {
+                if let Some((id, pos, vel, color)) = edited {
                     if let Some(p) = self.world.positions.get_mut(id) {
                         *p = pos;
                     }
                     if let Some(v) = self.world.velocities.get_mut(id) {
                         *v = vel;
                     }
+                    // insert rather than get_mut so editing also works for an entity whose
+                    // colour slot is missing (a scene saved before colours existed).
+                    self.world.colors.insert(id, color);
                 }
 
                 if let Some(gpu) = &mut self.gpu {

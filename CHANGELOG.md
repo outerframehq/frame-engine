@@ -9,6 +9,16 @@ lands and the patch version bumps for fixes and small additions.
 
 ## [Unreleased]
 
+### Added
+
+Engine:
+
+- A `Color` component, kept in lockstep with position and velocity and serialized with the scene.
+
+Editor (frame-editor):
+
+- Entities now render in their own color, editable per entity from the Inspector. The selected entity is brightened rather than recolored, so its color stays visible while you edit it.
+
 ### Changed
 
 Engine:
