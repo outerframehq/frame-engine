@@ -14,6 +14,7 @@ fn main() {
     let mut world = World {
         positions: ComponentStorage::new(),
         velocities: ComponentStorage::new(),
+        colors: ComponentStorage::new(),
     };
 
     world.spawn(
