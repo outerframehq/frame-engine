@@ -7,13 +7,15 @@ struct Camera {
 // Per-entity instance data (matches InstanceRaw in main.rs).
 struct InstanceInput {
     @location(0) position: vec3<f32>,
-    @location(1) selected: f32,
+    @location(1) color: vec3<f32>,
+    @location(2) selected: f32,
 };
 
 struct VertexOutput {
     @builtin(position) clip_position: vec4<f32>,
-    @location(0) selected: f32,
-    @location(1) shade: f32,
+    @location(0) color: vec3<f32>,
+    @location(1) selected: f32,
+    @location(2) shade: f32,
 };
 
 // Side length of each entity cube, in world units.
@@ -65,6 +67,7 @@ fn vs_main(@builtin(vertex_index) vi: u32, instance: InstanceInput) -> VertexOut
 
     var out: VertexOutput;
     out.clip_position = camera.view_proj * vec4<f32>(world_pos, 1.0);
+    out.color = instance.color;
     out.selected = instance.selected;
     out.shade = shade;
     return out;
@@ -72,10 +75,9 @@ fn vs_main(@builtin(vertex_index) vi: u32, instance: InstanceInput) -> VertexOut
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
-    let base = mix(
-        vec3<f32>(0.95, 0.85, 0.35), // yellow
-        vec3<f32>(0.95, 0.55, 0.15), // orange (selected)
-        in.selected,
-    );
-    return vec4<f32>(base * in.shade, 1.0);
+    // Each entity draws in its own colour. The selected entity is brightened
+    // toward white so it stands out without hiding the colour you're editing.
+    let lit = in.color * in.shade;
+    let highlighted = mix(lit, vec3<f32>(1.0, 1.0, 1.0), 0.3 * in.selected);
+    return vec4<f32>(highlighted, 1.0);
 }

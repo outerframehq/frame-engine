@@ -48,20 +48,26 @@ struct CameraUniform {
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 struct InstanceRaw {
     position: [f32; 3],
+    color: [f32; 3],
     selected: f32,
 }
 
 impl InstanceRaw {
-    const ATTRIBS: [wgpu::VertexAttribute; 2] = [
+    const ATTRIBS: [wgpu::VertexAttribute; 3] = [
         wgpu::VertexAttribute {
             format: wgpu::VertexFormat::Float32x3,
             offset: 0,
             shader_location: 0,
         },
         wgpu::VertexAttribute {
-            format: wgpu::VertexFormat::Float32,
+            format: wgpu::VertexFormat::Float32x3,
             offset: std::mem::size_of::<[f32; 3]>() as wgpu::BufferAddress, // 12
             shader_location: 1,
+        },
+        wgpu::VertexAttribute {
+            format: wgpu::VertexFormat::Float32,
+            offset: std::mem::size_of::<[f32; 6]>() as wgpu::BufferAddress, // 24
+            shader_location: 2,
         },
     ];
 
@@ -927,9 +933,15 @@ impl ApplicationHandler for App {
                     .iter()
                     .enumerate()
                     .filter_map(|(id, slot)| slot.as_ref().map(|p| (id, p)))
-                    .map(|(id, p)| InstanceRaw {
-                        position: [p.x, p.y, p.z],
-                        selected: if Some(id) == selected { 1.0 } else { 0.0 },
+                    .map(|(id, p)| {
+                        // Falls back to the default colour if this entity has no colour slot,
+                        // which only happens for scenes saved before colours existed.
+                        let color = self.world.colors.get(id).copied().unwrap_or_default();
+                        InstanceRaw {
+                            position: [p.x, p.y, p.z],
+                            color: [color.r, color.g, color.b],
+                            selected: if Some(id) == selected { 1.0 } else { 0.0 },
+                        }
                     })
                     .collect();
 
@@ -1198,9 +1210,9 @@ impl ApplicationHandler for App {
 // The fallback scene used when there's no scene.ron on disk yet.
 fn default_world() -> World {
     let mut world = World {
+        colors: ComponentStorage::new(),
         positions: ComponentStorage::new(),
         velocities: ComponentStorage::new(),
-        colors: ComponentStorage::new(),
     };
 
     world.spawn(
