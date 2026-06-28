@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use frame_engine::core::Clock;
+use frame_engine::input::{Button, InputState};
 use frame_engine::systems;
 use frame_engine::world::{ComponentStorage, Position, Velocity, World};
 use glam::{Mat4, Vec3, Vec4};
@@ -648,6 +649,8 @@ struct App {
     console_tab: ConsoleTab,
     // Lines shown in the console Output tab (also echoed to the terminal).
     log_lines: Vec<String>,
+    // Which movement buttons (WASD) are currently held, read by the input system.
+    input: InputState,
 }
 
 impl App {
@@ -832,6 +835,21 @@ impl ApplicationHandler for App {
                 self.cam_distance = self.cam_distance.clamp(10.0, 2000.0);
             }
             WindowEvent::KeyboardInput { event, .. } if !ui_wants_keys => {
+                // Level-triggered movement input (WASD). Updated on both press
+                // and release so the input system always sees what is held right
+                // now. This is separate from the edge-triggered actions below,
+                // which only fire on press.
+                if let PhysicalKey::Code(code) = event.physical_key {
+                    let pressed = event.state == ElementState::Pressed;
+                    match code {
+                        KeyCode::KeyW => self.input.set(Button::Up, pressed),
+                        KeyCode::KeyA => self.input.set(Button::Left, pressed),
+                        KeyCode::KeyS => self.input.set(Button::Down, pressed),
+                        KeyCode::KeyD => self.input.set(Button::Right, pressed),
+                        _ => {}
+                    }
+                }
+
                 if event.state == ElementState::Pressed {
                     if let PhysicalKey::Code(code) = event.physical_key {
                         // Position nudge — moves the selected entity along a world
@@ -923,6 +941,7 @@ impl ApplicationHandler for App {
             WindowEvent::RedrawRequested => {
                 let owed = self.clock.advance(!self.paused);
                 for _ in 0..owed {
+                    systems::input_movement(&mut self.world, &self.input, self.selected);
                     systems::movement(&mut self.world);
                 }
 
@@ -1311,6 +1330,7 @@ fn main() {
         current_tab: Tab::Scene,
         console_tab: ConsoleTab::Output,
         log_lines: vec!["Frame Editor started.".to_string()],
+        input: InputState::new(),
     };
 
     println!(
