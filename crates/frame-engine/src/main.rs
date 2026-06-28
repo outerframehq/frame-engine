@@ -1,5 +1,5 @@
 use frame_engine::core::Clock;
-use frame_engine::world::{ComponentStorage, Position, Velocity, World};
+use frame_engine::world::{Position, Velocity, World};
 use frame_engine::{render, systems};
 
 const TICK_RATE: u32 = 30;
@@ -11,12 +11,7 @@ fn main() {
     let mut clock = Clock::new(TICK_RATE, MAX_CATCHUP_TICKS);
     let mut tick: u64 = 0;
 
-    let mut world = World {
-        positions: ComponentStorage::new(),
-        velocities: ComponentStorage::new(),
-        colors: ComponentStorage::new(),
-        controlled: ComponentStorage::new(),
-    };
+    let mut world = World::new();
 
     world.spawn(
         Position {
@@ -54,7 +49,6 @@ fn main() {
             dz: 0.0,
         },
     );
-
     world.spawn(
         Position {
             x: 5.0,

@@ -26,7 +26,7 @@ pub struct Color {
     pub b: f32,
 }
 
-#[derive(Serialize, Deserialize)]
+#[derive(Serialize, Deserialize, Default)]
 pub struct World {
     pub positions: ComponentStorage<Position>,
     pub velocities: ComponentStorage<Velocity>,
@@ -49,6 +49,12 @@ impl Default for Color {
 }
 
 impl World {
+    /// A fresh, empty world. Because `World` derives `Default`, adding a new
+    /// component field updates construction in exactly one place: the derive.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
     pub fn spawn(&mut self, position: Position, velocity: Velocity) -> usize {
         let free_slot = self.positions.iter().position(|slot| slot.is_none());
         let id = free_slot.unwrap_or_else(|| self.positions.len());

@@ -5,7 +5,7 @@ use std::sync::Arc;
 use frame_engine::core::Clock;
 use frame_engine::input::{Button, InputState};
 use frame_engine::systems;
-use frame_engine::world::{Color, ComponentStorage, Controlled, Position, Velocity, World};
+use frame_engine::world::{Controlled, Position, Velocity, World};
 use glam::{Mat4, Vec3, Vec4};
 use wgpu::util::DeviceExt;
 use winit::application::ApplicationHandler;
@@ -1308,12 +1308,7 @@ impl ApplicationHandler for App {
 
 // The fallback scene used when there's no scene.ron on disk yet.
 fn default_world() -> World {
-    let mut world = World {
-        colors: ComponentStorage::new(),
-        positions: ComponentStorage::new(),
-        velocities: ComponentStorage::new(),
-        controlled: ComponentStorage::new(),
-    };
+    let mut world = World::new();
 
     world.spawn(
         Position {
