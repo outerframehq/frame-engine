@@ -15,11 +15,13 @@ Engine:
 
 - A `Color` component, kept in lockstep with position and velocity and serialized with the scene.
 - An input system and a logical `InputState`, so entities can be driven by held buttons instead of only fixed velocity.
+- A `Controlled` marker (tag) component; the input system now drives every entity that carries it.
 
 Editor (frame-editor):
 
 - Entities now render in their own color, editable per entity from the Inspector. The selected entity is brightened rather than recolored, so its color stays visible while you edit it.
 - WASD drives the selected entity while the simulation is running.
+- Mark an entity Controlled from the Inspector to drive it with WASD. Step moved to the period key so it no longer shares S with movement.
 
 ### Changed
 
