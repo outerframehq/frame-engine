@@ -621,6 +621,8 @@ struct App {
     new_script_name: String,
     // Filter text for the Inspector's script picker (persists between frames).
     script_filter: String,
+    // Which library script is open in the Script Editor's centre pane (by name).
+    open_script: Option<String>,
     // GPU texture for the toolbar logo, uploaded once on the first frame.
     logo_texture: Option<egui::TextureHandle>,
 }
@@ -1037,6 +1039,7 @@ impl ApplicationHandler for App {
                 let mut script_library = std::mem::take(&mut self.world.script_library);
                 let mut new_script_name = std::mem::take(&mut self.new_script_name);
                 let mut script_filter = std::mem::take(&mut self.script_filter);
+                let mut open_script = std::mem::take(&mut self.open_script);
                 // Live entity ids for the Scene list, plus the selected entity's
                 // position/velocity lifted into a local so the egui closure never
                 // touches `self`. Any edits get written back into the world after
@@ -1383,65 +1386,118 @@ impl ApplicationHandler for App {
                                     });
                                 });
                             if center_tab == CenterTab::Scripts {
-                                egui::CentralPanel::default().show(ui, |ui| {
-                                    ui.label("Script library");
-                                    ui.separator();
-                                    // New-script bar. Kept ABOVE the list on purpose.
-                                    // The list below is a *greedy* scroll area
-                                    // (auto_shrink [false, false]) that expands to fill
-                                    // all the remaining height, so anything placed AFTER
-                                    // it gets pushed off the bottom of the panel and is
-                                    // clipped away — which is exactly why this row used
-                                    // to be invisible. Rule of thumb: a greedy scroll
-                                    // area must be the LAST thing in a vertical stack.
-                                    ui.horizontal(|ui| {
+                                // Staged deletion: we can't remove from the map while a
+                                // panel closure is borrowing it, so a Delete click just
+                                // records the name; we apply it after both panels close.
+                                let mut delete: Option<String> = None;
+                                // LEFT: the script list — names only — plus the "add" box.
+                                // Clicking a name opens it in the centre editor. This is
+                                // what makes the editor scale: one open script at a time,
+                                // not every script stacked with its own code box.
+                                egui::Panel::left("script_list")
+                                    .resizable(true)
+                                    .default_size(180.0)
+                                    .show(ui, |ui| {
+                                        ui.label("Scripts");
+                                        ui.separator();
                                         ui.add(
                                             egui::TextEdit::singleline(&mut new_script_name)
-                                                .hint_text("new script name"),
+                                                .hint_text("new script name")
+                                                .desired_width(f32::INFINITY),
                                         );
                                         if ui.button("Add").clicked() {
                                             let key = new_script_name.trim().to_string();
                                             if !key.is_empty() {
                                                 // entry(..).or_default() inserts an empty
                                                 // String for a new name, or leaves an
-                                                // existing script untouched.
-                                                script_library.entry(key).or_default();
+                                                // existing script untouched. Open it so the
+                                                // centre editor jumps straight to it.
+                                                script_library.entry(key.clone()).or_default();
+                                                open_script = Some(key);
                                                 new_script_name.clear();
                                             }
                                         }
+                                        ui.separator();
+                                        egui::ScrollArea::vertical()
+                                            .auto_shrink([false, false])
+                                            .show(ui, |ui| {
+                                                if script_library.is_empty() {
+                                                    ui.weak("No scripts yet.");
+                                                }
+                                                for name in script_library.keys() {
+                                                    ui.selectable_value(
+                                                        &mut open_script,
+                                                        Some(name.clone()),
+                                                        name.as_str(),
+                                                    );
+                                                }
+                                            });
                                     });
-                                    ui.separator();
-                                    // Staged: can't remove from the map while iterating it.
-                                    let mut delete: Option<String> = None;
-                                    egui::ScrollArea::vertical()
-                                        .auto_shrink([false, false])
-                                        .show(ui, |ui| {
-                                            if script_library.is_empty() {
-                                                ui.weak(
-                                                    "No scripts yet. Name one above and click Add, \
-                                                 then type its behaviour here.",
-                                                );
+                                // CENTRE: one big code editor for the open script. Fills the
+                                // gap the docks leave; on the Viewport tab this whole block
+                                // is skipped, so the 3D scene shows through instead.
+                                egui::CentralPanel::default().show(ui, |ui| {
+                                    // Only edit a name that still exists — a stale
+                                    // open_script (e.g. after a delete) falls through to
+                                    // the empty state below.
+                                    let open = open_script
+                                        .as_ref()
+                                        .filter(|n| script_library.contains_key(*n))
+                                        .cloned();
+                                    match open {
+                                        Some(name) => {
+                                            ui.horizontal(|ui| {
+                                                ui.strong(&name);
+                                                if ui.small_button("Delete").clicked() {
+                                                    delete = Some(name.clone());
+                                                }
+                                            });
+                                            ui.separator();
+                                            if let Some(source) = script_library.get_mut(&name) {
+                                                // Fill the pane. A TextEdit's height comes from
+                                                // desired_rows, not from any available space, so
+                                                // to fill we compute how many rows fit the
+                                                // remaining height. Measured HERE, before the
+                                                // scroll area — inside it, available_height is the
+                                                // unbounded content height, not the viewport.
+                                                // We shave a row so the editor's frame margin
+                                                // doesn't tip the scroll area into showing a
+                                                // scrollbar when the script is short; a longer
+                                                // script grows past this and the scroll area then
+                                                // does its job.
+                                                let row_h = ui
+                                                    .text_style_height(&egui::TextStyle::Monospace);
+                                                let rows = ((ui.available_height() / row_h).floor()
+                                                    - 1.0)
+                                                    .max(3.0)
+                                                    as usize;
+                                                egui::ScrollArea::vertical()
+                                                    .auto_shrink([false, false])
+                                                    .show(ui, |ui| {
+                                                        ui.add(
+                                                            egui::TextEdit::multiline(source)
+                                                                .code_editor()
+                                                                .desired_rows(rows)
+                                                                .desired_width(f32::INFINITY),
+                                                        );
+                                                    });
                                             }
-                                            for (name, source) in script_library.iter_mut() {
-                                                ui.horizontal(|ui| {
-                                                    ui.strong(name.as_str());
-                                                    if ui.small_button("Delete").clicked() {
-                                                        delete = Some(name.clone());
-                                                    }
-                                                });
-                                                ui.add(
-                                                    egui::TextEdit::multiline(source)
-                                                        .code_editor()
-                                                        .desired_rows(10)
-                                                        .desired_width(f32::INFINITY),
-                                                );
-                                                ui.add_space(10.0);
-                                            }
-                                        });
-                                    if let Some(name) = delete {
-                                        script_library.remove(&name);
+                                        }
+                                        None => {
+                                            ui.weak(
+                                                "Select a script on the left, or add one to begin.",
+                                            );
+                                        }
                                     }
                                 });
+                                // Apply a staged deletion now that no panel borrows the map.
+                                // If the open script was the one deleted, close the editor.
+                                if let Some(name) = delete {
+                                    script_library.remove(&name);
+                                    if open_script.as_ref() == Some(&name) {
+                                        open_script = None;
+                                    }
+                                }
                             }
                         });
                     state.handle_platform_output(window, full_output.platform_output);
@@ -1458,6 +1514,7 @@ impl ApplicationHandler for App {
                 self.world.script_library = script_library;
                 self.new_script_name = new_script_name;
                 self.script_filter = script_filter;
+                self.open_script = open_script;
                 self.selected = new_selection;
                 // Push any inspector edits back into the world. The render this
                 // frame already used the old values; the change shows next frame
@@ -1606,6 +1663,7 @@ fn main() {
         input: InputState::new(),
         new_script_name: String::new(),
         script_filter: String::new(),
+        open_script: None,
         script_runtime: script::RhaiRuntime::new(),
         logo_texture: None,
     };
