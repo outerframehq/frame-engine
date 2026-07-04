@@ -111,7 +111,7 @@ Scene save and load (`F5` and `F9`). The editor loads a scene from a RON file on
 
 Docked panel UI via `egui`. The editor uses a docked layout rather than a bare viewport:
 
-- A top toolbar showing the editor's logo, with placeholder File, Edit, View, and Help menus. The logo is the embedded PNG, uploaded once as an egui texture. The editor also sets a window and taskbar icon from the same image, which is honoured on X11 and Windows; on Wayland the desktop reads the icon from a matching `.desktop` file instead.
+- A top toolbar showing the editor's logo and working File, Edit, View, and Help menus. Each menu item runs the same action as its keyboard shortcut: the menu and the key are two triggers for one command (a method on the editor), so they cannot drift apart. File saves, reloads, and quits; Edit spawns, despawns, and clears the selection; View toggles play/pause, steps a tick, and toggles the controls overlay; Help shows an about line. The logo is the embedded PNG, uploaded once as an egui texture. The editor also sets a window and taskbar icon from the same image, which is honoured on X11 and Windows; on Wayland the desktop reads the icon from a matching `.desktop` file instead.
 - A right inspector dock with two tabs. The Scene tab lists every live entity and lets you select one by clicking it. The Inspector tab shows the selected entity's position and velocity as draggable number fields, a colour picker for its colour, a draggable field for its scale, and a checkbox for whether it is `Controlled` (WASD-driven). Every edit writes straight back into the world.
 - A bottom console dock with an Output tab that shows a live log of editor actions, plus a Terminal placeholder for later.
 - Panels are solid but resizable. Dragging a panel's inner edge resizes it, and the viewport reflows around it.
@@ -124,7 +124,6 @@ Runs the simulation live on the engine's clock. The editor advances the world by
 
 What's next for the editor, in rough order:
 
-- Wire the toolbar and File menu to the actions that already work by keyboard, so save, load, play, pause, and step have a visible counterpart.
 - Richer authoring: gizmos to drag an entity in the viewport, undo and redo, and prefabs, added as real use of the engine demands them.
 - Further per-entity appearance. Colour and scale exist now; mesh and material are the next steps so authored scenes can look like more than coloured, resized cubes (see Open questions).
 - Movable, dockable panels. The current panels are fixed in place. A later step is letting them be rearranged and split, the way a full IDE layout works.

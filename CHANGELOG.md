@@ -26,6 +26,7 @@ Editor (frame-editor):
 - The Frame Editor logo now appears in the toolbar.
 - The editor now has its own application icon, shown by the desktop and taskbar.
 - Resize the selected entity from the Inspector. Picking grows the entity's hit-box with its scale, so a scaled-up cube stays clickable.
+- Toolbar File, Edit, View, and Help menus, wired to the same actions as the keyboard shortcuts: save and reload a scene, quit, spawn and despawn entities, clear the selection, play/pause, step a tick, and toggle the controls overlay.
 
 ### Changed
 

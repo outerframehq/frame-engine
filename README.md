@@ -54,13 +54,13 @@ Early development, past the toy stage, with a working engine and a usable editor
 - Live entity editing: nudge the selection with the arrow keys and Page Up/Down, spawn with `N`, despawn with `Delete`, and drive a `Controlled` entity with WASD while the sim is playing.
 - Scene save and load: `F5` saves the world to a RON file, `F9` reloads it, and the editor loads a scene on startup.
 - A docked panel layout built with `egui`:
-  - a top toolbar showing the editor's logo, with placeholder menus,
+  - a top toolbar showing the editor's logo and working File/Edit/View/Help menus, each item mirroring a keyboard shortcut (save, reload, quit; spawn, despawn, clear selection; play/pause, step, controls overlay),
   - a right inspector dock with a Scene tab (lists entities, click to select) and an Inspector tab (edit the selected entity's position, velocity, colour, and scale, and toggle whether it is `Controlled`, all written straight back into the world),
   - a bottom console dock with an Output tab showing a live log and a Terminal placeholder,
   - panels that are solid but resizable.
 - Runs the simulation live on the engine's fixed-timestep clock, so the sim ticks at a true 30 per second independent of the window's repaint rate, with play, pause, and step controls.
 
-Currently at the frontier: wiring the toolbar and File menu to the actions that already work by keyboard, then richer authoring (gizmos, undo and redo, prefabs) and further per-entity appearance (mesh, material) beyond the colour and scale that now exist.
+Currently at the frontier: richer authoring (gizmos, undo and redo, prefabs) and further per-entity appearance (mesh, material) beyond the colour and scale that now exist.
 
 ## Principles
 
