@@ -619,6 +619,8 @@ struct App {
     input: InputState,
     // Text in the "new script name" box on the Scripts tab (persists between frames).
     new_script_name: String,
+    // Filter text for the Inspector's script picker (persists between frames).
+    script_filter: String,
     // GPU texture for the toolbar logo, uploaded once on the first frame.
     logo_texture: Option<egui::TextureHandle>,
 }
@@ -1034,6 +1036,7 @@ impl ApplicationHandler for App {
                 let log_lines = std::mem::take(&mut self.log_lines);
                 let mut script_library = std::mem::take(&mut self.world.script_library);
                 let mut new_script_name = std::mem::take(&mut self.new_script_name);
+                let mut script_filter = std::mem::take(&mut self.script_filter);
                 // Live entity ids for the Scene list, plus the selected entity's
                 // position/velocity lifted into a local so the egui closure never
                 // touches `self`. Any edits get written back into the world after
@@ -1076,12 +1079,14 @@ impl ApplicationHandler for App {
                 let logo = self.logo_texture.clone();
                 let paused = self.paused;
                 let mut menu_action: Option<MenuAction> = None;
-                let (egui_paint_jobs, egui_textures_delta, egui_ppp) =
-                    if let (Some(state), Some(window)) =
-                        (self.egui_state.as_mut(), self.window.as_ref())
-                    {
-                        let raw_input = state.take_egui_input(window);
-                        let full_output = self.egui_ctx.run_ui(raw_input, |ui| {
+                let (egui_paint_jobs, egui_textures_delta, egui_ppp) = if let (
+                    Some(state),
+                    Some(window),
+                ) =
+                    (self.egui_state.as_mut(), self.window.as_ref())
+                {
+                    let raw_input = state.take_egui_input(window);
+                    let full_output = self.egui_ctx.run_ui(raw_input, |ui| {
                             // Top toolbar strip — fixed height, placeholder menu.
                             egui::Panel::top("toolbar").resizable(false).show(ui, |ui| {
                                 ui.horizontal(|ui| {
@@ -1287,27 +1292,59 @@ impl ApplicationHandler for App {
                                                 ui.checkbox(controlled, "Controlled (WASD)");
                                                 ui.add_space(8.0);
                                                 ui.label("Script");
-                                                // `script_source` is now the NAME of a library
-                                                // script this entity uses (or None). Pick from the
-                                                // library; the source itself is edited in the
-                                                // Scripts tab, once, shared by every user.
+                                                // `script_source` is the NAME of a library script
+                                                // this entity uses (or None). The source itself is
+                                                // edited once in the Script Editor tab, shared by
+                                                // every entity that references it.
                                                 if script_library.is_empty() {
                                                     ui.weak(
-                                                    "No scripts yet — add some in the Scripts tab.",
+                                                    "No scripts yet — add some in the Script Editor tab.",
                                                 );
                                                 } else {
-                                                    ui.selectable_value(
-                                                        script_source,
-                                                        None,
-                                                        "(none)",
-                                                    );
-                                                    for name in script_library.keys() {
-                                                        ui.selectable_value(
-                                                            script_source,
-                                                            Some(name.clone()),
-                                                            name.as_str(),
-                                                        );
-                                                    }
+                                                    // Godot-style "attach script" picker. The
+                                                    // dropdown carries a filter box and shows only
+                                                    // the names containing it (case-insensitive
+                                                    // substring), so it stays usable with hundreds
+                                                    // or thousands of scripts — unlike a flat list.
+                                                    // Clone the current name for the button label so
+                                                    // we don't hold a borrow of `script_source` into
+                                                    // the closure that also writes to it.
+                                                    let selected_text = script_source
+                                                        .clone()
+                                                        .unwrap_or_else(|| "(none)".to_string());
+                                                    egui::ComboBox::from_id_salt("script_picker")
+                                                        .selected_text(selected_text)
+                                                        .show_ui(ui, |ui| {
+                                                            ui.add(
+                                                                egui::TextEdit::singleline(
+                                                                    &mut script_filter,
+                                                                )
+                                                                .hint_text("filter…"),
+                                                            );
+                                                            ui.separator();
+                                                            // "(none)" ignores the filter so you
+                                                            // can always detach the script.
+                                                            ui.selectable_value(
+                                                                script_source,
+                                                                None,
+                                                                "(none)",
+                                                            );
+                                                            let needle =
+                                                                script_filter.to_lowercase();
+                                                            for name in script_library.keys() {
+                                                                if needle.is_empty()
+                                                                    || name
+                                                                        .to_lowercase()
+                                                                        .contains(&needle)
+                                                                {
+                                                                    ui.selectable_value(
+                                                                        script_source,
+                                                                        Some(name.clone()),
+                                                                        name.as_str(),
+                                                                    );
+                                                                }
+                                                            }
+                                                        });
                                                     // Flag a reference to a script that was deleted.
                                                     if let Some(name) = script_source.as_ref() {
                                                         if !script_library.contains_key(name) {
@@ -1407,19 +1444,20 @@ impl ApplicationHandler for App {
                                 });
                             }
                         });
-                        state.handle_platform_output(window, full_output.platform_output);
-                        let ppp = full_output.pixels_per_point;
-                        let jobs = self.egui_ctx.tessellate(full_output.shapes, ppp);
-                        (jobs, full_output.textures_delta, ppp)
-                    } else {
-                        (Vec::new(), egui::TexturesDelta::default(), 1.0)
-                    };
+                    state.handle_platform_output(window, full_output.platform_output);
+                    let ppp = full_output.pixels_per_point;
+                    let jobs = self.egui_ctx.tessellate(full_output.shapes, ppp);
+                    (jobs, full_output.textures_delta, ppp)
+                } else {
+                    (Vec::new(), egui::TexturesDelta::default(), 1.0)
+                };
                 self.current_tab = tab;
                 self.center_tab = center_tab;
                 self.console_tab = console_tab;
                 self.log_lines = log_lines;
                 self.world.script_library = script_library;
                 self.new_script_name = new_script_name;
+                self.script_filter = script_filter;
                 self.selected = new_selection;
                 // Push any inspector edits back into the world. The render this
                 // frame already used the old values; the change shows next frame
@@ -1567,6 +1605,7 @@ fn main() {
         log_lines: vec!["Frame Editor started.".to_string()],
         input: InputState::new(),
         new_script_name: String::new(),
+        script_filter: String::new(),
         script_runtime: script::RhaiRuntime::new(),
         logo_texture: None,
     };
