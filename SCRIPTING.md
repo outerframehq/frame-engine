@@ -1,9 +1,13 @@
 # Scripting in Frame Engine
 
 Any entity can carry a **script**: a small piece of code that runs every tick and
-changes that entity. You attach one from the Inspector (select an entity, then
-**Add script**), type into the box, and the behaviour takes effect live — no
-rebuild. This page is the reference for what you can write.
+changes that entity. Scripts live in a shared **library**: you write one in the
+editor's **Script Editor** tab, then attach it to an entity from the
+**Inspector** — select an entity, open its **Script** picker, and choose the
+script by name. Because scripts are shared, one script can drive many entities,
+and editing it in the Script Editor updates every entity that uses it at once.
+Changes take effect live, with no rebuild. This page is the reference for what
+you can write.
 
 ## The language
 
@@ -26,7 +30,8 @@ You don't need most of it. Most useful scripts are one or two lines.
 ## How a script runs
 
 - It runs **once per tick**, and the simulation runs at **30 ticks per second**.
-- It runs for **every entity that carries a script**, independently.
+- It runs for **every entity that carries a script**, independently. The same
+  library script can be attached to many entities; each runs it on its own state.
 - Each tick the entity's current state is handed to your script as variables,
   your code runs, and any variables you changed are written back into the world.
 - It's **deterministic**: the same tick produces the same result every time.
@@ -116,9 +121,9 @@ kind of number is speed; the `* 50.0` kind is size or distance.
 ## When a script has a mistake
 
 A script that doesn't compile (a typo, an unfinished line) simply does nothing —
-the entity holds still, and the error is reported once. Fix the text and it picks
-up again automatically. You can't crash the editor with a bad script, so
-experiment freely.
+the entity keeps whatever state it already had, and the error is reported once in
+the editor's Output console. Fix the text and it picks up again automatically. You
+can't crash the editor with a bad script, so experiment freely.
 
 ## A note on the vocabulary
 

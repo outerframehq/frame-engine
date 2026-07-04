@@ -16,7 +16,7 @@ Engine:
 - A `Color` component, kept in lockstep with position and velocity and serialized with the scene.
 - An input system and a logical `InputState`, so entities can be driven by held buttons instead of only fixed velocity.
 - A `Controlled` marker (tag) component; the input system now drives every entity that carries it.
-- A `Scale` component (uniform size factor), kept in lockstep with the other components and serialized with the scene.
+- A `Scale` component (per-axis size factor, x/y/z), kept in lockstep with the other components and serialized with the scene.
 - A `Script` component that names a shared behaviour, plus a `script_library` on the world (script name to source) so a script's source lives once and every entity that uses it changes together.
 - A `ScriptRuntime` trait (the seam a host implements to run scripts) and a `run_scripts` system. The engine stores script source as data and owns the seam; it interprets nothing itself.
 

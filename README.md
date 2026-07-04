@@ -36,7 +36,7 @@ Early development, past the toy stage, with a working engine and a usable editor
 **Engine**
 
 - A deterministic fixed-timestep clock (in `core/`) with spiral-of-death protection, used by both the engine binary and the editor.
-- A hand-rolled ECS world with several component types (position, velocity, colour, a uniform scale, and a `Controlled` marker) and runtime spawn and despawn. Spawn reuses freed slots, so entity ids stay stable and despawned slots are reclaimed.
+- A hand-rolled ECS world with several component types (position, velocity, colour, a per-axis scale, and a `Controlled` marker) and runtime spawn and despawn. Spawn reuses freed slots, so entity ids stay stable and despawned slots are reclaimed.
 - A generic `ComponentStorage<T>` type, wired into the world. It implements `Default`, and `World` derives `Default`, so a fresh world is built in one place and adding a component type is cheap and uniform.
 - A movement system that advances entities each tick, and an input system that drives `Controlled` entities from held WASD keys.
 - Per-entity colour and scale, stored as component data and serialized with the scene.
