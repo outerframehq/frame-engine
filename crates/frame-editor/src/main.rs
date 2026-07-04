@@ -1471,15 +1471,43 @@ impl ApplicationHandler for App {
                                                     - 1.0)
                                                     .max(3.0)
                                                     as usize;
+                                                // Line-number gutter: one right-justified number
+                                                // per logical line (newline count + 1). Built as a
+                                                // plain monospace string so its rows line up with
+                                                // the editor's, which shares the Monospace style.
+                                                // NOTE: a very long line that soft-wraps in the
+                                                // editor still gets one number here, so the gutter
+                                                // drifts below a wrapped line — fine for now, since
+                                                // script lines are short; revisit with no-wrap +
+                                                // horizontal scroll if it ever bites.
+                                                let line_count =
+                                                    source.matches('\n').count() + 1;
+                                                let digits = line_count.to_string().len();
+                                                let gutter: String = (1..=line_count)
+                                                    .map(|n| format!("{n:>digits$}"))
+                                                    .collect::<Vec<_>>()
+                                                    .join("\n");
                                                 egui::ScrollArea::vertical()
                                                     .auto_shrink([false, false])
                                                     .show(ui, |ui| {
-                                                        ui.add(
-                                                            egui::TextEdit::multiline(source)
-                                                                .code_editor()
-                                                                .desired_rows(rows)
-                                                                .desired_width(f32::INFINITY),
-                                                        );
+                                                        ui.horizontal_top(|ui| {
+                                                            // Gutter, nudged down 2px to match the
+                                                            // editor's top margin (Margin y = 2).
+                                                            ui.vertical(|ui| {
+                                                                ui.add_space(2.0);
+                                                                ui.add(egui::Label::new(
+                                                                    egui::RichText::new(&gutter)
+                                                                        .monospace()
+                                                                        .weak(),
+                                                                ));
+                                                            });
+                                                            ui.add(
+                                                                egui::TextEdit::multiline(source)
+                                                                    .code_editor()
+                                                                    .desired_rows(rows)
+                                                                    .desired_width(f32::INFINITY),
+                                                            );
+                                                        });
                                                     });
                                             }
                                         }
