@@ -15,6 +15,7 @@ use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Icon, Window, WindowId};
 
 mod font;
+mod script;
 
 const TICK_RATE: u32 = 30;
 const MAX_CATCHUP_TICKS: u32 = 5;
@@ -651,6 +652,7 @@ enum MenuAction {
 }
 
 struct App {
+    script_runtime: script::RhaiRuntime,
     window: Option<Arc<Window>>,
     gpu: Option<GpuState>,
     world: World,
@@ -1029,6 +1031,7 @@ impl ApplicationHandler for App {
             WindowEvent::RedrawRequested => {
                 let owed = self.clock.advance(!self.paused);
                 for _ in 0..owed {
+                    systems::run_scripts(&mut self.world, &mut self.script_runtime);
                     systems::input_movement(&mut self.world, &self.input);
                     systems::movement(&mut self.world);
                 }
@@ -1531,6 +1534,7 @@ fn main() {
         log_lines: vec!["Frame Editor started.".to_string()],
         input: InputState::new(),
 
+        script_runtime: script::RhaiRuntime::new(),
         logo_texture: None,
     };
 
