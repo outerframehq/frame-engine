@@ -676,6 +676,82 @@ impl App {
         }
     }
 
+    // --- Editor actions ---
+    // One definition per action. The keyboard and the menus are just two
+    // triggers that call these; the behaviour lives in exactly one place.
+
+    /// Toggle the simulation between playing and paused.
+    fn toggle_pause(&mut self) {
+        self.paused = !self.paused;
+        self.log(if self.paused { "Paused" } else { "Playing" });
+    }
+
+    /// Advance the simulation exactly one tick. Only meaningful while paused.
+    fn step_once(&mut self) {
+        if self.paused {
+            systems::movement(&mut self.world);
+            self.log("Stepped one tick");
+        }
+    }
+
+    /// Clear the current selection.
+    fn clear_selection(&mut self) {
+        self.selected = None;
+        self.log("Selection cleared");
+    }
+
+    /// Toggle the on-screen controls overlay.
+    fn toggle_help(&mut self) {
+        self.show_help = !self.show_help;
+    }
+
+    /// Spawn a new entity at the camera focus and select it.
+    fn spawn_at_focus(&mut self) {
+        let id = self.world.spawn(
+            Position {
+                x: self.cam_focus_x,
+                y: self.cam_focus_y,
+                z: 0.0,
+            },
+            Velocity {
+                dx: 0.0,
+                dy: 0.0,
+                dz: 0.0,
+            },
+        );
+        self.selected = Some(id);
+        self.log(format!("Spawned entity {id}"));
+    }
+
+    /// Despawn the selected entity, if any.
+    fn despawn_selected(&mut self) {
+        if let Some(id) = self.selected {
+            self.world.despawn(id);
+            self.selected = None;
+            self.log(format!("Despawned entity {id}"));
+        }
+    }
+
+    /// Save the current world to disk.
+    fn save_scene(&mut self) {
+        match self.world.save_to_file(SCENE_PATH) {
+            Ok(()) => self.log(format!("Saved scene to {SCENE_PATH}")),
+            Err(e) => self.log(format!("Save failed: {e}")),
+        }
+    }
+
+    /// Reload the world from disk, discarding the current one.
+    fn reload_scene(&mut self) {
+        match World::load_from_file(SCENE_PATH) {
+            Ok(world) => {
+                self.world = world;
+                self.selected = None;
+                self.log(format!("Reloaded scene from {SCENE_PATH}"));
+            }
+            Err(e) => self.log(format!("Reload failed: {e}")),
+        }
+    }
+
     fn pick(&mut self) {
         let (width_u, height_u) = match &self.window {
             Some(window) => {
@@ -881,6 +957,21 @@ impl ApplicationHandler for App {
                         KeyCode::KeyA => self.input.set(Button::Left, pressed),
                         KeyCode::KeyS => self.input.set(Button::Down, pressed),
                         KeyCode::KeyD => self.input.set(Button::Right, pressed),
+                        KeyCode::Space => self.toggle_pause(),
+                        // Period steps the sim one tick while paused.
+                        // Kept off S so it doesn't collide with WASD.
+                        KeyCode::Period => self.step_once(),
+                        KeyCode::Escape => self.clear_selection(),
+                        // H: toggle the controls overlay.
+                        KeyCode::KeyH => self.toggle_help(),
+                        // N: spawn a new entity at the camera focus, and select it.
+                        KeyCode::KeyN => self.spawn_at_focus(),
+                        // Delete: despawn the selected entity.
+                        KeyCode::Delete => self.despawn_selected(),
+                        // F5: save the current world to disk.
+                        KeyCode::F5 => self.save_scene(),
+                        // F9: reload the world from disk, discarding the current one.
+                        KeyCode::F9 => self.reload_scene(),
                         _ => {}
                     }
                 }
