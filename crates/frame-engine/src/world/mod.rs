@@ -2,6 +2,17 @@ mod storage;
 use serde::{Deserialize, Serialize};
 pub use storage::ComponentStorage;
 
+#[derive(Serialize, Deserialize, Clone)]
+pub struct Script {
+    /// Names a behaviour the runtime knows how to run — e.g. "spinner".
+    /// The engine never looks inside this. It's just an identifier the host's
+    /// script runtime resolves to actual code.
+    pub name: String,
+    // Next step, not now — per-entity parameters a script can read.
+    // BTreeMap, not HashMap, so iteration order is deterministic:
+    // pub vars: std::collections::BTreeMap<String, ScriptValue>,
+}
+
 #[derive(Serialize, Deserialize, Clone, Copy)]
 pub struct Controlled;
 
@@ -36,6 +47,8 @@ pub struct World {
     pub controlled: ComponentStorage<Controlled>,
     #[serde(default)]
     pub scales: ComponentStorage<Scale>,
+    #[serde(default)]
+    pub scripts: ComponentStorage<Script>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy)]
@@ -95,6 +108,7 @@ impl World {
             self.colors.remove(id);
             self.controlled.remove(id);
             self.scales.remove(id);
+            self.scripts.remove(id);
         }
     }
 
@@ -111,4 +125,14 @@ impl World {
         let world = ron::from_str(&text)?;
         Ok(world)
     }
+}
+
+pub trait ScriptRuntime {
+    /// Called once per tick, before any entity's script runs. Lets a runtime
+    /// advance shared per-tick state (such as a clock exposed to scripts).
+    /// Optional — the default does nothing.
+    fn begin_tick(&mut self) {}
+
+    /// Run one entity's script for this tick, applying its effects to `world`.
+    fn run(&mut self, world: &mut World, entity: usize);
 }

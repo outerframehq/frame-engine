@@ -1,5 +1,19 @@
 use crate::input::{Button, InputState};
+use crate::world::ScriptRuntime;
 use crate::world::World;
+
+pub fn run_scripts(world: &mut World, runtime: &mut dyn ScriptRuntime) {
+    runtime.begin_tick();
+    let ids: Vec<usize> = world
+        .scripts
+        .iter()
+        .enumerate()
+        .filter_map(|(id, slot)| slot.as_ref().map(|_| id))
+        .collect();
+    for id in ids {
+        runtime.run(world, id);
+    }
+}
 
 pub fn movement(world: &mut World) {
     for (position_slot, velocity_slot) in world.positions.iter_mut().zip(world.velocities.iter()) {
