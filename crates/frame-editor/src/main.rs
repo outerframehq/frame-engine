@@ -633,6 +633,23 @@ enum ConsoleTab {
     Terminal,
 }
 
+/// A command chosen from the toolbar menus this frame, applied after the egui
+/// pass. The menu closure can't borrow `self`, so it stages the choice here and
+/// we dispatch it afterwards — the same lift-then-write-back pattern the
+/// selection and inspector edits use.
+enum MenuAction {
+    SaveScene,
+    ReloadScene,
+    SpawnEntity,
+    DespawnSelected,
+    ClearSelection,
+    TogglePause,
+    StepOnce,
+    ToggleHelp,
+    About,
+    Quit,
+}
+
 struct App {
     window: Option<Arc<Window>>,
     gpu: Option<GpuState>,
@@ -957,21 +974,6 @@ impl ApplicationHandler for App {
                         KeyCode::KeyA => self.input.set(Button::Left, pressed),
                         KeyCode::KeyS => self.input.set(Button::Down, pressed),
                         KeyCode::KeyD => self.input.set(Button::Right, pressed),
-                        KeyCode::Space => self.toggle_pause(),
-                        // Period steps the sim one tick while paused.
-                        // Kept off S so it doesn't collide with WASD.
-                        KeyCode::Period => self.step_once(),
-                        KeyCode::Escape => self.clear_selection(),
-                        // H: toggle the controls overlay.
-                        KeyCode::KeyH => self.toggle_help(),
-                        // N: spawn a new entity at the camera focus, and select it.
-                        KeyCode::KeyN => self.spawn_at_focus(),
-                        // Delete: despawn the selected entity.
-                        KeyCode::Delete => self.despawn_selected(),
-                        // F5: save the current world to disk.
-                        KeyCode::F5 => self.save_scene(),
-                        // F9: reload the world from disk, discarding the current one.
-                        KeyCode::F9 => self.reload_scene(),
                         _ => {}
                     }
                 }
@@ -999,67 +1001,24 @@ impl ApplicationHandler for App {
                                 }
                             }
                         } else if !event.repeat {
-                            // One-shot actions — ignore auto-repeat.
+                            // One-shot actions — fire once per fresh press (no
+                            // auto-repeat). Each calls the same method the menus do.
                             match code {
-                                KeyCode::Space => {
-                                    self.paused = !self.paused;
-                                    self.log(if self.paused { "Paused" } else { "Playing" });
-                                }
+                                KeyCode::Space => self.toggle_pause(),
                                 // Period steps the sim one tick while paused.
                                 // Kept off S so it doesn't collide with WASD.
-                                KeyCode::Period => {
-                                    if self.paused {
-                                        systems::movement(&mut self.world);
-                                        self.log("Stepped one tick");
-                                    }
-                                }
-                                KeyCode::Escape => {
-                                    self.selected = None;
-                                    self.log("Selection cleared");
-                                }
+                                KeyCode::Period => self.step_once(),
+                                KeyCode::Escape => self.clear_selection(),
                                 // H: toggle the controls overlay.
-                                KeyCode::KeyH => {
-                                    self.show_help = !self.show_help;
-                                }
+                                KeyCode::KeyH => self.toggle_help(),
                                 // N: spawn a new entity at the camera focus, and select it.
-                                KeyCode::KeyN => {
-                                    let id = self.world.spawn(
-                                        Position {
-                                            x: self.cam_focus_x,
-                                            y: self.cam_focus_y,
-                                            z: 0.0,
-                                        },
-                                        Velocity {
-                                            dx: 0.0,
-                                            dy: 0.0,
-                                            dz: 0.0,
-                                        },
-                                    );
-                                    self.selected = Some(id);
-                                    self.log(format!("Spawned entity {id}"));
-                                }
+                                KeyCode::KeyN => self.spawn_at_focus(),
                                 // Delete: despawn the selected entity.
-                                KeyCode::Delete => {
-                                    if let Some(id) = self.selected {
-                                        self.world.despawn(id);
-                                        self.selected = None;
-                                        self.log(format!("Despawned entity {id}"));
-                                    }
-                                }
+                                KeyCode::Delete => self.despawn_selected(),
                                 // F5: save the current world to disk.
-                                KeyCode::F5 => match self.world.save_to_file(SCENE_PATH) {
-                                    Ok(()) => self.log(format!("Saved scene to {SCENE_PATH}")),
-                                    Err(e) => self.log(format!("Save failed: {e}")),
-                                },
+                                KeyCode::F5 => self.save_scene(),
                                 // F9: reload the world from disk, discarding the current one.
-                                KeyCode::F9 => match World::load_from_file(SCENE_PATH) {
-                                    Ok(world) => {
-                                        self.world = world;
-                                        self.selected = None;
-                                        self.log(format!("Reloaded scene from {SCENE_PATH}"));
-                                    }
-                                    Err(e) => self.log(format!("Reload failed: {e}")),
-                                },
+                                KeyCode::F9 => self.reload_scene(),
                                 _ => {}
                             }
                         }
@@ -1200,6 +1159,8 @@ impl ApplicationHandler for App {
                     ));
                 }
                 let logo = self.logo_texture.clone();
+                let paused = self.paused;
+                let mut menu_action: Option<MenuAction> = None;
                 let (egui_paint_jobs, egui_textures_delta, egui_ppp) =
                     if let (Some(state), Some(window)) =
                         (self.egui_state.as_mut(), self.window.as_ref())
@@ -1216,13 +1177,48 @@ impl ApplicationHandler for App {
                                         );
                                         ui.separator();
                                     }
-                                    ui.label("File");
-                                    ui.separator();
-                                    ui.label("Edit");
-                                    ui.separator();
-                                    ui.label("View");
-                                    ui.separator();
-                                    ui.label("Help");
+                                    ui.menu_button("File", |ui| {
+                                        if ui.button("Save scene").clicked() {
+                                            menu_action = Some(MenuAction::SaveScene);
+                                        }
+                                        if ui.button("Reload scene").clicked() {
+                                            menu_action = Some(MenuAction::ReloadScene);
+                                        }
+                                        ui.separator();
+                                        if ui.button("Quit").clicked() {
+                                            menu_action = Some(MenuAction::Quit);
+                                        }
+                                    });
+                                    ui.menu_button("Edit", |ui| {
+                                        if ui.button("Spawn entity").clicked() {
+                                            menu_action = Some(MenuAction::SpawnEntity);
+                                        }
+                                        if ui.button("Despawn selected").clicked() {
+                                            menu_action = Some(MenuAction::DespawnSelected);
+                                        }
+                                        ui.separator();
+                                        if ui.button("Clear selection").clicked() {
+                                            menu_action = Some(MenuAction::ClearSelection);
+                                        }
+                                    });
+                                    ui.menu_button("View", |ui| {
+                                        let play_pause = if paused { "Play" } else { "Pause" };
+                                        if ui.button(play_pause).clicked() {
+                                            menu_action = Some(MenuAction::TogglePause);
+                                        }
+                                        if ui.button("Step one tick").clicked() {
+                                            menu_action = Some(MenuAction::StepOnce);
+                                        }
+                                        ui.separator();
+                                        if ui.button("Controls overlay").clicked() {
+                                            menu_action = Some(MenuAction::ToggleHelp);
+                                        }
+                                    });
+                                    ui.menu_button("Help", |ui| {
+                                        if ui.button("About").clicked() {
+                                            menu_action = Some(MenuAction::About);
+                                        }
+                                    });
                                 });
                             });
                             // Bottom console dock — Output (the live log) and a
@@ -1390,6 +1386,26 @@ impl ApplicationHandler for App {
                     } else {
                         self.world.controlled.remove(id);
                     }
+                }
+
+                // A menu item clicked this frame runs the same action method the
+                // keyboard uses — one command, two triggers. This sits at
+                // statement level (NOT inside the `edited` block above), so it
+                // fires whether or not an entity is selected.
+                match menu_action {
+                    Some(MenuAction::SaveScene) => self.save_scene(),
+                    Some(MenuAction::ReloadScene) => self.reload_scene(),
+                    Some(MenuAction::SpawnEntity) => self.spawn_at_focus(),
+                    Some(MenuAction::DespawnSelected) => self.despawn_selected(),
+                    Some(MenuAction::ClearSelection) => self.clear_selection(),
+                    Some(MenuAction::TogglePause) => self.toggle_pause(),
+                    Some(MenuAction::StepOnce) => self.step_once(),
+                    Some(MenuAction::ToggleHelp) => self.toggle_help(),
+                    Some(MenuAction::About) => {
+                        self.log("Frame Editor — a hand-rolled Rust simulation engine and editor.");
+                    }
+                    Some(MenuAction::Quit) => event_loop.exit(),
+                    None => {}
                 }
 
                 if let Some(gpu) = &mut self.gpu {
