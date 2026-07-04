@@ -5,7 +5,7 @@ use std::sync::Arc;
 use frame_engine::core::Clock;
 use frame_engine::input::{Button, InputState};
 use frame_engine::systems;
-use frame_engine::world::{Controlled, Position, Velocity, World};
+use frame_engine::world::{Controlled, Position, Script, Velocity, World};
 use glam::{Mat4, Vec3, Vec4};
 use wgpu::util::DeviceExt;
 use winit::application::ApplicationHandler;
@@ -1143,6 +1143,7 @@ impl ApplicationHandler for App {
                         self.world.colors.get(id).copied().unwrap_or_default(),
                         self.world.controlled.get(id).is_some(),
                         self.world.scales.get(id).copied().unwrap_or_default(),
+                        self.world.scripts.get(id).map(|s| s.source.clone()),
                     ))
                 });
 
@@ -1292,7 +1293,15 @@ impl ApplicationHandler for App {
                                                 });
                                         }
                                         Tab::Inspector => match &mut edited {
-                                            Some((id, pos, vel, color, controlled, scale)) => {
+                                            Some((
+                                                id,
+                                                pos,
+                                                vel,
+                                                color,
+                                                controlled,
+                                                scale,
+                                                script_source,
+                                            )) => {
                                                 ui.label(format!("Entity {id}"));
                                                 ui.add_space(4.0);
                                                 ui.label("Position");
@@ -1366,6 +1375,38 @@ impl ApplicationHandler for App {
                                                 });
                                                 ui.add_space(4.0);
                                                 ui.checkbox(controlled, "Controlled (WASD)");
+
+                                                ui.add_space(8.0);
+                                                ui.label("Script");
+                                                // Staged so we never reassign `script_source`
+                                                // while matching on it.
+                                                let mut add_script = false;
+                                                let mut remove_script = false;
+                                                match script_source {
+                                                    Some(src) => {
+                                                        ui.add(
+                                                            egui::TextEdit::multiline(src)
+                                                                .code_editor()
+                                                                .desired_rows(4)
+                                                                .desired_width(f32::INFINITY),
+                                                        );
+                                                        if ui.button("Remove script").clicked() {
+                                                            remove_script = true;
+                                                        }
+                                                    }
+                                                    None => {
+                                                        ui.weak("No script on this entity.");
+                                                        if ui.button("Add script").clicked() {
+                                                            add_script = true;
+                                                        }
+                                                    }
+                                                }
+                                                if add_script {
+                                                    *script_source = Some(String::new());
+                                                }
+                                                if remove_script {
+                                                    *script_source = None;
+                                                }
                                             }
                                             None => {
                                                 ui.weak("No entity selected");
@@ -1391,7 +1432,7 @@ impl ApplicationHandler for App {
                 // Push any inspector edits back into the world. The render this
                 // frame already used the old values; the change shows next frame
                 // (same one-frame path as the keyboard nudge).
-                if let Some((id, pos, vel, color, controlled, scale)) = edited {
+                if let Some((id, pos, vel, color, controlled, scale, script_source)) = edited {
                     if let Some(p) = self.world.positions.get_mut(id) {
                         *p = pos;
                     }
@@ -1404,6 +1445,14 @@ impl ApplicationHandler for App {
                         self.world.controlled.insert(id, Controlled);
                     } else {
                         self.world.controlled.remove(id);
+                    }
+                    match script_source {
+                        Some(src) => {
+                            self.world.scripts.insert(id, Script { source: src });
+                        }
+                        None => {
+                            self.world.scripts.remove(id);
+                        }
                     }
                 }
 
