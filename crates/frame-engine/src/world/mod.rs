@@ -4,10 +4,10 @@ pub use storage::ComponentStorage;
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Script {
-    /// The behaviour itself, as source text — not a name pointing at Rust-baked
-    /// code. Because it's data, it serializes with the scene and can be edited
-    /// without recompiling the editor.
-    pub source: String,
+    /// The name of a script in the world's `script_library`. The behaviour
+    /// itself lives once in the library; entities reference it by name, so
+    /// editing a library script updates every entity that uses it.
+    pub uses: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy)]
@@ -46,6 +46,11 @@ pub struct World {
     pub scales: ComponentStorage<Scale>,
     #[serde(default)]
     pub scripts: ComponentStorage<Script>,
+    /// Named, reusable scripts shared across entities. Entities reference these
+    /// by name (Step 2). Plain data — name -> Rhai source — so the engine stays
+    /// VM-free and the library saves and loads with the scene.
+    #[serde(default)]
+    pub script_library: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy)]

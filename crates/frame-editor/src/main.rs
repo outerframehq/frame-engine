@@ -1,52 +1,40 @@
 const LOGO_PNG: &[u8] = include_bytes!("../assets/frame-editor.png");
-
-use std::sync::Arc;
-
 use frame_engine::core::Clock;
 use frame_engine::input::{Button, InputState};
 use frame_engine::systems;
 use frame_engine::world::{Controlled, Position, Script, Velocity, World};
 use glam::{Mat4, Vec3, Vec4};
+use std::sync::Arc;
 use wgpu::util::DeviceExt;
 use winit::application::ApplicationHandler;
 use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Icon, Window, WindowId};
-
 mod font;
 mod script;
-
 const TICK_RATE: u32 = 30;
 const MAX_CATCHUP_TICKS: u32 = 5;
-
 // Vertical field of view, shared by the projection and the pan maths.
 const FOV_DEGREES: f32 = 45.0;
-
 // Size of each entity cube in world units.
 // NOTE: must match CUBE_SIZE in shader.wgsl (render and pick must agree).
 const QUAD_SIZE: f32 = 8.0;
-
 // How fast middle-drag sweeps the orbit, in radians per pixel.
 const ORBIT_SENS: f32 = 0.005;
-
 // Format of the depth buffer. 32-bit float depth, no stencil.
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
-
 // Where scenes are saved to / loaded from. Relative to the working directory,
 // which is the workspace root when run via `cargo run`. Gitignored.
 const SCENE_PATH: &str = "scene.ron";
-
 // How far a single nudge moves the selected entity, in world units.
 const EDIT_STEP: f32 = 5.0;
-
 // The camera data handed to the shader. Must match the `Camera` struct in shader.wgsl.
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 struct CameraUniform {
     view_proj: [[f32; 4]; 4],
 }
-
 // Per-entity instance data: world position plus a selected flag (0 or 1).
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
@@ -56,7 +44,6 @@ struct InstanceRaw {
     selected: f32,
     scale: [f32; 3],
 }
-
 impl InstanceRaw {
     const ATTRIBS: [wgpu::VertexAttribute; 4] = [
         wgpu::VertexAttribute {
@@ -80,7 +67,6 @@ impl InstanceRaw {
             shader_location: 3,
         },
     ];
-
     fn layout() -> wgpu::VertexBufferLayout<'static> {
         wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<InstanceRaw>() as wgpu::BufferAddress,
@@ -89,7 +75,6 @@ impl InstanceRaw {
         }
     }
 }
-
 // A screen-space overlay rectangle (text pixel), positioned directly in NDC.
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
@@ -97,7 +82,6 @@ struct TextInstance {
     offset: [f32; 2], // bottom-left corner in NDC
     size: [f32; 2],   // width/height in NDC
 }
-
 impl TextInstance {
     const ATTRIBS: [wgpu::VertexAttribute; 2] = [
         wgpu::VertexAttribute {
@@ -111,7 +95,6 @@ impl TextInstance {
             shader_location: 1,
         },
     ];
-
     fn layout() -> wgpu::VertexBufferLayout<'static> {
         wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<TextInstance>() as wgpu::BufferAddress,
@@ -120,7 +103,6 @@ impl TextInstance {
         }
     }
 }
-
 // Create (or recreate) the depth texture's view, sized to match the surface.
 // Called once at startup and again on every resize.
 fn create_depth_view(
@@ -143,7 +125,6 @@ fn create_depth_view(
     });
     texture.create_view(&wgpu::TextureViewDescriptor::default())
 }
-
 // Turn a string into a pile of screen-space quads, one per lit font pixel.
 //
 // Coordinates flow: a font pixel lives at some screen pixel (x right, y DOWN
@@ -164,14 +145,12 @@ fn build_text(
     let mut out = Vec::new();
     let mut cursor_x = start_x;
     let mut cursor_y = start_y;
-
     for c in text.chars() {
         if c == '\n' {
             cursor_x = start_x;
             cursor_y += (font::GLYPH_HEIGHT as f32 + 1.0) * pixel;
             continue;
         }
-
         let rows = font::glyph(c);
         for (row_i, &bits) in rows.iter().enumerate() {
             for col in 0..font::GLYPH_WIDTH {
@@ -180,30 +159,24 @@ fn build_text(
                 if !lit {
                     continue;
                 }
-
                 // This font dot's top-left, in screen pixels.
                 let sx = cursor_x + col as f32 * pixel;
                 let sy = cursor_y + row_i as f32 * pixel;
-
                 // Convert to an NDC rectangle. The quad's offset is its
                 // bottom-left corner and it grows +x (right) and +y (up), so we
                 // anchor at the dot's BOTTOM edge (sy + pixel) after the flip.
                 let ndc_x = sx / screen_w * 2.0 - 1.0;
                 let ndc_y_bottom = 1.0 - (sy + pixel) / screen_h * 2.0;
-
                 out.push(TextInstance {
                     offset: [ndc_x, ndc_y_bottom],
                     size: [pixel / screen_w * 2.0, pixel / screen_h * 2.0],
                 });
             }
         }
-
         cursor_x += (font::GLYPH_WIDTH as f32 + 1.0) * pixel;
     }
-
     out
 }
-
 // Build the camera's view-projection matrix from its current state.
 //
 // The eye orbits the focus point at `distance`, swung around by yaw (around the
@@ -219,7 +192,6 @@ fn camera_matrix(
     height: u32,
 ) -> Mat4 {
     let aspect = width as f32 / height.max(1) as f32;
-
     let target = Vec3::new(focus_x, focus_y, 0.0);
     let offset = Vec3::new(
         pitch.cos() * yaw.sin(),
@@ -228,13 +200,10 @@ fn camera_matrix(
     ) * distance;
     let eye = target + offset;
     let up = Vec3::Y;
-
     let view = Mat4::look_at_rh(eye, target, up);
     let proj = Mat4::perspective_rh(FOV_DEGREES.to_radians(), aspect, 0.1, 10000.0);
-
     proj * view
 }
-
 fn camera_view_proj(
     focus_x: f32,
     focus_y: f32,
@@ -246,7 +215,6 @@ fn camera_view_proj(
 ) -> [[f32; 4]; 4] {
     camera_matrix(focus_x, focus_y, distance, yaw, pitch, width, height).to_cols_array_2d()
 }
-
 // Project a world point through the view-projection matrix to screen pixels.
 fn project(vp: Mat4, x: f32, y: f32, z: f32, width: f32, height: f32) -> Option<(f32, f32)> {
     let clip = vp * Vec4::new(x, y, z, 1.0);
@@ -259,7 +227,6 @@ fn project(vp: Mat4, x: f32, y: f32, z: f32, width: f32, height: f32) -> Option<
     let screen_y = (1.0 - (ndc_y * 0.5 + 0.5)) * height;
     Some((screen_x, screen_y))
 }
-
 // All the long-lived GPU objects, bundled so they travel together.
 struct GpuState {
     surface: wgpu::Surface<'static>,
@@ -273,31 +240,24 @@ struct GpuState {
     depth_view: wgpu::TextureView,
     egui_renderer: egui_wgpu::Renderer,
 }
-
 impl GpuState {
     fn new(window: Arc<Window>) -> GpuState {
         let size = window.inner_size();
-
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let surface = instance.create_surface(window.clone()).unwrap();
-
         let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
             power_preference: wgpu::PowerPreference::default(),
             compatible_surface: Some(&surface),
             force_fallback_adapter: false,
         }))
         .unwrap();
-
         let (device, queue) =
             pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default())).unwrap();
-
         let config = surface
             .get_default_config(&adapter, size.width.max(1), size.height.max(1))
             .unwrap();
         surface.configure(&device, &config);
-
         let depth_view = create_depth_view(&device, &config);
-
         // egui's renderer. It draws in its own pass with no depth attachment,
         // so RendererOptions::default() (depth_stencil_format: None) is correct.
         let egui_renderer = egui_wgpu::Renderer::new(
@@ -305,7 +265,6 @@ impl GpuState {
             config.format,
             egui_wgpu::RendererOptions::default(),
         );
-
         let camera_uniform = CameraUniform {
             view_proj: Mat4::IDENTITY.to_cols_array_2d(),
         };
@@ -314,7 +273,6 @@ impl GpuState {
             contents: bytemuck::cast_slice(&[camera_uniform]),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
-
         let camera_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("camera bind group layout"),
@@ -329,7 +287,6 @@ impl GpuState {
                     count: None,
                 }],
             });
-
         let camera_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("camera bind group"),
             layout: &camera_bind_group_layout,
@@ -338,17 +295,14 @@ impl GpuState {
                 resource: camera_buffer.as_entire_binding(),
             }],
         });
-
         // --- Entity pipeline (world-space, camera-driven) ---
         let entity_shader = device.create_shader_module(wgpu::include_wgsl!("shader.wgsl"));
-
         let entity_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("entity pipeline layout"),
                 bind_group_layouts: &[Some(&camera_bind_group_layout)],
                 immediate_size: 0,
             });
-
         let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("entity pipeline"),
             layout: Some(&entity_pipeline_layout),
@@ -383,16 +337,13 @@ impl GpuState {
             multiview_mask: None,
             cache: None,
         });
-
         // --- Text/overlay pipeline (screen-space, no camera) ---
         let text_shader = device.create_shader_module(wgpu::include_wgsl!("text.wgsl"));
-
         let text_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("text pipeline layout"),
             bind_group_layouts: &[], // no camera — positions are already in NDC
             immediate_size: 0,
         });
-
         let text_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
             label: Some("text pipeline"),
             layout: Some(&text_pipeline_layout),
@@ -426,7 +377,6 @@ impl GpuState {
             multiview_mask: None,
             cache: None,
         });
-
         GpuState {
             surface,
             device,
@@ -440,7 +390,6 @@ impl GpuState {
             egui_renderer,
         }
     }
-
     fn resize(&mut self, width: u32, height: u32) {
         if width > 0 && height > 0 {
             self.config.width = width;
@@ -450,7 +399,6 @@ impl GpuState {
             self.depth_view = create_depth_view(&self.device, &self.config);
         }
     }
-
     // Draw one frame: entities (world-space cubes) then text (screen overlay).
     fn render(
         &mut self,
@@ -467,7 +415,6 @@ impl GpuState {
             0,
             bytemuck::cast_slice(&[camera_uniform]),
         );
-
         // egui: upload any new/changed textures before we start encoding.
         for (id, image_delta) in &egui_textures_delta.set {
             self.egui_renderer
@@ -477,7 +424,6 @@ impl GpuState {
             size_in_pixels: [self.config.width, self.config.height],
             pixels_per_point: egui_ppp,
         };
-
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame)
             | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
@@ -486,7 +432,6 @@ impl GpuState {
                 return;
             }
         };
-
         let instance_buffer = if instances.is_empty() {
             None
         } else {
@@ -499,7 +444,6 @@ impl GpuState {
                     }),
             )
         };
-
         let text_buffer = if text_instances.is_empty() {
             None
         } else {
@@ -512,17 +456,14 @@ impl GpuState {
                     }),
             )
         };
-
         let view = frame
             .texture
             .create_view(&wgpu::TextureViewDescriptor::default());
-
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("frame encoder"),
             });
-
         // egui: record its vertex/index uploads into the encoder. Must happen
         // before any render pass is active.
         let egui_user_buffers = self.egui_renderer.update_buffers(
@@ -532,7 +473,6 @@ impl GpuState {
             egui_paint_jobs,
             &egui_screen,
         );
-
         {
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("main pass"),
@@ -563,7 +503,6 @@ impl GpuState {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-
             // entities — 36 vertices per cube (6 faces x 2 tris x 3 verts)
             render_pass.set_pipeline(&self.render_pipeline);
             render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
@@ -571,7 +510,6 @@ impl GpuState {
                 render_pass.set_vertex_buffer(0, buffer.slice(..));
                 render_pass.draw(0..36, 0..instances.len() as u32);
             }
-
             // text overlay (screen-space, drawn on top, no camera)
             render_pass.set_pipeline(&self.text_pipeline);
             if let Some(buffer) = &text_buffer {
@@ -579,7 +517,6 @@ impl GpuState {
                 render_pass.draw(0..6, 0..text_instances.len() as u32);
             }
         }
-
         // egui pass: layered over the scene (load, don't clear), no depth.
         // egui's renderer requires a RenderPass<'static>, hence forget_lifetime.
         {
@@ -604,12 +541,10 @@ impl GpuState {
             self.egui_renderer
                 .render(&mut egui_pass, egui_paint_jobs, &egui_screen);
         }
-
         // egui: free textures it no longer needs, after this frame's draw.
         for id in &egui_textures_delta.free {
             self.egui_renderer.free_texture(id);
         }
-
         // egui's upload command buffers must be submitted before the main one.
         self.queue.submit(
             egui_user_buffers
@@ -619,21 +554,24 @@ impl GpuState {
         frame.present();
     }
 }
-
 /// Which tab is showing in the right-hand inspector dock.
 #[derive(Clone, Copy, PartialEq)]
 enum Tab {
     Scene,
     Inspector,
 }
-
+/// Which view fills the central area: the 3D viewport, or the script editor.
+#[derive(Clone, Copy, PartialEq)]
+enum CenterTab {
+    Viewport,
+    Scripts,
+}
 /// Which tab is showing in the bottom console dock.
 #[derive(Clone, Copy, PartialEq)]
 enum ConsoleTab {
     Output,
     Terminal,
 }
-
 /// A command chosen from the toolbar menus this frame, applied after the egui
 /// pass. The menu closure can't borrow `self`, so it stages the choice here and
 /// we dispatch it afterwards — the same lift-then-write-back pattern the
@@ -650,7 +588,6 @@ enum MenuAction {
     About,
     Quit,
 }
-
 struct App {
     script_runtime: script::RhaiRuntime,
     window: Option<Arc<Window>>,
@@ -672,17 +609,19 @@ struct App {
     egui_state: Option<egui_winit::State>,
     // Active tab in the right-hand inspector dock.
     current_tab: Tab,
+    // Which view fills the central area (viewport or script editor).
+    center_tab: CenterTab,
     // Active tab in the bottom console dock.
     console_tab: ConsoleTab,
     // Lines shown in the console Output tab (also echoed to the terminal).
     log_lines: Vec<String>,
     // Which movement buttons (WASD) are currently held, read by the input system.
     input: InputState,
-
+    // Text in the "new script name" box on the Scripts tab (persists between frames).
+    new_script_name: String,
     // GPU texture for the toolbar logo, uploaded once on the first frame.
     logo_texture: Option<egui::TextureHandle>,
 }
-
 impl App {
     /// Append a line to the in-editor log (shown in the console Output tab) and
     /// echo it to the terminal. The buffer is capped so it can't grow forever.
@@ -694,17 +633,14 @@ impl App {
             self.log_lines.remove(0);
         }
     }
-
     // --- Editor actions ---
     // One definition per action. The keyboard and the menus are just two
     // triggers that call these; the behaviour lives in exactly one place.
-
     /// Toggle the simulation between playing and paused.
     fn toggle_pause(&mut self) {
         self.paused = !self.paused;
         self.log(if self.paused { "Paused" } else { "Playing" });
     }
-
     /// Advance the simulation exactly one tick. Only meaningful while paused.
     fn step_once(&mut self) {
         if self.paused {
@@ -712,18 +648,15 @@ impl App {
             self.log("Stepped one tick");
         }
     }
-
     /// Clear the current selection.
     fn clear_selection(&mut self) {
         self.selected = None;
         self.log("Selection cleared");
     }
-
     /// Toggle the on-screen controls overlay.
     fn toggle_help(&mut self) {
         self.show_help = !self.show_help;
     }
-
     /// Spawn a new entity at the camera focus and select it.
     fn spawn_at_focus(&mut self) {
         let id = self.world.spawn(
@@ -741,7 +674,6 @@ impl App {
         self.selected = Some(id);
         self.log(format!("Spawned entity {id}"));
     }
-
     /// Despawn the selected entity, if any.
     fn despawn_selected(&mut self) {
         if let Some(id) = self.selected {
@@ -750,7 +682,6 @@ impl App {
             self.log(format!("Despawned entity {id}"));
         }
     }
-
     /// Save the current world to disk.
     fn save_scene(&mut self) {
         match self.world.save_to_file(SCENE_PATH) {
@@ -758,7 +689,6 @@ impl App {
             Err(e) => self.log(format!("Save failed: {e}")),
         }
     }
-
     /// Reload the world from disk, discarding the current one.
     fn reload_scene(&mut self) {
         match World::load_from_file(SCENE_PATH) {
@@ -770,7 +700,6 @@ impl App {
             Err(e) => self.log(format!("Reload failed: {e}")),
         }
     }
-
     fn pick(&mut self) {
         let (width_u, height_u) = match &self.window {
             Some(window) => {
@@ -781,7 +710,6 @@ impl App {
         };
         let width = width_u as f32;
         let height = height_u as f32;
-
         let vp = camera_matrix(
             self.cam_focus_x,
             self.cam_focus_y,
@@ -791,7 +719,6 @@ impl App {
             width_u,
             height_u,
         );
-
         let cursor_x = self.last_cursor.0 as f32;
         let cursor_y = self.last_cursor.1 as f32;
         let mut picked: Option<usize> = None;
@@ -812,7 +739,6 @@ impl App {
                 }
             }
         }
-
         if let Some(id) = picked {
             self.selected = Some(id);
             if let (Some(p), Some(v)) =
@@ -826,7 +752,6 @@ impl App {
         }
     }
 }
-
 // Decode the embedded logo into a winit window icon (shown in the title bar and
 // the OS taskbar). Returns None if it can't decode, so the window still opens.
 // NOTE: honoured on X11 and Windows; Wayland ignores it and takes the taskbar
@@ -836,7 +761,6 @@ fn load_window_icon() -> Option<Icon> {
     let (width, height) = rgba.dimensions();
     Icon::from_rgba(rgba.into_raw(), width, height).ok()
 }
-
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
         #[allow(unused_mut)]
@@ -852,7 +776,6 @@ impl ApplicationHandler for App {
         }
         let window = Arc::new(event_loop.create_window(attributes).unwrap());
         self.gpu = Some(GpuState::new(window.clone()));
-
         // egui input state. Lives here because it needs the window; the egui
         // Context it shares already exists on App.
         let egui_state = egui_winit::State::new(
@@ -864,11 +787,9 @@ impl ApplicationHandler for App {
             None,
         );
         self.egui_state = Some(egui_state);
-
         window.request_redraw();
         self.window = Some(window);
     }
-
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
         // Release GPU and window resources here, while winit's platform
         // connection (the Wayland display) is still alive. If we let these drop
@@ -880,7 +801,6 @@ impl ApplicationHandler for App {
         self.egui_state = None;
         self.window = None;
     }
-
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         // Feed every event to egui so its own widgets (dragging the panel,
         // future buttons/sliders) keep working. We deliberately ignore the
@@ -891,7 +811,6 @@ impl ApplicationHandler for App {
         if let (Some(state), Some(window)) = (self.egui_state.as_mut(), self.window.as_ref()) {
             let _ = state.on_window_event(window, &event);
         }
-
         // Is the cursor over an egui panel? Because we now drive egui through
         // run_ui — which establishes the root available-rect — egui's own test
         // works: true over the toolbar/inspector, false over the 3D viewport.
@@ -899,7 +818,6 @@ impl ApplicationHandler for App {
         // state can never get stuck.
         let pointer_over_ui = self.egui_ctx.is_pointer_over_egui();
         let ui_wants_keys = self.egui_ctx.egui_wants_keyboard_input();
-
         match event {
             WindowEvent::CloseRequested => {
                 println!("Close requested; Shutting Down");
@@ -929,7 +847,6 @@ impl ApplicationHandler for App {
             WindowEvent::CursorMoved { position, .. } => {
                 let dx = (position.x - self.last_cursor.0) as f32;
                 let dy = (position.y - self.last_cursor.1) as f32;
-
                 if self.orbiting {
                     // Sweep the orbit. Drag right -> swing around; drag up ->
                     // rise over the top. Pitch is clamped just short of the
@@ -943,7 +860,6 @@ impl ApplicationHandler for App {
                         let visible_world_height =
                             2.0 * self.cam_distance * (FOV_DEGREES.to_radians() * 0.5).tan();
                         let world_per_px = visible_world_height / height_px;
-
                         self.cam_focus_x -= dx * world_per_px;
                         self.cam_focus_y += dy * world_per_px;
                     }
@@ -980,7 +896,6 @@ impl ApplicationHandler for App {
                         _ => {}
                     }
                 }
-
                 if !ui_wants_keys && event.state == ElementState::Pressed {
                     if let PhysicalKey::Code(code) = event.physical_key {
                         // Position nudge — moves the selected entity along a world
@@ -994,7 +909,6 @@ impl ApplicationHandler for App {
                             KeyCode::PageDown => Some((0.0, 0.0, -EDIT_STEP)),
                             _ => None,
                         };
-
                         if let Some((dx, dy, dz)) = nudge {
                             if let Some(id) = self.selected {
                                 if let Some(p) = self.world.positions.get_mut(id) {
@@ -1035,7 +949,6 @@ impl ApplicationHandler for App {
                     systems::input_movement(&mut self.world, &self.input);
                     systems::movement(&mut self.world);
                 }
-
                 let selected = self.selected;
                 let instances: Vec<InstanceRaw> = self
                     .world
@@ -1056,7 +969,6 @@ impl ApplicationHandler for App {
                         }
                     })
                     .collect();
-
                 let (width, height) = match &self.window {
                     Some(window) => {
                         let size = window.inner_size();
@@ -1064,12 +976,10 @@ impl ApplicationHandler for App {
                     }
                     None => (1, 1),
                 };
-
                 // The selected entity's ID/POS/VEL now live in the Inspector
                 // panel, so the old top-left readout is retired. The controls
                 // legend below is the only remaining hand-rolled overlay.
                 let mut text_instances: Vec<TextInstance> = Vec::new();
-
                 // Controls overlay (toggle with H), anchored bottom-left. Drawn
                 // at a smaller pixel size than the inspector so it reads as
                 // secondary furniture.
@@ -1100,7 +1010,6 @@ impl ApplicationHandler for App {
                         height as f32,
                     ));
                 }
-
                 let view_proj = camera_view_proj(
                     self.cam_focus_x,
                     self.cam_focus_y,
@@ -1110,7 +1019,6 @@ impl ApplicationHandler for App {
                     width,
                     height,
                 );
-
                 // --- Run egui for this frame ---
                 // run_ui hands our closure a full-screen root Ui and runs the
                 // begin/end pass internally. Panels shown into that root dock to
@@ -1121,8 +1029,11 @@ impl ApplicationHandler for App {
                 // the live log. We move state in/out via locals so the closure
                 // never has to borrow `self`.
                 let mut tab = self.current_tab;
+                let mut center_tab = self.center_tab;
                 let mut console_tab = self.console_tab;
                 let log_lines = std::mem::take(&mut self.log_lines);
+                let mut script_library = std::mem::take(&mut self.world.script_library);
+                let mut new_script_name = std::mem::take(&mut self.new_script_name);
                 // Live entity ids for the Scene list, plus the selected entity's
                 // position/velocity lifted into a local so the egui closure never
                 // touches `self`. Any edits get written back into the world after
@@ -1143,10 +1054,9 @@ impl ApplicationHandler for App {
                         self.world.colors.get(id).copied().unwrap_or_default(),
                         self.world.controlled.get(id).is_some(),
                         self.world.scales.get(id).copied().unwrap_or_default(),
-                        self.world.scripts.get(id).map(|s| s.source.clone()),
+                        self.world.scripts.get(id).map(|s| s.uses.clone()),
                     ))
                 });
-
                 // Upload the logo to the GPU on the first frame, then reuse the handle.
                 if self.logo_texture.is_none() {
                     let rgba = image::load_from_memory(LOGO_PNG)
@@ -1375,37 +1285,37 @@ impl ApplicationHandler for App {
                                                 });
                                                 ui.add_space(4.0);
                                                 ui.checkbox(controlled, "Controlled (WASD)");
-
                                                 ui.add_space(8.0);
                                                 ui.label("Script");
-                                                // Staged so we never reassign `script_source`
-                                                // while matching on it.
-                                                let mut add_script = false;
-                                                let mut remove_script = false;
-                                                match script_source {
-                                                    Some(src) => {
-                                                        ui.add(
-                                                            egui::TextEdit::multiline(src)
-                                                                .code_editor()
-                                                                .desired_rows(4)
-                                                                .desired_width(f32::INFINITY),
+                                                // `script_source` is now the NAME of a library
+                                                // script this entity uses (or None). Pick from the
+                                                // library; the source itself is edited in the
+                                                // Scripts tab, once, shared by every user.
+                                                if script_library.is_empty() {
+                                                    ui.weak(
+                                                    "No scripts yet — add some in the Scripts tab.",
+                                                );
+                                                } else {
+                                                    ui.selectable_value(
+                                                        script_source,
+                                                        None,
+                                                        "(none)",
+                                                    );
+                                                    for name in script_library.keys() {
+                                                        ui.selectable_value(
+                                                            script_source,
+                                                            Some(name.clone()),
+                                                            name.as_str(),
                                                         );
-                                                        if ui.button("Remove script").clicked() {
-                                                            remove_script = true;
+                                                    }
+                                                    // Flag a reference to a script that was deleted.
+                                                    if let Some(name) = script_source.as_ref() {
+                                                        if !script_library.contains_key(name) {
+                                                            ui.weak(format!(
+                                                                "(uses missing script '{name}')"
+                                                            ));
                                                         }
                                                     }
-                                                    None => {
-                                                        ui.weak("No script on this entity.");
-                                                        if ui.button("Add script").clicked() {
-                                                            add_script = true;
-                                                        }
-                                                    }
-                                                }
-                                                if add_script {
-                                                    *script_source = Some(String::new());
-                                                }
-                                                if remove_script {
-                                                    *script_source = None;
                                                 }
                                             }
                                             None => {
@@ -1415,8 +1325,87 @@ impl ApplicationHandler for App {
                                         },
                                     }
                                 });
-                            // The space left in the middle is the 3D viewport —
-                            // we draw nothing there, so the scene shows through.
+                            // Central area: a tab strip (Viewport | Script Editor),
+                            // then, on the Script tab, an opaque panel that fills the
+                            // gap the docks leave. On the Viewport tab we draw nothing
+                            // here, so the 3D scene shows through as before.
+                            egui::Panel::top("center_tabs")
+                                .resizable(false)
+                                .show(ui, |ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.selectable_value(
+                                            &mut center_tab,
+                                            CenterTab::Viewport,
+                                            "Viewport",
+                                        );
+                                        ui.selectable_value(
+                                            &mut center_tab,
+                                            CenterTab::Scripts,
+                                            "Script Editor",
+                                        );
+                                    });
+                                });
+                            if center_tab == CenterTab::Scripts {
+                                egui::CentralPanel::default().show(ui, |ui| {
+                                    ui.label("Script library");
+                                    ui.separator();
+                                    // New-script bar. Kept ABOVE the list on purpose.
+                                    // The list below is a *greedy* scroll area
+                                    // (auto_shrink [false, false]) that expands to fill
+                                    // all the remaining height, so anything placed AFTER
+                                    // it gets pushed off the bottom of the panel and is
+                                    // clipped away — which is exactly why this row used
+                                    // to be invisible. Rule of thumb: a greedy scroll
+                                    // area must be the LAST thing in a vertical stack.
+                                    ui.horizontal(|ui| {
+                                        ui.add(
+                                            egui::TextEdit::singleline(&mut new_script_name)
+                                                .hint_text("new script name"),
+                                        );
+                                        if ui.button("Add").clicked() {
+                                            let key = new_script_name.trim().to_string();
+                                            if !key.is_empty() {
+                                                // entry(..).or_default() inserts an empty
+                                                // String for a new name, or leaves an
+                                                // existing script untouched.
+                                                script_library.entry(key).or_default();
+                                                new_script_name.clear();
+                                            }
+                                        }
+                                    });
+                                    ui.separator();
+                                    // Staged: can't remove from the map while iterating it.
+                                    let mut delete: Option<String> = None;
+                                    egui::ScrollArea::vertical()
+                                        .auto_shrink([false, false])
+                                        .show(ui, |ui| {
+                                            if script_library.is_empty() {
+                                                ui.weak(
+                                                    "No scripts yet. Name one above and click Add, \
+                                                 then type its behaviour here.",
+                                                );
+                                            }
+                                            for (name, source) in script_library.iter_mut() {
+                                                ui.horizontal(|ui| {
+                                                    ui.strong(name.as_str());
+                                                    if ui.small_button("Delete").clicked() {
+                                                        delete = Some(name.clone());
+                                                    }
+                                                });
+                                                ui.add(
+                                                    egui::TextEdit::multiline(source)
+                                                        .code_editor()
+                                                        .desired_rows(10)
+                                                        .desired_width(f32::INFINITY),
+                                                );
+                                                ui.add_space(10.0);
+                                            }
+                                        });
+                                    if let Some(name) = delete {
+                                        script_library.remove(&name);
+                                    }
+                                });
+                            }
                         });
                         state.handle_platform_output(window, full_output.platform_output);
                         let ppp = full_output.pixels_per_point;
@@ -1426,8 +1415,11 @@ impl ApplicationHandler for App {
                         (Vec::new(), egui::TexturesDelta::default(), 1.0)
                     };
                 self.current_tab = tab;
+                self.center_tab = center_tab;
                 self.console_tab = console_tab;
                 self.log_lines = log_lines;
+                self.world.script_library = script_library;
+                self.new_script_name = new_script_name;
                 self.selected = new_selection;
                 // Push any inspector edits back into the world. The render this
                 // frame already used the old values; the change shows next frame
@@ -1447,15 +1439,14 @@ impl ApplicationHandler for App {
                         self.world.controlled.remove(id);
                     }
                     match script_source {
-                        Some(src) => {
-                            self.world.scripts.insert(id, Script { source: src });
+                        Some(uses) => {
+                            self.world.scripts.insert(id, Script { uses });
                         }
                         None => {
                             self.world.scripts.remove(id);
                         }
                     }
                 }
-
                 // A menu item clicked this frame runs the same action method the
                 // keyboard uses — one command, two triggers. This sits at
                 // statement level (NOT inside the `edited` block above), so it
@@ -1475,7 +1466,6 @@ impl ApplicationHandler for App {
                     Some(MenuAction::Quit) => event_loop.exit(),
                     None => {}
                 }
-
                 if let Some(gpu) = &mut self.gpu {
                     gpu.render(
                         &instances,
@@ -1494,11 +1484,9 @@ impl ApplicationHandler for App {
         }
     }
 }
-
 // The fallback scene used when there's no scene.ron on disk yet.
 fn default_world() -> World {
     let mut world = World::new();
-
     world.spawn(
         Position {
             x: 0.0,
@@ -1535,13 +1523,10 @@ fn default_world() -> World {
             dz: 0.6,
         },
     );
-
     world
 }
-
 fn main() {
     let event_loop = EventLoop::new().unwrap();
-
     // Load the scene from disk if one exists; otherwise start from a default
     // scene. The default is just a fallback for a fresh checkout — once you save
     // (F5), that file is what loads next time.
@@ -1555,9 +1540,7 @@ fn main() {
             default_world()
         }
     };
-
     let entity_count = world.positions.len();
-
     let mut app = App {
         window: None,
         gpu: None,
@@ -1579,18 +1562,17 @@ fn main() {
         egui_ctx: egui::Context::default(),
         egui_state: None,
         current_tab: Tab::Scene,
+        center_tab: CenterTab::Viewport,
         console_tab: ConsoleTab::Output,
         log_lines: vec!["Frame Editor started.".to_string()],
         input: InputState::new(),
-
+        new_script_name: String::new(),
         script_runtime: script::RhaiRuntime::new(),
         logo_texture: None,
     };
-
     println!(
         "Editor Started, Engine World created with {} entities",
         entity_count
     );
-
     event_loop.run_app(&mut app).unwrap();
 }

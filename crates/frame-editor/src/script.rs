@@ -33,27 +33,34 @@ impl ScriptRuntime for RhaiRuntime {
     }
 
     fn run(&mut self, world: &mut World, entity: usize) {
-        // The behaviour is data on the component now: its source text. Clone it
-        // so we aren't borrowing `world` while we mutate it below.
-        let source = match world.scripts.get(entity) {
-            Some(script) => script.source.clone(),
+        // The entity references a library script by name. Resolve the name to
+        // its source through the world's library. Clone both so we aren't
+        // borrowing `world` while we mutate it below.
+        let uses = match world.scripts.get(entity) {
+            Some(script) => script.uses.clone(),
             None => return,
         };
+        let source = match world.script_library.get(&uses) {
+            Some(src) => src.clone(),
+            None => return, // references a script that isn't in the library — skip
+        };
 
-        // Compile on first sight, cache by source. A broken script caches as
-        // None (reported once) rather than recompiling every tick.
+        // Compile on first sight, cache by source. Because the key is the source
+        // text, every entity using the same library script shares one compiled
+        // AST, and editing that library script (new text) recompiles it once for
+        // all of them. A broken script caches as None (reported once).
         if !self.compiled.contains_key(&source) {
             let compiled = match self.engine.compile(&source) {
                 Ok(ast) => Some(ast),
                 Err(e) => {
-                    eprintln!("Script failed to compile: {e}");
+                    eprintln!("Script '{uses}' failed to compile: {e}");
                     None
                 }
             };
             self.compiled.insert(source.clone(), compiled);
         }
         let Some(Some(ast)) = self.compiled.get(&source) else {
-            return; // unknown or known-bad script
+            return; // known-bad script
         };
 
         // --- Read the entity's state into the scope as script variables ---
