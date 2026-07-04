@@ -53,7 +53,7 @@ struct InstanceRaw {
     position: [f32; 3],
     color: [f32; 3],
     selected: f32,
-    scale: f32,
+    scale: [f32; 3],
 }
 
 impl InstanceRaw {
@@ -74,7 +74,7 @@ impl InstanceRaw {
             shader_location: 2,
         },
         wgpu::VertexAttribute {
-            format: wgpu::VertexFormat::Float32,
+            format: wgpu::VertexFormat::Float32x3,
             offset: std::mem::size_of::<[f32; 7]>() as wgpu::BufferAddress, // 28
             shader_location: 3,
         },
@@ -797,9 +797,10 @@ impl App {
             if let Some(p) = slot {
                 // Hit-box grows with the entity's scale so picking matches what's drawn.
                 let scale = self.world.scales.get(id).copied().unwrap_or_default();
-                let half = QUAD_SIZE * 0.5 * scale.factor;
+                let half_x = QUAD_SIZE * 0.5 * scale.x;
+                let half_y = QUAD_SIZE * 0.5 * scale.y;
                 let center = project(vp, p.x, p.y, p.z, width, height);
-                let corner = project(vp, p.x + half, p.y + half, p.z, width, height);
+                let corner = project(vp, p.x + half_x, p.y + half_y, p.z, width, height);
                 if let (Some((cx, cy)), Some((ex, ey))) = (center, corner) {
                     let half_w = (ex - cx).abs();
                     let half_h = (ey - cy).abs();
@@ -1048,7 +1049,7 @@ impl ApplicationHandler for App {
                             position: [p.x, p.y, p.z],
                             color: [color.r, color.g, color.b],
                             selected: if Some(id) == selected { 1.0 } else { 0.0 },
-                            scale: scale.factor,
+                            scale: [scale.x, scale.y, scale.z],
                         }
                     })
                     .collect();
@@ -1340,11 +1341,26 @@ impl ApplicationHandler for App {
                                                 }
                                                 ui.add_space(4.0);
                                                 ui.label("Scale");
-                                                ui.add(
-                                                    egui::DragValue::new(&mut scale.factor)
-                                                        .speed(0.05)
-                                                        .range(0.1..=100.0),
-                                                );
+                                                ui.horizontal(|ui| {
+                                                    ui.add(
+                                                        egui::DragValue::new(&mut scale.x)
+                                                            .speed(0.05)
+                                                            .range(0.1..=100.0)
+                                                            .prefix("x "),
+                                                    );
+                                                    ui.add(
+                                                        egui::DragValue::new(&mut scale.y)
+                                                            .speed(0.05)
+                                                            .range(0.1..=100.0)
+                                                            .prefix("y "),
+                                                    );
+                                                    ui.add(
+                                                        egui::DragValue::new(&mut scale.z)
+                                                            .speed(0.05)
+                                                            .range(0.1..=100.0)
+                                                            .prefix("z "),
+                                                    );
+                                                });
                                                 ui.add_space(4.0);
                                                 ui.checkbox(controlled, "Controlled (WASD)");
                                             }

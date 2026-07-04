@@ -40,13 +40,20 @@ pub struct World {
 
 #[derive(Serialize, Deserialize, Clone, Copy)]
 pub struct Scale {
-    pub factor: f32,
+    pub x: f32,
+    pub y: f32,
+    pub z: f32,
 }
 
 impl Default for Scale {
     fn default() -> Self {
-        // 1.0 = unsacaled , deriving Default would give 0.0, a zero size
-        Scale { factor: 1.0 }
+        // 1.0 on every axis = unscaled. Deriving Default would give 0.0 — a
+        // zero-size, invisible entity.
+        Scale {
+            x: 1.0,
+            y: 1.0,
+            z: 1.0,
+        }
     }
 }
 
