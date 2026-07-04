@@ -4,13 +4,10 @@ pub use storage::ComponentStorage;
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Script {
-    /// Names a behaviour the runtime knows how to run — e.g. "spinner".
-    /// The engine never looks inside this. It's just an identifier the host's
-    /// script runtime resolves to actual code.
-    pub name: String,
-    // Next step, not now — per-entity parameters a script can read.
-    // BTreeMap, not HashMap, so iteration order is deterministic:
-    // pub vars: std::collections::BTreeMap<String, ScriptValue>,
+    /// The behaviour itself, as source text — not a name pointing at Rust-baked
+    /// code. Because it's data, it serializes with the scene and can be edited
+    /// without recompiling the editor.
+    pub source: String,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy)]

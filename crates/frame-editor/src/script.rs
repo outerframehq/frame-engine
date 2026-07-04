@@ -7,31 +7,21 @@ use frame_engine::world::{Script, ScriptRuntime, World};
 
 pub struct RhaiRuntime {
     engine: rhai::Engine,
-    compiled: HashMap<String, rhai::AST>,
-    // Tick counter, advanced once per tick in begin_tick and exposed to scripts
-    // as `t`. A count, not wall-clock time, so it stays deterministic.
+    // Compile cache, keyed by source text. Compile once, run every tick. Keying
+    // by source means shared scripts compile once and EDITED scripts (new text =
+    // new key) recompile themselves. `None` = a script that failed to compile,
+    // cached so we don't retry it every tick.
+    compiled: HashMap<String, Option<rhai::AST>>,
     time: f64,
 }
 
 impl RhaiRuntime {
     pub fn new() -> Self {
-        let engine = rhai::Engine::new();
-        let mut compiled = HashMap::new();
-
-        // Orbit the origin in the XY plane — shows off position writes plus the
-        // `t` clock. Try swapping in the pulse below to see scale animate too.
-        let orbit = "px = cos(t * 0.08) * 50.0; py = sin(t * 0.08) * 50.0;";
-        // let pulse = "let s = 1.0 + sin(t * 0.1) * 0.5; sx = s; sy = s; sz = s;";
-        compiled.insert(
-            "spinner".to_string(),
-            engine
-                .compile(orbit)
-                .expect("built-in script should compile"),
-        );
-
+        // Nothing is compiled here any more: behaviour is data on the world's
+        // Script components, compiled on first sight in `run` below.
         Self {
-            engine,
-            compiled,
+            engine: rhai::Engine::new(),
+            compiled: HashMap::new(),
             time: 0.0,
         }
     }
@@ -43,12 +33,27 @@ impl ScriptRuntime for RhaiRuntime {
     }
 
     fn run(&mut self, world: &mut World, entity: usize) {
-        let name = match world.scripts.get(entity) {
-            Some(script) => script.name.clone(),
+        // The behaviour is data on the component now: its source text. Clone it
+        // so we aren't borrowing `world` while we mutate it below.
+        let source = match world.scripts.get(entity) {
+            Some(script) => script.source.clone(),
             None => return,
         };
-        let Some(ast) = self.compiled.get(&name) else {
-            return;
+
+        // Compile on first sight, cache by source. A broken script caches as
+        // None (reported once) rather than recompiling every tick.
+        if !self.compiled.contains_key(&source) {
+            let compiled = match self.engine.compile(&source) {
+                Ok(ast) => Some(ast),
+                Err(e) => {
+                    eprintln!("Script failed to compile: {e}");
+                    None
+                }
+            };
+            self.compiled.insert(source.clone(), compiled);
+        }
+        let Some(Some(ast)) = self.compiled.get(&source) else {
+            return; // unknown or known-bad script
         };
 
         // --- Read the entity's state into the scope as script variables ---
