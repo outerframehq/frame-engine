@@ -37,6 +37,7 @@ Editor (frame-editor):
 - Live syntax checking in the Script Editor: the open script is compile-checked and a status line shows the syntax error's line, column, and message, or confirms it parses. (Syntax only — Rhai surfaces unknown-variable and type errors at run time.)
 - Entities render as their chosen primitive (cube, sphere, or plane), and a Mesh dropdown in the Inspector picks the shape per entity.
 - Overlapping entities are tinted red in the viewport, a live view of the engine's collision detection.
+- Scripts can read whether their entity is colliding this tick, via a read-only `hit` variable. Collision detection now runs first in the tick loop so scripts see it deterministically.
 
 ### Changed
 

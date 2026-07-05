@@ -1134,17 +1134,19 @@ impl ApplicationHandler for App {
             WindowEvent::RedrawRequested => {
                 let owed = self.clock.advance(!self.paused);
                 for _ in 0..owed {
+                    // Detection runs first each tick, so a script can read whether
+                    // its entity is colliding *this* tick (via the `hit` variable)
+                    // and react before movement is applied.
+                    systems::collision(&mut self.world);
                     systems::run_scripts(&mut self.world, &mut self.script_runtime);
                     systems::input_movement(&mut self.world, &self.input);
                     systems::movement(&mut self.world);
                 }
-                // Collision is detection-only (a trigger): recompute overlaps
-                // from the current positions every frame — including while paused
-                // and editing — so the red tint below always reflects what's on
-                // screen. Nothing in the sim consumes the result yet, so running
-                // it here rather than inside the tick loop doesn't affect
-                // determinism; it would move into the tick loop once collisions
-                // drive behaviour (a script query, or a response).
+                // Refresh collisions once more for the editor's red tint. Inside
+                // the loop, detection ran at each tick's start (before that tick's
+                // movement); this recomputes it at the final, on-screen positions,
+                // and also keeps the tint live while paused (when the loop above
+                // doesn't run at all) or while dragging entities around.
                 systems::collision(&mut self.world);
                 let colliding: std::collections::HashSet<usize> = self
                     .world

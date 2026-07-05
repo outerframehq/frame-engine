@@ -105,9 +105,16 @@ impl ScriptRuntime for RhaiRuntime {
         };
         let mut scale = world.scales.get(entity).copied().unwrap_or_default();
         let mut color = world.colors.get(entity).copied().unwrap_or_default();
+        // Whether this entity is part of any overlapping pair this tick, from the
+        // engine's collision system (which runs before scripts). Read-only.
+        let hit = world
+            .collisions
+            .iter()
+            .any(|&(a, b)| a == entity || b == entity);
 
         let mut scope = rhai::Scope::new();
         scope.push("t", self.time); // read-only context
+        scope.push("hit", hit); // read-only: colliding with anything this tick
         scope.push("px", px);
         scope.push("py", py);
         scope.push("pz", pz);

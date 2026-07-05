@@ -50,9 +50,10 @@ These are set for you every tick. Read them, write them, or both.
 | `dx` `dy` `dz` | Velocity (per tick)            | read/write | Added to position every tick.      |
 | `sx` `sy` `sz` | Scale (per axis)               | read/write | `1.0` is normal size.              |
 | `cr` `cg` `cb` | Colour (red, green, blue)      | read/write | Each `0.0`–`1.0`.                  |
+| `hit`          | Colliding this tick            | read-only  | `true` if this entity's box overlaps another's. |
 
-Anything you don't set keeps its current value. `t` is read-only — writing to it
-does nothing.
+Anything you don't set keeps its current value. `t` and `hit` are read-only —
+writing to them does nothing.
 
 ## Position vs velocity — the one thing to understand
 
@@ -114,6 +115,21 @@ if pz > 60.0 {
     dz = 0.5;
 }
 ```
+
+**Halt on contact** — stop dead whenever you overlap another entity:
+
+```rust
+if hit {
+    dx = 0.0;
+    dy = 0.0;
+    dz = 0.0;
+}
+```
+
+`hit` is `true` on any tick this entity's box overlaps another's (the editor also
+tints overlapping entities red, so you can see it happening). It's a plain
+detection flag — nothing pushes the entities apart, so what happens next is
+entirely up to your script.
 
 Change any number and watch it update while the simulation plays. The `* 0.08`
 kind of number is speed; the `* 50.0` kind is size or distance.
