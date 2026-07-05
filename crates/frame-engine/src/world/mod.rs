@@ -143,14 +143,19 @@ impl World {
     }
 
     /// Serialize the whole world to a RON file.
-    pub fn save_to_file(&self, path: &str) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn save_to_file(
+        &self,
+        path: impl AsRef<std::path::Path>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let ron = ron::ser::to_string_pretty(self, ron::ser::PrettyConfig::default())?;
         std::fs::write(path, ron)?;
         Ok(())
     }
 
     /// Load a world back from a RON file, replacing whatever was there.
-    pub fn load_from_file(path: &str) -> Result<World, Box<dyn std::error::Error>> {
+    pub fn load_from_file(
+        path: impl AsRef<std::path::Path>,
+    ) -> Result<World, Box<dyn std::error::Error>> {
         let text = std::fs::read_to_string(path)?;
         let world = ron::from_str(&text)?;
         Ok(world)

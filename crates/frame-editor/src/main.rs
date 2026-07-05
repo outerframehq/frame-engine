@@ -762,7 +762,9 @@ enum ConsoleTab {
 /// we dispatch it afterwards — the same lift-then-write-back pattern the
 /// selection and inspector edits use.
 enum MenuAction {
+    OpenScene,
     SaveScene,
+    SaveSceneAs,
     ReloadScene,
     SpawnEntity,
     DespawnSelected,
@@ -1107,6 +1109,9 @@ struct App {
     window: Option<Arc<Window>>,
     gpu: Option<GpuState>,
     world: World,
+    // Where "Save scene" writes and "Reload scene" reads. Set by Open/Save-As
+    // (and defaulted to the startup scene). None means Save prompts for a path.
+    current_scene_path: Option<std::path::PathBuf>,
     paused: bool,
     clock: Clock,
     cam_focus_x: f32,
@@ -1204,19 +1209,68 @@ impl App {
         }
     }
     /// Save the current world to disk.
+    /// Save to the current scene path, or fall back to "Save as…" if there
+    /// isn't one yet.
     fn save_scene(&mut self) {
-        match self.world.save_to_file(SCENE_PATH) {
-            Ok(()) => self.log(format!("Saved scene to {SCENE_PATH}")),
-            Err(e) => self.log(format!("Save failed: {e}")),
+        match self.current_scene_path.clone() {
+            Some(path) => match self.world.save_to_file(&path) {
+                Ok(()) => self.log(format!("Saved scene to {}", path.display())),
+                Err(e) => self.log(format!("Save failed: {e}")),
+            },
+            None => self.save_scene_as(),
         }
     }
-    /// Reload the world from disk, discarding the current one.
+
+    /// Ask for a path with a native file dialog, save there, and remember it as
+    /// the current scene.
+    fn save_scene_as(&mut self) {
+        let picked = rfd::FileDialog::new()
+            .add_filter("Frame scene", &["ron"])
+            .set_file_name("scene.ron")
+            .set_title("Save scene as")
+            .save_file();
+        if let Some(path) = picked {
+            match self.world.save_to_file(&path) {
+                Ok(()) => {
+                    self.log(format!("Saved scene to {}", path.display()));
+                    self.current_scene_path = Some(path);
+                }
+                Err(e) => self.log(format!("Save failed: {e}")),
+            }
+        }
+    }
+
+    /// Ask for a scene file with a native file dialog and load it, replacing the
+    /// current world and making it the current scene.
+    fn open_scene(&mut self) {
+        let picked = rfd::FileDialog::new()
+            .add_filter("Frame scene", &["ron"])
+            .set_title("Open scene")
+            .pick_file();
+        if let Some(path) = picked {
+            match World::load_from_file(&path) {
+                Ok(world) => {
+                    self.world = world;
+                    self.selected = None;
+                    self.log(format!("Opened scene from {}", path.display()));
+                    self.current_scene_path = Some(path);
+                }
+                Err(e) => self.log(format!("Open failed: {e}")),
+            }
+        }
+    }
+
+    /// Reload the world from the current scene path, discarding the current one.
     fn reload_scene(&mut self) {
-        match World::load_from_file(SCENE_PATH) {
+        let Some(path) = self.current_scene_path.clone() else {
+            self.log("No scene to reload — open or save one first".to_string());
+            return;
+        };
+        match World::load_from_file(&path) {
             Ok(world) => {
                 self.world = world;
                 self.selected = None;
-                self.log(format!("Reloaded scene from {SCENE_PATH}"));
+                self.log(format!("Reloaded scene from {}", path.display()));
             }
             Err(e) => self.log(format!("Reload failed: {e}")),
         }
@@ -1691,8 +1745,15 @@ impl ApplicationHandler for App {
                                         ui.separator();
                                     }
                                     ui.menu_button("File", |ui| {
+                                        if ui.button("Open scene…").clicked() {
+                                            menu_action = Some(MenuAction::OpenScene);
+                                        }
+                                        ui.separator();
                                         if ui.button("Save scene").clicked() {
                                             menu_action = Some(MenuAction::SaveScene);
+                                        }
+                                        if ui.button("Save scene as…").clicked() {
+                                            menu_action = Some(MenuAction::SaveSceneAs);
                                         }
                                         if ui.button("Reload scene").clicked() {
                                             menu_action = Some(MenuAction::ReloadScene);
@@ -1839,7 +1900,9 @@ impl ApplicationHandler for App {
                 // statement level (NOT inside the `edited` block above), so it
                 // fires whether or not an entity is selected.
                 match menu_action {
+                    Some(MenuAction::OpenScene) => self.open_scene(),
                     Some(MenuAction::SaveScene) => self.save_scene(),
+                    Some(MenuAction::SaveSceneAs) => self.save_scene_as(),
                     Some(MenuAction::ReloadScene) => self.reload_scene(),
                     Some(MenuAction::SpawnEntity) => self.spawn_at_focus(),
                     Some(MenuAction::DespawnSelected) => self.despawn_selected(),
@@ -1933,6 +1996,9 @@ fn main() {
         window: None,
         gpu: None,
         world,
+        // Default Save/Reload target to the startup scene, so Save works out of
+        // the box; Open and Save-As repoint it.
+        current_scene_path: Some(std::path::PathBuf::from(SCENE_PATH)),
         paused: false,
         clock: Clock::new(TICK_RATE, MAX_CATCHUP_TICKS),
         cam_focus_x: 0.0,
