@@ -1040,6 +1040,15 @@ impl ApplicationHandler for App {
                 let mut new_script_name = std::mem::take(&mut self.new_script_name);
                 let mut script_filter = std::mem::take(&mut self.script_filter);
                 let mut open_script = std::mem::take(&mut self.open_script);
+                // Compile-check the open script once per frame, before the egui
+                // pass (the runtime lives on `self`, which the egui closure can't
+                // borrow). This reflects the source as of frame start; an edit
+                // made this frame shows its result next frame — the same one-frame
+                // path the inspector edits use. None = no script open.
+                let script_status: Option<Result<(), script::ScriptError>> = open_script
+                    .as_ref()
+                    .and_then(|name| script_library.get(name))
+                    .map(|src| self.script_runtime.check(src));
                 // Live entity ids for the Scene list, plus the selected entity's
                 // position/velocity lifted into a local so the egui closure never
                 // touches `self`. Any edits get written back into the world after
@@ -1453,6 +1462,35 @@ impl ApplicationHandler for App {
                                                 }
                                             });
                                             ui.separator();
+                                            // Compile status for the open script. Kept above the
+                                            // editor so it doesn't fight the fill logic below
+                                            // (which measures the height left AFTER this line).
+                                            // Always shown — a steady green line keeps the editor
+                                            // from jumping a row when an error clears. Syntax only:
+                                            // Rhai reports unknown-variable / type errors at run
+                                            // time, not here.
+                                            match &script_status {
+                                                Some(Ok(())) => {
+                                                    ui.colored_label(
+                                                        egui::Color32::from_rgb(0x7c, 0xc5, 0x7c),
+                                                        "No syntax errors",
+                                                    );
+                                                }
+                                                Some(Err(e)) => {
+                                                    let loc = match (e.line, e.column) {
+                                                        (Some(l), Some(c)) => {
+                                                            format!("line {l}, col {c}: ")
+                                                        }
+                                                        (Some(l), None) => format!("line {l}: "),
+                                                        _ => String::new(),
+                                                    };
+                                                    ui.colored_label(
+                                                        egui::Color32::from_rgb(0xe0, 0x6c, 0x6c),
+                                                        format!("{loc}{}", e.message),
+                                                    );
+                                                }
+                                                None => {}
+                                            }
                                             if let Some(source) = script_library.get_mut(&name) {
                                                 // Fill the pane. A TextEdit's height comes from
                                                 // desired_rows, not from any available space, so

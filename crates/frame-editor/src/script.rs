@@ -5,6 +5,16 @@ use std::collections::HashMap;
 
 use frame_engine::world::{Script, ScriptRuntime, World};
 
+/// A compile error from checking a script's source, shaped for the editor to
+/// display: a human-readable message plus the 1-based line and column, if the
+/// parser pinned them down. Only ever produced by `RhaiRuntime::check`.
+#[derive(Clone)]
+pub struct ScriptError {
+    pub line: Option<usize>,
+    pub column: Option<usize>,
+    pub message: String,
+}
+
 pub struct RhaiRuntime {
     engine: rhai::Engine,
     // Compile cache, keyed by source text. Compile once, run every tick. Keying
@@ -23,6 +33,25 @@ impl RhaiRuntime {
             engine: rhai::Engine::new(),
             compiled: HashMap::new(),
             time: 0.0,
+        }
+    }
+
+    /// Compile-check a script's source without running it or touching the run
+    /// cache. `Ok(())` means it parses; `Err` carries the first parse error with
+    /// its position. This catches SYNTAX errors only — Rhai is dynamically
+    /// typed, so an unknown variable or a type mismatch is a *run-time* error and
+    /// won't show here. The editor calls this to give live feedback as you type.
+    pub fn check(&self, source: &str) -> Result<(), ScriptError> {
+        match self.engine.compile(source) {
+            Ok(_) => Ok(()),
+            Err(err) => Err(ScriptError {
+                line: err.position().line(),
+                column: err.position().position(),
+                // err_type() prints the bare message; the position is reported
+                // separately above, so we don't want compile()'s "(line N, ...)"
+                // suffix duplicated here.
+                message: err.err_type().to_string(),
+            }),
         }
     }
 }
