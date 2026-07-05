@@ -2,6 +2,13 @@ mod storage;
 use serde::{Deserialize, Serialize};
 pub use storage::ComponentStorage;
 
+/// The world-space size of an entity at scale 1, in world units. This is a
+/// simulation fact (it's what collision boxes are built from), so it lives in
+/// the engine. The editor's rendering and picking must use the same value:
+/// `QUAD_SIZE` in the editor references this, and `MESH_SIZE` in shader.wgsl
+/// (which can't import Rust) must be kept equal to it by hand.
+pub const ENTITY_SIZE: f32 = 8.0;
+
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Script {
     /// The name of a script in the world's `script_library`. The behaviour
@@ -65,6 +72,11 @@ pub struct World {
     /// VM-free and the library saves and loads with the scene.
     #[serde(default)]
     pub script_library: std::collections::BTreeMap<String, String>,
+    /// Pairs of entity ids whose boxes overlap, as of the last time the
+    /// collision system ran. Transient, derived state — recomputed each run and
+    /// never saved with the scene, so it's skipped by serde and defaults empty.
+    #[serde(skip)]
+    pub collisions: Vec<(usize, usize)>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy)]

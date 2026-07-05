@@ -17,9 +17,10 @@ const TICK_RATE: u32 = 30;
 const MAX_CATCHUP_TICKS: u32 = 5;
 // Vertical field of view, shared by the projection and the pan maths.
 const FOV_DEGREES: f32 = 45.0;
-// Size of each entity cube in world units.
-// NOTE: must match CUBE_SIZE in shader.wgsl (render and pick must agree).
-const QUAD_SIZE: f32 = 8.0;
+// World-space size of an entity, used for picking. Defined once in the engine
+// (it's a simulation fact — collision boxes use it too); we reference it here so
+// pick and collision can't drift. MESH_SIZE in shader.wgsl must match it by hand.
+const QUAD_SIZE: f32 = frame_engine::world::ENTITY_SIZE;
 // How fast middle-drag sweeps the orbit, in radians per pixel.
 const ORBIT_SENS: f32 = 0.005;
 // Format of the depth buffer. 32-bit float depth, no stencil.
@@ -118,7 +119,11 @@ fn sphere_vertices() -> Vec<MeshVertex> {
     const LON: u32 = 18; // segments around
     const RADIUS: f32 = 0.5;
     let point = |theta: f32, phi: f32| -> [f32; 3] {
-        [theta.sin() * phi.cos(), theta.cos(), theta.sin() * phi.sin()]
+        [
+            theta.sin() * phi.cos(),
+            theta.cos(),
+            theta.sin() * phi.sin(),
+        ]
     };
     let vert = |unit: [f32; 3]| MeshVertex {
         position: [unit[0] * RADIUS, unit[1] * RADIUS, unit[2] * RADIUS],
@@ -1133,6 +1138,20 @@ impl ApplicationHandler for App {
                     systems::input_movement(&mut self.world, &self.input);
                     systems::movement(&mut self.world);
                 }
+                // Collision is detection-only (a trigger): recompute overlaps
+                // from the current positions every frame — including while paused
+                // and editing — so the red tint below always reflects what's on
+                // screen. Nothing in the sim consumes the result yet, so running
+                // it here rather than inside the tick loop doesn't affect
+                // determinism; it would move into the tick loop once collisions
+                // drive behaviour (a script query, or a response).
+                systems::collision(&mut self.world);
+                let colliding: std::collections::HashSet<usize> = self
+                    .world
+                    .collisions
+                    .iter()
+                    .flat_map(|&(a, b)| [a, b])
+                    .collect();
                 let selected = self.selected;
                 // Group instances by primitive so the renderer can draw each
                 // shape in one call. Buckets are kept in the engine's Mesh order
@@ -1146,9 +1165,22 @@ impl ApplicationHandler for App {
                     let color = self.world.colors.get(id).copied().unwrap_or_default();
                     let scale = self.world.scales.get(id).copied().unwrap_or_default();
                     let mesh = self.world.meshes.get(id).copied().unwrap_or_default();
+                    // Tint entities that are currently overlapping toward red so a
+                    // collision is obvious at a glance. Purely visual — detection
+                    // changes nothing about the entity's own colour in the world.
+                    let rgb = if colliding.contains(&id) {
+                        const T: f32 = 0.6; // how far toward red
+                        [
+                            color.r * (1.0 - T) + 1.0 * T,
+                            color.g * (1.0 - T) + 0.15 * T,
+                            color.b * (1.0 - T) + 0.15 * T,
+                        ]
+                    } else {
+                        [color.r, color.g, color.b]
+                    };
                     let raw = InstanceRaw {
                         position: [p.x, p.y, p.z],
-                        color: [color.r, color.g, color.b],
+                        color: rgb,
                         selected: if Some(id) == selected { 1.0 } else { 0.0 },
                         scale: [scale.x, scale.y, scale.z],
                     };
@@ -1809,7 +1841,8 @@ impl ApplicationHandler for App {
                 // Push any inspector edits back into the world. The render this
                 // frame already used the old values; the change shows next frame
                 // (same one-frame path as the keyboard nudge).
-                if let Some((id, pos, vel, color, controlled, scale, script_source, mesh)) = edited {
+                if let Some((id, pos, vel, color, controlled, scale, script_source, mesh)) = edited
+                {
                     if let Some(p) = self.world.positions.get_mut(id) {
                         *p = pos;
                     }
