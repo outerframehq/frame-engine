@@ -19,6 +19,8 @@ Engine:
 - A `Scale` component (per-axis size factor, x/y/z), kept in lockstep with the other components and serialized with the scene.
 - A `Script` component that names a shared behaviour, plus a `script_library` on the world (script name to source) so a script's source lives once and every entity that uses it changes together.
 - A `ScriptRuntime` trait (the seam a host implements to run scripts) and a `run_scripts` system. The engine stores script source as data and owns the seam; it interprets nothing itself.
+- A `Mesh` component (Cube, Sphere, or Plane primitive), per-entity appearance data serialized with the scene; defaults to Cube, so older scenes load unchanged.
+- AABB collision detection: an `ENTITY_SIZE` constant and a `collision` system that records overlapping entity-box pairs on the world as triggers — detection only, with no physics response. The boxes are scale-boxes (shape-agnostic), and the result is transient (never saved with the scene).
 
 Editor (frame-editor):
 
@@ -32,6 +34,9 @@ Editor (frame-editor):
 - Entity scripts now run, through a Rhai backend in the editor.
 - A Script Editor tab in the centre area: a sidebar of script names beside one large code editor with a line-number gutter, for writing and editing the shared script library.
 - Assign a script to the selected entity from the Inspector, through a searchable, filterable picker.
+- Live syntax checking in the Script Editor: the open script is compile-checked and a status line shows the syntax error's line, column, and message, or confirms it parses. (Syntax only — Rhai surfaces unknown-variable and type errors at run time.)
+- Entities render as their chosen primitive (cube, sphere, or plane), and a Mesh dropdown in the Inspector picks the shape per entity.
+- Overlapping entities are tinted red in the viewport, a live view of the engine's collision detection.
 
 ### Changed
 
