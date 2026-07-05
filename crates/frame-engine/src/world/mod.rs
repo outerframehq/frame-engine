@@ -34,6 +34,18 @@ pub struct Color {
     pub b: f32,
 }
 
+/// The primitive shape an entity is drawn as. Per-entity appearance data, on the
+/// same footing as `Color` and `Scale`: the engine stores and serializes it but
+/// never draws — the editor turns it into geometry. Defaults to `Cube`, so
+/// scenes saved before meshes existed load and look exactly as they did.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Mesh {
+    #[default]
+    Cube,
+    Sphere,
+    Plane,
+}
+
 #[derive(Serialize, Deserialize, Default)]
 pub struct World {
     pub positions: ComponentStorage<Position>,
@@ -44,6 +56,8 @@ pub struct World {
     pub controlled: ComponentStorage<Controlled>,
     #[serde(default)]
     pub scales: ComponentStorage<Scale>,
+    #[serde(default)]
+    pub meshes: ComponentStorage<Mesh>,
     #[serde(default)]
     pub scripts: ComponentStorage<Script>,
     /// Named, reusable scripts shared across entities. Entities reference these
@@ -99,6 +113,7 @@ impl World {
         self.velocities.insert(id, velocity);
         self.colors.insert(id, Color::default());
         self.scales.insert(id, Scale::default());
+        self.meshes.insert(id, Mesh::default());
         id
     }
 
@@ -110,6 +125,7 @@ impl World {
             self.colors.remove(id);
             self.controlled.remove(id);
             self.scales.remove(id);
+            self.meshes.remove(id);
             self.scripts.remove(id);
         }
     }
