@@ -9,6 +9,12 @@ lands and the patch version bumps for fixes and small additions.
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-07-05
+
+The first release meant to be genuinely usable: you can build a scene, script it,
+watch it collide, arrange the editor to taste, and save what you made. Past a tech
+demo, though still early.
+
 ### Added
 
 Engine:
@@ -38,6 +44,8 @@ Editor (frame-editor):
 - Entities render as their chosen primitive (cube, sphere, or plane), and a Mesh dropdown in the Inspector picks the shape per entity.
 - Overlapping entities are tinted red in the viewport, a live view of the engine's collision detection.
 - Scripts can read whether their entity is colliding this tick, via a read-only `hit` variable. Collision detection now runs first in the tick loop so scripts see it deterministically.
+- Dockable panels (egui_dock): the Viewport, Scene, Inspector, and Script Editor are now tabs that can be dragged, tabbed together, and split apart at runtime. The Viewport is one of them, drawn transparently so the 3D scene shows through, with 3D input routed by the viewport tab's own rect. The toolbar and console stay fixed.
+- Open a scene or save one to a chosen path through a native file dialog (File → Open scene…, Save scene as…), alongside the existing F5/F9 save-and-reload of the current scene.
 
 ### Changed
 
@@ -82,5 +90,6 @@ Editor (frame-editor):
 
 - The editor can crash on window close during GPU teardown. It does not affect editing or saved scenes.
 
-[Unreleased]: https://github.com/outerframehq/frame-engine/compare/0.1.0...HEAD
+[Unreleased]: https://github.com/outerframehq/frame-engine/compare/0.2.0...HEAD
+[0.2.0]: https://github.com/outerframehq/frame-engine/compare/0.1.0...0.2.0
 [0.1.0]: https://github.com/outerframehq/frame-engine/releases/tag/0.1.0
