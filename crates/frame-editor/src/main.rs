@@ -740,15 +740,15 @@ impl GpuState {
     }
 }
 /// Which tab is showing in the right-hand inspector dock.
-#[derive(Clone, Copy, PartialEq)]
+/// A dockable tool panel, shown as a tab in the right-hand egui_dock area. These
+/// can be dragged, tabbed together, and split apart at runtime. The 3D viewport
+/// is deliberately NOT one of these — it stays the fixed background the docks
+/// leave uncovered, so its input routing and transparency are unchanged.
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum Tab {
+    Viewport,
     Scene,
     Inspector,
-}
-/// Which view fills the central area: the 3D viewport, or the script editor.
-#[derive(Clone, Copy, PartialEq)]
-enum CenterTab {
-    Viewport,
     Scripts,
 }
 /// Which tab is showing in the bottom console dock.
@@ -773,6 +773,335 @@ enum MenuAction {
     About,
     Quit,
 }
+/// The selected entity's editable state, lifted out of the world for the
+/// Inspector to edit and written back after the egui pass.
+type EditedEntity = (
+    usize,
+    Position,
+    Velocity,
+    frame_engine::world::Color,
+    bool,
+    frame_engine::world::Scale,
+    Option<String>,
+    Mesh,
+);
+
+/// Scene tab: the entity list.
+fn scene_tab_ui(ui: &mut egui::Ui, entity_ids: &[usize], selection: &mut Option<usize>) {
+    ui.label(format!("{} entities", entity_ids.len()));
+    ui.separator();
+    egui::ScrollArea::vertical()
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            for &id in entity_ids {
+                ui.selectable_value(selection, Some(id), format!("Entity {id}"));
+            }
+        });
+}
+
+/// Inspector tab: the selected entity's properties.
+fn inspector_tab_ui(
+    ui: &mut egui::Ui,
+    edited: &mut Option<EditedEntity>,
+    script_library: &std::collections::BTreeMap<String, String>,
+    script_filter: &mut String,
+) {
+    match edited {
+        Some((id, pos, vel, color, controlled, scale, script_source, mesh)) => {
+            ui.label(format!("Entity {id}"));
+            ui.add_space(4.0);
+            ui.label("Position");
+            ui.horizontal(|ui| {
+                ui.add(egui::DragValue::new(&mut pos.x).speed(1.0).prefix("x "));
+                ui.add(egui::DragValue::new(&mut pos.y).speed(1.0).prefix("y "));
+                ui.add(egui::DragValue::new(&mut pos.z).speed(1.0).prefix("z "));
+            });
+            ui.add_space(4.0);
+            ui.label("Velocity");
+            ui.horizontal(|ui| {
+                ui.add(egui::DragValue::new(&mut vel.dx).speed(0.1).prefix("dx "));
+                ui.add(egui::DragValue::new(&mut vel.dy).speed(0.1).prefix("dy "));
+                ui.add(egui::DragValue::new(&mut vel.dz).speed(0.1).prefix("dz "));
+            });
+            ui.add_space(4.0);
+            ui.label("Color");
+            let mut rgb = [color.r, color.g, color.b];
+            if ui.color_edit_button_rgb(&mut rgb).changed() {
+                color.r = rgb[0];
+                color.g = rgb[1];
+                color.b = rgb[2];
+            }
+            ui.add_space(4.0);
+            ui.label("Scale");
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::DragValue::new(&mut scale.x)
+                        .speed(0.05)
+                        .range(0.1..=100.0)
+                        .prefix("x "),
+                );
+                ui.add(
+                    egui::DragValue::new(&mut scale.y)
+                        .speed(0.05)
+                        .range(0.1..=100.0)
+                        .prefix("y "),
+                );
+                ui.add(
+                    egui::DragValue::new(&mut scale.z)
+                        .speed(0.05)
+                        .range(0.1..=100.0)
+                        .prefix("z "),
+                );
+            });
+            ui.add_space(4.0);
+            ui.label("Mesh");
+            let mesh_label = match *mesh {
+                Mesh::Cube => "Cube",
+                Mesh::Sphere => "Sphere",
+                Mesh::Plane => "Plane",
+            };
+            egui::ComboBox::from_id_salt("mesh_picker")
+                .selected_text(mesh_label)
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(mesh, Mesh::Cube, "Cube");
+                    ui.selectable_value(mesh, Mesh::Sphere, "Sphere");
+                    ui.selectable_value(mesh, Mesh::Plane, "Plane");
+                });
+            ui.add_space(4.0);
+            ui.checkbox(controlled, "Controlled (WASD)");
+            ui.add_space(8.0);
+            ui.label("Script");
+            if script_library.is_empty() {
+                ui.weak("No scripts yet — add some in the Script Editor tab.");
+            } else {
+                let selected_text = script_source
+                    .clone()
+                    .unwrap_or_else(|| "(none)".to_string());
+                egui::ComboBox::from_id_salt("script_picker")
+                    .selected_text(selected_text)
+                    .show_ui(ui, |ui| {
+                        ui.add(egui::TextEdit::singleline(script_filter).hint_text("filter…"));
+                        ui.separator();
+                        ui.selectable_value(script_source, None, "(none)");
+                        let needle = script_filter.to_lowercase();
+                        for name in script_library.keys() {
+                            if needle.is_empty() || name.to_lowercase().contains(&needle) {
+                                ui.selectable_value(
+                                    script_source,
+                                    Some(name.clone()),
+                                    name.as_str(),
+                                );
+                            }
+                        }
+                    });
+                if let Some(name) = script_source.as_ref() {
+                    if !script_library.contains_key(name) {
+                        ui.weak(format!("(uses missing script '{name}')"));
+                    }
+                }
+            }
+        }
+        None => {
+            ui.weak("No entity selected");
+            ui.weak("Click a cube, or pick one in Scene.");
+        }
+    }
+}
+
+/// Script Editor tab: a script name list above one code editor. Laid out
+/// vertically (rather than a left sidebar) so it reads well in a docked column.
+fn scripts_tab_ui(
+    ui: &mut egui::Ui,
+    script_library: &mut std::collections::BTreeMap<String, String>,
+    new_script_name: &mut String,
+    open_script: &mut Option<String>,
+    script_status: &Option<Result<(), script::ScriptError>>,
+) {
+    let mut delete: Option<String> = None;
+    // LEFT: the script list and the "new script" box, in a resizable sidebar.
+    egui::Panel::left("script_list")
+        .resizable(true)
+        .default_size(200.0)
+        .show(ui, |ui| {
+            ui.label("Scripts");
+            ui.separator();
+            ui.add(
+                egui::TextEdit::singleline(new_script_name)
+                    .hint_text("new script name")
+                    .desired_width(f32::INFINITY),
+            );
+            if ui.button("Add").clicked() {
+                let key = new_script_name.trim().to_string();
+                if !key.is_empty() {
+                    script_library.entry(key.clone()).or_default();
+                    *open_script = Some(key);
+                    new_script_name.clear();
+                }
+            }
+            ui.separator();
+            egui::ScrollArea::vertical()
+                .id_salt("script_name_list")
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    if script_library.is_empty() {
+                        ui.weak("No scripts yet.");
+                    }
+                    for name in script_library.keys() {
+                        ui.selectable_value(open_script, Some(name.clone()), name.as_str());
+                    }
+                });
+        });
+    // RIGHT: the editor for the open script fills the space the sidebar leaves.
+    let open = open_script
+        .as_ref()
+        .filter(|n| script_library.contains_key(*n))
+        .cloned();
+    match open {
+        Some(name) => {
+            ui.horizontal(|ui| {
+                ui.strong(&name);
+                if ui.small_button("Delete").clicked() {
+                    delete = Some(name.clone());
+                }
+            });
+            match script_status {
+                Some(Ok(())) => {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(0x7c, 0xc5, 0x7c),
+                        "No syntax errors",
+                    );
+                }
+                Some(Err(e)) => {
+                    let loc = match (e.line, e.column) {
+                        (Some(l), Some(c)) => format!("line {l}, col {c}: "),
+                        (Some(l), None) => format!("line {l}: "),
+                        _ => String::new(),
+                    };
+                    ui.colored_label(
+                        egui::Color32::from_rgb(0xe0, 0x6c, 0x6c),
+                        format!("{loc}{}", e.message),
+                    );
+                }
+                None => {}
+            }
+            if let Some(source) = script_library.get_mut(&name) {
+                let row_h = ui.text_style_height(&egui::TextStyle::Monospace);
+                let rows = ((ui.available_height() / row_h).floor() - 1.0).max(3.0) as usize;
+                let line_count = source.matches('\n').count() + 1;
+                let digits = line_count.to_string().len();
+                let gutter: String = (1..=line_count)
+                    .map(|n| format!("{n:>digits$}"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                egui::ScrollArea::vertical()
+                    .id_salt("script_editor")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.horizontal_top(|ui| {
+                            ui.vertical(|ui| {
+                                ui.add_space(2.0);
+                                ui.add(egui::Label::new(
+                                    egui::RichText::new(&gutter).monospace().weak(),
+                                ));
+                            });
+                            ui.add(
+                                egui::TextEdit::multiline(source)
+                                    .code_editor()
+                                    .desired_rows(rows)
+                                    .desired_width(f32::INFINITY),
+                            );
+                        });
+                    });
+            }
+        }
+        None => {
+            ui.weak("Select a script on the left, or add one to begin.");
+        }
+    }
+    if let Some(name) = delete {
+        script_library.remove(&name);
+        if open_script.as_ref() == Some(&name) {
+            *open_script = None;
+        }
+    }
+}
+
+/// Owns the transient per-frame state the dockable tabs read and write, so
+/// egui_dock's `TabViewer::ui` can reach it. Built fresh from the world each
+/// frame and drained back into the world afterwards.
+struct EditorTabViewer {
+    entity_ids: Vec<usize>,
+    selection: Option<usize>,
+    edited: Option<EditedEntity>,
+    script_library: std::collections::BTreeMap<String, String>,
+    new_script_name: String,
+    script_filter: String,
+    open_script: Option<String>,
+    script_status: Option<Result<(), script::ScriptError>>,
+    // Set by the Viewport tab each frame to its transparent body rect (egui
+    // points). `None` when the Viewport tab isn't visible. Used to route 3D
+    // input: clicks/drags land on the viewport only when the cursor is here.
+    viewport_rect: Option<egui::Rect>,
+}
+
+impl egui_dock::TabViewer for EditorTabViewer {
+    type Tab = Tab;
+
+    fn title(&mut self, tab: &mut Self::Tab) -> egui::WidgetText {
+        match tab {
+            Tab::Viewport => "Viewport",
+            Tab::Scene => "Scene",
+            Tab::Inspector => "Inspector",
+            Tab::Scripts => "Script Editor",
+        }
+        .into()
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, tab: &mut Self::Tab) {
+        match tab {
+            // The viewport draws nothing itself — the 3D scene is rendered behind
+            // egui and shows through this tab's transparent body. We only record
+            // the body rect so window_event can route 3D input to it.
+            Tab::Viewport => {
+                self.viewport_rect = Some(ui.max_rect());
+            }
+            Tab::Scene => scene_tab_ui(ui, &self.entity_ids, &mut self.selection),
+            Tab::Inspector => inspector_tab_ui(
+                ui,
+                &mut self.edited,
+                &self.script_library,
+                &mut self.script_filter,
+            ),
+            Tab::Scripts => scripts_tab_ui(
+                ui,
+                &mut self.script_library,
+                &mut self.new_script_name,
+                &mut self.open_script,
+                &self.script_status,
+            ),
+        }
+    }
+
+    /// These tool panels are always present; don't offer a close button.
+    fn is_closeable(&self, _tab: &Self::Tab) -> bool {
+        false
+    }
+
+    /// Leave the Viewport tab's body unpainted so the 3D scene behind egui shows
+    /// through it. Every other tab clears its background normally.
+    fn clear_background(&self, tab: &Self::Tab) -> bool {
+        !matches!(tab, Tab::Viewport)
+    }
+
+    /// No scroll bars over the viewport — it's a fixed window onto the 3D scene.
+    fn scroll_bars(&self, tab: &Self::Tab) -> [bool; 2] {
+        match tab {
+            Tab::Viewport => [false, false],
+            _ => [true, true],
+        }
+    }
+}
+
 struct App {
     script_runtime: script::RhaiRuntime,
     window: Option<Arc<Window>>,
@@ -792,10 +1121,13 @@ struct App {
     show_help: bool,
     egui_ctx: egui::Context,
     egui_state: Option<egui_winit::State>,
-    // Active tab in the right-hand inspector dock.
-    current_tab: Tab,
-    // Which view fills the central area (viewport or script editor).
-    center_tab: CenterTab,
+    // The layout of the dockable panels (Viewport, Scene, Inspector, Scripts).
+    // egui_dock owns the arrangement and which tab is active; we just persist it.
+    dock_state: egui_dock::DockState<Tab>,
+    // The Viewport tab's on-screen rect (egui points) from last frame, or None if
+    // it wasn't visible. window_event routes 3D input by this instead of by
+    // is_pointer_over_egui, which would read true over the viewport tab.
+    viewport_rect: Option<egui::Rect>,
     // Active tab in the bottom console dock.
     console_tab: ConsoleTab,
     // Lines shown in the console Output tab (also echoed to the terminal).
@@ -1000,12 +1332,20 @@ impl ApplicationHandler for App {
         if let (Some(state), Some(window)) = (self.egui_state.as_mut(), self.window.as_ref()) {
             let _ = state.on_window_event(window, &event);
         }
-        // Is the cursor over an egui panel? Because we now drive egui through
-        // run_ui — which establishes the root available-rect — egui's own test
-        // works: true over the toolbar/inspector, false over the 3D viewport.
-        // Press and release are judged identically (by location), so drag/orbit
-        // state can never get stuck.
-        let pointer_over_ui = self.egui_ctx.is_pointer_over_egui();
+        // The viewport is now an egui_dock tab, so is_pointer_over_egui() reads
+        // true over it and would kill 3D input. Instead we route 3D input by the
+        // viewport tab's own body rect: allow picking/orbit/zoom only when the
+        // cursor is inside it. viewport_rect is in egui points; the winit cursor
+        // is in physical pixels, so divide by pixels_per_point to compare. None
+        // (viewport tab hidden behind another tab) means no 3D input.
+        let over_viewport = self.viewport_rect.is_some_and(|r| {
+            let ppp = self.egui_ctx.pixels_per_point();
+            let p = egui::pos2(
+                self.last_cursor.0 as f32 / ppp,
+                self.last_cursor.1 as f32 / ppp,
+            );
+            r.contains(p)
+        });
         let ui_wants_keys = self.egui_ctx.egui_wants_keyboard_input();
         match event {
             WindowEvent::CloseRequested => {
@@ -1017,7 +1357,7 @@ impl ApplicationHandler for App {
                     gpu.resize(size.width, size.height);
                 }
             }
-            WindowEvent::MouseInput { state, button, .. } if !pointer_over_ui => {
+            WindowEvent::MouseInput { state, button, .. } if over_viewport => {
                 let pressed = state == ElementState::Pressed;
                 match button {
                     MouseButton::Left => {
@@ -1055,7 +1395,7 @@ impl ApplicationHandler for App {
                 }
                 self.last_cursor = (position.x, position.y);
             }
-            WindowEvent::MouseWheel { delta, .. } if !pointer_over_ui => {
+            WindowEvent::MouseWheel { delta, .. } if over_viewport => {
                 let scroll = match delta {
                     MouseScrollDelta::LineDelta(_, y) => y,
                     MouseScrollDelta::PixelDelta(pos) => pos.y as f32,
@@ -1259,14 +1599,12 @@ impl ApplicationHandler for App {
                 // tabs/content are still a mockup wired to nothing but text and
                 // the live log. We move state in/out via locals so the closure
                 // never has to borrow `self`.
-                let mut tab = self.current_tab;
-                let mut center_tab = self.center_tab;
                 let mut console_tab = self.console_tab;
                 let log_lines = std::mem::take(&mut self.log_lines);
-                let mut script_library = std::mem::take(&mut self.world.script_library);
-                let mut new_script_name = std::mem::take(&mut self.new_script_name);
-                let mut script_filter = std::mem::take(&mut self.script_filter);
-                let mut open_script = std::mem::take(&mut self.open_script);
+                let script_library = std::mem::take(&mut self.world.script_library);
+                let new_script_name = std::mem::take(&mut self.new_script_name);
+                let script_filter = std::mem::take(&mut self.script_filter);
+                let open_script = std::mem::take(&mut self.open_script);
                 // Compile-check the open script once per frame, before the egui
                 // pass (the runtime lives on `self`, which the egui closure can't
                 // borrow). This reflects the source as of frame start; an edit
@@ -1287,8 +1625,8 @@ impl ApplicationHandler for App {
                     .enumerate()
                     .filter_map(|(i, slot)| slot.as_ref().map(|_| i))
                     .collect();
-                let mut new_selection = self.selected;
-                let mut edited = self.selected.and_then(|id| {
+                let new_selection = self.selected;
+                let edited = self.selected.and_then(|id| {
                     Some((
                         id,
                         *self.world.positions.get(id)?,
@@ -1319,14 +1657,29 @@ impl ApplicationHandler for App {
                 let logo = self.logo_texture.clone();
                 let paused = self.paused;
                 let mut menu_action: Option<MenuAction> = None;
-                let (egui_paint_jobs, egui_textures_delta, egui_ppp) = if let (
-                    Some(state),
-                    Some(window),
-                ) =
-                    (self.egui_state.as_mut(), self.window.as_ref())
-                {
-                    let raw_input = state.take_egui_input(window);
-                    let full_output = self.egui_ctx.run_ui(raw_input, |ui| {
+                // Move the dock's per-frame state into the viewer, and lift the
+                // dock layout off `self` (swapping in a throwaway) so the egui
+                // closure can borrow neither. Both are drained back afterwards.
+                let mut dock_state =
+                    std::mem::replace(&mut self.dock_state, egui_dock::DockState::new(Vec::new()));
+                let mut viewer = EditorTabViewer {
+                    entity_ids,
+                    selection: new_selection,
+                    edited,
+                    script_library,
+                    new_script_name,
+                    script_filter,
+                    open_script,
+                    script_status,
+                    // Reset each frame; the Viewport tab sets it if it's visible.
+                    viewport_rect: None,
+                };
+                let (egui_paint_jobs, egui_textures_delta, egui_ppp) =
+                    if let (Some(state), Some(window)) =
+                        (self.egui_state.as_mut(), self.window.as_ref())
+                    {
+                        let raw_input = state.take_egui_input(window);
+                        let full_output = self.egui_ctx.run_ui(raw_input, |ui| {
                             // Top toolbar strip — fixed height, placeholder menu.
                             egui::Panel::top("toolbar").resizable(false).show(ui, |ui| {
                                 ui.horizontal(|ui| {
@@ -1422,424 +1775,37 @@ impl ApplicationHandler for App {
                                 });
                             // Right inspector dock — Scene / Inspector tabs.
                             // Drag its left edge to resize.
-                            egui::Panel::right("inspector")
-                                .resizable(true)
-                                .default_size(260.0)
+                            // The dock fills the whole central area (below the
+                            // toolbar, above the console). Frame::NONE keeps it
+                            // from painting a background, so the Viewport tab —
+                            // whose body we leave unpainted — shows the 3D scene
+                            // rendered behind egui. This lets the Script Editor
+                            // tab take over the centre, full-width.
+                            egui::CentralPanel::default()
+                                .frame(egui::Frame::NONE)
                                 .show(ui, |ui| {
-                                    ui.horizontal(|ui| {
-                                        ui.selectable_value(&mut tab, Tab::Scene, "Scene");
-                                        ui.selectable_value(&mut tab, Tab::Inspector, "Inspector");
-                                    });
-                                    ui.separator();
-                                    match tab {
-                                        Tab::Scene => {
-                                            ui.label(format!("{} entities", entity_ids.len()));
-                                            ui.separator();
-                                            egui::ScrollArea::vertical()
-                                                .auto_shrink([false, false])
-                                                .show(ui, |ui| {
-                                                    for &id in &entity_ids {
-                                                        ui.selectable_value(
-                                                            &mut new_selection,
-                                                            Some(id),
-                                                            format!("Entity {id}"),
-                                                        );
-                                                    }
-                                                });
-                                        }
-                                        Tab::Inspector => match &mut edited {
-                                            Some((
-                                                id,
-                                                pos,
-                                                vel,
-                                                color,
-                                                controlled,
-                                                scale,
-                                                script_source,
-                                                mesh,
-                                            )) => {
-                                                ui.label(format!("Entity {id}"));
-                                                ui.add_space(4.0);
-                                                ui.label("Position");
-                                                ui.horizontal(|ui| {
-                                                    ui.add(
-                                                        egui::DragValue::new(&mut pos.x)
-                                                            .speed(1.0)
-                                                            .prefix("x "),
-                                                    );
-                                                    ui.add(
-                                                        egui::DragValue::new(&mut pos.y)
-                                                            .speed(1.0)
-                                                            .prefix("y "),
-                                                    );
-                                                    ui.add(
-                                                        egui::DragValue::new(&mut pos.z)
-                                                            .speed(1.0)
-                                                            .prefix("z "),
-                                                    );
-                                                });
-                                                ui.add_space(4.0);
-                                                ui.label("Velocity");
-                                                ui.horizontal(|ui| {
-                                                    ui.add(
-                                                        egui::DragValue::new(&mut vel.dx)
-                                                            .speed(0.1)
-                                                            .prefix("dx "),
-                                                    );
-                                                    ui.add(
-                                                        egui::DragValue::new(&mut vel.dy)
-                                                            .speed(0.1)
-                                                            .prefix("dy "),
-                                                    );
-                                                    ui.add(
-                                                        egui::DragValue::new(&mut vel.dz)
-                                                            .speed(0.1)
-                                                            .prefix("dz "),
-                                                    );
-                                                });
-                                                ui.add_space(4.0);
-                                                ui.label("Color");
-                                                // The widget wants a [f32; 3]; copy in, let the user
-                                                // edit, copy back into Color only when it changed.
-                                                let mut rgb = [color.r, color.g, color.b];
-                                                if ui.color_edit_button_rgb(&mut rgb).changed() {
-                                                    color.r = rgb[0];
-                                                    color.g = rgb[1];
-                                                    color.b = rgb[2];
-                                                }
-                                                ui.add_space(4.0);
-                                                ui.label("Scale");
-                                                ui.horizontal(|ui| {
-                                                    ui.add(
-                                                        egui::DragValue::new(&mut scale.x)
-                                                            .speed(0.05)
-                                                            .range(0.1..=100.0)
-                                                            .prefix("x "),
-                                                    );
-                                                    ui.add(
-                                                        egui::DragValue::new(&mut scale.y)
-                                                            .speed(0.05)
-                                                            .range(0.1..=100.0)
-                                                            .prefix("y "),
-                                                    );
-                                                    ui.add(
-                                                        egui::DragValue::new(&mut scale.z)
-                                                            .speed(0.05)
-                                                            .range(0.1..=100.0)
-                                                            .prefix("z "),
-                                                    );
-                                                });
-                                                ui.add_space(4.0);
-                                                ui.label("Mesh");
-                                                // The primitive shape this entity draws as. Copy the
-                                                // current value out for the button label so the
-                                                // combo closure can borrow `mesh` mutably below.
-                                                let mesh_label = match *mesh {
-                                                    Mesh::Cube => "Cube",
-                                                    Mesh::Sphere => "Sphere",
-                                                    Mesh::Plane => "Plane",
-                                                };
-                                                egui::ComboBox::from_id_salt("mesh_picker")
-                                                    .selected_text(mesh_label)
-                                                    .show_ui(ui, |ui| {
-                                                        ui.selectable_value(
-                                                            mesh,
-                                                            Mesh::Cube,
-                                                            "Cube",
-                                                        );
-                                                        ui.selectable_value(
-                                                            mesh,
-                                                            Mesh::Sphere,
-                                                            "Sphere",
-                                                        );
-                                                        ui.selectable_value(
-                                                            mesh,
-                                                            Mesh::Plane,
-                                                            "Plane",
-                                                        );
-                                                    });
-                                                ui.add_space(4.0);
-                                                ui.checkbox(controlled, "Controlled (WASD)");
-                                                ui.add_space(8.0);
-                                                ui.label("Script");
-                                                // `script_source` is the NAME of a library script
-                                                // this entity uses (or None). The source itself is
-                                                // edited once in the Script Editor tab, shared by
-                                                // every entity that references it.
-                                                if script_library.is_empty() {
-                                                    ui.weak(
-                                                    "No scripts yet — add some in the Script Editor tab.",
-                                                );
-                                                } else {
-                                                    // Godot-style "attach script" picker. The
-                                                    // dropdown carries a filter box and shows only
-                                                    // the names containing it (case-insensitive
-                                                    // substring), so it stays usable with hundreds
-                                                    // or thousands of scripts — unlike a flat list.
-                                                    // Clone the current name for the button label so
-                                                    // we don't hold a borrow of `script_source` into
-                                                    // the closure that also writes to it.
-                                                    let selected_text = script_source
-                                                        .clone()
-                                                        .unwrap_or_else(|| "(none)".to_string());
-                                                    egui::ComboBox::from_id_salt("script_picker")
-                                                        .selected_text(selected_text)
-                                                        .show_ui(ui, |ui| {
-                                                            ui.add(
-                                                                egui::TextEdit::singleline(
-                                                                    &mut script_filter,
-                                                                )
-                                                                .hint_text("filter…"),
-                                                            );
-                                                            ui.separator();
-                                                            // "(none)" ignores the filter so you
-                                                            // can always detach the script.
-                                                            ui.selectable_value(
-                                                                script_source,
-                                                                None,
-                                                                "(none)",
-                                                            );
-                                                            let needle =
-                                                                script_filter.to_lowercase();
-                                                            for name in script_library.keys() {
-                                                                if needle.is_empty()
-                                                                    || name
-                                                                        .to_lowercase()
-                                                                        .contains(&needle)
-                                                                {
-                                                                    ui.selectable_value(
-                                                                        script_source,
-                                                                        Some(name.clone()),
-                                                                        name.as_str(),
-                                                                    );
-                                                                }
-                                                            }
-                                                        });
-                                                    // Flag a reference to a script that was deleted.
-                                                    if let Some(name) = script_source.as_ref() {
-                                                        if !script_library.contains_key(name) {
-                                                            ui.weak(format!(
-                                                                "(uses missing script '{name}')"
-                                                            ));
-                                                        }
-                                                    }
-                                                }
-                                            }
-                                            None => {
-                                                ui.weak("No entity selected");
-                                                ui.weak("Click a cube, or pick one in Scene.");
-                                            }
-                                        },
-                                    }
+                                    egui_dock::DockArea::new(&mut dock_state)
+                                        .show_inside(ui, &mut viewer);
                                 });
-                            // Central area: a tab strip (Viewport | Script Editor),
-                            // then, on the Script tab, an opaque panel that fills the
-                            // gap the docks leave. On the Viewport tab we draw nothing
-                            // here, so the 3D scene shows through as before.
-                            egui::Panel::top("center_tabs")
-                                .resizable(false)
-                                .show(ui, |ui| {
-                                    ui.horizontal(|ui| {
-                                        ui.selectable_value(
-                                            &mut center_tab,
-                                            CenterTab::Viewport,
-                                            "Viewport",
-                                        );
-                                        ui.selectable_value(
-                                            &mut center_tab,
-                                            CenterTab::Scripts,
-                                            "Script Editor",
-                                        );
-                                    });
-                                });
-                            if center_tab == CenterTab::Scripts {
-                                // Staged deletion: we can't remove from the map while a
-                                // panel closure is borrowing it, so a Delete click just
-                                // records the name; we apply it after both panels close.
-                                let mut delete: Option<String> = None;
-                                // LEFT: the script list — names only — plus the "add" box.
-                                // Clicking a name opens it in the centre editor. This is
-                                // what makes the editor scale: one open script at a time,
-                                // not every script stacked with its own code box.
-                                egui::Panel::left("script_list")
-                                    .resizable(true)
-                                    .default_size(180.0)
-                                    .show(ui, |ui| {
-                                        ui.label("Scripts");
-                                        ui.separator();
-                                        ui.add(
-                                            egui::TextEdit::singleline(&mut new_script_name)
-                                                .hint_text("new script name")
-                                                .desired_width(f32::INFINITY),
-                                        );
-                                        if ui.button("Add").clicked() {
-                                            let key = new_script_name.trim().to_string();
-                                            if !key.is_empty() {
-                                                // entry(..).or_default() inserts an empty
-                                                // String for a new name, or leaves an
-                                                // existing script untouched. Open it so the
-                                                // centre editor jumps straight to it.
-                                                script_library.entry(key.clone()).or_default();
-                                                open_script = Some(key);
-                                                new_script_name.clear();
-                                            }
-                                        }
-                                        ui.separator();
-                                        egui::ScrollArea::vertical()
-                                            .auto_shrink([false, false])
-                                            .show(ui, |ui| {
-                                                if script_library.is_empty() {
-                                                    ui.weak("No scripts yet.");
-                                                }
-                                                for name in script_library.keys() {
-                                                    ui.selectable_value(
-                                                        &mut open_script,
-                                                        Some(name.clone()),
-                                                        name.as_str(),
-                                                    );
-                                                }
-                                            });
-                                    });
-                                // CENTRE: one big code editor for the open script. Fills the
-                                // gap the docks leave; on the Viewport tab this whole block
-                                // is skipped, so the 3D scene shows through instead.
-                                egui::CentralPanel::default().show(ui, |ui| {
-                                    // Only edit a name that still exists — a stale
-                                    // open_script (e.g. after a delete) falls through to
-                                    // the empty state below.
-                                    let open = open_script
-                                        .as_ref()
-                                        .filter(|n| script_library.contains_key(*n))
-                                        .cloned();
-                                    match open {
-                                        Some(name) => {
-                                            ui.horizontal(|ui| {
-                                                ui.strong(&name);
-                                                if ui.small_button("Delete").clicked() {
-                                                    delete = Some(name.clone());
-                                                }
-                                            });
-                                            ui.separator();
-                                            // Compile status for the open script. Kept above the
-                                            // editor so it doesn't fight the fill logic below
-                                            // (which measures the height left AFTER this line).
-                                            // Always shown — a steady green line keeps the editor
-                                            // from jumping a row when an error clears. Syntax only:
-                                            // Rhai reports unknown-variable / type errors at run
-                                            // time, not here.
-                                            match &script_status {
-                                                Some(Ok(())) => {
-                                                    ui.colored_label(
-                                                        egui::Color32::from_rgb(0x7c, 0xc5, 0x7c),
-                                                        "No syntax errors",
-                                                    );
-                                                }
-                                                Some(Err(e)) => {
-                                                    let loc = match (e.line, e.column) {
-                                                        (Some(l), Some(c)) => {
-                                                            format!("line {l}, col {c}: ")
-                                                        }
-                                                        (Some(l), None) => format!("line {l}: "),
-                                                        _ => String::new(),
-                                                    };
-                                                    ui.colored_label(
-                                                        egui::Color32::from_rgb(0xe0, 0x6c, 0x6c),
-                                                        format!("{loc}{}", e.message),
-                                                    );
-                                                }
-                                                None => {}
-                                            }
-                                            if let Some(source) = script_library.get_mut(&name) {
-                                                // Fill the pane. A TextEdit's height comes from
-                                                // desired_rows, not from any available space, so
-                                                // to fill we compute how many rows fit the
-                                                // remaining height. Measured HERE, before the
-                                                // scroll area — inside it, available_height is the
-                                                // unbounded content height, not the viewport.
-                                                // We shave a row so the editor's frame margin
-                                                // doesn't tip the scroll area into showing a
-                                                // scrollbar when the script is short; a longer
-                                                // script grows past this and the scroll area then
-                                                // does its job.
-                                                let row_h = ui
-                                                    .text_style_height(&egui::TextStyle::Monospace);
-                                                let rows = ((ui.available_height() / row_h).floor()
-                                                    - 1.0)
-                                                    .max(3.0)
-                                                    as usize;
-                                                // Line-number gutter: one right-justified number
-                                                // per logical line (newline count + 1). Built as a
-                                                // plain monospace string so its rows line up with
-                                                // the editor's, which shares the Monospace style.
-                                                // NOTE: a very long line that soft-wraps in the
-                                                // editor still gets one number here, so the gutter
-                                                // drifts below a wrapped line — fine for now, since
-                                                // script lines are short; revisit with no-wrap +
-                                                // horizontal scroll if it ever bites.
-                                                let line_count =
-                                                    source.matches('\n').count() + 1;
-                                                let digits = line_count.to_string().len();
-                                                let gutter: String = (1..=line_count)
-                                                    .map(|n| format!("{n:>digits$}"))
-                                                    .collect::<Vec<_>>()
-                                                    .join("\n");
-                                                egui::ScrollArea::vertical()
-                                                    .auto_shrink([false, false])
-                                                    .show(ui, |ui| {
-                                                        ui.horizontal_top(|ui| {
-                                                            // Gutter, nudged down 2px to match the
-                                                            // editor's top margin (Margin y = 2).
-                                                            ui.vertical(|ui| {
-                                                                ui.add_space(2.0);
-                                                                ui.add(egui::Label::new(
-                                                                    egui::RichText::new(&gutter)
-                                                                        .monospace()
-                                                                        .weak(),
-                                                                ));
-                                                            });
-                                                            ui.add(
-                                                                egui::TextEdit::multiline(source)
-                                                                    .code_editor()
-                                                                    .desired_rows(rows)
-                                                                    .desired_width(f32::INFINITY),
-                                                            );
-                                                        });
-                                                    });
-                                            }
-                                        }
-                                        None => {
-                                            ui.weak(
-                                                "Select a script on the left, or add one to begin.",
-                                            );
-                                        }
-                                    }
-                                });
-                                // Apply a staged deletion now that no panel borrows the map.
-                                // If the open script was the one deleted, close the editor.
-                                if let Some(name) = delete {
-                                    script_library.remove(&name);
-                                    if open_script.as_ref() == Some(&name) {
-                                        open_script = None;
-                                    }
-                                }
-                            }
                         });
-                    state.handle_platform_output(window, full_output.platform_output);
-                    let ppp = full_output.pixels_per_point;
-                    let jobs = self.egui_ctx.tessellate(full_output.shapes, ppp);
-                    (jobs, full_output.textures_delta, ppp)
-                } else {
-                    (Vec::new(), egui::TexturesDelta::default(), 1.0)
-                };
-                self.current_tab = tab;
-                self.center_tab = center_tab;
+                        state.handle_platform_output(window, full_output.platform_output);
+                        let ppp = full_output.pixels_per_point;
+                        let jobs = self.egui_ctx.tessellate(full_output.shapes, ppp);
+                        (jobs, full_output.textures_delta, ppp)
+                    } else {
+                        (Vec::new(), egui::TexturesDelta::default(), 1.0)
+                    };
                 self.console_tab = console_tab;
                 self.log_lines = log_lines;
-                self.world.script_library = script_library;
-                self.new_script_name = new_script_name;
-                self.script_filter = script_filter;
-                self.open_script = open_script;
-                self.selected = new_selection;
+                // Drain the dock layout and the tabs' state back onto self.
+                self.dock_state = dock_state;
+                self.viewport_rect = viewer.viewport_rect;
+                self.world.script_library = viewer.script_library;
+                self.new_script_name = viewer.new_script_name;
+                self.script_filter = viewer.script_filter;
+                self.open_script = viewer.open_script;
+                self.selected = viewer.selection;
+                let edited = viewer.edited;
                 // Push any inspector edits back into the world. The render this
                 // frame already used the old values; the change shows next frame
                 // (same one-frame path as the keyboard nudge).
@@ -1983,8 +1949,20 @@ fn main() {
         show_help: true,
         egui_ctx: egui::Context::default(),
         egui_state: None,
-        current_tab: Tab::Scene,
-        center_tab: CenterTab::Viewport,
+        // Default layout mirrors the old editor: the Viewport and Script Editor
+        // are tabs filling the centre (click Script Editor to edit full-width
+        // over the viewport), with Scene and Inspector docked on the right. All
+        // of it is draggable, tabbable, and splittable at runtime.
+        dock_state: {
+            let mut state = egui_dock::DockState::new(vec![Tab::Viewport, Tab::Scripts]);
+            state.main_surface_mut().split_right(
+                egui_dock::NodeIndex::root(),
+                0.78,
+                vec![Tab::Scene, Tab::Inspector],
+            );
+            state
+        },
+        viewport_rect: None,
         console_tab: ConsoleTab::Output,
         log_lines: vec!["Frame Editor started.".to_string()],
         input: InputState::new(),
