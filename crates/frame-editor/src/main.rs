@@ -2,7 +2,7 @@ const LOGO_PNG: &[u8] = include_bytes!("../assets/frame-editor.png");
 use frame_engine::core::Clock;
 use frame_engine::input::{Button, InputState};
 use frame_engine::systems;
-use frame_engine::world::{Controlled, Position, Script, Velocity, World};
+use frame_engine::world::{Controlled, Mesh, Position, Script, Velocity, World};
 use glam::{Mat4, Vec3, Vec4};
 use std::sync::Arc;
 use wgpu::util::DeviceExt;
@@ -35,17 +35,17 @@ const EDIT_STEP: f32 = 5.0;
 struct CameraUniform {
     view_proj: [[f32; 4]; 4],
 }
-// Per-entity instance data: world position plus a selected flag (0 or 1).
+// Per-vertex mesh geometry: a position in the primitive's local (roughly unit)
+// space and its surface normal. One shared vertex buffer holds every primitive's
+// vertices back to back; each entity instance picks which slice to draw.
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
-struct InstanceRaw {
+struct MeshVertex {
     position: [f32; 3],
-    color: [f32; 3],
-    selected: f32,
-    scale: [f32; 3],
+    normal: [f32; 3],
 }
-impl InstanceRaw {
-    const ATTRIBS: [wgpu::VertexAttribute; 4] = [
+impl MeshVertex {
+    const ATTRIBS: [wgpu::VertexAttribute; 2] = [
         wgpu::VertexAttribute {
             format: wgpu::VertexFormat::Float32x3,
             offset: 0,
@@ -56,15 +56,148 @@ impl InstanceRaw {
             offset: std::mem::size_of::<[f32; 3]>() as wgpu::BufferAddress, // 12
             shader_location: 1,
         },
+    ];
+    fn layout() -> wgpu::VertexBufferLayout<'static> {
+        wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<MeshVertex>() as wgpu::BufferAddress,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &Self::ATTRIBS,
+        }
+    }
+}
+
+// --- Primitive geometry, generated once on the CPU ---
+// Each primitive is built at roughly unit size (half-extent 0.5 / radius 0.5),
+// centred on the origin, so the shader scales them all by the same MESH_SIZE and
+// a default entity comes out exactly the size the cube always was. These are
+// ordered to match the engine's `Mesh` enum: Cube, Sphere, Plane.
+
+// A unit cube: 36 vertices (6 faces x 2 triangles), each face flat-shaded with
+// one outward normal. This reproduces the cube the shader used to synthesise, so
+// existing scenes look identical.
+fn cube_vertices() -> Vec<MeshVertex> {
+    // 8 corners of a cube with half-extent 0.5.
+    const C: [[f32; 3]; 8] = [
+        [-0.5, -0.5, -0.5],
+        [0.5, -0.5, -0.5],
+        [0.5, 0.5, -0.5],
+        [-0.5, 0.5, -0.5],
+        [-0.5, -0.5, 0.5],
+        [0.5, -0.5, 0.5],
+        [0.5, 0.5, 0.5],
+        [-0.5, 0.5, 0.5],
+    ];
+    // Each face: six corner indices (two triangles) and one outward normal.
+    const FACES: [([usize; 6], [f32; 3]); 6] = [
+        ([4, 5, 6, 6, 7, 4], [0.0, 0.0, 1.0]),  // +Z front
+        ([1, 0, 3, 3, 2, 1], [0.0, 0.0, -1.0]), // -Z back
+        ([5, 1, 2, 2, 6, 5], [1.0, 0.0, 0.0]),  // +X right
+        ([0, 4, 7, 7, 3, 0], [-1.0, 0.0, 0.0]), // -X left
+        ([3, 2, 6, 6, 7, 3], [0.0, 1.0, 0.0]),  // +Y top
+        ([0, 1, 5, 5, 4, 0], [0.0, -1.0, 0.0]), // -Y bottom
+    ];
+    let mut verts = Vec::with_capacity(36);
+    for (indices, normal) in FACES {
+        for i in indices {
+            verts.push(MeshVertex {
+                position: C[i],
+                normal,
+            });
+        }
+    }
+    verts
+}
+
+// A UV sphere of radius 0.5, built as rings of quads. The surface normal at any
+// point on a sphere centred on the origin is just its (unit) direction, so the
+// normal is the unit position and the position is that scaled by the radius. The
+// poles produce a few degenerate (zero-area) triangles, which draw nothing.
+fn sphere_vertices() -> Vec<MeshVertex> {
+    use std::f32::consts::PI;
+    const LAT: u32 = 12; // rings from pole to pole
+    const LON: u32 = 18; // segments around
+    const RADIUS: f32 = 0.5;
+    let point = |theta: f32, phi: f32| -> [f32; 3] {
+        [theta.sin() * phi.cos(), theta.cos(), theta.sin() * phi.sin()]
+    };
+    let vert = |unit: [f32; 3]| MeshVertex {
+        position: [unit[0] * RADIUS, unit[1] * RADIUS, unit[2] * RADIUS],
+        normal: unit,
+    };
+    let mut verts = Vec::new();
+    for lat in 0..LAT {
+        let t0 = PI * lat as f32 / LAT as f32;
+        let t1 = PI * (lat + 1) as f32 / LAT as f32;
+        for lon in 0..LON {
+            let p0 = 2.0 * PI * lon as f32 / LON as f32;
+            let p1 = 2.0 * PI * (lon + 1) as f32 / LON as f32;
+            let a = point(t0, p0);
+            let b = point(t1, p0);
+            let c = point(t1, p1);
+            let d = point(t0, p1);
+            // two triangles per quad: (a, b, c) and (a, c, d)
+            verts.push(vert(a));
+            verts.push(vert(b));
+            verts.push(vert(c));
+            verts.push(vert(a));
+            verts.push(vert(c));
+            verts.push(vert(d));
+        }
+    }
+    verts
+}
+
+// A flat, horizontal quad in the XZ plane (a floor tile), facing up (+Y),
+// half-extent 0.5 — the same footprint as the cube's base. Back-face culling is
+// off, so it's visible from below too.
+fn plane_vertices() -> Vec<MeshVertex> {
+    let normal = [0.0, 1.0, 0.0];
+    let v = |x: f32, z: f32| MeshVertex {
+        position: [x, 0.0, z],
+        normal,
+    };
+    vec![
+        v(-0.5, -0.5),
+        v(0.5, -0.5),
+        v(0.5, 0.5),
+        v(0.5, 0.5),
+        v(-0.5, 0.5),
+        v(-0.5, -0.5),
+    ]
+}
+
+// Per-entity instance data: world position plus a selected flag (0 or 1).
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct InstanceRaw {
+    position: [f32; 3],
+    color: [f32; 3],
+    selected: f32,
+    scale: [f32; 3],
+}
+impl InstanceRaw {
+    // Locations 0-1 belong to the mesh vertex buffer (MeshVertex); the instance
+    // attributes continue from 2.
+    const ATTRIBS: [wgpu::VertexAttribute; 4] = [
         wgpu::VertexAttribute {
-            format: wgpu::VertexFormat::Float32,
-            offset: std::mem::size_of::<[f32; 6]>() as wgpu::BufferAddress, // 24
+            format: wgpu::VertexFormat::Float32x3,
+            offset: 0,
             shader_location: 2,
         },
         wgpu::VertexAttribute {
             format: wgpu::VertexFormat::Float32x3,
-            offset: std::mem::size_of::<[f32; 7]>() as wgpu::BufferAddress, // 28
+            offset: std::mem::size_of::<[f32; 3]>() as wgpu::BufferAddress, // 12
             shader_location: 3,
+        },
+        wgpu::VertexAttribute {
+            format: wgpu::VertexFormat::Float32,
+            offset: std::mem::size_of::<[f32; 6]>() as wgpu::BufferAddress, // 24
+            shader_location: 4,
+        },
+        wgpu::VertexAttribute {
+            format: wgpu::VertexFormat::Float32x3,
+            offset: std::mem::size_of::<[f32; 7]>() as wgpu::BufferAddress, // 28
+            shader_location: 5,
         },
     ];
     fn layout() -> wgpu::VertexBufferLayout<'static> {
@@ -235,6 +368,11 @@ struct GpuState {
     config: wgpu::SurfaceConfiguration,
     render_pipeline: wgpu::RenderPipeline,
     text_pipeline: wgpu::RenderPipeline,
+    // One vertex buffer holding every primitive's geometry back to back, plus
+    // each primitive's vertex range within it, ordered Cube, Sphere, Plane
+    // (matching the engine's `Mesh` enum). Built once; static for the app's life.
+    mesh_vertex_buffer: wgpu::Buffer,
+    mesh_ranges: [std::ops::Range<u32>; 3],
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
     depth_view: wgpu::TextureView,
@@ -295,6 +433,26 @@ impl GpuState {
                 resource: camera_buffer.as_entire_binding(),
             }],
         });
+        // --- Primitive geometry: one shared vertex buffer, built once ---
+        // Concatenate every primitive's vertices and remember each one's range,
+        // in the engine's Mesh order (Cube, Sphere, Plane). At draw time we bind
+        // this buffer and draw the range for whichever primitive an entity uses.
+        let cube = cube_vertices();
+        let sphere = sphere_vertices();
+        let plane = plane_vertices();
+        let mut mesh_verts: Vec<MeshVertex> = Vec::new();
+        let cube_range = 0u32..cube.len() as u32;
+        mesh_verts.extend(cube);
+        let sphere_range = mesh_verts.len() as u32..(mesh_verts.len() + sphere.len()) as u32;
+        mesh_verts.extend(sphere);
+        let plane_range = mesh_verts.len() as u32..(mesh_verts.len() + plane.len()) as u32;
+        mesh_verts.extend(plane);
+        let mesh_ranges = [cube_range, sphere_range, plane_range];
+        let mesh_vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("mesh vertex buffer"),
+            contents: bytemuck::cast_slice(&mesh_verts),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
         // --- Entity pipeline (world-space, camera-driven) ---
         let entity_shader = device.create_shader_module(wgpu::include_wgsl!("shader.wgsl"));
         let entity_pipeline_layout =
@@ -310,7 +468,7 @@ impl GpuState {
                 module: &entity_shader,
                 entry_point: Some("vs_main"),
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
-                buffers: &[InstanceRaw::layout()],
+                buffers: &[MeshVertex::layout(), InstanceRaw::layout()],
             },
             fragment: Some(wgpu::FragmentState {
                 module: &entity_shader,
@@ -384,6 +542,8 @@ impl GpuState {
             config,
             render_pipeline,
             text_pipeline,
+            mesh_vertex_buffer,
+            mesh_ranges,
             camera_buffer,
             camera_bind_group,
             depth_view,
@@ -403,6 +563,10 @@ impl GpuState {
     fn render(
         &mut self,
         instances: &[InstanceRaw],
+        // How many instances belong to each primitive, in Cube, Sphere, Plane
+        // order. `instances` is laid out in that same order, so these counts also
+        // give each primitive's contiguous slice of the instance buffer.
+        group_counts: [u32; 3],
         text_instances: &[TextInstance],
         view_proj: [[f32; 4]; 4],
         egui_paint_jobs: &[egui::epaint::ClippedPrimitive],
@@ -503,12 +667,28 @@ impl GpuState {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            // entities — 36 vertices per cube (6 faces x 2 tris x 3 verts)
+            // entities — draw each primitive's instances against its own
+            // geometry. The shared mesh buffer sits at slot 0; the per-entity
+            // instance buffer (grouped by primitive) at slot 1. For each
+            // primitive with any instances, draw its vertex range for its
+            // contiguous slice of instances.
             render_pass.set_pipeline(&self.render_pipeline);
             render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
             if let Some(buffer) = &instance_buffer {
-                render_pass.set_vertex_buffer(0, buffer.slice(..));
-                render_pass.draw(0..36, 0..instances.len() as u32);
+                render_pass.set_vertex_buffer(0, self.mesh_vertex_buffer.slice(..));
+                let stride = std::mem::size_of::<InstanceRaw>() as wgpu::BufferAddress;
+                let mut instance_start = 0u32;
+                for (primitive, count) in group_counts.iter().enumerate() {
+                    if *count > 0 {
+                        // Bind just this group's slice of the instance buffer and
+                        // draw from instance 0, rather than using a non-zero first
+                        // instance (which some backends validate against).
+                        let begin = instance_start as wgpu::BufferAddress * stride;
+                        render_pass.set_vertex_buffer(1, buffer.slice(begin..));
+                        render_pass.draw(self.mesh_ranges[primitive].clone(), 0..*count);
+                    }
+                    instance_start += count;
+                }
             }
             // text overlay (screen-space, drawn on top, no camera)
             render_pass.set_pipeline(&self.text_pipeline);
@@ -954,25 +1134,38 @@ impl ApplicationHandler for App {
                     systems::movement(&mut self.world);
                 }
                 let selected = self.selected;
-                let instances: Vec<InstanceRaw> = self
-                    .world
-                    .positions
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(id, slot)| slot.as_ref().map(|p| (id, p)))
-                    .map(|(id, p)| {
-                        // Falls back to the default colour if this entity has no colour slot,
-                        // which only happens for scenes saved before colours existed.
-                        let color = self.world.colors.get(id).copied().unwrap_or_default();
-                        let scale = self.world.scales.get(id).copied().unwrap_or_default();
-                        InstanceRaw {
-                            position: [p.x, p.y, p.z],
-                            color: [color.r, color.g, color.b],
-                            selected: if Some(id) == selected { 1.0 } else { 0.0 },
-                            scale: [scale.x, scale.y, scale.z],
-                        }
-                    })
-                    .collect();
+                // Group instances by primitive so the renderer can draw each
+                // shape in one call. Buckets are kept in the engine's Mesh order
+                // (Cube, Sphere, Plane); an entity with no mesh slot (an old
+                // scene) falls back to Cube via unwrap_or_default.
+                let mut cube_i: Vec<InstanceRaw> = Vec::new();
+                let mut sphere_i: Vec<InstanceRaw> = Vec::new();
+                let mut plane_i: Vec<InstanceRaw> = Vec::new();
+                for (id, slot) in self.world.positions.iter().enumerate() {
+                    let Some(p) = slot.as_ref() else { continue };
+                    let color = self.world.colors.get(id).copied().unwrap_or_default();
+                    let scale = self.world.scales.get(id).copied().unwrap_or_default();
+                    let mesh = self.world.meshes.get(id).copied().unwrap_or_default();
+                    let raw = InstanceRaw {
+                        position: [p.x, p.y, p.z],
+                        color: [color.r, color.g, color.b],
+                        selected: if Some(id) == selected { 1.0 } else { 0.0 },
+                        scale: [scale.x, scale.y, scale.z],
+                    };
+                    match mesh {
+                        Mesh::Cube => cube_i.push(raw),
+                        Mesh::Sphere => sphere_i.push(raw),
+                        Mesh::Plane => plane_i.push(raw),
+                    }
+                }
+                let group_counts = [
+                    cube_i.len() as u32,
+                    sphere_i.len() as u32,
+                    plane_i.len() as u32,
+                ];
+                let mut instances = cube_i;
+                instances.extend(sphere_i);
+                instances.extend(plane_i);
                 let (width, height) = match &self.window {
                     Some(window) => {
                         let size = window.inner_size();
@@ -1070,6 +1263,7 @@ impl ApplicationHandler for App {
                         self.world.controlled.get(id).is_some(),
                         self.world.scales.get(id).copied().unwrap_or_default(),
                         self.world.scripts.get(id).map(|s| s.uses.clone()),
+                        self.world.meshes.get(id).copied().unwrap_or_default(),
                     ))
                 });
                 // Upload the logo to the GPU on the first frame, then reuse the handle.
@@ -1228,6 +1422,7 @@ impl ApplicationHandler for App {
                                                 controlled,
                                                 scale,
                                                 script_source,
+                                                mesh,
                                             )) => {
                                                 ui.label(format!("Entity {id}"));
                                                 ui.add_space(4.0);
@@ -1300,6 +1495,35 @@ impl ApplicationHandler for App {
                                                             .prefix("z "),
                                                     );
                                                 });
+                                                ui.add_space(4.0);
+                                                ui.label("Mesh");
+                                                // The primitive shape this entity draws as. Copy the
+                                                // current value out for the button label so the
+                                                // combo closure can borrow `mesh` mutably below.
+                                                let mesh_label = match *mesh {
+                                                    Mesh::Cube => "Cube",
+                                                    Mesh::Sphere => "Sphere",
+                                                    Mesh::Plane => "Plane",
+                                                };
+                                                egui::ComboBox::from_id_salt("mesh_picker")
+                                                    .selected_text(mesh_label)
+                                                    .show_ui(ui, |ui| {
+                                                        ui.selectable_value(
+                                                            mesh,
+                                                            Mesh::Cube,
+                                                            "Cube",
+                                                        );
+                                                        ui.selectable_value(
+                                                            mesh,
+                                                            Mesh::Sphere,
+                                                            "Sphere",
+                                                        );
+                                                        ui.selectable_value(
+                                                            mesh,
+                                                            Mesh::Plane,
+                                                            "Plane",
+                                                        );
+                                                    });
                                                 ui.add_space(4.0);
                                                 ui.checkbox(controlled, "Controlled (WASD)");
                                                 ui.add_space(8.0);
@@ -1585,7 +1809,7 @@ impl ApplicationHandler for App {
                 // Push any inspector edits back into the world. The render this
                 // frame already used the old values; the change shows next frame
                 // (same one-frame path as the keyboard nudge).
-                if let Some((id, pos, vel, color, controlled, scale, script_source)) = edited {
+                if let Some((id, pos, vel, color, controlled, scale, script_source, mesh)) = edited {
                     if let Some(p) = self.world.positions.get_mut(id) {
                         *p = pos;
                     }
@@ -1594,6 +1818,7 @@ impl ApplicationHandler for App {
                     }
                     self.world.colors.insert(id, color);
                     self.world.scales.insert(id, scale);
+                    self.world.meshes.insert(id, mesh);
                     if controlled {
                         self.world.controlled.insert(id, Controlled);
                     } else {
@@ -1630,6 +1855,7 @@ impl ApplicationHandler for App {
                 if let Some(gpu) = &mut self.gpu {
                     gpu.render(
                         &instances,
+                        group_counts,
                         &text_instances,
                         view_proj,
                         &egui_paint_jobs,

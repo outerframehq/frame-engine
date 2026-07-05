@@ -4,12 +4,21 @@ struct Camera {
 };
 @group(0) @binding(0) var<uniform> camera: Camera;
 
-// Per-entity instance data (matches InstanceRaw in main.rs).
-struct InstanceInput {
+// Per-vertex mesh data (matches MeshVertex in main.rs). Position is in the
+// primitive's local space — roughly unit-sized, centred on the origin — and is
+// blown up to world size below. Bound at vertex-buffer slot 0.
+struct VertexInput {
     @location(0) position: vec3<f32>,
-    @location(1) color: vec3<f32>,
-    @location(2) selected: f32,
-    @location(3) scale: vec3<f32>,
+    @location(1) normal: vec3<f32>,
+};
+
+// Per-entity instance data (matches InstanceRaw in main.rs). Bound at slot 1.
+// Locations continue after the mesh attributes above.
+struct InstanceInput {
+    @location(2) position: vec3<f32>,
+    @location(3) color: vec3<f32>,
+    @location(4) selected: f32,
+    @location(5) scale: vec3<f32>,
 };
 
 struct VertexOutput {
@@ -19,55 +28,22 @@ struct VertexOutput {
     @location(2) shade: f32,
 };
 
-// Side length of each entity cube, in world units.
-// NOTE: must match QUAD_SIZE in main.rs (render and pick must agree).
-const CUBE_SIZE: f32 = 8.0;
-
-// 8 corners of a unit cube centred on the origin (half-extent 0.5).
-var<private> CORNERS: array<vec3<f32>, 8> = array<vec3<f32>, 8>(
-    vec3<f32>(-0.5, -0.5, -0.5),
-    vec3<f32>( 0.5, -0.5, -0.5),
-    vec3<f32>( 0.5,  0.5, -0.5),
-    vec3<f32>(-0.5,  0.5, -0.5),
-    vec3<f32>(-0.5, -0.5,  0.5),
-    vec3<f32>( 0.5, -0.5,  0.5),
-    vec3<f32>( 0.5,  0.5,  0.5),
-    vec3<f32>(-0.5,  0.5,  0.5),
-);
-
-// 36 indices: 6 faces x 2 triangles x 3 verts, grouped by face.
-var<private> INDICES: array<u32, 36> = array<u32, 36>(
-    4u, 5u, 6u, 6u, 7u, 4u, // +Z front
-    1u, 0u, 3u, 3u, 2u, 1u, // -Z back
-    5u, 1u, 2u, 2u, 6u, 5u, // +X right
-    0u, 4u, 7u, 7u, 3u, 0u, // -X left
-    3u, 2u, 6u, 6u, 7u, 3u, // +Y top
-    0u, 1u, 5u, 5u, 4u, 0u, // -Y bottom
-);
-
-// One outward normal per face (face = vertex_index / 6).
-var<private> NORMALS: array<vec3<f32>, 6> = array<vec3<f32>, 6>(
-    vec3<f32>( 0.0,  0.0,  1.0),
-    vec3<f32>( 0.0,  0.0, -1.0),
-    vec3<f32>( 1.0,  0.0,  0.0),
-    vec3<f32>(-1.0,  0.0,  0.0),
-    vec3<f32>( 0.0,  1.0,  0.0),
-    vec3<f32>( 0.0, -1.0,  0.0),
-);
+// World size of a primitive at scale 1. Primitives are generated at ~unit size
+// in main.rs and scaled up by this, so a default entity is exactly the size the
+// cube always was. NOTE: must match MESH_SIZE in main.rs (render and pick agree).
+const MESH_SIZE: f32 = 8.0;
 
 @vertex
-fn vs_main(@builtin(vertex_index) vi: u32, instance: InstanceInput) -> VertexOutput {
-    let corner = CORNERS[INDICES[vi]];
-    // Per-axis scale (component-wise). Normals need no correction: the faces are
-    // axis-aligned and the scale is diagonal, so it never tilts a normal off its
-    // own axis. (A rotated or non-axis-aligned mesh would need the inverse-
-    // transpose of the scale here instead.)
-    let world_pos = instance.position + corner * CUBE_SIZE * instance.scale;
+fn vs_main(vertex: VertexInput, instance: InstanceInput) -> VertexOutput {
+    // Per-axis scale (component-wise), then place at the entity's position.
+    let world_pos = instance.position + vertex.position * MESH_SIZE * instance.scale;
 
-    // Fixed-direction shading so the cube reads as 3D as you orbit.
-    let normal = NORMALS[vi / 6u];
+    // Fixed-direction shading so shapes read as 3D as you orbit. We use the
+    // mesh's own normals directly. A diagonal scale leaves an axis-aligned cube
+    // normal untouched, and a uniformly-scaled sphere keeps correct normals too;
+    // a *non-uniformly* scaled sphere shades approximately, which is fine here.
     let light_dir = normalize(vec3<f32>(0.4, 0.8, 0.6));
-    let diffuse = max(dot(normal, light_dir), 0.0);
+    let diffuse = max(dot(normalize(vertex.normal), light_dir), 0.0);
     let shade = 0.4 + 0.6 * diffuse; // ambient floor + diffuse
 
     var out: VertexOutput;
