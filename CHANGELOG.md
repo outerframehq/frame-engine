@@ -9,6 +9,17 @@ lands and the patch version bumps for fixes and small additions.
 
 ## [Unreleased]
 
+### Added
+
+Editor (frame-editor):
+
+- A project launcher. The editor now opens on a launcher screen to create, open, and manage projects, rather than loading one fixed scene. Creating or opening a project loads its scene and switches into the editor; File > Close project returns to the launcher.
+- Projects. A project is a folder holding a scene file named after the project (the file's stem is the project name) and a `project.ron` manifest (description and version). Create a named project, or open an existing one by picking its folder.
+- A recent-projects list on the launcher, sorted by most-recently-edited and remembered across runs. Each project is a full-width card showing its name, description, last-edited date, and version, with Edit, Play, and Settings actions.
+- A project-settings window, opened from a card, to edit the name, version, and description. It saves when the window closes (its X or the Save button); renaming the project renames its scene file. Description and version are stored in the project's `project.ron`.
+
+(Play, on the cards, is a placeholder until the separate game window lands.)
+
 ## [0.2.0] - 2026-07-05
 
 The first release meant to be genuinely usable: you can build a scene, script it,

@@ -27,7 +27,7 @@ Frame Engine is a learning project as much as a tool: I am still growing my own 
 
 **For a stable build, download a tagged release rather than cloning `main`.** Releases are cut at points where the project is known to build and run, so a release is your dependable copy. Tagged releases are on the project's Releases page.
 
-The latest release is **0.1.0**. The capabilities listed below reflect current `main`, which is ahead of that release.
+The latest release is **0.2.0**. The capabilities listed below reflect current `main`, which may be ahead of that release.
 
 ## Status
 
@@ -55,16 +55,16 @@ Early development, past the toy stage, with a working engine and a usable editor
 - An orbit, pan, and zoom camera (left-drag pan, scroll zoom, middle-drag orbit).
 - Click-to-pick selection: click an entity to select it. The selected entity is brightened rather than recoloured, so its own colour stays visible while you edit it.
 - Live entity editing: nudge the selection with the arrow keys and Page Up/Down, spawn with `N`, despawn with `Delete`, and drive a `Controlled` entity with WASD while the sim is playing.
-- Scene save and load: `F5` saves the world to a RON file, `F9` reloads it, and the editor loads a scene on startup.
-- A Script Editor: the centre area tabs between the 3D viewport and a script editor, where the shared script library is written — a sidebar of script names beside a single code editor with a line-number gutter and a live syntax check (a status line flags parse errors with their line and column). Scripts run live through a Rhai backend and are assigned to entities from the Inspector. See [SCRIPTING.md](SCRIPTING.md) for how to write them.
-- A docked panel layout built with `egui`:
-  - a top toolbar showing the editor's logo and working File/Edit/View/Help menus, each item mirroring a keyboard shortcut (save, reload, quit; spawn, despawn, clear selection; play/pause, step, controls overlay),
-  - a right inspector dock with a Scene tab (lists entities, click to select) and an Inspector tab (edit the selected entity's position, velocity, colour, and scale, pick its mesh primitive, toggle whether it is `Controlled`, and assign a library script through a searchable picker, all written straight back into the world),
-  - a bottom console dock with an Output tab showing a live log and a Terminal placeholder,
-  - panels that are solid but resizable.
+- A project launcher: the editor opens on a launcher to create a named project, open one by folder, or reopen a recent one from a list of cards (name, description, last-edited date, version, and Edit / Play / Settings actions). A project is a folder holding a scene file named after it and a `project.ron` manifest (description, version); Settings edits those and renames the scene file.
+- Scene save and load: opening a project loads its scene, `F5` saves it and `F9` reloads it, and the File menu also opens or saves a scene to any path through a native file dialog.
+- A Script Editor: a dockable tab where the shared script library is written — a sidebar of script names beside a single code editor with a line-number gutter and a live syntax check (a status line flags parse errors with their line and column). Scripts run live through a Rhai backend and are assigned to entities from the Inspector. See [SCRIPTING.md](SCRIPTING.md) for how to write them.
+- A dockable panel layout built with `egui` and `egui_dock`. The Viewport, Scene, Inspector, and Script Editor are tabs you can drag, tab together, and split apart; the Viewport is a transparent tab so the 3D shows through. Alongside them:
+  - a top toolbar showing the editor's logo and working File/Edit/View/Help menus, each item mirroring a keyboard shortcut (open/save/reload scene, close project, quit; spawn, despawn, clear selection; play/pause, step, controls overlay),
+  - a Scene tab (lists entities, click to select) and an Inspector tab (edit the selected entity's position, velocity, colour, and scale, pick its mesh primitive, toggle whether it is `Controlled`, and assign a library script through a searchable picker, all written straight back into the world),
+  - a fixed bottom console dock with an Output tab showing a live log and a Terminal placeholder.
 - Runs the simulation live on the engine's fixed-timestep clock, so the sim ticks at a true 30 per second independent of the window's repaint rate, with play, pause, and step controls.
 
-Currently at the frontier: richer authoring (gizmos, undo and redo, prefabs, and draggable/dockable panels); per-entity appearance beyond colour, scale, and mesh (material, textures); collision that does more than detect (a response, mesh-fitted boxes, exposing overlaps to scripts); and a more discoverable script API.
+Currently at the frontier: playing a project as a standalone game window; richer authoring (gizmos, undo and redo, prefabs); per-entity appearance beyond colour, scale, and mesh (material, textures); collision that does more than detect (a response, mesh-fitted boxes, richer script queries); and a more discoverable script API.
 
 ## Principles
 
@@ -72,7 +72,7 @@ Currently at the frontier: richer authoring (gizmos, undo and redo, prefabs, and
 - **Headless by default.** Runs with no window. Rendering is optional and added on top.
 - **Deterministic, fixed-timestep.** One tick is always the same slice of simulated time, so behaviour is identical across machines. The editor honours this with the engine's own clock rather than ticking once per rendered frame.
 - **Reusable.** The engine is its own library crate, so it can power more than one game or tool. Dependencies point inward: tools depend on the engine, never the reverse.
-- **Hand-roll the heart, buy the rest.** The engine is built by hand to be understood deeply. Solved problems that are not the heart (windowing, the GPU API, linear algebra, UI) use existing libraries: `winit`, `wgpu`, `glam`, `egui`.
+- **Hand-roll the heart, buy the rest.** The engine is built by hand to be understood deeply. Solved problems that are not the heart (windowing, the GPU API, linear algebra, UI, file dialogs, config paths, dates) use existing libraries: `winit`, `wgpu`, `glam`, `egui` and `egui_dock`, `rfd`, `dirs`, `chrono`, and — in the editor, for the project manifest — `serde` with `ron`.
 - **No premature abstraction.** Machinery is built when the pain is real, not before. The fixed-timestep clock stayed duplicated inline until a second consumer made the duplication real, then moved into `core/`.
 
 ## Workspace structure
@@ -113,7 +113,7 @@ Run the engine (headless tick loop and ASCII debug view):
 cargo run -p frame-engine
 ```
 
-Run the editor (opens a 3D window with the docked panel layout):
+Run the editor (opens the project launcher; pick or create a project to enter the 3D editor):
 
 ```
 cargo run -p frame-editor
