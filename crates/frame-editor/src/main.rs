@@ -25,9 +25,6 @@ const QUAD_SIZE: f32 = frame_engine::world::ENTITY_SIZE;
 const ORBIT_SENS: f32 = 0.005;
 // Format of the depth buffer. 32-bit float depth, no stencil.
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
-// Where scenes are saved to / loaded from. Relative to the working directory,
-// which is the workspace root when run via `cargo run`. Gitignored.
-const SCENE_PATH: &str = "scene.ron";
 // How far a single nudge moves the selected entity, in world units.
 const EDIT_STEP: f32 = 5.0;
 // The camera data handed to the shader. Must match the `Camera` struct in shader.wgsl.
@@ -761,11 +758,31 @@ enum ConsoleTab {
 /// pass. The menu closure can't borrow `self`, so it stages the choice here and
 /// we dispatch it afterwards — the same lift-then-write-back pattern the
 /// selection and inspector edits use.
+/// Which screen the editor is showing. It starts at the launcher; creating or
+/// opening a project loads its scene and switches to the editor proper.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AppMode {
+    Launcher,
+    Editor,
+}
+
+/// A choice made on the launcher screen this frame, applied after the egui pass
+/// (so the blocking file dialog doesn't run mid-draw) — the same lift-then-act
+/// pattern the toolbar menus use.
+enum LauncherAction {
+    NewProject,
+    OpenProject,
+    OpenRecent(std::path::PathBuf),
+    PlayRecent(std::path::PathBuf),
+    OpenSettings(std::path::PathBuf),
+}
+
 enum MenuAction {
     OpenScene,
     SaveScene,
     SaveSceneAs,
     ReloadScene,
+    CloseProject,
     SpawnEntity,
     DespawnSelected,
     ClearSelection,
@@ -1108,6 +1125,15 @@ struct App {
     script_runtime: script::RhaiRuntime,
     window: Option<Arc<Window>>,
     gpu: Option<GpuState>,
+    // Launcher screen vs the editor proper.
+    mode: AppMode,
+    // Name of the open project (its folder name), shown in the window title.
+    project_name: Option<String>,
+    // Remembered projects, most-recently-edited first, shown on the launcher.
+    // Refreshed when the launcher is (re)entered and on open/create.
+    recent_projects: Vec<RecentProject>,
+    // The name typed on the launcher for a new project (becomes its scene file).
+    new_project_name: String,
     world: World,
     // Where "Save scene" writes and "Reload scene" reads. Set by Open/Save-As
     // (and defaulted to the startup scene). None means Save prompts for a path.
@@ -1274,6 +1300,239 @@ impl App {
             }
             Err(e) => self.log(format!("Reload failed: {e}")),
         }
+    }
+
+    /// Draw the launcher screen: an egui-only frame (no simulation, no 3D) with
+    /// buttons to create or open a project. Mirrors the editor's egui→render
+    /// handoff, but renders an empty 3D scene behind the UI.
+    fn draw_launcher(&mut self) {
+        let mut action: Option<LauncherAction> = None;
+        let recent = self.recent_projects.clone();
+        let mut name_input = std::mem::take(&mut self.new_project_name);
+        let (jobs, tex_delta, ppp) = if let (Some(state), Some(window)) =
+            (self.egui_state.as_mut(), self.window.as_ref())
+        {
+            let raw_input = state.take_egui_input(window);
+            let full_output = self.egui_ctx.run_ui(raw_input, |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    ui.add_space(12.0);
+                    ui.heading("Frame Editor");
+                    ui.add_space(10.0);
+                    // Header bar: create a named project, or open an existing one.
+                    ui.horizontal(|ui| {
+                        ui.label("New project:");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut name_input)
+                                .hint_text("name")
+                                .desired_width(200.0),
+                        );
+                        if ui.button("Create…").clicked() {
+                            action = Some(LauncherAction::NewProject);
+                        }
+                        ui.add_space(16.0);
+                        if ui.button("Open existing project…").clicked() {
+                            action = Some(LauncherAction::OpenProject);
+                        }
+                    });
+                    ui.add_space(12.0);
+                    ui.separator();
+                    ui.add_space(8.0);
+
+                    if recent.is_empty() {
+                        ui.weak("No projects yet — create one above to begin.");
+                    } else {
+                        ui.heading("Projects");
+                        ui.add_space(8.0);
+                        egui::ScrollArea::vertical()
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                for proj in &recent {
+                                    ui.group(|ui| {
+                                        // Fill the width so each project is a
+                                        // full-width row: name and date on the
+                                        // left, actions pushed to the right.
+                                        ui.set_min_width(ui.available_width());
+                                        ui.horizontal(|ui| {
+                                            ui.vertical(|ui| {
+                                                ui.label(
+                                                    egui::RichText::new(&proj.name)
+                                                        .size(18.0)
+                                                        .strong(),
+                                                );
+                                                ui.add_space(2.0);
+                                                ui.weak(format!(
+                                                    "Last edited {}",
+                                                    format_edited(proj.modified)
+                                                ));
+                                            });
+                                            ui.with_layout(
+                                                egui::Layout::right_to_left(egui::Align::Center),
+                                                |ui| {
+                                                    if ui.button("Settings").clicked() {
+                                                        action =
+                                                            Some(LauncherAction::OpenSettings(
+                                                                proj.root.clone(),
+                                                            ));
+                                                    }
+                                                    if ui.button("Play").clicked() {
+                                                        action = Some(LauncherAction::PlayRecent(
+                                                            proj.root.clone(),
+                                                        ));
+                                                    }
+                                                    if ui.button("Edit").clicked() {
+                                                        action = Some(LauncherAction::OpenRecent(
+                                                            proj.root.clone(),
+                                                        ));
+                                                    }
+                                                },
+                                            );
+                                        });
+                                    });
+                                    ui.add_space(6.0);
+                                }
+                            });
+                    }
+                });
+            });
+            state.handle_platform_output(window, full_output.platform_output);
+            let ppp = full_output.pixels_per_point;
+            let jobs = self.egui_ctx.tessellate(full_output.shapes, ppp);
+            (jobs, full_output.textures_delta, ppp)
+        } else {
+            (Vec::new(), egui::TexturesDelta::default(), 1.0)
+        };
+        if let Some(gpu) = &mut self.gpu {
+            gpu.render(
+                &[],
+                [0, 0, 0],
+                &[],
+                Mat4::IDENTITY.to_cols_array_2d(),
+                &jobs,
+                &tex_delta,
+                ppp,
+            );
+        }
+        self.new_project_name = name_input;
+        match action {
+            Some(LauncherAction::NewProject) => self.new_project(),
+            Some(LauncherAction::OpenProject) => self.open_project(),
+            Some(LauncherAction::OpenRecent(root)) => self.open_project_at(root),
+            Some(LauncherAction::PlayRecent(_)) => {
+                self.log("Play mode (a separate game window) is coming next.".to_string());
+            }
+            Some(LauncherAction::OpenSettings(_)) => {
+                self.log(
+                    "Project settings (name, description, version) are coming next.".to_string(),
+                );
+            }
+            None => {}
+        }
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+
+    /// Create a project: take the name typed on the launcher, pick a folder,
+    /// and scaffold `<name>.ron` (a starter scene) into it. The project's name is
+    /// that scene file's stem.
+    fn new_project(&mut self) {
+        let name = self.new_project_name.trim().to_string();
+        if name.is_empty() {
+            self.log("Type a project name first".to_string());
+            return;
+        }
+        if name.contains(['/', '\\']) {
+            self.log("Project name can't contain slashes".to_string());
+            return;
+        }
+        let Some(folder) = rfd::FileDialog::new()
+            .set_title("Choose a folder for the new project")
+            .pick_folder()
+        else {
+            return;
+        };
+        let scene_path = folder.join(format!("{name}.ron"));
+        let world = default_world();
+        match world.save_to_file(&scene_path) {
+            Ok(()) => {
+                self.world = world;
+                self.new_project_name.clear();
+                self.add_recent_project(&folder);
+                self.enter_editor(name, scene_path);
+            }
+            Err(e) => self.log(format!("Could not create project: {e}")),
+        }
+    }
+
+    /// Open a project: pick its folder and load the scene inside it.
+    fn open_project(&mut self) {
+        let Some(root) = rfd::FileDialog::new()
+            .set_title("Open a project folder")
+            .pick_folder()
+        else {
+            return;
+        };
+        self.open_project_at(root);
+    }
+
+    /// Open the project at a known folder (the folder picker and the recent
+    /// list both route here). Loads the folder's scene file.
+    fn open_project_at(&mut self, root: std::path::PathBuf) {
+        let Some(scene_path) = find_scene(&root) else {
+            self.log("That folder has no scene to open".to_string());
+            return;
+        };
+        let name = scene_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("Project")
+            .to_string();
+        match World::load_from_file(&scene_path) {
+            Ok(world) => {
+                self.world = world;
+                self.add_recent_project(&root);
+                self.enter_editor(name, scene_path);
+            }
+            Err(e) => self.log(format!("Could not open project: {e}")),
+        }
+    }
+
+    /// Record a project as recently used and refresh the sorted launcher list.
+    fn add_recent_project(&mut self, root: &std::path::Path) {
+        let mut roots = read_recent_projects();
+        roots.retain(|r| r != root);
+        roots.insert(0, root.to_path_buf());
+        roots.truncate(20);
+        write_recent_projects(&roots);
+        self.recent_projects = sorted_recent_projects();
+    }
+
+    /// Close the open project and return to the launcher. Does not save — use
+    /// Save (F5) first to keep changes.
+    fn close_project(&mut self) {
+        self.mode = AppMode::Launcher;
+        self.project_name = None;
+        self.current_scene_path = None;
+        self.selected = None;
+        self.paused = false;
+        self.world = World::default();
+        self.recent_projects = sorted_recent_projects();
+        if let Some(window) = &self.window {
+            window.set_title("Frame Editor");
+        }
+    }
+
+    /// Switch from the launcher into the editor with a project loaded.
+    fn enter_editor(&mut self, name: String, scene_path: std::path::PathBuf) {
+        self.current_scene_path = Some(scene_path);
+        self.selected = None;
+        self.paused = false;
+        self.mode = AppMode::Editor;
+        if let Some(window) = &self.window {
+            window.set_title(&format!("Frame Editor — {name}"));
+        }
+        self.log(format!("Opened project '{name}'"));
+        self.project_name = Some(name);
     }
     fn pick(&mut self) {
         let (width_u, height_u) = match &self.window {
@@ -1461,7 +1720,7 @@ impl ApplicationHandler for App {
                 }
                 self.cam_distance = self.cam_distance.clamp(10.0, 2000.0);
             }
-            WindowEvent::KeyboardInput { event, .. } => {
+            WindowEvent::KeyboardInput { event, .. } if matches!(self.mode, AppMode::Editor) => {
                 // Level-triggered movement input (WASD). Updated on both press
                 // and release so the input system always sees what is held right
                 // now. Tracked even when egui holds keyboard focus — otherwise
@@ -1526,6 +1785,12 @@ impl ApplicationHandler for App {
                 }
             }
             WindowEvent::RedrawRequested => {
+                // On the launcher screen there's no simulation and no 3D — draw
+                // just the launcher UI and stop.
+                if matches!(self.mode, AppMode::Launcher) {
+                    self.draw_launcher();
+                    return;
+                }
                 let owed = self.clock.advance(!self.paused);
                 for _ in 0..owed {
                     // Detection runs first each tick, so a script can read whether
@@ -1759,6 +2024,9 @@ impl ApplicationHandler for App {
                                             menu_action = Some(MenuAction::ReloadScene);
                                         }
                                         ui.separator();
+                                        if ui.button("Close project").clicked() {
+                                            menu_action = Some(MenuAction::CloseProject);
+                                        }
                                         if ui.button("Quit").clicked() {
                                             menu_action = Some(MenuAction::Quit);
                                         }
@@ -1904,6 +2172,7 @@ impl ApplicationHandler for App {
                     Some(MenuAction::SaveScene) => self.save_scene(),
                     Some(MenuAction::SaveSceneAs) => self.save_scene_as(),
                     Some(MenuAction::ReloadScene) => self.reload_scene(),
+                    Some(MenuAction::CloseProject) => self.close_project(),
                     Some(MenuAction::SpawnEntity) => self.spawn_at_focus(),
                     Some(MenuAction::DespawnSelected) => self.despawn_selected(),
                     Some(MenuAction::ClearSelection) => self.clear_selection(),
@@ -1936,6 +2205,105 @@ impl ApplicationHandler for App {
     }
 }
 // The fallback scene used when there's no scene.ron on disk yet.
+/// Path to the file that remembers recently opened projects (one folder path
+/// per line), under the platform config directory.
+fn recent_projects_file() -> Option<std::path::PathBuf> {
+    dirs::config_dir().map(|d| d.join("frame-editor").join("recent-projects.txt"))
+}
+
+/// The remembered project folders as written, unfiltered and in file order.
+fn read_recent_projects() -> Vec<std::path::PathBuf> {
+    let Some(file) = recent_projects_file() else {
+        return Vec::new();
+    };
+    let Ok(text) = std::fs::read_to_string(&file) else {
+        return Vec::new();
+    };
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(std::path::PathBuf::from)
+        .collect()
+}
+
+/// Persist the remembered project folders.
+fn write_recent_projects(roots: &[std::path::PathBuf]) {
+    let Some(file) = recent_projects_file() else {
+        return;
+    };
+    if let Some(parent) = file.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let text = roots
+        .iter()
+        .filter_map(|p| p.to_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let _ = std::fs::write(&file, text);
+}
+
+/// Remembered projects that still exist, most-recently-edited first (by each
+/// project scene file's modification time).
+/// A remembered project, resolved for display on the launcher: its folder, the
+/// scene file inside it, the name (the scene file's stem), and when it was last
+/// edited (the scene file's modification time).
+#[derive(Clone)]
+struct RecentProject {
+    root: std::path::PathBuf,
+    name: String,
+    modified: Option<std::time::SystemTime>,
+}
+
+/// Find a project folder's scene file: the first `.ron` in it that isn't the
+/// `project.ron` manifest. A project's name is this file's stem.
+fn find_scene(folder: &std::path::Path) -> Option<std::path::PathBuf> {
+    let mut scenes: Vec<std::path::PathBuf> = std::fs::read_dir(folder)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            p.extension().and_then(|x| x.to_str()) == Some("ron")
+                && p.file_name().and_then(|n| n.to_str()) != Some("project.ron")
+        })
+        .collect();
+    scenes.sort();
+    scenes.into_iter().next()
+}
+
+/// Remembered projects that still hold a scene, most-recently-edited first.
+fn sorted_recent_projects() -> Vec<RecentProject> {
+    let mut projects: Vec<RecentProject> = read_recent_projects()
+        .into_iter()
+        .filter_map(|root| {
+            let scene = find_scene(&root)?;
+            let name = scene
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("Project")
+                .to_string();
+            let modified = std::fs::metadata(&scene).and_then(|m| m.modified()).ok();
+            Some(RecentProject {
+                root,
+                name,
+                modified,
+            })
+        })
+        .collect();
+    projects.sort_by_key(|p| p.modified);
+    projects.reverse();
+    projects
+}
+
+/// Format a scene's last-edited time as a local date and time for the launcher.
+fn format_edited(modified: Option<std::time::SystemTime>) -> String {
+    match modified {
+        Some(t) => chrono::DateTime::<chrono::Local>::from(t)
+            .format("%b %e, %Y at %H:%M")
+            .to_string(),
+        None => "unknown".to_string(),
+    }
+}
+
 fn default_world() -> World {
     let mut world = World::new();
     world.spawn(
@@ -1978,27 +2346,19 @@ fn default_world() -> World {
 }
 fn main() {
     let event_loop = EventLoop::new().unwrap();
-    // Load the scene from disk if one exists; otherwise start from a default
-    // scene. The default is just a fallback for a fresh checkout — once you save
-    // (F5), that file is what loads next time.
-    let world = match World::load_from_file(SCENE_PATH) {
-        Ok(world) => {
-            println!("Loaded scene from {SCENE_PATH}");
-            world
-        }
-        Err(e) => {
-            println!("No scene loaded ({e}); starting from the default scene");
-            default_world()
-        }
-    };
-    let entity_count = world.positions.len();
+    // The editor opens on the launcher screen with no project loaded, so it
+    // starts from an empty world; creating or opening a project replaces it.
+    let world = World::default();
     let mut app = App {
         window: None,
         gpu: None,
         world,
-        // Default Save/Reload target to the startup scene, so Save works out of
-        // the box; Open and Save-As repoint it.
-        current_scene_path: Some(std::path::PathBuf::from(SCENE_PATH)),
+        mode: AppMode::Launcher,
+        project_name: None,
+        recent_projects: sorted_recent_projects(),
+        new_project_name: String::new(),
+        // No scene target until a project is opened.
+        current_scene_path: None,
         paused: false,
         clock: Clock::new(TICK_RATE, MAX_CATCHUP_TICKS),
         cam_focus_x: 0.0,
@@ -2038,9 +2398,6 @@ fn main() {
         script_runtime: script::RhaiRuntime::new(),
         logo_texture: None,
     };
-    println!(
-        "Editor Started, Engine World created with {} entities",
-        entity_count
-    );
+    println!("Frame Editor started at the launcher.");
     event_loop.run_app(&mut app).unwrap();
 }
