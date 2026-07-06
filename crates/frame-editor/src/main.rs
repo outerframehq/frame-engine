@@ -1134,6 +1134,13 @@ struct App {
     recent_projects: Vec<RecentProject>,
     // The name typed on the launcher for a new project (becomes its scene file).
     new_project_name: String,
+    // Project-settings window state (opened from a card's Settings button).
+    settings_open: bool,
+    settings_root: Option<std::path::PathBuf>,
+    settings_orig_name: String,
+    settings_name: String,
+    settings_description: String,
+    settings_version: String,
     world: World,
     // Where "Save scene" writes and "Reload scene" reads. Set by Open/Save-As
     // (and defaulted to the startup scene). None means Save prompts for a path.
@@ -1309,6 +1316,12 @@ impl App {
         let mut action: Option<LauncherAction> = None;
         let recent = self.recent_projects.clone();
         let mut name_input = std::mem::take(&mut self.new_project_name);
+        // Project-settings window state, lifted so the closure doesn't touch self.
+        let was_settings_open = self.settings_open;
+        let mut settings_open = self.settings_open;
+        let mut s_name = std::mem::take(&mut self.settings_name);
+        let mut s_desc = std::mem::take(&mut self.settings_description);
+        let mut s_version = std::mem::take(&mut self.settings_version);
         let (jobs, tex_delta, ppp) = if let (Some(state), Some(window)) =
             (self.egui_state.as_mut(), self.window.as_ref())
         {
@@ -1359,11 +1372,6 @@ impl App {
                                                         .size(18.0)
                                                         .strong(),
                                                 );
-                                                ui.add_space(2.0);
-                                                ui.weak(format!(
-                                                    "Last edited {}",
-                                                    format_edited(proj.modified)
-                                                ));
                                             });
                                             ui.with_layout(
                                                 egui::Layout::right_to_left(egui::Align::Center),
@@ -1387,12 +1395,81 @@ impl App {
                                                 },
                                             );
                                         });
+                                        if !proj.description.is_empty() {
+                                            ui.add_space(4.0);
+                                            egui::ScrollArea::vertical()
+                                                .id_salt(("card_desc", &proj.root))
+                                                .max_height(60.0)
+                                                .auto_shrink([false, true])
+                                                .show(ui, |ui| {
+                                                    ui.label(&proj.description);
+                                                });
+                                        }
+                                        if !proj.version.is_empty() {
+                                            ui.add_space(6.0);
+                                            ui.horizontal(|ui| {
+                                                ui.weak(format!(
+                                                    "Last edited {}",
+                                                    format_edited(proj.modified)
+                                                ));
+                                                ui.with_layout(
+                                                    egui::Layout::right_to_left(
+                                                        egui::Align::Center,
+                                                    ),
+                                                    |ui| {
+                                                        ui.add_space(4.0);
+                                                        ui.weak(format!("v{}", proj.version));
+                                                    },
+                                                );
+                                            });
+                                        } else {
+                                            ui.add_space(6.0);
+                                            ui.weak(format!(
+                                                "Last edited {}",
+                                                format_edited(proj.modified)
+                                            ));
+                                        }
                                     });
                                     ui.add_space(6.0);
                                 }
                             });
                     }
                 });
+                // Project-settings window, floating above the launcher. Closing
+                // it (its X or Save) flips `settings_open`, which triggers a save.
+                if settings_open {
+                    let mut keep_open = true;
+                    let mut save_clicked = false;
+                    egui::Window::new("Project settings")
+                        .collapsible(false)
+                        .resizable(false)
+                        .open(&mut keep_open)
+                        .show(ui.ctx(), |ui| {
+                            egui::Grid::new("settings_grid")
+                                .num_columns(2)
+                                .spacing([8.0, 8.0])
+                                .show(ui, |ui| {
+                                    ui.label("Name");
+                                    ui.text_edit_singleline(&mut s_name);
+                                    ui.end_row();
+                                    ui.label("Version");
+                                    ui.text_edit_singleline(&mut s_version);
+                                    ui.end_row();
+                                });
+                            ui.add_space(6.0);
+                            ui.label("Description");
+                            ui.text_edit_multiline(&mut s_desc);
+                            ui.add_space(10.0);
+                            ui.weak("Closing saves. Renaming changes the scene file.");
+                            ui.add_space(6.0);
+                            if ui.button("Save & close").clicked() {
+                                save_clicked = true;
+                            }
+                        });
+                    if !keep_open || save_clicked {
+                        settings_open = false;
+                    }
+                }
             });
             state.handle_platform_output(window, full_output.platform_output);
             let ppp = full_output.pixels_per_point;
@@ -1413,6 +1490,15 @@ impl App {
             );
         }
         self.new_project_name = name_input;
+        if was_settings_open && !settings_open {
+            // The window closed this frame (X or Save) — persist and refresh.
+            self.save_settings(s_name, s_desc, s_version);
+        } else {
+            self.settings_open = settings_open;
+            self.settings_name = s_name;
+            self.settings_description = s_desc;
+            self.settings_version = s_version;
+        }
         match action {
             Some(LauncherAction::NewProject) => self.new_project(),
             Some(LauncherAction::OpenProject) => self.open_project(),
@@ -1420,11 +1506,7 @@ impl App {
             Some(LauncherAction::PlayRecent(_)) => {
                 self.log("Play mode (a separate game window) is coming next.".to_string());
             }
-            Some(LauncherAction::OpenSettings(_)) => {
-                self.log(
-                    "Project settings (name, description, version) are coming next.".to_string(),
-                );
-            }
+            Some(LauncherAction::OpenSettings(root)) => self.open_settings(root),
             None => {}
         }
         if let Some(window) = &self.window {
@@ -1455,6 +1537,13 @@ impl App {
         let world = default_world();
         match world.save_to_file(&scene_path) {
             Ok(()) => {
+                write_manifest(
+                    &folder,
+                    &ProjectManifest {
+                        description: String::new(),
+                        version: "0.1.0".to_string(),
+                    },
+                );
                 self.world = world;
                 self.new_project_name.clear();
                 self.add_recent_project(&folder);
@@ -1520,6 +1609,59 @@ impl App {
         if let Some(window) = &self.window {
             window.set_title("Frame Editor");
         }
+    }
+
+    /// Open the project-settings window for a project, loading its current name
+    /// (the scene stem) and manifest (description, version) into the fields.
+    fn open_settings(&mut self, root: std::path::PathBuf) {
+        let Some(scene) = find_scene(&root) else {
+            self.log("That folder has no scene to configure".to_string());
+            return;
+        };
+        let name = scene
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("Project")
+            .to_string();
+        let manifest = read_manifest(&root);
+        self.settings_orig_name = name.clone();
+        self.settings_name = name;
+        self.settings_description = manifest.description;
+        self.settings_version = manifest.version;
+        self.settings_root = Some(root);
+        self.settings_open = true;
+    }
+
+    /// Save the project-settings window's fields: write the manifest, and rename
+    /// the scene file if the name changed (the name *is* the scene file's stem).
+    /// Called when the window closes.
+    fn save_settings(&mut self, name: String, description: String, version: String) {
+        let Some(root) = self.settings_root.clone() else {
+            return;
+        };
+        let new_name = name.trim();
+        // Rename the scene file if the name changed and is usable.
+        if !new_name.is_empty()
+            && new_name != self.settings_orig_name
+            && !new_name.contains(['/', '\\'])
+        {
+            let from = root.join(format!("{}.ron", self.settings_orig_name));
+            let to = root.join(format!("{new_name}.ron"));
+            match std::fs::rename(&from, &to) {
+                Ok(()) => self.log(format!("Renamed project to '{new_name}'")),
+                Err(e) => self.log(format!("Could not rename project: {e}")),
+            }
+        }
+        write_manifest(
+            &root,
+            &ProjectManifest {
+                description,
+                version,
+            },
+        );
+        self.settings_open = false;
+        self.settings_root = None;
+        self.recent_projects = sorted_recent_projects();
     }
 
     /// Switch from the launcher into the editor with a project loaded.
@@ -2244,6 +2386,31 @@ fn write_recent_projects(roots: &[std::path::PathBuf]) {
 
 /// Remembered projects that still exist, most-recently-edited first (by each
 /// project scene file's modification time).
+/// Per-project metadata stored beside the scene in `project.ron`. The project's
+/// name is the scene file's stem, so it isn't duplicated here.
+#[derive(serde::Serialize, serde::Deserialize, Default, Clone)]
+struct ProjectManifest {
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    version: String,
+}
+
+/// Read a project's manifest, or a default one if it has none yet.
+fn read_manifest(root: &std::path::Path) -> ProjectManifest {
+    std::fs::read_to_string(root.join("project.ron"))
+        .ok()
+        .and_then(|t| ron::from_str(&t).ok())
+        .unwrap_or_default()
+}
+
+/// Write a project's manifest.
+fn write_manifest(root: &std::path::Path, manifest: &ProjectManifest) {
+    if let Ok(text) = ron::ser::to_string_pretty(manifest, ron::ser::PrettyConfig::default()) {
+        let _ = std::fs::write(root.join("project.ron"), text);
+    }
+}
+
 /// A remembered project, resolved for display on the launcher: its folder, the
 /// scene file inside it, the name (the scene file's stem), and when it was last
 /// edited (the scene file's modification time).
@@ -2251,6 +2418,8 @@ fn write_recent_projects(roots: &[std::path::PathBuf]) {
 struct RecentProject {
     root: std::path::PathBuf,
     name: String,
+    description: String,
+    version: String,
     modified: Option<std::time::SystemTime>,
 }
 
@@ -2282,9 +2451,12 @@ fn sorted_recent_projects() -> Vec<RecentProject> {
                 .unwrap_or("Project")
                 .to_string();
             let modified = std::fs::metadata(&scene).and_then(|m| m.modified()).ok();
+            let manifest = read_manifest(&root);
             Some(RecentProject {
-                root,
+                root: root.clone(),
                 name,
+                description: manifest.description,
+                version: manifest.version,
                 modified,
             })
         })
@@ -2357,6 +2529,12 @@ fn main() {
         project_name: None,
         recent_projects: sorted_recent_projects(),
         new_project_name: String::new(),
+        settings_open: false,
+        settings_root: None,
+        settings_orig_name: String::new(),
+        settings_name: String::new(),
+        settings_description: String::new(),
+        settings_version: String::new(),
         // No scene target until a project is opened.
         current_scene_path: None,
         paused: false,

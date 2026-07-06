@@ -21,4 +21,6 @@ egui_dock = "0.20"
 rfd = "0.17"
 dirs = "6"
 chrono = "0.4"
+serde = { version = "1", features = ["derive"] }
+ron = "0.12"
 rhai = "1.25"
