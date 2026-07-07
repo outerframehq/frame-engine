@@ -52,6 +52,96 @@ pub fn collision(world: &mut World) {
     }
 }
 
+/// Push overlapping entities apart along their least-overlapping axis (the
+/// minimum translation vector) so they stop interpenetrating. Entities carrying
+/// the `Static` marker don't move: a dynamic-vs-static pair pushes the dynamic
+/// entity the full way out, a dynamic-vs-dynamic pair splits the push evenly,
+/// and two static entities are left alone. Runs after movement, correcting the
+/// overlaps this tick's motion produced.
+///
+/// Corrections are gathered against a snapshot and applied together, so the pass
+/// is deterministic and order-independent within a tick. It is a single pass, so
+/// deep stacks may take a few ticks to settle — fine at these scales. Uses the
+/// same axis-aligned scale-boxes as `collision`.
+pub fn resolve_collisions(world: &mut World) {
+    use crate::world::ENTITY_SIZE;
+    let half = ENTITY_SIZE * 0.5;
+
+    // Snapshot each live entity's centre, half-extents, and static flag.
+    let mut boxes: Vec<(usize, [f32; 3], [f32; 3], bool)> = Vec::new();
+    for (id, slot) in world.positions.iter().enumerate() {
+        let Some(p) = slot.as_ref() else { continue };
+        let s = world.scales.get(id).copied().unwrap_or_default();
+        let is_static = world.statics.get(id).is_some();
+        boxes.push((
+            id,
+            [p.x, p.y, p.z],
+            [half * s.x, half * s.y, half * s.z],
+            is_static,
+        ));
+    }
+
+    // Accumulate corrections keyed by entity, then apply them all at once.
+    let mut corrections: Vec<(usize, [f32; 3])> = Vec::new();
+    for i in 0..boxes.len() {
+        for j in (i + 1)..boxes.len() {
+            let (id_a, c_a, h_a, static_a) = boxes[i];
+            let (id_b, c_b, h_b, static_b) = boxes[j];
+            if static_a && static_b {
+                continue; // neither can move
+            }
+            // Overlap on each axis; if any is <= 0 the boxes don't intersect.
+            let mut overlap = [0.0f32; 3];
+            let mut separated = false;
+            for axis in 0..3 {
+                let o = (h_a[axis] + h_b[axis]) - (c_a[axis] - c_b[axis]).abs();
+                if o <= 0.0 {
+                    separated = true;
+                    break;
+                }
+                overlap[axis] = o;
+            }
+            if separated {
+                continue;
+            }
+            // Resolve along the axis of least overlap (the minimum translation).
+            let mut axis = 0;
+            for a in 1..3 {
+                if overlap[a] < overlap[axis] {
+                    axis = a;
+                }
+            }
+            // Push a away from b; if the centres coincide on this axis, pick a
+            // stable default direction.
+            let dir = if c_a[axis] >= c_b[axis] { 1.0 } else { -1.0 };
+            let push = overlap[axis];
+            let (share_a, share_b) = match (static_a, static_b) {
+                (false, true) => (1.0, 0.0),
+                (true, false) => (0.0, 1.0),
+                _ => (0.5, 0.5),
+            };
+            if share_a > 0.0 {
+                let mut d = [0.0; 3];
+                d[axis] = dir * push * share_a;
+                corrections.push((id_a, d));
+            }
+            if share_b > 0.0 {
+                let mut d = [0.0; 3];
+                d[axis] = -dir * push * share_b;
+                corrections.push((id_b, d));
+            }
+        }
+    }
+
+    for (id, d) in corrections {
+        if let Some(p) = world.positions.get_mut(id) {
+            p.x += d[0];
+            p.y += d[1];
+            p.z += d[2];
+        }
+    }
+}
+
 pub fn run_scripts(world: &mut World, runtime: &mut dyn ScriptRuntime) {
     runtime.begin_tick();
     let ids: Vec<usize> = world

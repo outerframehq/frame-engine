@@ -2,7 +2,7 @@ const LOGO_PNG: &[u8] = include_bytes!("../assets/frame-editor.png");
 use frame_engine::core::Clock;
 use frame_engine::input::{Button, InputState};
 use frame_engine::systems;
-use frame_engine::world::{Controlled, Mesh, Position, Script, Velocity, World};
+use frame_engine::world::{Controlled, Mesh, Position, Script, Static, Velocity, World};
 use glam::{Mat4, Vec3, Vec4};
 use std::sync::Arc;
 use wgpu::util::DeviceExt;
@@ -803,6 +803,7 @@ type EditedEntity = (
     frame_engine::world::Scale,
     Option<String>,
     Mesh,
+    bool,
 );
 
 /// Scene tab: the entity list.
@@ -826,7 +827,7 @@ fn inspector_tab_ui(
     script_filter: &mut String,
 ) {
     match edited {
-        Some((id, pos, vel, color, controlled, scale, script_source, mesh)) => {
+        Some((id, pos, vel, color, controlled, scale, script_source, mesh, is_static)) => {
             ui.label(format!("Entity {id}"));
             ui.add_space(4.0);
             ui.label("Position");
@@ -888,6 +889,7 @@ fn inspector_tab_ui(
                 });
             ui.add_space(4.0);
             ui.checkbox(controlled, "Controlled (WASD)");
+            ui.checkbox(is_static, "Static (immovable)");
             ui.add_space(8.0);
             ui.label("Script");
             if script_library.is_empty() {
@@ -1216,6 +1218,7 @@ impl App {
     fn step_once(&mut self) {
         if self.paused {
             systems::movement(&mut self.world);
+            systems::resolve_collisions(&mut self.world);
             self.log("Stepped one tick");
         }
     }
@@ -1734,6 +1737,7 @@ impl App {
                 systems::run_scripts(world, &mut self.script_runtime);
                 systems::input_movement(world, &self.game_input);
                 systems::movement(world);
+                systems::resolve_collisions(world);
             }
         }
         let (width, height) = match &self.game_window {
@@ -2098,6 +2102,7 @@ impl ApplicationHandler for App {
                     systems::run_scripts(&mut self.world, &mut self.script_runtime);
                     systems::input_movement(&mut self.world, &self.input);
                     systems::movement(&mut self.world);
+                    systems::resolve_collisions(&mut self.world);
                 }
                 // Refresh collisions once more for the editor's red tint. Inside
                 // the loop, detection ran at each tick's start (before that tick's
@@ -2210,6 +2215,7 @@ impl ApplicationHandler for App {
                         self.world.scales.get(id).copied().unwrap_or_default(),
                         self.world.scripts.get(id).map(|s| s.uses.clone()),
                         self.world.meshes.get(id).copied().unwrap_or_default(),
+                        self.world.statics.get(id).is_some(),
                     ))
                 });
                 // Upload the logo to the GPU on the first frame, then reuse the handle.
@@ -2393,7 +2399,17 @@ impl ApplicationHandler for App {
                 // Push any inspector edits back into the world. The render this
                 // frame already used the old values; the change shows next frame
                 // (same one-frame path as the keyboard nudge).
-                if let Some((id, pos, vel, color, controlled, scale, script_source, mesh)) = edited
+                if let Some((
+                    id,
+                    pos,
+                    vel,
+                    color,
+                    controlled,
+                    scale,
+                    script_source,
+                    mesh,
+                    is_static,
+                )) = edited
                 {
                     if let Some(p) = self.world.positions.get_mut(id) {
                         *p = pos;
@@ -2408,6 +2424,11 @@ impl ApplicationHandler for App {
                         self.world.controlled.insert(id, Controlled);
                     } else {
                         self.world.controlled.remove(id);
+                    }
+                    if is_static {
+                        self.world.statics.insert(id, Static);
+                    } else {
+                        self.world.statics.remove(id);
                     }
                     match script_source {
                         Some(uses) => {

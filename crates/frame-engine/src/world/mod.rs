@@ -20,6 +20,11 @@ pub struct Script {
 #[derive(Serialize, Deserialize, Clone, Copy)]
 pub struct Controlled;
 
+/// Marks an entity as immovable: collision response never pushes it, so other
+/// entities rest against it (a floor, a wall) instead of shoving it aside.
+#[derive(Serialize, Deserialize, Clone, Copy)]
+pub struct Static;
+
 #[derive(Serialize, Deserialize, Clone, Copy)]
 pub struct Position {
     pub x: f32,
@@ -61,6 +66,8 @@ pub struct World {
     pub colors: ComponentStorage<Color>,
     #[serde(default)]
     pub controlled: ComponentStorage<Controlled>,
+    #[serde(default)]
+    pub statics: ComponentStorage<Static>,
     #[serde(default)]
     pub scales: ComponentStorage<Scale>,
     #[serde(default)]
