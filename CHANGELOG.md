@@ -11,14 +11,19 @@ lands and the patch version bumps for fixes and small additions.
 
 ### Added
 
+Engine:
+
+- Collision response. A `resolve_collisions` system pushes overlapping entities apart along their least-overlapping axis (the minimum translation vector) after movement, so they stop interpenetrating. Detection-only collision (the `hit` flag) is unchanged; this adds the automatic separation on top.
+- A `Static` marker component. A static entity is immovable — collision response never pushes it, so others rest against it (a floor, a wall). A dynamic-vs-static pair pushes only the dynamic entity; dynamic-vs-dynamic splits the push evenly. Serialized with the scene; defaults off, so older scenes are unaffected.
+
 Editor (frame-editor):
 
 - A project launcher. The editor now opens on a launcher screen to create, open, and manage projects, rather than loading one fixed scene. Creating or opening a project loads its scene and switches into the editor; File > Close project returns to the launcher.
 - Projects. A project is a folder holding a scene file named after the project (the file's stem is the project name) and a `project.ron` manifest (description and version). Create a named project, or open an existing one by picking its folder.
 - A recent-projects list on the launcher, sorted by most-recently-edited and remembered across runs. Each project is a full-width card showing its name, description, last-edited date, and version, with Edit, Play, and Settings actions.
 - A project-settings window, opened from a card, to edit the name, version, and description. It saves when the window closes (its X or the Save button); renaming the project renames its scene file. Description and version are stored in the project's `project.ron`.
-
-(Play, on the cards, is a placeholder until the separate game window lands.)
+- Play a project in a separate, clean game window: its own window and GPU surface running a copy of the project's world — the 3D scene only, no editor chrome — with the simulation running and WASD driving `Controlled` entities. Close the window or press Esc to return to the launcher.
+- A Static (immovable) checkbox in the Inspector, marking an entity so collision response leaves it in place.
 
 ## [0.2.0] - 2026-07-05
 

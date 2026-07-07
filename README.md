@@ -41,7 +41,7 @@ Early development, past the toy stage, with a working engine and a usable editor
 - A movement system that advances entities each tick, and an input system that drives `Controlled` entities from held WASD keys.
 - Per-entity colour and scale, stored as component data and serialized with the scene.
 - A per-entity `Mesh` primitive (cube, sphere, or plane), stored as component data and serialized with the scene; defaults to cube, so older scenes load unchanged.
-- AABB collision detection: a `collision` system records which entity boxes overlap each run, as triggers — detection only, with no physics response. Boxes are axis-aligned scale-boxes derived from a shared `ENTITY_SIZE`, the world-space size the editor also renders and picks against.
+- AABB collision, detection and response: a `collision` system records which entity boxes overlap each run (feeding the `hit` script flag and the editor's red tint), and a `resolve_collisions` system pushes overlapping entities apart along their least-overlapping axis after movement. A `Static` marker keeps an entity immovable, so others rest against it. Boxes are axis-aligned scale-boxes derived from a shared `ENTITY_SIZE`, the world-space size the editor also renders and picks against.
 - Per-entity scripting: an entity can carry a `Script` that names a shared library script (source held once on the world, in a name-to-source map), with a `ScriptRuntime` trait and a `run_scripts` system forming the seam. The engine stores script source as data and runs nothing itself — the interpreter lives in the editor, the same way rendering does.
 - A graphics-free input abstraction (which buttons are held), fed by the editor and read by systems, so input can drive the simulation without the engine knowing about windowing.
 - Scene serialization to and from a human-readable RON file (`serde` and RON), with backward compatibility for scenes saved before newer fields like colour and scale existed.
@@ -60,11 +60,13 @@ Early development, past the toy stage, with a working engine and a usable editor
 - A Script Editor: a dockable tab where the shared script library is written — a sidebar of script names beside a single code editor with a line-number gutter and a live syntax check (a status line flags parse errors with their line and column). Scripts run live through a Rhai backend and are assigned to entities from the Inspector. See [SCRIPTING.md](SCRIPTING.md) for how to write them.
 - A dockable panel layout built with `egui` and `egui_dock`. The Viewport, Scene, Inspector, and Script Editor are tabs you can drag, tab together, and split apart; the Viewport is a transparent tab so the 3D shows through. Alongside them:
   - a top toolbar showing the editor's logo and working File/Edit/View/Help menus, each item mirroring a keyboard shortcut (open/save/reload scene, close project, quit; spawn, despawn, clear selection; play/pause, step, controls overlay),
-  - a Scene tab (lists entities, click to select) and an Inspector tab (edit the selected entity's position, velocity, colour, and scale, pick its mesh primitive, toggle whether it is `Controlled`, and assign a library script through a searchable picker, all written straight back into the world),
+  - a Scene tab (lists entities, click to select) and an Inspector tab (edit the selected entity's position, velocity, colour, and scale, pick its mesh primitive, toggle whether it is `Controlled` or `Static`, and assign a library script through a searchable picker, all written straight back into the world),
   - a fixed bottom console dock with an Output tab showing a live log and a Terminal placeholder.
 - Runs the simulation live on the engine's fixed-timestep clock, so the sim ticks at a true 30 per second independent of the window's repaint rate, with play, pause, and step controls.
 
-Currently at the frontier: playing a project as a standalone game window; richer authoring (gizmos, undo and redo, prefabs); per-entity appearance beyond colour, scale, and mesh (material, textures); collision that does more than detect (a response, mesh-fitted boxes, richer script queries); and a more discoverable script API.
+Play a project in a separate, clean game window — its own window and GPU surface running the world with no editor chrome, the simulation live and WASD driving `Controlled` entities.
+
+Currently at the frontier: richer authoring (gizmos, undo and redo, prefabs); per-entity appearance beyond colour, scale, and mesh (material, textures); collision refinements (mesh-fitted boxes, richer script queries, a broad phase); and a more discoverable script API.
 
 ## Principles
 
