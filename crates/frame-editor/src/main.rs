@@ -1172,6 +1172,18 @@ struct App {
     log_lines: Vec<String>,
     // Which movement buttons (WASD) are currently held, read by the input system.
     input: InputState,
+    // A separate "clean" game window for Play: its own window + GPU surface,
+    // running a copy of the project's world with no editor chrome. None when not
+    // playing. game_input drives Controlled entities; game_clock ticks the sim.
+    game_window: Option<Arc<Window>>,
+    game_gpu: Option<GpuState>,
+    game_world: Option<World>,
+    game_input: InputState,
+    game_clock: Clock,
+    // Set when the game window asks to close; the actual teardown happens in
+    // about_to_wait, outside event dispatch, so dropping the wgpu surface on
+    // Wayland doesn't segfault mid-event.
+    game_closing: bool,
     // Text in the "new script name" box on the Scripts tab (persists between frames).
     new_script_name: String,
     // Filter text for the Inspector's script picker (persists between frames).
@@ -1312,7 +1324,7 @@ impl App {
     /// Draw the launcher screen: an egui-only frame (no simulation, no 3D) with
     /// buttons to create or open a project. Mirrors the editor's egui→render
     /// handoff, but renders an empty 3D scene behind the UI.
-    fn draw_launcher(&mut self) {
+    fn draw_launcher(&mut self, event_loop: &ActiveEventLoop) {
         let mut action: Option<LauncherAction> = None;
         let recent = self.recent_projects.clone();
         let mut name_input = std::mem::take(&mut self.new_project_name);
@@ -1503,9 +1515,7 @@ impl App {
             Some(LauncherAction::NewProject) => self.new_project(),
             Some(LauncherAction::OpenProject) => self.open_project(),
             Some(LauncherAction::OpenRecent(root)) => self.open_project_at(root),
-            Some(LauncherAction::PlayRecent(_)) => {
-                self.log("Play mode (a separate game window) is coming next.".to_string());
-            }
+            Some(LauncherAction::PlayRecent(root)) => self.start_play(event_loop, root),
             Some(LauncherAction::OpenSettings(root)) => self.open_settings(root),
             None => {}
         }
@@ -1664,6 +1674,134 @@ impl App {
         self.recent_projects = sorted_recent_projects();
     }
 
+    /// Play a project: open a separate, clean game window (its own GPU surface),
+    /// load the project's scene into it, and run the simulation there with no
+    /// editor chrome. Closing the window returns to the launcher.
+    fn start_play(&mut self, event_loop: &ActiveEventLoop, root: std::path::PathBuf) {
+        if self.game_window.is_some() {
+            return; // already playing
+        }
+        let Some(scene) = find_scene(&root) else {
+            self.log("That project has no scene to play".to_string());
+            return;
+        };
+        let world = match World::load_from_file(&scene) {
+            Ok(world) => world,
+            Err(e) => {
+                self.log(format!("Could not play project: {e}"));
+                return;
+            }
+        };
+        let name = scene
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("Game")
+            .to_string();
+        let attributes = Window::default_attributes().with_title(format!("{name} — Play"));
+        let window = match event_loop.create_window(attributes) {
+            Ok(w) => Arc::new(w),
+            Err(e) => {
+                self.log(format!("Could not open game window: {e}"));
+                return;
+            }
+        };
+        let gpu = GpuState::new(window.clone());
+        window.request_redraw();
+        self.game_gpu = Some(gpu);
+        self.game_world = Some(world);
+        self.game_input = InputState::new();
+        self.game_clock = Clock::new(TICK_RATE, MAX_CATCHUP_TICKS);
+        self.game_window = Some(window);
+        self.log(format!("Playing '{name}'"));
+    }
+
+    /// Close the game window and stop playing. GPU state is dropped first (its
+    /// surface holds a window handle) — the same teardown order as on exit.
+    fn close_game(&mut self) {
+        self.game_gpu = None;
+        self.game_world = None;
+        self.game_window = None;
+        self.game_input = InputState::new();
+    }
+
+    /// Advance and render the game window: tick the game world on its own clock
+    /// (always running), draw it with the shared 3D pipeline, and no egui/overlay.
+    fn render_game(&mut self) {
+        let owed = self.game_clock.advance(true);
+        for _ in 0..owed {
+            if let Some(world) = self.game_world.as_mut() {
+                systems::collision(world);
+                systems::run_scripts(world, &mut self.script_runtime);
+                systems::input_movement(world, &self.game_input);
+                systems::movement(world);
+            }
+        }
+        let (width, height) = match &self.game_window {
+            Some(w) => {
+                let size = w.inner_size();
+                (size.width.max(1), size.height.max(1))
+            }
+            None => return,
+        };
+        let (instances, group_counts) = match &self.game_world {
+            Some(world) => {
+                let empty = std::collections::HashSet::new();
+                build_instances(world, None, &empty)
+            }
+            None => return,
+        };
+        let view_proj = camera_view_proj(
+            self.cam_focus_x,
+            self.cam_focus_y,
+            self.cam_distance,
+            self.cam_yaw,
+            self.cam_pitch,
+            width,
+            height,
+        );
+        if let Some(gpu) = self.game_gpu.as_mut() {
+            gpu.render(
+                &instances,
+                group_counts,
+                &[],
+                view_proj,
+                &[],
+                &egui::TexturesDelta::default(),
+                1.0,
+            );
+        }
+        if let Some(window) = &self.game_window {
+            window.request_redraw();
+        }
+    }
+
+    /// Handle an event addressed to the game window.
+    fn game_window_event(&mut self, event: WindowEvent) {
+        match event {
+            WindowEvent::CloseRequested => self.game_closing = true,
+            WindowEvent::Resized(size) => {
+                if let Some(gpu) = self.game_gpu.as_mut() {
+                    gpu.resize(size.width, size.height);
+                }
+            }
+            WindowEvent::RedrawRequested => self.render_game(),
+            WindowEvent::KeyboardInput { event, .. } => {
+                let pressed = event.state == ElementState::Pressed;
+                if let PhysicalKey::Code(code) = event.physical_key {
+                    match code {
+                        KeyCode::Escape => self.game_closing = true,
+                        KeyCode::KeyW => self.game_input.set(Button::Up, pressed),
+                        KeyCode::KeyA => self.game_input.set(Button::Left, pressed),
+                        KeyCode::KeyS => self.game_input.set(Button::Down, pressed),
+                        KeyCode::KeyD => self.game_input.set(Button::Right, pressed),
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Switch from the launcher into the editor with a project loaded.
     fn enter_editor(&mut self, name: String, scene_path: std::path::PathBuf) {
         self.current_scene_path = Some(scene_path);
@@ -1766,6 +1904,16 @@ impl ApplicationHandler for App {
         window.request_redraw();
         self.window = Some(window);
     }
+    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+        // Tear down a closing game window here, after all events for this cycle
+        // are dispatched. Dropping the wgpu surface from inside the window's own
+        // CloseRequested handler segfaults on Wayland; doing it here — outside
+        // event dispatch, with the display still alive — is safe.
+        if self.game_closing {
+            self.close_game();
+            self.game_closing = false;
+        }
+    }
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
         // Release GPU and window resources here, while winit's platform
         // connection (the Wayland display) is still alive. If we let these drop
@@ -1776,8 +1924,16 @@ impl ApplicationHandler for App {
         self.gpu = None;
         self.egui_state = None;
         self.window = None;
+        self.game_gpu = None;
+        self.game_world = None;
+        self.game_window = None;
     }
-    fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
+        // Events addressed to the separate game window go to its own handler.
+        if self.game_window.as_ref().is_some_and(|w| w.id() == id) {
+            self.game_window_event(event);
+            return;
+        }
         // Feed every event to egui so its own widgets (dragging the panel,
         // future buttons/sliders) keep working. We deliberately ignore the
         // returned `consumed` flag: in 0.35 it's driven by egui's *interaction*
@@ -1930,7 +2086,7 @@ impl ApplicationHandler for App {
                 // On the launcher screen there's no simulation and no 3D — draw
                 // just the launcher UI and stop.
                 if matches!(self.mode, AppMode::Launcher) {
-                    self.draw_launcher();
+                    self.draw_launcher(event_loop);
                     return;
                 }
                 let owed = self.clock.advance(!self.paused);
@@ -1956,51 +2112,8 @@ impl ApplicationHandler for App {
                     .flat_map(|&(a, b)| [a, b])
                     .collect();
                 let selected = self.selected;
-                // Group instances by primitive so the renderer can draw each
-                // shape in one call. Buckets are kept in the engine's Mesh order
-                // (Cube, Sphere, Plane); an entity with no mesh slot (an old
-                // scene) falls back to Cube via unwrap_or_default.
-                let mut cube_i: Vec<InstanceRaw> = Vec::new();
-                let mut sphere_i: Vec<InstanceRaw> = Vec::new();
-                let mut plane_i: Vec<InstanceRaw> = Vec::new();
-                for (id, slot) in self.world.positions.iter().enumerate() {
-                    let Some(p) = slot.as_ref() else { continue };
-                    let color = self.world.colors.get(id).copied().unwrap_or_default();
-                    let scale = self.world.scales.get(id).copied().unwrap_or_default();
-                    let mesh = self.world.meshes.get(id).copied().unwrap_or_default();
-                    // Tint entities that are currently overlapping toward red so a
-                    // collision is obvious at a glance. Purely visual — detection
-                    // changes nothing about the entity's own colour in the world.
-                    let rgb = if colliding.contains(&id) {
-                        const T: f32 = 0.6; // how far toward red
-                        [
-                            color.r * (1.0 - T) + 1.0 * T,
-                            color.g * (1.0 - T) + 0.15 * T,
-                            color.b * (1.0 - T) + 0.15 * T,
-                        ]
-                    } else {
-                        [color.r, color.g, color.b]
-                    };
-                    let raw = InstanceRaw {
-                        position: [p.x, p.y, p.z],
-                        color: rgb,
-                        selected: if Some(id) == selected { 1.0 } else { 0.0 },
-                        scale: [scale.x, scale.y, scale.z],
-                    };
-                    match mesh {
-                        Mesh::Cube => cube_i.push(raw),
-                        Mesh::Sphere => sphere_i.push(raw),
-                        Mesh::Plane => plane_i.push(raw),
-                    }
-                }
-                let group_counts = [
-                    cube_i.len() as u32,
-                    sphere_i.len() as u32,
-                    plane_i.len() as u32,
-                ];
-                let mut instances = cube_i;
-                instances.extend(sphere_i);
-                instances.extend(plane_i);
+                // Per-primitive instance buckets from the world (see build_instances).
+                let (instances, group_counts) = build_instances(&self.world, selected, &colliding);
                 let (width, height) = match &self.window {
                     Some(window) => {
                         let size = window.inner_size();
@@ -2476,6 +2589,56 @@ fn format_edited(modified: Option<std::time::SystemTime>) -> String {
     }
 }
 
+/// Build per-primitive instance buckets from a world, in the engine's Mesh order
+/// (Cube, Sphere, Plane). Colliding entities are tinted toward red (a debug
+/// flag); the selected entity, if any, is highlighted. Shared by the editor
+/// viewport and the play window.
+fn build_instances(
+    world: &World,
+    selected: Option<usize>,
+    colliding: &std::collections::HashSet<usize>,
+) -> (Vec<InstanceRaw>, [u32; 3]) {
+    let mut cube_i: Vec<InstanceRaw> = Vec::new();
+    let mut sphere_i: Vec<InstanceRaw> = Vec::new();
+    let mut plane_i: Vec<InstanceRaw> = Vec::new();
+    for (id, slot) in world.positions.iter().enumerate() {
+        let Some(p) = slot.as_ref() else { continue };
+        let color = world.colors.get(id).copied().unwrap_or_default();
+        let scale = world.scales.get(id).copied().unwrap_or_default();
+        let mesh = world.meshes.get(id).copied().unwrap_or_default();
+        let rgb = if colliding.contains(&id) {
+            const T: f32 = 0.6; // how far toward red
+            [
+                color.r * (1.0 - T) + 1.0 * T,
+                color.g * (1.0 - T) + 0.15 * T,
+                color.b * (1.0 - T) + 0.15 * T,
+            ]
+        } else {
+            [color.r, color.g, color.b]
+        };
+        let raw = InstanceRaw {
+            position: [p.x, p.y, p.z],
+            color: rgb,
+            selected: if Some(id) == selected { 1.0 } else { 0.0 },
+            scale: [scale.x, scale.y, scale.z],
+        };
+        match mesh {
+            Mesh::Cube => cube_i.push(raw),
+            Mesh::Sphere => sphere_i.push(raw),
+            Mesh::Plane => plane_i.push(raw),
+        }
+    }
+    let group_counts = [
+        cube_i.len() as u32,
+        sphere_i.len() as u32,
+        plane_i.len() as u32,
+    ];
+    let mut instances = cube_i;
+    instances.extend(sphere_i);
+    instances.extend(plane_i);
+    (instances, group_counts)
+}
+
 fn default_world() -> World {
     let mut world = World::new();
     world.spawn(
@@ -2570,6 +2733,12 @@ fn main() {
         console_tab: ConsoleTab::Output,
         log_lines: vec!["Frame Editor started.".to_string()],
         input: InputState::new(),
+        game_window: None,
+        game_gpu: None,
+        game_world: None,
+        game_input: InputState::new(),
+        game_clock: Clock::new(TICK_RATE, MAX_CATCHUP_TICKS),
+        game_closing: false,
         new_script_name: String::new(),
         script_filter: String::new(),
         open_script: None,
