@@ -13,8 +13,10 @@ lands and the patch version bumps for fixes and small additions.
 
 Engine:
 
-- Collision response. A `resolve_collisions` system pushes overlapping entities apart along their least-overlapping axis (the minimum translation vector) after movement, so they stop interpenetrating. Detection-only collision (the `hit` flag) is unchanged; this adds the automatic separation on top.
+- Collision response. A `resolve_collisions` system pushes overlapping entities apart along their least-overlapping axis (the minimum translation vector) after movement, so they stop interpenetrating, and zeros the velocity heading into a surface so a fallen entity rests instead of accumulating speed (a script-driven bounce, already moving away, is preserved). Detection-only collision (the `hit` flag) is unchanged; this adds the automatic separation on top.
 - A `Static` marker component. A static entity is immovable — collision response never pushes it, so others rest against it (a floor, a wall). A dynamic-vs-static pair pushes only the dynamic entity; dynamic-vs-dynamic splits the push evenly. Serialized with the scene; defaults off, so older scenes are unaffected.
+- Gravity. A `Gravity` marker component and a `gravity` system accelerate marked (non-static) entities downward (−Y) each tick, at a tunable `GRAVITY` strength. Opt-in per entity, so scenes without it are unaffected.
+- Mesh-fitted collision boxes. A `Plane` now has a flat (zero-height) collision box matching what's drawn, so entities rest on its surface rather than on an invisible ledge half an entity-size above it. Cubes and spheres keep their full box.
 
 Editor (frame-editor):
 
@@ -23,7 +25,7 @@ Editor (frame-editor):
 - A recent-projects list on the launcher, sorted by most-recently-edited and remembered across runs. Each project is a full-width card showing its name, description, last-edited date, and version, with Edit, Play, and Settings actions.
 - A project-settings window, opened from a card, to edit the name, version, and description. It saves when the window closes (its X or the Save button); renaming the project renames its scene file. Description and version are stored in the project's `project.ron`.
 - Play a project in a separate, clean game window: its own window and GPU surface running a copy of the project's world — the 3D scene only, no editor chrome — with the simulation running and WASD driving `Controlled` entities. Close the window or press Esc to return to the launcher.
-- A Static (immovable) checkbox in the Inspector, marking an entity so collision response leaves it in place.
+- A Static (immovable) checkbox in the Inspector, marking an entity so collision response leaves it in place, and a Gravity (falls) checkbox marking an entity to be pulled downward.
 
 ## [0.2.0] - 2026-07-05
 
