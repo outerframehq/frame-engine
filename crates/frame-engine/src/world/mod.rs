@@ -9,6 +9,11 @@ pub use storage::ComponentStorage;
 /// (which can't import Rust) must be kept equal to it by hand.
 pub const ENTITY_SIZE: f32 = 8.0;
 
+/// Downward (−Y) acceleration added to a falling entity's velocity each tick.
+/// A tunable knob: larger falls faster. Only entities with the `Gravity` marker
+/// are affected.
+pub const GRAVITY: f32 = 0.3;
+
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Script {
     /// The name of a script in the world's `script_library`. The behaviour
@@ -24,6 +29,12 @@ pub struct Controlled;
 /// entities rest against it (a floor, a wall) instead of shoving it aside.
 #[derive(Serialize, Deserialize, Clone, Copy)]
 pub struct Static;
+
+/// Marks an entity as affected by gravity: it accelerates downward (−Y) each
+/// tick. Opt-in, so entities without it don't fall. A `Static` entity ignores
+/// gravity even if marked.
+#[derive(Serialize, Deserialize, Clone, Copy)]
+pub struct Gravity;
 
 #[derive(Serialize, Deserialize, Clone, Copy)]
 pub struct Position {
@@ -68,6 +79,8 @@ pub struct World {
     pub controlled: ComponentStorage<Controlled>,
     #[serde(default)]
     pub statics: ComponentStorage<Static>,
+    #[serde(default)]
+    pub gravities: ComponentStorage<Gravity>,
     #[serde(default)]
     pub scales: ComponentStorage<Scale>,
     #[serde(default)]

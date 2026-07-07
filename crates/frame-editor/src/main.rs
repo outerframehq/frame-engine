@@ -2,7 +2,7 @@ const LOGO_PNG: &[u8] = include_bytes!("../assets/frame-editor.png");
 use frame_engine::core::Clock;
 use frame_engine::input::{Button, InputState};
 use frame_engine::systems;
-use frame_engine::world::{Controlled, Mesh, Position, Script, Static, Velocity, World};
+use frame_engine::world::{Controlled, Gravity, Mesh, Position, Script, Static, Velocity, World};
 use glam::{Mat4, Vec3, Vec4};
 use std::sync::Arc;
 use wgpu::util::DeviceExt;
@@ -804,6 +804,7 @@ type EditedEntity = (
     Option<String>,
     Mesh,
     bool,
+    bool,
 );
 
 /// Scene tab: the entity list.
@@ -827,7 +828,18 @@ fn inspector_tab_ui(
     script_filter: &mut String,
 ) {
     match edited {
-        Some((id, pos, vel, color, controlled, scale, script_source, mesh, is_static)) => {
+        Some((
+            id,
+            pos,
+            vel,
+            color,
+            controlled,
+            scale,
+            script_source,
+            mesh,
+            is_static,
+            has_gravity,
+        )) => {
             ui.label(format!("Entity {id}"));
             ui.add_space(4.0);
             ui.label("Position");
@@ -890,6 +902,7 @@ fn inspector_tab_ui(
             ui.add_space(4.0);
             ui.checkbox(controlled, "Controlled (WASD)");
             ui.checkbox(is_static, "Static (immovable)");
+            ui.checkbox(has_gravity, "Gravity (falls)");
             ui.add_space(8.0);
             ui.label("Script");
             if script_library.is_empty() {
@@ -1217,6 +1230,7 @@ impl App {
     /// Advance the simulation exactly one tick. Only meaningful while paused.
     fn step_once(&mut self) {
         if self.paused {
+            systems::gravity(&mut self.world);
             systems::movement(&mut self.world);
             systems::resolve_collisions(&mut self.world);
             self.log("Stepped one tick");
@@ -1736,6 +1750,7 @@ impl App {
                 systems::collision(world);
                 systems::run_scripts(world, &mut self.script_runtime);
                 systems::input_movement(world, &self.game_input);
+                systems::gravity(world);
                 systems::movement(world);
                 systems::resolve_collisions(world);
             }
@@ -2101,6 +2116,7 @@ impl ApplicationHandler for App {
                     systems::collision(&mut self.world);
                     systems::run_scripts(&mut self.world, &mut self.script_runtime);
                     systems::input_movement(&mut self.world, &self.input);
+                    systems::gravity(&mut self.world);
                     systems::movement(&mut self.world);
                     systems::resolve_collisions(&mut self.world);
                 }
@@ -2216,6 +2232,7 @@ impl ApplicationHandler for App {
                         self.world.scripts.get(id).map(|s| s.uses.clone()),
                         self.world.meshes.get(id).copied().unwrap_or_default(),
                         self.world.statics.get(id).is_some(),
+                        self.world.gravities.get(id).is_some(),
                     ))
                 });
                 // Upload the logo to the GPU on the first frame, then reuse the handle.
@@ -2409,6 +2426,7 @@ impl ApplicationHandler for App {
                     script_source,
                     mesh,
                     is_static,
+                    has_gravity,
                 )) = edited
                 {
                     if let Some(p) = self.world.positions.get_mut(id) {
@@ -2429,6 +2447,11 @@ impl ApplicationHandler for App {
                         self.world.statics.insert(id, Static);
                     } else {
                         self.world.statics.remove(id);
+                    }
+                    if has_gravity {
+                        self.world.gravities.insert(id, Gravity);
+                    } else {
+                        self.world.gravities.remove(id);
                     }
                     match script_source {
                         Some(uses) => {

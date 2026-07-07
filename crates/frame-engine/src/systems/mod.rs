@@ -2,6 +2,19 @@ use crate::input::{Button, InputState};
 use crate::world::ScriptRuntime;
 use crate::world::World;
 
+/// Half-extents of an entity's axis-aligned collision box, per axis. A `Plane`
+/// is a flat floor tile, so its box is flat in Y (zero height) to match what's
+/// drawn — otherwise things rest on an invisible ledge half an `ENTITY_SIZE`
+/// above its surface. Cubes and spheres use the full scale-box.
+fn half_extents(mesh: crate::world::Mesh, scale: crate::world::Scale) -> [f32; 3] {
+    use crate::world::{ENTITY_SIZE, Mesh};
+    let h = ENTITY_SIZE * 0.5;
+    match mesh {
+        Mesh::Plane => [h * scale.x, 0.0, h * scale.z],
+        _ => [h * scale.x, h * scale.y, h * scale.z],
+    }
+}
+
 /// Detect which entity boxes overlap and record the pairs on the world.
 ///
 /// This is detection only — a *trigger*, not physics. It finds overlaps and
@@ -15,9 +28,6 @@ use crate::world::World;
 /// scale collide identically. The sweep is O(n^2) over live entities, which is
 /// fine at these counts; a broad phase is a later concern if entity counts grow.
 pub fn collision(world: &mut World) {
-    use crate::world::ENTITY_SIZE;
-    let half = ENTITY_SIZE * 0.5;
-
     // Snapshot every live entity's box first (this borrows the world's storages
     // immutably); the pairwise test below then only touches the local snapshot
     // and `world.collisions`, so there's no borrow clash.
@@ -25,7 +35,8 @@ pub fn collision(world: &mut World) {
     for (id, slot) in world.positions.iter().enumerate() {
         let Some(p) = slot.as_ref() else { continue };
         let s = world.scales.get(id).copied().unwrap_or_default();
-        let (hx, hy, hz) = (half * s.x, half * s.y, half * s.z);
+        let mesh = world.meshes.get(id).copied().unwrap_or_default();
+        let [hx, hy, hz] = half_extents(mesh, s);
         boxes.push((
             id,
             [p.x - hx, p.y - hy, p.z - hz],
@@ -64,25 +75,19 @@ pub fn collision(world: &mut World) {
 /// deep stacks may take a few ticks to settle — fine at these scales. Uses the
 /// same axis-aligned scale-boxes as `collision`.
 pub fn resolve_collisions(world: &mut World) {
-    use crate::world::ENTITY_SIZE;
-    let half = ENTITY_SIZE * 0.5;
-
     // Snapshot each live entity's centre, half-extents, and static flag.
     let mut boxes: Vec<(usize, [f32; 3], [f32; 3], bool)> = Vec::new();
     for (id, slot) in world.positions.iter().enumerate() {
         let Some(p) = slot.as_ref() else { continue };
         let s = world.scales.get(id).copied().unwrap_or_default();
+        let mesh = world.meshes.get(id).copied().unwrap_or_default();
         let is_static = world.statics.get(id).is_some();
-        boxes.push((
-            id,
-            [p.x, p.y, p.z],
-            [half * s.x, half * s.y, half * s.z],
-            is_static,
-        ));
+        boxes.push((id, [p.x, p.y, p.z], half_extents(mesh, s), is_static));
     }
 
     // Accumulate corrections keyed by entity, then apply them all at once.
-    let mut corrections: Vec<(usize, [f32; 3])> = Vec::new();
+    // (entity id, resolution axis, direction it was pushed, position delta).
+    let mut corrections: Vec<(usize, usize, f32, [f32; 3])> = Vec::new();
     for i in 0..boxes.len() {
         for j in (i + 1)..boxes.len() {
             let (id_a, c_a, h_a, static_a) = boxes[i];
@@ -123,21 +128,54 @@ pub fn resolve_collisions(world: &mut World) {
             if share_a > 0.0 {
                 let mut d = [0.0; 3];
                 d[axis] = dir * push * share_a;
-                corrections.push((id_a, d));
+                corrections.push((id_a, axis, dir, d));
             }
             if share_b > 0.0 {
                 let mut d = [0.0; 3];
                 d[axis] = -dir * push * share_b;
-                corrections.push((id_b, d));
+                corrections.push((id_b, axis, -dir, d));
             }
         }
     }
 
-    for (id, d) in corrections {
+    for (id, axis, dir, d) in corrections {
         if let Some(p) = world.positions.get_mut(id) {
             p.x += d[0];
             p.y += d[1];
             p.z += d[2];
+        }
+        // Kill the velocity heading *into* the surface, so a fallen entity rests
+        // instead of accumulating downward speed. Velocity already moving away
+        // (a script-driven bounce) is left alone.
+        if let Some(v) = world.velocities.get_mut(id) {
+            let vc = match axis {
+                0 => &mut v.dx,
+                1 => &mut v.dy,
+                _ => &mut v.dz,
+            };
+            if *vc * dir < 0.0 {
+                *vc = 0.0;
+            }
+        }
+    }
+}
+
+/// Accelerate every falling entity downward (−Y). An entity falls if it carries
+/// the `Gravity` marker and isn't `Static`. This adds to velocity, not position,
+/// so `movement` integrates it and `resolve_collisions` can arrest it against a
+/// floor. Strength is the `GRAVITY` constant.
+pub fn gravity(world: &mut World) {
+    use crate::world::GRAVITY;
+    let falling: Vec<usize> = (0..world.velocities.len())
+        .filter(|&id| {
+            world.velocities.get(id).is_some()
+                && world.gravities.get(id).is_some()
+                && world.statics.get(id).is_none()
+        })
+        .collect();
+    for id in falling {
+        if let Some(v) = world.velocities.get_mut(id) {
+            v.dy -= GRAVITY;
         }
     }
 }
