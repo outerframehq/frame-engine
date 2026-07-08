@@ -22,35 +22,35 @@ pub struct Script {
     pub uses: String,
 }
 
-#[derive(Serialize, Deserialize, Clone, Copy)]
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq)]
 pub struct Controlled;
 
 /// Marks an entity as immovable: collision response never pushes it, so other
 /// entities rest against it (a floor, a wall) instead of shoving it aside.
-#[derive(Serialize, Deserialize, Clone, Copy)]
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq)]
 pub struct Static;
 
 /// Marks an entity as affected by gravity: it accelerates downward (−Y) each
 /// tick. Opt-in, so entities without it don't fall. A `Static` entity ignores
 /// gravity even if marked.
-#[derive(Serialize, Deserialize, Clone, Copy)]
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq)]
 pub struct Gravity;
 
-#[derive(Serialize, Deserialize, Clone, Copy)]
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq)]
 pub struct Position {
     pub x: f32,
     pub y: f32,
     pub z: f32,
 }
 
-#[derive(Serialize, Deserialize, Clone, Copy)]
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq)]
 pub struct Velocity {
     pub dx: f32,
     pub dy: f32,
     pub dz: f32,
 }
 
-#[derive(Serialize, Deserialize, Clone, Copy)]
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq)]
 pub struct Color {
     pub r: f32,
     pub g: f32,
@@ -69,7 +69,7 @@ pub enum Mesh {
     Plane,
 }
 
-#[derive(Serialize, Deserialize, Default)]
+#[derive(Serialize, Deserialize, Default, Clone)]
 pub struct World {
     pub positions: ComponentStorage<Position>,
     pub velocities: ComponentStorage<Velocity>,
@@ -99,7 +99,7 @@ pub struct World {
     pub collisions: Vec<(usize, usize)>,
 }
 
-#[derive(Serialize, Deserialize, Clone, Copy)]
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq)]
 pub struct Scale {
     pub x: f32,
     pub y: f32,

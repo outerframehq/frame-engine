@@ -7,7 +7,9 @@ use glam::{Mat4, Vec3, Vec4};
 use std::sync::Arc;
 use wgpu::util::DeviceExt;
 use winit::application::ApplicationHandler;
-use winit::event::{ElementState, MouseButton, MouseScrollDelta, WindowEvent};
+use winit::event::{
+    DeviceEvent, DeviceId, ElementState, MouseButton, MouseScrollDelta, WindowEvent,
+};
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Icon, Window, WindowId};
@@ -23,10 +25,14 @@ const FOV_DEGREES: f32 = 45.0;
 const QUAD_SIZE: f32 = frame_engine::world::ENTITY_SIZE;
 // How fast middle-drag sweeps the orbit, in radians per pixel.
 const ORBIT_SENS: f32 = 0.005;
+// Mouselook sensitivity for the flythrough camera (radians per pixel of motion).
+const LOOK_SENS: f32 = 0.005;
 // Format of the depth buffer. 32-bit float depth, no stencil.
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 // How far a single nudge moves the selected entity, in world units.
 const EDIT_STEP: f32 = 5.0;
+// How far the WASD free camera pans the focus point per frame (while paused).
+const CAM_PAN_SPEED: f32 = 3.0;
 // The camera data handed to the shader. Must match the `Camera` struct in shader.wgsl.
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
@@ -320,6 +326,7 @@ fn build_text(
 fn camera_matrix(
     focus_x: f32,
     focus_y: f32,
+    focus_z: f32,
     distance: f32,
     yaw: f32,
     pitch: f32,
@@ -327,7 +334,7 @@ fn camera_matrix(
     height: u32,
 ) -> Mat4 {
     let aspect = width as f32 / height.max(1) as f32;
-    let target = Vec3::new(focus_x, focus_y, 0.0);
+    let target = Vec3::new(focus_x, focus_y, focus_z);
     let offset = Vec3::new(
         pitch.cos() * yaw.sin(),
         pitch.sin(),
@@ -342,13 +349,26 @@ fn camera_matrix(
 fn camera_view_proj(
     focus_x: f32,
     focus_y: f32,
+    focus_z: f32,
     distance: f32,
     yaw: f32,
     pitch: f32,
     width: u32,
     height: u32,
 ) -> [[f32; 4]; 4] {
-    camera_matrix(focus_x, focus_y, distance, yaw, pitch, width, height).to_cols_array_2d()
+    camera_matrix(
+        focus_x, focus_y, focus_z, distance, yaw, pitch, width, height,
+    )
+    .to_cols_array_2d()
+}
+// The camera's look direction (eye -> target) for a given yaw/pitch. Matches the
+// orbit convention, so entering fly mode preserves the current heading.
+fn view_forward(yaw: f32, pitch: f32) -> Vec3 {
+    Vec3::new(
+        -(pitch.cos() * yaw.sin()),
+        -pitch.sin(),
+        -(pitch.cos() * yaw.cos()),
+    )
 }
 // Project a world point through the view-projection matrix to screen pixels.
 fn project(vp: Mat4, x: f32, y: f32, z: f32, width: f32, height: f32) -> Option<(f32, f32)> {
@@ -783,6 +803,8 @@ enum MenuAction {
     SaveSceneAs,
     ReloadScene,
     CloseProject,
+    Undo,
+    Redo,
     SpawnEntity,
     DespawnSelected,
     ClearSelection,
@@ -1157,6 +1179,14 @@ struct App {
     settings_description: String,
     settings_version: String,
     world: World,
+    // Undo/redo: full-world snapshots. Pushed before a mutating gesture; undo
+    // pops to the redo stack and back. `inspector_editing` coalesces a drag into
+    // one snapshot. `ctrl_held`/`shift_held` track modifiers for the shortcuts.
+    undo_stack: Vec<World>,
+    redo_stack: Vec<World>,
+    inspector_editing: bool,
+    ctrl_held: bool,
+    shift_held: bool,
     // Where "Save scene" writes and "Reload scene" reads. Set by Open/Save-As
     // (and defaulted to the startup scene). None means Save prompts for a path.
     current_scene_path: Option<std::path::PathBuf>,
@@ -1181,6 +1211,17 @@ struct App {
     // it wasn't visible. window_event routes 3D input by this instead of by
     // is_pointer_over_egui, which would read true over the viewport tab.
     viewport_rect: Option<egui::Rect>,
+    // Flythrough camera: true while the right mouse button is held over the
+    // viewport. The cursor is grabbed and hidden, mouse motion looks around, and
+    // WASD flies. A focus Z lets the camera move in the full look direction.
+    fly_mode: bool,
+    cam_focus_z: f32,
+    // Free-camera eye position, used only while flying. Seeded from the orbit eye
+    // on entry; WASD moves it and mouselook turns it in place (no orbit pivot).
+    cam_eye: Vec3,
+    // Whether an entity was picked during this fly session; if so, orbit resumes
+    // around it on exit.
+    fly_picked: bool,
     // Active tab in the bottom console dock.
     console_tab: ConsoleTab,
     // Lines shown in the console Output tab (also echoed to the terminal).
@@ -1245,8 +1286,94 @@ impl App {
     fn toggle_help(&mut self) {
         self.show_help = !self.show_help;
     }
+    /// Snapshot the world onto the undo stack before a mutating action. Clears
+    /// the redo stack (a new edit invalidates any redo history) and caps history.
+    fn push_undo(&mut self) {
+        const MAX_UNDO: usize = 50;
+        self.undo_stack.push(self.world.clone());
+        if self.undo_stack.len() > MAX_UNDO {
+            self.undo_stack.remove(0);
+        }
+        self.redo_stack.clear();
+    }
+    /// Restore the previous world state, moving the current one onto the redo
+    /// stack.
+    fn undo(&mut self) {
+        if let Some(prev) = self.undo_stack.pop() {
+            self.redo_stack.push(self.world.clone());
+            self.world = prev;
+            self.selected = None;
+            self.log("Undo".to_string());
+        } else {
+            self.log("Nothing to undo".to_string());
+        }
+    }
+    /// Re-apply an undone change.
+    fn redo(&mut self) {
+        if let Some(next) = self.redo_stack.pop() {
+            self.undo_stack.push(self.world.clone());
+            self.world = next;
+            self.selected = None;
+            self.log("Redo".to_string());
+        } else {
+            self.log("Nothing to redo".to_string());
+        }
+    }
+    /// Enter or leave the flythrough camera. Entering grabs and hides the cursor
+    /// so mouse motion becomes look input; leaving restores it. Locked grab gives
+    /// raw motion for smooth mouselook; Confined is a fallback if Locked isn't
+    /// supported (some Wayland setups).
+    fn set_fly(&mut self, on: bool) {
+        if self.fly_mode == on {
+            return;
+        }
+        self.fly_mode = on;
+        if on {
+            // Seed the free camera from the current orbit eye, so flight begins
+            // exactly where the orbit view was.
+            let offset = Vec3::new(
+                self.cam_pitch.cos() * self.cam_yaw.sin(),
+                self.cam_pitch.sin(),
+                self.cam_pitch.cos() * self.cam_yaw.cos(),
+            ) * self.cam_distance;
+            self.cam_eye = Vec3::new(self.cam_focus_x, self.cam_focus_y, self.cam_focus_z) + offset;
+            self.fly_picked = false;
+        } else {
+            // Return to orbit. Pivot around the entity picked while flying, or —
+            // if none — a point straight ahead, so the view doesn't jump. Then
+            // rebuild yaw/pitch/distance so the orbit eye stays where flight left
+            // it (looking at the pivot).
+            if !self.fly_picked {
+                let ahead =
+                    self.cam_eye + view_forward(self.cam_yaw, self.cam_pitch) * self.cam_distance;
+                self.cam_focus_x = ahead.x;
+                self.cam_focus_y = ahead.y;
+                self.cam_focus_z = ahead.z;
+            }
+            let focus = Vec3::new(self.cam_focus_x, self.cam_focus_y, self.cam_focus_z);
+            let offset = self.cam_eye - focus;
+            let dist = offset.length();
+            if dist > 0.001 {
+                self.cam_distance = dist.clamp(10.0, 2000.0);
+                self.cam_pitch = (offset.y / dist).asin().clamp(-1.4, 1.4);
+                self.cam_yaw = offset.x.atan2(offset.z);
+            }
+        }
+        if let Some(window) = &self.window {
+            if on {
+                let _ = window
+                    .set_cursor_grab(winit::window::CursorGrabMode::Locked)
+                    .or_else(|_| window.set_cursor_grab(winit::window::CursorGrabMode::Confined));
+                window.set_cursor_visible(false);
+            } else {
+                let _ = window.set_cursor_grab(winit::window::CursorGrabMode::None);
+                window.set_cursor_visible(true);
+            }
+        }
+    }
     /// Spawn a new entity at the camera focus and select it.
     fn spawn_at_focus(&mut self) {
+        self.push_undo();
         let id = self.world.spawn(
             Position {
                 x: self.cam_focus_x,
@@ -1265,6 +1392,7 @@ impl App {
     /// Despawn the selected entity, if any.
     fn despawn_selected(&mut self) {
         if let Some(id) = self.selected {
+            self.push_undo();
             self.world.despawn(id);
             self.selected = None;
             self.log(format!("Despawned entity {id}"));
@@ -1772,6 +1900,7 @@ impl App {
         let view_proj = camera_view_proj(
             self.cam_focus_x,
             self.cam_focus_y,
+            self.cam_focus_z,
             self.cam_distance,
             self.cam_yaw,
             self.cam_pitch,
@@ -1833,6 +1962,28 @@ impl App {
         self.log(format!("Opened project '{name}'"));
         self.project_name = Some(name);
     }
+    /// The current view-projection matrix: an orbit around the focus normally, or
+    /// a free camera from `cam_eye` while flying.
+    fn view_matrix(&self, width: u32, height: u32) -> Mat4 {
+        if self.fly_mode {
+            let aspect = width as f32 / height.max(1) as f32;
+            let forward = view_forward(self.cam_yaw, self.cam_pitch);
+            let view = Mat4::look_at_rh(self.cam_eye, self.cam_eye + forward, Vec3::Y);
+            let proj = Mat4::perspective_rh(FOV_DEGREES.to_radians(), aspect, 0.1, 10000.0);
+            proj * view
+        } else {
+            camera_matrix(
+                self.cam_focus_x,
+                self.cam_focus_y,
+                self.cam_focus_z,
+                self.cam_distance,
+                self.cam_yaw,
+                self.cam_pitch,
+                width,
+                height,
+            )
+        }
+    }
     fn pick(&mut self) {
         let (width_u, height_u) = match &self.window {
             Some(window) => {
@@ -1843,17 +1994,15 @@ impl App {
         };
         let width = width_u as f32;
         let height = height_u as f32;
-        let vp = camera_matrix(
-            self.cam_focus_x,
-            self.cam_focus_y,
-            self.cam_distance,
-            self.cam_yaw,
-            self.cam_pitch,
-            width_u,
-            height_u,
-        );
-        let cursor_x = self.last_cursor.0 as f32;
-        let cursor_y = self.last_cursor.1 as f32;
+        let vp = self.view_matrix(width_u, height_u);
+        // While flying the cursor is locked, so aim from screen centre (a
+        // crosshair): look at an entity and click to pick it. Otherwise use the
+        // cursor.
+        let (cursor_x, cursor_y) = if self.fly_mode {
+            (width * 0.5, height * 0.5)
+        } else {
+            (self.last_cursor.0 as f32, self.last_cursor.1 as f32)
+        };
         let mut picked: Option<usize> = None;
         for (id, slot) in self.world.positions.iter().enumerate() {
             if let Some(p) = slot {
@@ -1874,6 +2023,16 @@ impl App {
         }
         if let Some(id) = picked {
             self.selected = Some(id);
+            // Picking while flying makes that entity the orbit pivot for when we
+            // drop back to orbit.
+            if self.fly_mode {
+                if let Some(p) = self.world.positions.get(id) {
+                    self.cam_focus_x = p.x;
+                    self.cam_focus_y = p.y;
+                    self.cam_focus_z = p.z;
+                    self.fly_picked = true;
+                }
+            }
             if let (Some(p), Some(v)) =
                 (self.world.positions.get(id), self.world.velocities.get(id))
             {
@@ -1933,6 +2092,25 @@ impl ApplicationHandler for App {
             self.game_closing = false;
         }
     }
+    fn device_event(
+        &mut self,
+        _event_loop: &ActiveEventLoop,
+        _device_id: DeviceId,
+        event: DeviceEvent,
+    ) {
+        // Raw mouse motion drives mouselook while flying. Raw motion (rather than
+        // cursor position) keeps looking smooth with the cursor grabbed in place.
+        if let DeviceEvent::MouseMotion { delta: (dx, dy) } = event {
+            if self.fly_mode {
+                self.cam_yaw += dx as f32 * LOOK_SENS;
+                self.cam_pitch -= dy as f32 * LOOK_SENS;
+                self.cam_pitch = self.cam_pitch.clamp(-1.4, 1.4);
+                if let Some(window) = &self.window {
+                    window.request_redraw();
+                }
+            }
+        }
+    }
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
         // Release GPU and window resources here, while winit's platform
         // connection (the Wayland display) is still alive. If we let these drop
@@ -1987,7 +2165,20 @@ impl ApplicationHandler for App {
                     gpu.resize(size.width, size.height);
                 }
             }
-            WindowEvent::MouseInput { state, button, .. } if over_viewport => {
+            WindowEvent::ModifiersChanged(mods) => {
+                self.ctrl_held = mods.state().control_key();
+                self.shift_held = mods.state().shift_key();
+                // Hold Alt for the flythrough camera; release to return to the
+                // standard view. Driven from the modifier state (not a key event)
+                // because a lone Alt press often only reports here on Wayland.
+                self.set_fly(mods.state().alt_key());
+            }
+            WindowEvent::Focused(false) => {
+                // Losing focus (e.g. Alt+Tab) drops the fly key without a release
+                // event, so leave fly mode here too and free the cursor.
+                self.set_fly(false);
+            }
+            WindowEvent::MouseInput { state, button, .. } if over_viewport || self.fly_mode => {
                 let pressed = state == ElementState::Pressed;
                 match button {
                     MouseButton::Left => {
@@ -2057,6 +2248,17 @@ impl ApplicationHandler for App {
                 }
                 if !ui_wants_keys && event.state == ElementState::Pressed {
                     if let PhysicalKey::Code(code) = event.physical_key {
+                        // Undo / redo (Ctrl+Z, Ctrl+Y or Ctrl+Shift+Z). Fires only
+                        // when no egui widget holds focus, so it doesn't fight a
+                        // text field's own editing.
+                        if self.ctrl_held && !event.repeat {
+                            match code {
+                                KeyCode::KeyZ if self.shift_held => self.redo(),
+                                KeyCode::KeyZ => self.undo(),
+                                KeyCode::KeyY => self.redo(),
+                                _ => {}
+                            }
+                        }
                         // Position nudge — moves the selected entity along a world
                         // axis. Runs on auto-repeat too, so holding a key glides.
                         let nudge = match code {
@@ -2070,6 +2272,11 @@ impl ApplicationHandler for App {
                         };
                         if let Some((dx, dy, dz)) = nudge {
                             if let Some(id) = self.selected {
+                                // One undo step per press-and-hold: snapshot on the
+                                // first press, not on each auto-repeat.
+                                if !event.repeat {
+                                    self.push_undo();
+                                }
                                 if let Some(p) = self.world.positions.get_mut(id) {
                                     p.x += dx;
                                     p.y += dy;
@@ -2108,6 +2315,28 @@ impl ApplicationHandler for App {
                     self.draw_launcher(event_loop);
                     return;
                 }
+                // Flythrough: while flying (right mouse held over the viewport),
+                // WASD moves the camera through the scene along the direction it's
+                // looking. Uses the actual view vectors, so it's correct at any
+                // angle. While playing, WASD instead drives Controlled entities.
+                if self.fly_mode {
+                    let forward = view_forward(self.cam_yaw, self.cam_pitch);
+                    let right = forward.cross(Vec3::Y).normalize_or_zero();
+                    let mut mv = Vec3::ZERO;
+                    if self.input.is_held(Button::Up) {
+                        mv += forward;
+                    }
+                    if self.input.is_held(Button::Down) {
+                        mv -= forward;
+                    }
+                    if self.input.is_held(Button::Right) {
+                        mv += right;
+                    }
+                    if self.input.is_held(Button::Left) {
+                        mv -= right;
+                    }
+                    self.cam_eye += mv.normalize_or_zero() * CAM_PAN_SPEED;
+                }
                 let owed = self.clock.advance(!self.paused);
                 for _ in 0..owed {
                     // Detection runs first each tick, so a script can read whether
@@ -2115,7 +2344,10 @@ impl ApplicationHandler for App {
                     // and react before movement is applied.
                     systems::collision(&mut self.world);
                     systems::run_scripts(&mut self.world, &mut self.script_runtime);
-                    systems::input_movement(&mut self.world, &self.input);
+                    // While flying, WASD moves the camera, not Controlled entities.
+                    if !self.fly_mode {
+                        systems::input_movement(&mut self.world, &self.input);
+                    }
                     systems::gravity(&mut self.world);
                     systems::movement(&mut self.world);
                     systems::resolve_collisions(&mut self.world);
@@ -2153,7 +2385,7 @@ impl ApplicationHandler for App {
                     let help = "CONTROLS   H TO HIDE\n\n\
                                                     SPACE  PLAY PAUSE\n\n\
                                                     .  STEP WHEN PAUSED\n\n\
-                                                    WASD  DRIVE CONTROLLED\n\n\
+                                                    WASD  DRIVE OR FLY\n\n\
                                                     N  SPAWN ENTITY\n\n\
                                                     DEL  DESPAWN SELECTED\n\n\
                                                     ARROWS  MOVE X Y\n\n\
@@ -2162,6 +2394,7 @@ impl ApplicationHandler for App {
                                                     ESC  DESELECT\n\n\
                                                     LMB  SELECT   DRAG PAN\n\n\
                                                     MMB  DRAG ORBIT\n\n\
+                                                    HOLD ALT  FLY CAM\n\n\
                                                     WHEEL  ZOOM";
                     let pixel = 2.0;
                     let lines = help.lines().count() as f32;
@@ -2176,15 +2409,7 @@ impl ApplicationHandler for App {
                         height as f32,
                     ));
                 }
-                let view_proj = camera_view_proj(
-                    self.cam_focus_x,
-                    self.cam_focus_y,
-                    self.cam_distance,
-                    self.cam_yaw,
-                    self.cam_pitch,
-                    width,
-                    height,
-                );
+                let view_proj = self.view_matrix(width, height).to_cols_array_2d();
                 // --- Run egui for this frame ---
                 // run_ui hands our closure a full-screen root Ui and runs the
                 // begin/end pass internally. Panels shown into that root dock to
@@ -2257,6 +2482,9 @@ impl ApplicationHandler for App {
                 // Move the dock's per-frame state into the viewer, and lift the
                 // dock layout off `self` (swapping in a throwaway) so the egui
                 // closure can borrow neither. Both are drained back afterwards.
+                // Snapshot of the selected entity's editable state before the UI
+                // pass, so we can tell if the Inspector changed it this frame.
+                let edited_before = edited.clone();
                 let mut dock_state =
                     std::mem::replace(&mut self.dock_state, egui_dock::DockState::new(Vec::new()));
                 let mut viewer = EditorTabViewer {
@@ -2310,6 +2538,13 @@ impl ApplicationHandler for App {
                                         }
                                     });
                                     ui.menu_button("Edit", |ui| {
+                                        if ui.button("Undo").clicked() {
+                                            menu_action = Some(MenuAction::Undo);
+                                        }
+                                        if ui.button("Redo").clicked() {
+                                            menu_action = Some(MenuAction::Redo);
+                                        }
+                                        ui.separator();
                                         if ui.button("Spawn entity").clicked() {
                                             menu_action = Some(MenuAction::SpawnEntity);
                                         }
@@ -2413,6 +2648,17 @@ impl ApplicationHandler for App {
                 self.open_script = viewer.open_script;
                 self.selected = viewer.selection;
                 let edited = viewer.edited;
+                // Coalesce Inspector edits into one undo step per gesture: snapshot
+                // on the first frame the values change, and reset when they stop.
+                // (This runs before the write-back below, so the world is still in
+                // its pre-edit state when we snapshot it.)
+                let inspector_changed = edited != edited_before;
+                if inspector_changed && !self.inspector_editing {
+                    self.push_undo();
+                    self.inspector_editing = true;
+                } else if !inspector_changed {
+                    self.inspector_editing = false;
+                }
                 // Push any inspector edits back into the world. The render this
                 // frame already used the old values; the change shows next frame
                 // (same one-frame path as the keyboard nudge).
@@ -2472,6 +2718,8 @@ impl ApplicationHandler for App {
                     Some(MenuAction::SaveSceneAs) => self.save_scene_as(),
                     Some(MenuAction::ReloadScene) => self.reload_scene(),
                     Some(MenuAction::CloseProject) => self.close_project(),
+                    Some(MenuAction::Undo) => self.undo(),
+                    Some(MenuAction::Redo) => self.redo(),
                     Some(MenuAction::SpawnEntity) => self.spawn_at_focus(),
                     Some(MenuAction::DespawnSelected) => self.despawn_selected(),
                     Some(MenuAction::ClearSelection) => self.clear_selection(),
@@ -2732,6 +2980,11 @@ fn main() {
         window: None,
         gpu: None,
         world,
+        undo_stack: Vec::new(),
+        redo_stack: Vec::new(),
+        inspector_editing: false,
+        ctrl_held: false,
+        shift_held: false,
         mode: AppMode::Launcher,
         project_name: None,
         recent_projects: sorted_recent_projects(),
@@ -2774,6 +3027,10 @@ fn main() {
             state
         },
         viewport_rect: None,
+        fly_mode: false,
+        cam_focus_z: 0.0,
+        cam_eye: Vec3::ZERO,
+        fly_picked: false,
         console_tab: ConsoleTab::Output,
         log_lines: vec!["Frame Editor started.".to_string()],
         input: InputState::new(),
