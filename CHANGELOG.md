@@ -17,6 +17,7 @@ Engine:
 - A `Static` marker component. A static entity is immovable — collision response never pushes it, so others rest against it (a floor, a wall). A dynamic-vs-static pair pushes only the dynamic entity; dynamic-vs-dynamic splits the push evenly. Serialized with the scene; defaults off, so older scenes are unaffected.
 - Gravity. A `Gravity` marker component and a `gravity` system accelerate marked (non-static) entities downward (−Y) each tick, at a tunable `GRAVITY` strength. Opt-in per entity, so scenes without it are unaffected.
 - Mesh-fitted collision boxes. A `Plane` now has a flat (zero-height) collision box matching what's drawn, so entities rest on its surface rather than on an invisible ledge half an entity-size above it. Cubes and spheres keep their full box.
+- `World` and `ComponentStorage` now derive `Clone`, and the plain-data components (`Position`, `Velocity`, `Color`, `Scale`) derive `PartialEq`, so the editor can snapshot and compare a world. No behaviour change on their own; they back the editor's undo/redo.
 
 Editor (frame-editor):
 
@@ -26,6 +27,8 @@ Editor (frame-editor):
 - A project-settings window, opened from a card, to edit the name, version, and description. It saves when the window closes (its X or the Save button); renaming the project renames its scene file. Description and version are stored in the project's `project.ron`.
 - Play a project in a separate, clean game window: its own window and GPU surface running a copy of the project's world — the 3D scene only, no editor chrome — with the simulation running and WASD driving `Controlled` entities. Close the window or press Esc to return to the launcher.
 - A Static (immovable) checkbox in the Inspector, marking an entity so collision response leaves it in place, and a Gravity (falls) checkbox marking an entity to be pulled downward.
+- Undo and redo (Ctrl+Z / Ctrl+Y or Ctrl+Shift+Z, and Edit > Undo/Redo), built on full-world snapshots. Spawning, despawning, position nudges, and Inspector edits are undoable; a drag or a held key coalesces into a single step. (Script-editor text typing isn't yet an independent step.)
+- A flythrough camera. Hold Alt to enter a free camera seeded from the current orbit view: the mouse looks around and WASD flies through the scene, with the cursor grabbed. Left-click picks the entity at screen-centre and makes it the pivot for when orbit resumes; releasing Alt returns to orbit. Known limitation: releasing Alt doesn't yet restore the exact pre-Alt view — orbit resumes from where flight ended.
 
 ## [0.2.0] - 2026-07-05
 

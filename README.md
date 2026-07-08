@@ -63,10 +63,12 @@ Early development, past the toy stage, with a working engine and a usable editor
   - a Scene tab (lists entities, click to select) and an Inspector tab (edit the selected entity's position, velocity, colour, and scale, pick its mesh primitive, toggle whether it is `Controlled` or `Static`, and assign a library script through a searchable picker, all written straight back into the world),
   - a fixed bottom console dock with an Output tab showing a live log and a Terminal placeholder.
 - Runs the simulation live on the engine's fixed-timestep clock, so the sim ticks at a true 30 per second independent of the window's repaint rate, with play, pause, and step controls.
+- Undo and redo (Ctrl+Z / Ctrl+Y), built on full-world snapshots. Spawning, despawning, nudging, and Inspector edits are undoable; a drag or a held key is a single step.
+- A flythrough camera: hold Alt to look around with the mouse and fly with WASD (cursor grabbed), seeded from the current view. Left-click picks the entity at screen-centre and makes it the orbit pivot; release Alt to return to orbit.
 
 Play a project in a separate, clean game window — its own window and GPU surface running the world with no editor chrome, the simulation live and WASD driving `Controlled` entities.
 
-Currently at the frontier: richer authoring (gizmos, undo and redo, prefabs); per-entity appearance beyond colour, scale, and mesh (material, textures); collision refinements (mesh-fitted boxes, richer script queries, a broad phase); and a more discoverable script API.
+Currently at the frontier: richer authoring (gizmos, prefabs); per-entity appearance beyond colour, scale, and mesh (material, textures); collision refinements (tighter or rotated boxes, richer script queries, a broad phase); and a more discoverable script API.
 
 ## Principles
 
@@ -128,8 +130,10 @@ Editor controls:
 - **Left-click** select an entity, **Esc** clear selection
 - **Arrow keys** move selection on X and Y, **Page Up / Page Down** move on Z
 - **N** spawn an entity, **Delete** despawn the selection
+- **Ctrl+Z** undo, **Ctrl+Y** (or **Ctrl+Shift+Z**) redo
 - **F5** save scene, **F9** reload scene
 - **Left-drag** pan, **Scroll** zoom, **Middle-drag** orbit
+- **Hold Alt** flythrough camera — mouse looks, **WASD** flies, left-click picks the centred entity as the orbit pivot
 - **H** toggle the controls overlay
 
 ## License
