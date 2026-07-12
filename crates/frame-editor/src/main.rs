@@ -33,6 +33,11 @@ const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 const EDIT_STEP: f32 = 5.0;
 // How far the WASD free camera pans the focus point per frame (while paused).
 const CAM_PAN_SPEED: f32 = 3.0;
+// Translate gizmo: how long each axis arm is, as a fraction of the distance from
+// the camera to the entity — so it keeps a roughly constant size on screen.
+const GIZMO_SCREEN_FRAC: f32 = 0.15;
+// How close (in pixels) the cursor must be to an arm to grab it.
+const GIZMO_PICK_PX: f32 = 10.0;
 // The camera data handed to the shader. Must match the `Camera` struct in shader.wgsl.
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
@@ -381,6 +386,40 @@ fn project(vp: Mat4, x: f32, y: f32, z: f32, width: f32, height: f32) -> Option<
     let screen_x = (ndc_x * 0.5 + 0.5) * width;
     let screen_y = (1.0 - (ndc_y * 0.5 + 0.5)) * height;
     Some((screen_x, screen_y))
+}
+// The translate gizmo, projected to screen. `origin` is the selected entity and
+// `ends` are the tips of its X, Y, Z arms, all in PHYSICAL pixels (the same space
+// as the cursor, so hit-testing is a straight comparison). `len` is how long one
+// arm is in world units, which is what converts a screen drag back into a world
+// move.
+#[derive(Clone, Copy)]
+struct GizmoScreen {
+    origin: (f32, f32),
+    ends: [(f32, f32); 3],
+    len: f32,
+}
+
+// The same gizmo in egui points, ready to paint, plus which arm is lit up.
+#[derive(Clone, Copy)]
+struct GizmoDraw {
+    origin: egui::Pos2,
+    ends: [egui::Pos2; 3],
+    active: Option<usize>,
+}
+
+// Shortest distance from a point to a line segment, in 2D. Used to decide whether
+// the cursor is on a gizmo arm.
+fn dist_to_segment(p: (f32, f32), a: (f32, f32), b: (f32, f32)) -> f32 {
+    let (vx, vy) = (b.0 - a.0, b.1 - a.1);
+    let (wx, wy) = (p.0 - a.0, p.1 - a.1);
+    let len2 = vx * vx + vy * vy;
+    if len2 <= 0.0001 {
+        return (wx * wx + wy * wy).sqrt();
+    }
+    // Project the point onto the segment, clamped to its ends.
+    let t = ((wx * vx + wy * vy) / len2).clamp(0.0, 1.0);
+    let (cx, cy) = (a.0 + vx * t, a.1 + vy * t);
+    ((p.0 - cx).powi(2) + (p.1 - cy).powi(2)).sqrt()
 }
 // All the long-lived GPU objects, bundled so they travel together.
 struct GpuState {
@@ -972,7 +1011,6 @@ fn scripts_tab_ui(
     new_script_name: &mut String,
     open_script: &mut Option<String>,
     script_status: &Option<Result<(), script::ScriptError>>,
-    script_warnings: &[script::ScriptError],
 ) {
     let mut delete: Option<String> = None;
     // LEFT: the script list and the "new script" box, in a resizable sidebar.
@@ -1022,23 +1060,11 @@ fn scripts_tab_ui(
                 }
             });
             match script_status {
-                Some(Ok(())) if script_warnings.is_empty() => {
-                    ui.colored_label(egui::Color32::from_rgb(0x7c, 0xc5, 0x7c), "No problems");
-                }
                 Some(Ok(())) => {
-                    // Parses, but uses names the script API doesn't define — the
-                    // script will run and silently do nothing at those lines.
-                    for w in script_warnings {
-                        let loc = match (w.line, w.column) {
-                            (Some(l), Some(c)) => format!("line {l}, col {c}: "),
-                            (Some(l), None) => format!("line {l}: "),
-                            _ => String::new(),
-                        };
-                        ui.colored_label(
-                            egui::Color32::from_rgb(0xd6, 0xa8, 0x4c),
-                            format!("{loc}{}", w.message),
-                        );
-                    }
+                    ui.colored_label(
+                        egui::Color32::from_rgb(0x7c, 0xc5, 0x7c),
+                        "No syntax errors",
+                    );
                 }
                 Some(Err(e)) => {
                     let loc = match (e.line, e.column) {
@@ -1107,11 +1133,12 @@ struct EditorTabViewer {
     script_filter: String,
     open_script: Option<String>,
     script_status: Option<Result<(), script::ScriptError>>,
-    script_warnings: Vec<script::ScriptError>,
     // Set by the Viewport tab each frame to its transparent body rect (egui
     // points). `None` when the Viewport tab isn't visible. Used to route 3D
     // input: clicks/drags land on the viewport only when the cursor is here.
     viewport_rect: Option<egui::Rect>,
+    // The translate gizmo to paint over the viewport, if anything is selected.
+    gizmo: Option<GizmoDraw>,
 }
 
 impl egui_dock::TabViewer for EditorTabViewer {
@@ -1134,6 +1161,32 @@ impl egui_dock::TabViewer for EditorTabViewer {
             // the body rect so window_event can route 3D input to it.
             Tab::Viewport => {
                 self.viewport_rect = Some(ui.max_rect());
+                // The translate gizmo is painted here, on top of the 3D showing
+                // through, rather than as scene geometry — it's a tool, not part of
+                // the world, and this keeps it out of the render pipeline entirely.
+                if let Some(g) = self.gizmo {
+                    let painter = ui.painter();
+                    // X red, Y green, Z blue — the usual convention.
+                    let colors = [
+                        egui::Color32::from_rgb(0xe0, 0x5c, 0x5c),
+                        egui::Color32::from_rgb(0x6c, 0xc9, 0x6c),
+                        egui::Color32::from_rgb(0x5c, 0x8c, 0xe0),
+                    ];
+                    for axis in 0..3 {
+                        let lit = g.active == Some(axis);
+                        let color = if lit {
+                            egui::Color32::from_rgb(0xff, 0xd5, 0x4c) // grabbed/hovered
+                        } else {
+                            colors[axis]
+                        };
+                        let width = if lit { 3.5 } else { 2.0 };
+                        painter.line_segment(
+                            [g.origin, g.ends[axis]],
+                            egui::Stroke::new(width, color),
+                        );
+                        painter.circle_filled(g.ends[axis], if lit { 6.0 } else { 4.5 }, color);
+                    }
+                }
             }
             Tab::Scene => scene_tab_ui(ui, &self.entity_ids, &mut self.selection),
             Tab::Inspector => inspector_tab_ui(
@@ -1148,7 +1201,6 @@ impl egui_dock::TabViewer for EditorTabViewer {
                 &mut self.new_script_name,
                 &mut self.open_script,
                 &self.script_status,
-                &self.script_warnings,
             ),
         }
     }
@@ -1214,6 +1266,12 @@ struct App {
     cam_pitch: f32,
     dragging: bool,
     orbiting: bool,
+    // Translate gizmo state. `gizmo` is recomputed each frame from the selection
+    // (None when nothing is selected). `gizmo_drag` is the axis currently being
+    // dragged, `gizmo_hover` the one under the cursor — 0 = X, 1 = Y, 2 = Z.
+    gizmo: Option<GizmoScreen>,
+    gizmo_drag: Option<usize>,
+    gizmo_hover: Option<usize>,
     last_cursor: (f64, f64),
     selected: Option<usize>,
     show_help: bool,
@@ -1999,6 +2057,83 @@ impl App {
             )
         }
     }
+    /// Where the camera actually is: the free-camera eye while flying, or the
+    /// orbit eye (focus plus the orbit offset) otherwise.
+    fn camera_eye(&self) -> Vec3 {
+        if self.fly_mode {
+            self.cam_eye
+        } else {
+            let offset = Vec3::new(
+                self.cam_pitch.cos() * self.cam_yaw.sin(),
+                self.cam_pitch.sin(),
+                self.cam_pitch.cos() * self.cam_yaw.cos(),
+            ) * self.cam_distance;
+            Vec3::new(self.cam_focus_x, self.cam_focus_y, self.cam_focus_z) + offset
+        }
+    }
+
+    /// Recompute the gizmo's screen geometry for the current selection and camera.
+    /// Arms are sized as a fraction of the camera-to-entity distance, so the gizmo
+    /// stays about the same size on screen however far away the entity is. Also
+    /// refreshes which arm the cursor is hovering.
+    fn update_gizmo(&mut self, width: u32, height: u32) {
+        self.gizmo = None;
+        // No gizmo while flying: the cursor is locked, so there's nothing to grab.
+        if self.fly_mode {
+            self.gizmo_hover = None;
+            return;
+        }
+        let Some(id) = self.selected else {
+            self.gizmo_hover = None;
+            return;
+        };
+        let Some(p) = self.world.positions.get(id).copied() else {
+            self.gizmo_hover = None;
+            return;
+        };
+        let (w, h) = (width as f32, height as f32);
+        let eye = self.camera_eye();
+        let dist = (Vec3::new(p.x, p.y, p.z) - eye).length();
+        let len = (dist * GIZMO_SCREEN_FRAC).max(1.0);
+        let vp = self.view_matrix(width, height);
+        let origin = project(vp, p.x, p.y, p.z, w, h);
+        let ex = project(vp, p.x + len, p.y, p.z, w, h);
+        let ey = project(vp, p.x, p.y + len, p.z, w, h);
+        let ez = project(vp, p.x, p.y, p.z + len, w, h);
+        if let (Some(origin), Some(ex), Some(ey), Some(ez)) = (origin, ex, ey, ez) {
+            self.gizmo = Some(GizmoScreen {
+                origin,
+                ends: [ex, ey, ez],
+                len,
+            });
+        }
+        // Hover follows the cursor unless a drag is already in progress.
+        self.gizmo_hover = if self.gizmo_drag.is_some() {
+            self.gizmo_drag
+        } else {
+            self.gizmo_hit()
+        };
+    }
+
+    /// Which gizmo arm, if any, the cursor is close enough to grab. Nearest wins,
+    /// so crossing arms behave sensibly.
+    fn gizmo_hit(&self) -> Option<usize> {
+        let g = self.gizmo?;
+        let cursor = (self.last_cursor.0 as f32, self.last_cursor.1 as f32);
+        let mut best: Option<(usize, f32)> = None;
+        for (axis, end) in g.ends.iter().enumerate() {
+            let d = dist_to_segment(cursor, g.origin, *end);
+            let better = match best {
+                None => true,
+                Some((_, bd)) => d < bd,
+            };
+            if d <= GIZMO_PICK_PX && better {
+                best = Some((axis, d));
+            }
+        }
+        best.map(|(axis, _)| axis)
+    }
+
     fn pick(&mut self) {
         let (width_u, height_u) = match &self.window {
             Some(window) => {
@@ -2197,9 +2332,22 @@ impl ApplicationHandler for App {
                 let pressed = state == ElementState::Pressed;
                 match button {
                     MouseButton::Left => {
-                        self.dragging = pressed;
                         if pressed {
-                            self.pick();
+                            // A press on a gizmo arm starts a drag on that axis —
+                            // it takes priority over both camera pan and picking,
+                            // so grabbing a handle never reselects or moves the
+                            // view. One undo step covers the whole drag.
+                            if let Some(axis) = self.gizmo_hit() {
+                                self.push_undo();
+                                self.gizmo_drag = Some(axis);
+                                self.gizmo_hover = Some(axis);
+                            } else {
+                                self.dragging = true;
+                                self.pick();
+                            }
+                        } else {
+                            self.dragging = false;
+                            self.gizmo_drag = None;
                         }
                     }
                     // Middle button held = orbit the camera.
@@ -2212,7 +2360,30 @@ impl ApplicationHandler for App {
             WindowEvent::CursorMoved { position, .. } => {
                 let dx = (position.x - self.last_cursor.0) as f32;
                 let dy = (position.y - self.last_cursor.1) as f32;
-                if self.orbiting {
+                if let (Some(axis), Some(g), Some(id)) =
+                    (self.gizmo_drag, self.gizmo, self.selected)
+                {
+                    // Map the screen drag onto the world axis: measure how far the
+                    // cursor moved *along* the arm's on-screen direction, as a
+                    // fraction of that arm's screen length, then apply the same
+                    // fraction of its world length. Screen and world stay in step,
+                    // so the entity tracks the cursor at any camera angle.
+                    let (ax, ay) = (g.ends[axis].0 - g.origin.0, g.ends[axis].1 - g.origin.1);
+                    let len2 = ax * ax + ay * ay;
+                    // An arm pointing nearly at the camera collapses to a dot on
+                    // screen; dragging it would be meaningless, so ignore it.
+                    if len2 > 1.0 {
+                        let t = (dx * ax + dy * ay) / len2;
+                        let step = t * g.len;
+                        if let Some(p) = self.world.positions.get_mut(id) {
+                            match axis {
+                                0 => p.x += step,
+                                1 => p.y += step,
+                                _ => p.z += step,
+                            }
+                        }
+                    }
+                } else if self.orbiting {
                     // Sweep the orbit. Drag right -> swing around; drag up ->
                     // rise over the top. Pitch is clamped just short of the
                     // poles so the up vector never degenerates.
@@ -2408,6 +2579,7 @@ impl ApplicationHandler for App {
                                                     F5 SAVE   F9 LOAD\n\n\
                                                     ESC  DESELECT\n\n\
                                                     LMB  SELECT   DRAG PAN\n\n\
+                                                    DRAG ARROWS  MOVE ENTITY\n\n\
                                                     MMB  DRAG ORBIT\n\n\
                                                     HOLD ALT  FLY CAM\n\n\
                                                     WHEEL  ZOOM";
@@ -2425,6 +2597,18 @@ impl ApplicationHandler for App {
                     ));
                 }
                 let view_proj = self.view_matrix(width, height).to_cols_array_2d();
+                // Refresh the translate gizmo for the current selection and camera,
+                // then convert it to egui points for the Viewport tab to paint.
+                self.update_gizmo(width, height);
+                let ppp = self.egui_ctx.pixels_per_point();
+                let gizmo_draw = self.gizmo.map(|g| {
+                    let to_pos = |p: (f32, f32)| egui::pos2(p.0 / ppp, p.1 / ppp);
+                    GizmoDraw {
+                        origin: to_pos(g.origin),
+                        ends: [to_pos(g.ends[0]), to_pos(g.ends[1]), to_pos(g.ends[2])],
+                        active: self.gizmo_hover,
+                    }
+                });
                 // --- Run egui for this frame ---
                 // run_ui hands our closure a full-screen root Ui and runs the
                 // begin/end pass internally. Panels shown into that root dock to
@@ -2449,14 +2633,6 @@ impl ApplicationHandler for App {
                     .as_ref()
                     .and_then(|name| script_library.get(name))
                     .map(|src| self.script_runtime.check(src));
-                // Semantic pass: names the script uses that the API doesn't define
-                // (a typo). Only meaningful when the source parses, which `warnings`
-                // enforces by returning nothing for unparseable source.
-                let script_warnings: Vec<script::ScriptError> = open_script
-                    .as_ref()
-                    .and_then(|name| script_library.get(name))
-                    .map(|src| self.script_runtime.warnings(src))
-                    .unwrap_or_default();
                 // Live entity ids for the Scene list, plus the selected entity's
                 // position/velocity lifted into a local so the egui closure never
                 // touches `self`. Any edits get written back into the world after
@@ -2519,9 +2695,9 @@ impl ApplicationHandler for App {
                     script_filter,
                     open_script,
                     script_status,
-                    script_warnings,
                     // Reset each frame; the Viewport tab sets it if it's visible.
                     viewport_rect: None,
+                    gizmo: gizmo_draw,
                 };
                 let (egui_paint_jobs, egui_textures_delta, egui_ppp) =
                     if let (Some(state), Some(window)) =
@@ -3032,6 +3208,9 @@ fn main() {
         cam_pitch: 0.3,
         dragging: false,
         orbiting: false,
+        gizmo: None,
+        gizmo_drag: None,
+        gizmo_hover: None,
         last_cursor: (0.0, 0.0),
         selected: None,
         show_help: true,
