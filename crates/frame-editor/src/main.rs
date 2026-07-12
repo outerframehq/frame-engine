@@ -972,6 +972,7 @@ fn scripts_tab_ui(
     new_script_name: &mut String,
     open_script: &mut Option<String>,
     script_status: &Option<Result<(), script::ScriptError>>,
+    script_warnings: &[script::ScriptError],
 ) {
     let mut delete: Option<String> = None;
     // LEFT: the script list and the "new script" box, in a resizable sidebar.
@@ -1021,11 +1022,23 @@ fn scripts_tab_ui(
                 }
             });
             match script_status {
+                Some(Ok(())) if script_warnings.is_empty() => {
+                    ui.colored_label(egui::Color32::from_rgb(0x7c, 0xc5, 0x7c), "No problems");
+                }
                 Some(Ok(())) => {
-                    ui.colored_label(
-                        egui::Color32::from_rgb(0x7c, 0xc5, 0x7c),
-                        "No syntax errors",
-                    );
+                    // Parses, but uses names the script API doesn't define — the
+                    // script will run and silently do nothing at those lines.
+                    for w in script_warnings {
+                        let loc = match (w.line, w.column) {
+                            (Some(l), Some(c)) => format!("line {l}, col {c}: "),
+                            (Some(l), None) => format!("line {l}: "),
+                            _ => String::new(),
+                        };
+                        ui.colored_label(
+                            egui::Color32::from_rgb(0xd6, 0xa8, 0x4c),
+                            format!("{loc}{}", w.message),
+                        );
+                    }
                 }
                 Some(Err(e)) => {
                     let loc = match (e.line, e.column) {
@@ -1094,6 +1107,7 @@ struct EditorTabViewer {
     script_filter: String,
     open_script: Option<String>,
     script_status: Option<Result<(), script::ScriptError>>,
+    script_warnings: Vec<script::ScriptError>,
     // Set by the Viewport tab each frame to its transparent body rect (egui
     // points). `None` when the Viewport tab isn't visible. Used to route 3D
     // input: clicks/drags land on the viewport only when the cursor is here.
@@ -1134,6 +1148,7 @@ impl egui_dock::TabViewer for EditorTabViewer {
                 &mut self.new_script_name,
                 &mut self.open_script,
                 &self.script_status,
+                &self.script_warnings,
             ),
         }
     }
@@ -2434,6 +2449,14 @@ impl ApplicationHandler for App {
                     .as_ref()
                     .and_then(|name| script_library.get(name))
                     .map(|src| self.script_runtime.check(src));
+                // Semantic pass: names the script uses that the API doesn't define
+                // (a typo). Only meaningful when the source parses, which `warnings`
+                // enforces by returning nothing for unparseable source.
+                let script_warnings: Vec<script::ScriptError> = open_script
+                    .as_ref()
+                    .and_then(|name| script_library.get(name))
+                    .map(|src| self.script_runtime.warnings(src))
+                    .unwrap_or_default();
                 // Live entity ids for the Scene list, plus the selected entity's
                 // position/velocity lifted into a local so the egui closure never
                 // touches `self`. Any edits get written back into the world after
@@ -2496,6 +2519,7 @@ impl ApplicationHandler for App {
                     script_filter,
                     open_script,
                     script_status,
+                    script_warnings,
                     // Reset each frame; the Viewport tab sets it if it's visible.
                     viewport_rect: None,
                 };
