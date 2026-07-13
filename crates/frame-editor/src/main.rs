@@ -835,6 +835,9 @@ enum LauncherAction {
     OpenRecent(std::path::PathBuf),
     PlayRecent(std::path::PathBuf),
     OpenSettings(std::path::PathBuf),
+    ConfirmDelete(std::path::PathBuf),
+    CancelDelete,
+    DeleteProject(std::path::PathBuf),
 }
 
 enum MenuAction {
@@ -1325,6 +1328,8 @@ struct App {
     new_project_name: String,
     // Project-settings window state (opened from a card's Settings button).
     settings_open: bool,
+    // A project the user clicked Delete on, awaiting Confirm/Cancel on its card.
+    pending_delete: Option<std::path::PathBuf>,
     settings_root: Option<std::path::PathBuf>,
     settings_orig_name: String,
     settings_name: String,
@@ -1445,9 +1450,12 @@ impl App {
         self.selected = None;
         self.log("Selection cleared");
     }
-    /// Toggle the on-screen controls overlay.
+    /// Toggle the on-screen controls overlay. The choice persists across runs.
     fn toggle_help(&mut self) {
         self.show_help = !self.show_help;
+        save_prefs(&EditorPrefs {
+            show_help: self.show_help,
+        });
     }
     /// Snapshot the world onto the undo stack before a mutating action. Clears
     /// the redo stack (a new edit invalidates any redo history) and caps history.
@@ -1638,6 +1646,7 @@ impl App {
         let mut name_input = std::mem::take(&mut self.new_project_name);
         // Project-settings window state, lifted so the closure doesn't touch self.
         let was_settings_open = self.settings_open;
+        let pending_delete = self.pending_delete.clone();
         let mut settings_open = self.settings_open;
         let mut s_name = std::mem::take(&mut self.settings_name);
         let mut s_desc = std::mem::take(&mut self.settings_description);
@@ -1696,21 +1705,58 @@ impl App {
                                             ui.with_layout(
                                                 egui::Layout::right_to_left(egui::Align::Center),
                                                 |ui| {
-                                                    if ui.button("Settings").clicked() {
-                                                        action =
-                                                            Some(LauncherAction::OpenSettings(
+                                                    if pending_delete.as_deref()
+                                                        == Some(proj.root.as_path())
+                                                    {
+                                                        // Confirm step: this card's
+                                                        // Delete was clicked.
+                                                        if ui.button("Cancel").clicked() {
+                                                            action = Some(
+                                                                LauncherAction::CancelDelete,
+                                                            );
+                                                        }
+                                                        if ui
+                                                            .button(
+                                                                egui::RichText::new(
+                                                                    "Delete folder",
+                                                                )
+                                                                .color(egui::Color32::from_rgb(
+                                                                    0xe0, 0x6c, 0x6c,
+                                                                )),
+                                                            )
+                                                            .clicked()
+                                                        {
+                                                            action = Some(
+                                                                LauncherAction::DeleteProject(
+                                                                    proj.root.clone(),
+                                                                ),
+                                                            );
+                                                        }
+                                                        ui.weak("Deletes the folder and everything in it.");
+                                                    } else {
+                                                        if ui.button("Delete").clicked() {
+                                                            action = Some(
+                                                                LauncherAction::ConfirmDelete(
+                                                                    proj.root.clone(),
+                                                                ),
+                                                            );
+                                                        }
+                                                        if ui.button("Settings").clicked() {
+                                                            action =
+                                                                Some(LauncherAction::OpenSettings(
+                                                                    proj.root.clone(),
+                                                                ));
+                                                        }
+                                                        if ui.button("Play").clicked() {
+                                                            action = Some(LauncherAction::PlayRecent(
                                                                 proj.root.clone(),
                                                             ));
-                                                    }
-                                                    if ui.button("Play").clicked() {
-                                                        action = Some(LauncherAction::PlayRecent(
-                                                            proj.root.clone(),
-                                                        ));
-                                                    }
-                                                    if ui.button("Edit").clicked() {
-                                                        action = Some(LauncherAction::OpenRecent(
-                                                            proj.root.clone(),
-                                                        ));
+                                                        }
+                                                        if ui.button("Edit").clicked() {
+                                                            action = Some(LauncherAction::OpenRecent(
+                                                                proj.root.clone(),
+                                                            ));
+                                                        }
                                                     }
                                                 },
                                             );
@@ -1825,6 +1871,9 @@ impl App {
             Some(LauncherAction::OpenRecent(root)) => self.open_project_at(root),
             Some(LauncherAction::PlayRecent(root)) => self.start_play(event_loop, root),
             Some(LauncherAction::OpenSettings(root)) => self.open_settings(root),
+            Some(LauncherAction::ConfirmDelete(root)) => self.pending_delete = Some(root),
+            Some(LauncherAction::CancelDelete) => self.pending_delete = None,
+            Some(LauncherAction::DeleteProject(root)) => self.delete_project(root),
             None => {}
         }
         if let Some(window) = &self.window {
@@ -1982,6 +2031,37 @@ impl App {
         self.recent_projects = sorted_recent_projects();
     }
 
+    /// Delete a project: remove its folder (and everything in it) from disk and
+    /// drop it from the recent-projects list. Only reachable via the card's
+    /// two-step Delete -> Delete folder confirmation.
+    fn delete_project(&mut self, root: std::path::PathBuf) {
+        self.pending_delete = None;
+        let name = root
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("project")
+            .to_string();
+        match std::fs::remove_dir_all(&root) {
+            Ok(()) => self.log(format!("Deleted project '{name}'")),
+            Err(e) => self.log(format!("Could not delete '{name}': {e}")),
+        }
+        // Rewrite the recents file without this folder, whether or not the
+        // filesystem delete succeeded partially.
+        if let Some(path) = recent_projects_file() {
+            if let Ok(text) = std::fs::read_to_string(&path) {
+                let kept: Vec<&str> = text
+                    .lines()
+                    .filter(|line| {
+                        let line = line.trim();
+                        !line.is_empty() && std::path::Path::new(line) != root.as_path()
+                    })
+                    .collect();
+                let _ = std::fs::write(&path, kept.join("\n"));
+            }
+        }
+        self.recent_projects = sorted_recent_projects();
+    }
+
     /// Play a project: open a separate, clean game window (its own GPU surface),
     /// load the project's scene into it, and run the simulation there with no
     /// editor chrome. Closing the window returns to the launcher.
@@ -2117,7 +2197,8 @@ impl App {
     fn enter_editor(&mut self, name: String, scene_path: std::path::PathBuf) {
         self.current_scene_path = Some(scene_path);
         self.selected = None;
-        self.paused = false;
+        // Open paused: arrange the scene first, press Space when ready to run.
+        self.paused = true;
         self.mode = AppMode::Editor;
         if let Some(window) = &self.window {
             window.set_title(&format!("Frame Editor — {name}"));
@@ -3069,6 +3150,41 @@ fn recent_projects_file() -> Option<std::path::PathBuf> {
     dirs::config_dir().map(|d| d.join("frame-editor").join("recent-projects.txt"))
 }
 
+/// Small editor preferences that persist across runs, stored as RON beside the
+/// recent-projects list. Currently just whether the controls overlay shows;
+/// hide it once (H) and it stays hidden on the next start.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct EditorPrefs {
+    show_help: bool,
+}
+
+impl Default for EditorPrefs {
+    fn default() -> Self {
+        Self { show_help: true }
+    }
+}
+
+fn prefs_file() -> Option<std::path::PathBuf> {
+    dirs::config_dir().map(|d| d.join("frame-editor").join("editor.ron"))
+}
+
+fn load_prefs() -> EditorPrefs {
+    prefs_file()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|t| ron::from_str(&t).ok())
+        .unwrap_or_default()
+}
+
+fn save_prefs(prefs: &EditorPrefs) {
+    let Some(path) = prefs_file() else { return };
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(text) = ron::to_string(prefs) {
+        let _ = std::fs::write(path, text);
+    }
+}
+
 /// The remembered project folders as written, unfiltered and in file order.
 fn read_recent_projects() -> Vec<std::path::PathBuf> {
     let Some(file) = recent_projects_file() else {
@@ -3398,6 +3514,7 @@ fn main() {
         recent_projects: sorted_recent_projects(),
         new_project_name: String::new(),
         settings_open: false,
+        pending_delete: None,
         settings_root: None,
         settings_orig_name: String::new(),
         settings_name: String::new(),
@@ -3423,7 +3540,7 @@ fn main() {
         gizmo_hover: None,
         last_cursor: (0.0, 0.0),
         selected: None,
-        show_help: true,
+        show_help: load_prefs().show_help,
         egui_ctx: egui::Context::default(),
         egui_state: None,
         // Default layout mirrors the old editor: the Viewport and Script Editor
