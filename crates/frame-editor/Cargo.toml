@@ -24,3 +24,4 @@ chrono = "0.4"
 serde = { version = "1", features = ["derive"] }
 ron = "0.12"
 rhai = { version = "1.25", features = ["internals"] }
+git2 = "0.21"

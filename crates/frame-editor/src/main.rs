@@ -806,6 +806,7 @@ enum Tab {
     Scene,
     Inspector,
     Scripts,
+    Source,
 }
 /// Which tab is showing in the bottom console dock.
 #[derive(Clone, Copy, PartialEq)]
@@ -867,6 +868,70 @@ type EditedEntity = (
     bool,
     bool,
 );
+
+/// Source Control tab: a read-only view of the open project's git state —
+/// branch, ahead/behind its upstream, and the changed files. No push, pull, or
+/// commit happens here (that's what keeps the editor out of credential
+/// handling); this answers "what state am I in?" and the terminal does the rest.
+fn source_tab_ui(ui: &mut egui::Ui, summary: &Option<GitSummary>) {
+    let Some(s) = summary else {
+        ui.label("This project isn't inside a git repository.");
+        ui.add_space(4.0);
+        ui.weak("Run `git init` in the project folder to start one.");
+        return;
+    };
+    ui.horizontal(|ui| {
+        ui.label("Branch:");
+        ui.strong(&s.branch);
+    });
+    match (&s.upstream, s.ahead_behind) {
+        (Some(up), Some((ahead, behind))) => {
+            ui.horizontal(|ui| {
+                ui.label("Upstream:");
+                ui.strong(up);
+            });
+            let state = match (ahead, behind) {
+                (0, 0) => "Up to date with upstream".to_string(),
+                (a, 0) => format!("{a} commit(s) ahead — ready to push"),
+                (0, b) => format!("{b} commit(s) behind — pull to catch up"),
+                (a, b) => format!("{a} ahead, {b} behind — diverged"),
+            };
+            ui.weak(state);
+            ui.add_space(2.0);
+            ui.weak("(as of the last fetch made outside the editor)");
+        }
+        _ => {
+            ui.weak("No upstream branch configured.");
+        }
+    }
+    ui.separator();
+    if s.files.is_empty() {
+        ui.colored_label(
+            egui::Color32::from_rgb(0x7c, 0xc5, 0x7c),
+            "Working tree clean — nothing to commit",
+        );
+        return;
+    }
+    ui.label(format!("{} change(s):", s.files.len()));
+    ui.add_space(4.0);
+    for f in &s.files {
+        ui.horizontal(|ui| {
+            let (label, color) = if f.staged {
+                (
+                    format!("{} (staged)", f.label),
+                    egui::Color32::from_rgb(0x7c, 0xc5, 0x7c),
+                )
+            } else {
+                (
+                    f.label.to_string(),
+                    egui::Color32::from_rgb(0xd6, 0xa8, 0x4c),
+                )
+            };
+            ui.colored_label(color, label);
+            ui.monospace(&f.path);
+        });
+    }
+}
 
 /// Scene tab: the entity list.
 fn scene_tab_ui(ui: &mut egui::Ui, entity_ids: &[usize], selection: &mut Option<usize>) {
@@ -1011,6 +1076,7 @@ fn scripts_tab_ui(
     new_script_name: &mut String,
     open_script: &mut Option<String>,
     script_status: &Option<Result<(), script::ScriptError>>,
+    script_warnings: &[script::ScriptError],
 ) {
     let mut delete: Option<String> = None;
     // LEFT: the script list and the "new script" box, in a resizable sidebar.
@@ -1060,11 +1126,23 @@ fn scripts_tab_ui(
                 }
             });
             match script_status {
+                Some(Ok(())) if script_warnings.is_empty() => {
+                    ui.colored_label(egui::Color32::from_rgb(0x7c, 0xc5, 0x7c), "No problems");
+                }
                 Some(Ok(())) => {
-                    ui.colored_label(
-                        egui::Color32::from_rgb(0x7c, 0xc5, 0x7c),
-                        "No syntax errors",
-                    );
+                    // Parses, but uses names the script API doesn't define — the
+                    // script will run and silently do nothing at those lines.
+                    for w in script_warnings {
+                        let loc = match (w.line, w.column) {
+                            (Some(l), Some(c)) => format!("line {l}, col {c}: "),
+                            (Some(l), None) => format!("line {l}: "),
+                            _ => String::new(),
+                        };
+                        ui.colored_label(
+                            egui::Color32::from_rgb(0xd6, 0xa8, 0x4c),
+                            format!("{loc}{}", w.message),
+                        );
+                    }
                 }
                 Some(Err(e)) => {
                     let loc = match (e.line, e.column) {
@@ -1133,6 +1211,10 @@ struct EditorTabViewer {
     script_filter: String,
     open_script: Option<String>,
     script_status: Option<Result<(), script::ScriptError>>,
+    script_warnings: Vec<script::ScriptError>,
+    // Read-only git snapshot for the Source Control tab (owned for the frame,
+    // handed back to the App afterwards).
+    git_summary: Option<GitSummary>,
     // Set by the Viewport tab each frame to its transparent body rect (egui
     // points). `None` when the Viewport tab isn't visible. Used to route 3D
     // input: clicks/drags land on the viewport only when the cursor is here.
@@ -1150,6 +1232,7 @@ impl egui_dock::TabViewer for EditorTabViewer {
             Tab::Scene => "Scene",
             Tab::Inspector => "Inspector",
             Tab::Scripts => "Script Editor",
+            Tab::Source => "Source Control",
         }
         .into()
     }
@@ -1201,7 +1284,9 @@ impl egui_dock::TabViewer for EditorTabViewer {
                 &mut self.new_script_name,
                 &mut self.open_script,
                 &self.script_status,
+                &self.script_warnings,
             ),
+            Tab::Source => source_tab_ui(ui, &self.git_summary),
         }
     }
 
@@ -1257,6 +1342,11 @@ struct App {
     // Where "Save scene" writes and "Reload scene" reads. Set by Open/Save-As
     // (and defaulted to the startup scene). None means Save prompts for a path.
     current_scene_path: Option<std::path::PathBuf>,
+    // Cached git state for the Source Control tab, refreshed on a timer rather
+    // than every frame (statuses() walks the working tree). None = not inside a
+    // git repository, or no project open.
+    git_summary: Option<GitSummary>,
+    git_refresh_at: std::time::Instant,
     paused: bool,
     clock: Clock,
     cam_focus_x: f32,
@@ -2600,6 +2690,16 @@ impl ApplicationHandler for App {
                 // Refresh the translate gizmo for the current selection and camera,
                 // then convert it to egui points for the Viewport tab to paint.
                 self.update_gizmo(width, height);
+                // Refresh the Source Control snapshot every couple of seconds —
+                // statuses() walks the working tree, so not every frame.
+                if self.git_refresh_at.elapsed().as_secs_f32() > 2.0 {
+                    self.git_refresh_at = std::time::Instant::now();
+                    self.git_summary = self
+                        .current_scene_path
+                        .as_ref()
+                        .and_then(|p| p.parent())
+                        .and_then(git_summary);
+                }
                 let ppp = self.egui_ctx.pixels_per_point();
                 let gizmo_draw = self.gizmo.map(|g| {
                     let to_pos = |p: (f32, f32)| egui::pos2(p.0 / ppp, p.1 / ppp);
@@ -2633,6 +2733,14 @@ impl ApplicationHandler for App {
                     .as_ref()
                     .and_then(|name| script_library.get(name))
                     .map(|src| self.script_runtime.check(src));
+                // Semantic pass: names the script uses that the API doesn't define
+                // (a typo). Only meaningful when the source parses, which `warnings`
+                // enforces by returning nothing for unparseable source.
+                let script_warnings: Vec<script::ScriptError> = open_script
+                    .as_ref()
+                    .and_then(|name| script_library.get(name))
+                    .map(|src| self.script_runtime.warnings(src))
+                    .unwrap_or_default();
                 // Live entity ids for the Scene list, plus the selected entity's
                 // position/velocity lifted into a local so the egui closure never
                 // touches `self`. Any edits get written back into the world after
@@ -2695,6 +2803,8 @@ impl ApplicationHandler for App {
                     script_filter,
                     open_script,
                     script_status,
+                    script_warnings,
+                    git_summary: std::mem::take(&mut self.git_summary),
                     // Reset each frame; the Viewport tab sets it if it's visible.
                     viewport_rect: None,
                     gizmo: gizmo_draw,
@@ -2843,6 +2953,7 @@ impl ApplicationHandler for App {
                 self.dock_state = dock_state;
                 self.viewport_rect = viewer.viewport_rect;
                 self.world.script_library = viewer.script_library;
+                self.git_summary = viewer.git_summary;
                 self.new_script_name = viewer.new_script_name;
                 self.script_filter = viewer.script_filter;
                 self.open_script = viewer.open_script;
@@ -3002,6 +3113,103 @@ struct ProjectManifest {
 }
 
 /// Read a project's manifest, or a default one if it has none yet.
+/// One changed file in the working tree, for the Source Control tab: its path
+/// and a short label ("modified", "new", "deleted", ...), plus whether the change
+/// is staged.
+struct GitFileStatus {
+    path: String,
+    label: &'static str,
+    staged: bool,
+}
+
+/// A read-only snapshot of the open project's git state: enough for "what state
+/// is my repo in?" at a glance. Produced by `git_summary`, refreshed on a timer.
+struct GitSummary {
+    branch: String,
+    // Commits ahead of / behind the upstream branch, if one is configured.
+    ahead_behind: Option<(usize, usize)>,
+    upstream: Option<String>,
+    files: Vec<GitFileStatus>,
+}
+
+/// Read the git state of the repository containing `root`, or None if it isn't
+/// inside one. Read-only: opens, reads, drops. No credentials are ever needed
+/// because nothing here talks to the network — ahead/behind counts compare
+/// against the remote-tracking ref as of the last fetch/pull done OUTSIDE the
+/// editor.
+fn git_summary(root: &std::path::Path) -> Option<GitSummary> {
+    // discover() walks up parent directories, so a project folder nested inside
+    // a repo (the common layout) is found too.
+    let repo = git2::Repository::discover(root).ok()?;
+
+    // Branch name (or a short description of a detached/unborn HEAD).
+    let head = repo.head().ok();
+    let branch = head
+        .as_ref()
+        .and_then(|h| h.shorthand().ok())
+        .unwrap_or("(no branch)")
+        .to_string();
+
+    // Ahead/behind vs. the upstream, if the branch has one configured.
+    let mut ahead_behind = None;
+    let mut upstream_name = None;
+    if let Some(h) = &head {
+        if h.is_branch() {
+            if let Ok(name) = h.shorthand() {
+                if let Ok(local) = repo.find_branch(name, git2::BranchType::Local) {
+                    if let Ok(up) = local.upstream() {
+                        if let Ok(Some(up_name)) = up.name() {
+                            upstream_name = Some(up_name.to_string());
+                        }
+                        if let (Some(local_oid), Some(up_oid)) = (h.target(), up.get().target()) {
+                            ahead_behind = repo.graph_ahead_behind(local_oid, up_oid).ok();
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Working-tree and index status, including untracked files.
+    let mut opts = git2::StatusOptions::new();
+    opts.include_untracked(true);
+    let mut files = Vec::new();
+    if let Ok(statuses) = repo.statuses(Some(&mut opts)) {
+        for entry in statuses.iter() {
+            let Ok(path) = entry.path() else { continue };
+            let s = entry.status();
+            // Index (staged) changes and worktree (unstaged) changes are separate
+            // flags on the same entry; a file can carry both.
+            let checks: [(git2::Status, &'static str, bool); 8] = [
+                (git2::Status::INDEX_NEW, "new", true),
+                (git2::Status::INDEX_MODIFIED, "modified", true),
+                (git2::Status::INDEX_DELETED, "deleted", true),
+                (git2::Status::WT_NEW, "new", false),
+                (git2::Status::WT_MODIFIED, "modified", false),
+                (git2::Status::WT_DELETED, "deleted", false),
+                (git2::Status::WT_RENAMED, "renamed", false),
+                (git2::Status::CONFLICTED, "conflicted", false),
+            ];
+            for (flag, label, staged) in checks {
+                if s.contains(flag) {
+                    files.push(GitFileStatus {
+                        path: path.to_string(),
+                        label,
+                        staged,
+                    });
+                }
+            }
+        }
+    }
+
+    Some(GitSummary {
+        branch,
+        ahead_behind,
+        upstream: upstream_name,
+        files,
+    })
+}
+
 fn read_manifest(root: &std::path::Path) -> ProjectManifest {
     std::fs::read_to_string(root.join("project.ron"))
         .ok()
@@ -3197,6 +3405,8 @@ fn main() {
         settings_version: String::new(),
         // No scene target until a project is opened.
         current_scene_path: None,
+        git_summary: None,
+        git_refresh_at: std::time::Instant::now(),
         paused: false,
         clock: Clock::new(TICK_RATE, MAX_CATCHUP_TICKS),
         cam_focus_x: 0.0,
@@ -3225,7 +3435,7 @@ fn main() {
             state.main_surface_mut().split_right(
                 egui_dock::NodeIndex::root(),
                 0.78,
-                vec![Tab::Scene, Tab::Inspector],
+                vec![Tab::Scene, Tab::Inspector, Tab::Source],
             );
             state
         },
