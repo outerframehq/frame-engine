@@ -61,12 +61,25 @@ pub struct Color {
 /// same footing as `Color` and `Scale`: the engine stores and serializes it but
 /// never draws — the editor turns it into geometry. Defaults to `Cube`, so
 /// scenes saved before meshes existed load and look exactly as they did.
-#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
 pub enum Mesh {
     #[default]
     Cube,
     Sphere,
     Plane,
+    /// An imported model, named after its file in the project's assets
+    /// folder ("tree" for assets/tree.obj). Its collision half extents live
+    /// in World::mesh_meta under the same name.
+    Custom(String),
+}
+
+/// Metadata for one imported model, keyed by name in World::mesh_meta. Holds
+/// the unit space half extents (each 0.5 or less, same unit sizing as the
+/// primitives) that collision fits its box to. Lives in the scene rather than
+/// the model file so a scene knows its collision shapes before assets load.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq)]
+pub struct MeshMeta {
+    pub half_extents: [f32; 3],
 }
 
 #[derive(Serialize, Deserialize, Default, Clone)]
@@ -81,6 +94,10 @@ pub struct World {
     pub statics: ComponentStorage<Static>,
     #[serde(default)]
     pub gravities: ComponentStorage<Gravity>,
+    /// Metadata for imported meshes, keyed by mesh name. Works like
+    /// script_library does for scripts.
+    #[serde(default)]
+    pub mesh_meta: std::collections::BTreeMap<String, MeshMeta>,
     #[serde(default)]
     pub scales: ComponentStorage<Scale>,
     #[serde(default)]

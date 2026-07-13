@@ -1016,10 +1016,11 @@ fn inspector_tab_ui(
             });
             ui.add_space(4.0);
             ui.label("Mesh");
-            let mesh_label = match *mesh {
-                Mesh::Cube => "Cube",
-                Mesh::Sphere => "Sphere",
-                Mesh::Plane => "Plane",
+            let mesh_label: String = match mesh {
+                Mesh::Cube => "Cube".to_string(),
+                Mesh::Sphere => "Sphere".to_string(),
+                Mesh::Plane => "Plane".to_string(),
+                Mesh::Custom(name) => name.clone(),
             };
             egui::ComboBox::from_id_salt("mesh_picker")
                 .selected_text(mesh_label)
@@ -2843,7 +2844,7 @@ impl ApplicationHandler for App {
                         self.world.controlled.get(id).is_some(),
                         self.world.scales.get(id).copied().unwrap_or_default(),
                         self.world.scripts.get(id).map(|s| s.uses.clone()),
-                        self.world.meshes.get(id).copied().unwrap_or_default(),
+                        self.world.meshes.get(id).cloned().unwrap_or_default(),
                         self.world.statics.get(id).is_some(),
                         self.world.gravities.get(id).is_some(),
                     ))
@@ -3421,7 +3422,7 @@ fn build_instances(
         let Some(p) = slot.as_ref() else { continue };
         let color = world.colors.get(id).copied().unwrap_or_default();
         let scale = world.scales.get(id).copied().unwrap_or_default();
-        let mesh = world.meshes.get(id).copied().unwrap_or_default();
+        let mesh = world.meshes.get(id).cloned().unwrap_or_default();
         let rgb = if colliding.contains(&id) {
             const T: f32 = 0.6; // how far toward red
             [
@@ -3442,6 +3443,9 @@ fn build_instances(
             Mesh::Cube => cube_i.push(raw),
             Mesh::Sphere => sphere_i.push(raw),
             Mesh::Plane => plane_i.push(raw),
+            // Imported models draw as a cube placeholder for now. Real
+            // rendering comes with the custom mesh registry in stage two.
+            Mesh::Custom(_) => cube_i.push(raw),
         }
     }
     let group_counts = [

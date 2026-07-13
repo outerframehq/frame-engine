@@ -2,15 +2,32 @@ use crate::input::{Button, InputState};
 use crate::world::ScriptRuntime;
 use crate::world::World;
 
-/// Half-extents of an entity's axis-aligned collision box, per axis. A `Plane`
-/// is a flat floor tile, so its box is flat in Y (zero height) to match what's
-/// drawn — otherwise things rest on an invisible ledge half an `ENTITY_SIZE`
-/// above its surface. Cubes and spheres use the full scale-box.
-fn half_extents(mesh: crate::world::Mesh, scale: crate::world::Scale) -> [f32; 3] {
+/// Half extents of an entity's axis aligned collision box, per axis. A Plane
+/// is a flat floor tile so its box is flat in Y (zero height) to match what is
+/// drawn, otherwise things rest on an invisible ledge half an ENTITY_SIZE above
+/// the surface. An imported Custom mesh uses its unit space half extents from
+/// the world's mesh_meta, fitted to the model at import, and falls back to a
+/// full cube box if the metadata is missing. Cubes and spheres use the full
+/// scale box.
+fn half_extents(
+    mesh: &crate::world::Mesh,
+    scale: crate::world::Scale,
+    meta: &std::collections::BTreeMap<String, crate::world::MeshMeta>,
+) -> [f32; 3] {
     use crate::world::{ENTITY_SIZE, Mesh};
     let h = ENTITY_SIZE * 0.5;
     match mesh {
         Mesh::Plane => [h * scale.x, 0.0, h * scale.z],
+        Mesh::Custom(name) => match meta.get(name) {
+            // Unit half extents map to world size through ENTITY_SIZE (a unit
+            // half of 0.5 is exactly the primitives' h), then per axis scale.
+            Some(m) => [
+                ENTITY_SIZE * m.half_extents[0] * scale.x,
+                ENTITY_SIZE * m.half_extents[1] * scale.y,
+                ENTITY_SIZE * m.half_extents[2] * scale.z,
+            ],
+            None => [h * scale.x, h * scale.y, h * scale.z],
+        },
         _ => [h * scale.x, h * scale.y, h * scale.z],
     }
 }
@@ -35,8 +52,8 @@ pub fn collision(world: &mut World) {
     for (id, slot) in world.positions.iter().enumerate() {
         let Some(p) = slot.as_ref() else { continue };
         let s = world.scales.get(id).copied().unwrap_or_default();
-        let mesh = world.meshes.get(id).copied().unwrap_or_default();
-        let [hx, hy, hz] = half_extents(mesh, s);
+        let mesh = world.meshes.get(id).cloned().unwrap_or_default();
+        let [hx, hy, hz] = half_extents(&mesh, s, &world.mesh_meta);
         boxes.push((
             id,
             [p.x - hx, p.y - hy, p.z - hz],
@@ -80,9 +97,9 @@ pub fn resolve_collisions(world: &mut World) {
     for (id, slot) in world.positions.iter().enumerate() {
         let Some(p) = slot.as_ref() else { continue };
         let s = world.scales.get(id).copied().unwrap_or_default();
-        let mesh = world.meshes.get(id).copied().unwrap_or_default();
+        let mesh = world.meshes.get(id).cloned().unwrap_or_default();
         let is_static = world.statics.get(id).is_some();
-        boxes.push((id, [p.x, p.y, p.z], half_extents(mesh, s), is_static));
+        boxes.push((id, [p.x, p.y, p.z], half_extents(&mesh, s, &world.mesh_meta), is_static));
     }
 
     // Accumulate corrections keyed by entity, then apply them all at once.
