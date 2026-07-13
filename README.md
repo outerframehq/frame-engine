@@ -57,7 +57,9 @@ Early development, past the toy stage, with a working engine and a usable editor
 - Live entity editing: nudge the selection with the arrow keys and Page Up/Down, spawn with `N`, despawn with `Delete`, and drive a `Controlled` entity with WASD while the sim is playing.
 - A project launcher: the editor opens on a launcher to create a named project, open one by folder, or reopen a recent one from a list of cards (name, description, last-edited date, version, and Edit / Play / Settings actions). A project is a folder holding a scene file named after it and a `project.ron` manifest (description, version); Settings edits those and renames the scene file.
 - Scene save and load: opening a project loads its scene, `F5` saves it and `F9` reloads it, and the File menu also opens or saves a scene to any path through a native file dialog.
-- A Script Editor: a dockable tab where the shared script library is written — a sidebar of script names beside a single code editor with a line-number gutter and a live syntax check (a status line flags parse errors with their line and column). Scripts run live through a Rhai backend and are assigned to entities from the Inspector. See [SCRIPTING.md](SCRIPTING.md) for how to write them.
+- A Script Editor: a dockable tab where the shared script library is written — a sidebar of script names beside a single code editor with a line-number gutter and live checks: a status line flags parse errors (line and column) in red, and unknown variables — names that aren't part of the script API or a local `let` — in amber, catching the typos Rhai would otherwise fail on silently at run time. Scripts see structured values (`pos.x`, `vel`, `color.r`, with vector arithmetic) alongside the older flat names, run live through a Rhai backend, and are assigned to entities from the Inspector. See [SCRIPTING.md](SCRIPTING.md) for how to write them.
+- A translate gizmo: selecting an entity draws three axis arms in the viewport (X red, Y green, Z blue); drag an arm to move the entity along that axis, at any camera angle, as a single undo step.
+- A Source Control tab: a read-only view of the open project's git state — branch, upstream with ahead/behind counts, and changed files (amber unstaged, green staged). No network, no credentials; commits and pushes stay in your terminal or git client.
 - A dockable panel layout built with `egui` and `egui_dock`. The Viewport, Scene, Inspector, and Script Editor are tabs you can drag, tab together, and split apart; the Viewport is a transparent tab so the 3D shows through. Alongside them:
   - a top toolbar showing the editor's logo and working File/Edit/View/Help menus, each item mirroring a keyboard shortcut (open/save/reload scene, close project, quit; spawn, despawn, clear selection; play/pause, step, controls overlay),
   - a Scene tab (lists entities, click to select) and an Inspector tab (edit the selected entity's position, velocity, colour, and scale, pick its mesh primitive, toggle whether it is `Controlled` or `Static`, and assign a library script through a searchable picker, all written straight back into the world),
@@ -68,7 +70,7 @@ Early development, past the toy stage, with a working engine and a usable editor
 
 Play a project in a separate, clean game window — its own window and GPU surface running the world with no editor chrome, the simulation live and WASD driving `Controlled` entities.
 
-Currently at the frontier: richer authoring (gizmos, prefabs); per-entity appearance beyond colour, scale, and mesh (material, textures); collision refinements (tighter or rotated boxes, richer script queries, a broad phase); and a more discoverable script API.
+Currently at the frontier: richer authoring (prefabs, rotation); per-entity appearance beyond colour, scale, and mesh (material, textures); collision refinements (tighter or rotated boxes, richer script queries, a broad phase); and a deeper script API (what a script can reach: the entity hit, its own id, markers, input).
 
 ## Principles
 
@@ -76,7 +78,7 @@ Currently at the frontier: richer authoring (gizmos, prefabs); per-entity appear
 - **Headless by default.** Runs with no window. Rendering is optional and added on top.
 - **Deterministic, fixed-timestep.** One tick is always the same slice of simulated time, so behaviour is identical across machines. The editor honours this with the engine's own clock rather than ticking once per rendered frame.
 - **Reusable.** The engine is its own library crate, so it can power more than one game or tool. Dependencies point inward: tools depend on the engine, never the reverse.
-- **Hand-roll the heart, buy the rest.** The engine is built by hand to be understood deeply. Solved problems that are not the heart (windowing, the GPU API, linear algebra, UI, file dialogs, config paths, dates) use existing libraries: `winit`, `wgpu`, `glam`, `egui` and `egui_dock`, `rfd`, `dirs`, `chrono`, and — in the editor, for the project manifest — `serde` with `ron`.
+- **Hand-roll the heart, buy the rest.** The engine is built by hand to be understood deeply. Solved problems that are not the heart (windowing, the GPU API, linear algebra, UI, file dialogs, config paths, dates, git) use existing libraries: `winit`, `wgpu`, `glam`, `egui` and `egui_dock`, `rfd`, `dirs`, `chrono`, `git2`, and — in the editor, for the project manifest — `serde` with `ron`.
 - **No premature abstraction.** Machinery is built when the pain is real, not before. The fixed-timestep clock stayed duplicated inline until a second consumer made the duplication real, then moved into `core/`.
 
 ## Workspace structure
@@ -133,6 +135,7 @@ Editor controls:
 - **Ctrl+Z** undo, **Ctrl+Y** (or **Ctrl+Shift+Z**) redo
 - **F5** save scene, **F9** reload scene
 - **Left-drag** pan, **Scroll** zoom, **Middle-drag** orbit
+- **Drag a gizmo arm** move the selected entity along that axis
 - **Hold Alt** flythrough camera — mouse looks, **WASD** flies, left-click picks the centred entity as the orbit pivot
 - **H** toggle the controls overlay
 
