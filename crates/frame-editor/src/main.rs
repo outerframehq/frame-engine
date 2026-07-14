@@ -421,6 +421,45 @@ fn dist_to_segment(p: (f32, f32), a: (f32, f32), b: (f32, f32)) -> f32 {
     let (cx, cy) = (a.0 + vx * t, a.1 + vy * t);
     ((p.0 - cx).powi(2) + (p.1 - cy).powi(2)).sqrt()
 }
+// Build the shared mesh vertex buffer: the three primitives first, then any
+// imported models, each with its vertex range recorded. Bucket order here must
+// match build_instances: Cube, Sphere, Plane, then customs in the given order
+// (sorted by name at the call sites).
+fn build_mesh_buffer(
+    device: &wgpu::Device,
+    customs: &[&frame_engine::assets::MeshData],
+) -> (wgpu::Buffer, Vec<std::ops::Range<u32>>) {
+    let mut mesh_verts: Vec<MeshVertex> = Vec::new();
+    let mut ranges: Vec<std::ops::Range<u32>> = Vec::new();
+    let push = |verts: Vec<MeshVertex>,
+                mesh_verts: &mut Vec<MeshVertex>,
+                ranges: &mut Vec<std::ops::Range<u32>>| {
+        let start = mesh_verts.len() as u32;
+        mesh_verts.extend(verts);
+        ranges.push(start..mesh_verts.len() as u32);
+    };
+    push(cube_vertices(), &mut mesh_verts, &mut ranges);
+    push(sphere_vertices(), &mut mesh_verts, &mut ranges);
+    push(plane_vertices(), &mut mesh_verts, &mut ranges);
+    for data in customs {
+        let verts: Vec<MeshVertex> = data
+            .vertices
+            .iter()
+            .map(|v| MeshVertex {
+                position: v.position,
+                normal: v.normal,
+            })
+            .collect();
+        push(verts, &mut mesh_verts, &mut ranges);
+    }
+    let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("mesh vertex buffer"),
+        contents: bytemuck::cast_slice(&mesh_verts),
+        usage: wgpu::BufferUsages::VERTEX,
+    });
+    (buffer, ranges)
+}
+
 // All the long-lived GPU objects, bundled so they travel together.
 struct GpuState {
     surface: wgpu::Surface<'static>,
@@ -433,7 +472,7 @@ struct GpuState {
     // each primitive's vertex range within it, ordered Cube, Sphere, Plane
     // (matching the engine's `Mesh` enum). Built once; static for the app's life.
     mesh_vertex_buffer: wgpu::Buffer,
-    mesh_ranges: [std::ops::Range<u32>; 3],
+    mesh_ranges: Vec<std::ops::Range<u32>>,
     camera_buffer: wgpu::Buffer,
     camera_bind_group: wgpu::BindGroup,
     depth_view: wgpu::TextureView,
@@ -498,22 +537,7 @@ impl GpuState {
         // Concatenate every primitive's vertices and remember each one's range,
         // in the engine's Mesh order (Cube, Sphere, Plane). At draw time we bind
         // this buffer and draw the range for whichever primitive an entity uses.
-        let cube = cube_vertices();
-        let sphere = sphere_vertices();
-        let plane = plane_vertices();
-        let mut mesh_verts: Vec<MeshVertex> = Vec::new();
-        let cube_range = 0u32..cube.len() as u32;
-        mesh_verts.extend(cube);
-        let sphere_range = mesh_verts.len() as u32..(mesh_verts.len() + sphere.len()) as u32;
-        mesh_verts.extend(sphere);
-        let plane_range = mesh_verts.len() as u32..(mesh_verts.len() + plane.len()) as u32;
-        mesh_verts.extend(plane);
-        let mesh_ranges = [cube_range, sphere_range, plane_range];
-        let mesh_vertex_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("mesh vertex buffer"),
-            contents: bytemuck::cast_slice(&mesh_verts),
-            usage: wgpu::BufferUsages::VERTEX,
-        });
+        let (mesh_vertex_buffer, mesh_ranges) = build_mesh_buffer(&device, &[]);
         // --- Entity pipeline (world-space, camera-driven) ---
         let entity_shader = device.create_shader_module(wgpu::include_wgsl!("shader.wgsl"));
         let entity_pipeline_layout =
@@ -611,6 +635,13 @@ impl GpuState {
             egui_renderer,
         }
     }
+    // Rebuild the mesh vertex buffer with the current set of imported models.
+    // Called when a project loads or a model gets imported. Cheap and rare.
+    fn set_custom_meshes(&mut self, customs: &[&frame_engine::assets::MeshData]) {
+        let (buffer, ranges) = build_mesh_buffer(&self.device, customs);
+        self.mesh_vertex_buffer = buffer;
+        self.mesh_ranges = ranges;
+    }
     fn resize(&mut self, width: u32, height: u32) {
         if width > 0 && height > 0 {
             self.config.width = width;
@@ -627,7 +658,7 @@ impl GpuState {
         // How many instances belong to each primitive, in Cube, Sphere, Plane
         // order. `instances` is laid out in that same order, so these counts also
         // give each primitive's contiguous slice of the instance buffer.
-        group_counts: [u32; 3],
+        group_counts: &[u32],
         text_instances: &[TextInstance],
         view_proj: [[f32; 4]; 4],
         egui_paint_jobs: &[egui::epaint::ClippedPrimitive],
@@ -746,7 +777,11 @@ impl GpuState {
                         // instance (which some backends validate against).
                         let begin = instance_start as wgpu::BufferAddress * stride;
                         render_pass.set_vertex_buffer(1, buffer.slice(begin..));
-                        render_pass.draw(self.mesh_ranges[primitive].clone(), 0..*count);
+                        // Skip a group with no matching range. Happens if the
+                        // instance list and mesh buffer briefly disagree.
+                        if let Some(range) = self.mesh_ranges.get(primitive) {
+                            render_pass.draw(range.clone(), 0..*count);
+                        }
                     }
                     instance_start += count;
                 }
@@ -813,6 +848,7 @@ enum Tab {
 enum ConsoleTab {
     Output,
     Terminal,
+    Assets,
 }
 /// A command chosen from the toolbar menus this frame, applied after the egui
 /// pass. The menu closure can't borrow `self`, so it stages the choice here and
@@ -842,6 +878,7 @@ enum LauncherAction {
 
 enum MenuAction {
     OpenScene,
+    ImportModel,
     SaveScene,
     SaveSceneAs,
     ReloadScene,
@@ -936,6 +973,245 @@ fn source_tab_ui(ui: &mut egui::Ui, summary: &Option<GitSummary>) {
     }
 }
 
+/// Render a small shaded preview of a model on the CPU. The mesh is already
+/// unit normalised, so a fixed camera angle frames everything: rotate, project
+/// orthographically, z buffer, one light. 64x64 is plenty for a browser tile.
+fn render_thumbnail(data: &frame_engine::assets::MeshData) -> egui::ColorImage {
+    const SIZE: usize = 64;
+    // Flat rgba bytes, filled with the background colour.
+    let mut pixels = vec![0u8; SIZE * SIZE * 4];
+    for px in pixels.chunks_exact_mut(4) {
+        px.copy_from_slice(&[30, 30, 34, 255]);
+    }
+    let mut depth = vec![f32::NEG_INFINITY; SIZE * SIZE];
+
+    // Fixed view: yaw then pitch, looking down -Z after rotation.
+    let (yaw, pitch) = (0.7f32, -0.45f32);
+    let (sy, cy) = yaw.sin_cos();
+    let (sp, cp) = pitch.sin_cos();
+    let rotate = |p: [f32; 3]| {
+        let (x, y, z) = (p[0], p[1], p[2]);
+        let (x1, z1) = (x * cy + z * sy, -x * sy + z * cy);
+        let (y2, z2) = (y * cp - z1 * sp, y * sp + z1 * cp);
+        [x1, y2, z2]
+    };
+    let light = {
+        let l = [0.4f32, 0.7, 0.6];
+        let len = (l[0] * l[0] + l[1] * l[1] + l[2] * l[2]).sqrt();
+        [l[0] / len, l[1] / len, l[2] / len]
+    };
+    // Unit coords sit in -0.5..0.5. Scale by 0.9 to leave a margin.
+    let to_px = |v: f32| (v * 0.9 + 0.5) * SIZE as f32;
+
+    for tri in data.vertices.chunks_exact(3) {
+        let p: Vec<[f32; 3]> = tri.iter().map(|v| rotate(v.position)).collect();
+        let n = {
+            let m = [
+                (tri[0].normal[0] + tri[1].normal[0] + tri[2].normal[0]) / 3.0,
+                (tri[0].normal[1] + tri[1].normal[1] + tri[2].normal[1]) / 3.0,
+                (tri[0].normal[2] + tri[1].normal[2] + tri[2].normal[2]) / 3.0,
+            ];
+            rotate(m)
+        };
+        let shade = (n[0] * light[0] + n[1] * light[1] + n[2] * light[2])
+            .abs()
+            .clamp(0.15, 1.0);
+        let color = [
+            (216.0 * shade) as u8,
+            (206.0 * shade) as u8,
+            (170.0 * shade) as u8,
+            255,
+        ];
+        // Screen space corners. Y flips because pixels count down.
+        let ax = to_px(p[0][0]);
+        let ay = to_px(-p[0][1]);
+        let bx = to_px(p[1][0]);
+        let by = to_px(-p[1][1]);
+        let cx = to_px(p[2][0]);
+        let cyp = to_px(-p[2][1]);
+        let min_x = ax.min(bx).min(cx).floor().max(0.0) as usize;
+        let max_x = (ax.max(bx).max(cx).ceil() as usize).min(SIZE - 1);
+        let min_y = ay.min(by).min(cyp).floor().max(0.0) as usize;
+        let max_y = (ay.max(by).max(cyp).ceil() as usize).min(SIZE - 1);
+        let area = (bx - ax) * (cyp - ay) - (by - ay) * (cx - ax);
+        if area.abs() <= f32::EPSILON {
+            continue;
+        }
+        for py in min_y..=max_y {
+            for px in min_x..=max_x {
+                let (fx, fy) = (px as f32 + 0.5, py as f32 + 0.5);
+                // Barycentric weights. Same sign as the area means inside.
+                let w0 = (bx - fx) * (cyp - fy) - (by - fy) * (cx - fx);
+                let w1 = (cx - fx) * (ay - fy) - (cyp - fy) * (ax - fx);
+                let w2 = (ax - fx) * (by - fy) - (ay - fy) * (bx - fx);
+                let inside =
+                    (w0 >= 0.0 && w1 >= 0.0 && w2 >= 0.0) || (w0 <= 0.0 && w1 <= 0.0 && w2 <= 0.0);
+                if !inside {
+                    continue;
+                }
+                let z = (w0 * p[0][2] + w1 * p[1][2] + w2 * p[2][2]) / area;
+                let i = py * SIZE + px;
+                if z > depth[i] {
+                    depth[i] = z;
+                    pixels[i * 4..i * 4 + 4].copy_from_slice(&color);
+                }
+            }
+        }
+    }
+    egui::ColorImage::from_rgba_unmultiplied([SIZE, SIZE], &pixels)
+}
+
+/// Assets tab: a small browser for the project's assets folder. Folders can be
+/// opened and created; files are listed with a tag for models. Import still
+/// happens through File > Import model.
+fn assets_tab_ui(
+    ui: &mut egui::Ui,
+    assets_root: Option<&std::path::Path>,
+    subdir: &mut std::path::PathBuf,
+    new_folder: &mut String,
+    thumbnails: &std::collections::HashMap<String, egui::TextureHandle>,
+    move_pending: &mut Option<std::path::PathBuf>,
+) {
+    let Some(root) = assets_root else {
+        ui.weak("Open a project to browse its assets.");
+        return;
+    };
+    let current = root.join(&*subdir);
+    // Header: where we are, plus Up when inside a subfolder.
+    ui.horizontal(|ui| {
+        if !subdir.as_os_str().is_empty() {
+            if ui.button("Up").clicked() {
+                subdir.pop();
+            }
+        }
+        let shown = if subdir.as_os_str().is_empty() {
+            "assets/".to_string()
+        } else {
+            format!("assets/{}/", subdir.display())
+        };
+        ui.monospace(shown);
+        // A marked file pastes into whichever folder is open.
+        if let Some(src) = move_pending.clone() {
+            let file = src
+                .file_name()
+                .and_then(|f| f.to_str())
+                .unwrap_or("file")
+                .to_string();
+            if ui.button(format!("Paste '{file}' here")).clicked() {
+                let dest = current.join(&file);
+                if src != dest {
+                    let _ = std::fs::rename(&src, &dest);
+                }
+                *move_pending = None;
+            }
+            if ui.button("Cancel move").clicked() {
+                *move_pending = None;
+            }
+        }
+    });
+    // New folder row.
+    ui.horizontal(|ui| {
+        ui.add(
+            egui::TextEdit::singleline(new_folder)
+                .hint_text("new folder name")
+                .desired_width(160.0),
+        );
+        let name = new_folder.trim().to_string();
+        let ok = !name.is_empty() && !name.contains(['/', '\\']);
+        if ui
+            .add_enabled(ok, egui::Button::new("New folder"))
+            .clicked()
+        {
+            let _ = std::fs::create_dir_all(current.join(&name));
+            new_folder.clear();
+        }
+    });
+    ui.separator();
+    // Listing: folders first, then files, both sorted by name.
+    let mut dirs: Vec<String> = Vec::new();
+    let mut files: Vec<String> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&current) {
+        for entry in entries.flatten() {
+            let Some(name) = entry.file_name().to_str().map(String::from) else {
+                continue;
+            };
+            match entry.file_type() {
+                Ok(t) if t.is_dir() => dirs.push(name),
+                Ok(_) => files.push(name),
+                Err(_) => {}
+            }
+        }
+    } else {
+        ui.weak("No assets folder yet. File > Import model creates it.");
+        return;
+    }
+    dirs.sort();
+    files.sort();
+    if dirs.is_empty() && files.is_empty() {
+        ui.weak("(empty)");
+    }
+    egui::ScrollArea::vertical()
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                for dir in &dirs {
+                    if ui.button(format!("[{dir}]")).clicked() {
+                        subdir.push(dir);
+                    }
+                }
+            });
+            if !dirs.is_empty() && !files.is_empty() {
+                ui.add_space(4.0);
+            }
+            // Files as tiles: preview square, name underneath, Move below.
+            ui.horizontal_wrapped(|ui| {
+                for file in &files {
+                    let stem = file.rsplit_once('.').map(|(st, _)| st).unwrap_or(file);
+                    ui.allocate_ui(egui::vec2(84.0, 112.0), |ui| {
+                        ui.vertical(|ui| {
+                            match thumbnails.get(stem) {
+                                Some(handle) => {
+                                    ui.add(
+                                        egui::Image::new(handle)
+                                            .fit_to_exact_size(egui::vec2(64.0, 64.0)),
+                                    );
+                                }
+                                None => {
+                                    // Not a model, or not loaded. A flat square
+                                    // with the extension keeps the grid even.
+                                    let (rect, _) = ui.allocate_exact_size(
+                                        egui::vec2(64.0, 64.0),
+                                        egui::Sense::hover(),
+                                    );
+                                    ui.painter().rect_filled(
+                                        rect,
+                                        2.0,
+                                        egui::Color32::from_rgb(45, 45, 50),
+                                    );
+                                    let ext = file
+                                        .rsplit_once('.')
+                                        .map(|(_, e)| e.to_uppercase())
+                                        .unwrap_or_default();
+                                    ui.painter().text(
+                                        rect.center(),
+                                        egui::Align2::CENTER_CENTER,
+                                        ext,
+                                        egui::FontId::monospace(12.0),
+                                        egui::Color32::GRAY,
+                                    );
+                                }
+                            }
+                            ui.add(egui::Label::new(egui::RichText::new(file).small()).truncate());
+                            if ui.small_button("Move").clicked() {
+                                *move_pending = Some(current.join(file));
+                            }
+                        });
+                    });
+                }
+            });
+        });
+}
+
 /// Scene tab: the entity list.
 fn scene_tab_ui(ui: &mut egui::Ui, entity_ids: &[usize], selection: &mut Option<usize>) {
     ui.label(format!("{} entities", entity_ids.len()));
@@ -955,6 +1231,7 @@ fn inspector_tab_ui(
     edited: &mut Option<EditedEntity>,
     script_library: &std::collections::BTreeMap<String, String>,
     script_filter: &mut String,
+    custom_mesh_names: &[String],
 ) {
     match edited {
         Some((
@@ -1028,6 +1305,10 @@ fn inspector_tab_ui(
                     ui.selectable_value(mesh, Mesh::Cube, "Cube");
                     ui.selectable_value(mesh, Mesh::Sphere, "Sphere");
                     ui.selectable_value(mesh, Mesh::Plane, "Plane");
+                    // Imported models come after the primitives.
+                    for name in custom_mesh_names {
+                        ui.selectable_value(mesh, Mesh::Custom(name.clone()), name);
+                    }
                 });
             ui.add_space(4.0);
             ui.checkbox(controlled, "Controlled (WASD)");
@@ -1216,6 +1497,8 @@ struct EditorTabViewer {
     open_script: Option<String>,
     script_status: Option<Result<(), script::ScriptError>>,
     script_warnings: Vec<script::ScriptError>,
+    // Names of the project's imported models, for the mesh picker.
+    custom_mesh_names: Vec<String>,
     // Read-only git snapshot for the Source Control tab (owned for the frame,
     // handed back to the App afterwards).
     git_summary: Option<GitSummary>,
@@ -1281,6 +1564,7 @@ impl egui_dock::TabViewer for EditorTabViewer {
                 &mut self.edited,
                 &self.script_library,
                 &mut self.script_filter,
+                &self.custom_mesh_names,
             ),
             Tab::Scripts => scripts_tab_ui(
                 ui,
@@ -1348,6 +1632,20 @@ struct App {
     // Where "Save scene" writes and "Reload scene" reads. Set by Open/Save-As
     // (and defaulted to the startup scene). None means Save prompts for a path.
     current_scene_path: Option<std::path::PathBuf>,
+    // Imported models for the open project, parsed once and kept CPU side so
+    // they can be uploaded to any GPU device (editor window and game window).
+    // BTreeMap so the name order is stable and sorted.
+    custom_meshes: std::collections::BTreeMap<String, frame_engine::assets::MeshData>,
+    // Names of the game window's uploaded models, same sorted order.
+    game_custom_names: Vec<String>,
+    // Assets tab browser state: the open subfolder inside assets/ and the
+    // pending new folder name.
+    assets_subdir: std::path::PathBuf,
+    new_asset_folder: String,
+    // Rendered previews for the Assets tab, keyed by model name.
+    thumbnails: std::collections::HashMap<String, egui::TextureHandle>,
+    // A file marked for moving, pasted into whichever folder is open.
+    move_pending: Option<std::path::PathBuf>,
     // Cached git state for the Source Control tab, refreshed on a timer rather
     // than every frame (statuses() walks the working tree). None = not inside a
     // git repository, or no project open.
@@ -1848,7 +2146,7 @@ impl App {
         if let Some(gpu) = &mut self.gpu {
             gpu.render(
                 &[],
-                [0, 0, 0],
+                &[0, 0, 0],
                 &[],
                 Mat4::IDENTITY.to_cols_array_2d(),
                 &jobs,
@@ -1967,6 +2265,10 @@ impl App {
     /// Close the open project and return to the launcher. Does not save — use
     /// Save (F5) first to keep changes.
     fn close_project(&mut self) {
+        self.custom_meshes.clear();
+        if let Some(gpu) = &mut self.gpu {
+            gpu.set_custom_meshes(&[]);
+        }
         self.mode = AppMode::Launcher;
         self.project_name = None;
         self.current_scene_path = None;
@@ -2094,7 +2396,17 @@ impl App {
                 return;
             }
         };
-        let gpu = GpuState::new(window.clone());
+        let mut gpu = GpuState::new(window.clone());
+        // The game window has its own device, so the project's models get
+        // parsed and uploaded for it separately. Play can start from the
+        // launcher with no project open in the editor, so load from the root.
+        let (models, errors) = load_project_models(&root);
+        for e in errors {
+            self.log(format!("Model load failed: {e}"));
+        }
+        self.game_custom_names = models.keys().cloned().collect();
+        let refs: Vec<&frame_engine::assets::MeshData> = models.values().collect();
+        gpu.set_custom_meshes(&refs);
         window.request_redraw();
         self.game_gpu = Some(gpu);
         self.game_world = Some(world);
@@ -2137,7 +2449,7 @@ impl App {
         let (instances, group_counts) = match &self.game_world {
             Some(world) => {
                 let empty = std::collections::HashSet::new();
-                build_instances(world, None, &empty)
+                build_instances(world, None, &empty, &self.game_custom_names)
             }
             None => return,
         };
@@ -2154,7 +2466,7 @@ impl App {
         if let Some(gpu) = self.game_gpu.as_mut() {
             gpu.render(
                 &instances,
-                group_counts,
+                &group_counts,
                 &[],
                 view_proj,
                 &[],
@@ -2195,6 +2507,130 @@ impl App {
     }
 
     /// Switch from the launcher into the editor with a project loaded.
+    // Rebuild the Assets tab previews from the loaded models.
+    fn rebuild_thumbnails(&mut self) {
+        self.thumbnails.clear();
+        for (name, data) in &self.custom_meshes {
+            let image = render_thumbnail(data);
+            let handle = self.egui_ctx.load_texture(
+                format!("thumb-{name}"),
+                image,
+                egui::TextureOptions::LINEAR,
+            );
+            self.thumbnails.insert(name.clone(), handle);
+        }
+    }
+
+    // Import a model: pick an .obj, copy it into the project's assets folder,
+    // parse it, record its half extents, and upload it to the GPU.
+    fn import_model(&mut self) {
+        let Some(root) = self
+            .current_scene_path
+            .as_ref()
+            .and_then(|p| p.parent())
+            .map(|p| p.to_path_buf())
+        else {
+            self.log("Open a project before importing a model".to_string());
+            return;
+        };
+        let Some(picked) = rfd::FileDialog::new()
+            .add_filter("OBJ model", &["obj"])
+            .pick_file()
+        else {
+            return; // dialog cancelled
+        };
+        let Some(file_name) = picked.file_name().map(|f| f.to_owned()) else {
+            return;
+        };
+        let Some(name) = picked
+            .file_stem()
+            .and_then(|st| st.to_str())
+            .map(String::from)
+        else {
+            return;
+        };
+        let text = match std::fs::read_to_string(&picked) {
+            Ok(t) => t,
+            Err(e) => {
+                self.log(format!("Could not read model: {e}"));
+                return;
+            }
+        };
+        let data = match frame_engine::assets::parse_obj(&text) {
+            Ok(d) => d,
+            Err(e) => {
+                self.log(format!("Could not parse model: {e}"));
+                return;
+            }
+        };
+        let assets = root.join("assets");
+        if let Err(e) = std::fs::create_dir_all(&assets) {
+            self.log(format!("Could not create assets folder: {e}"));
+            return;
+        }
+        let dest = assets.join(&file_name);
+        // Copying onto itself fails on some platforms, so skip when the picked
+        // file is already in the assets folder.
+        if picked != dest {
+            if let Err(e) = std::fs::copy(&picked, &dest) {
+                self.log(format!("Could not copy model into assets: {e}"));
+                return;
+            }
+        }
+        let replaced = self.custom_meshes.contains_key(&name);
+        self.world.mesh_meta.insert(
+            name.clone(),
+            frame_engine::world::MeshMeta {
+                half_extents: data.half_extents,
+            },
+        );
+        self.custom_meshes.insert(name.clone(), data);
+        let refs: Vec<&frame_engine::assets::MeshData> = self.custom_meshes.values().collect();
+        if let Some(gpu) = &mut self.gpu {
+            gpu.set_custom_meshes(&refs);
+        }
+        self.rebuild_thumbnails();
+        if replaced {
+            self.log(format!("Replaced model '{name}'"));
+        } else {
+            self.log(format!("Imported model '{name}'"));
+        }
+    }
+
+    // Parse the open project's models, record their half extents in the
+    // world, and upload them to the editor GPU.
+    fn load_project_assets(&mut self) {
+        self.custom_meshes.clear();
+        if let Some(root) = self
+            .current_scene_path
+            .as_ref()
+            .and_then(|p| p.parent())
+            .map(|p| p.to_path_buf())
+        {
+            let (models, errors) = load_project_models(&root);
+            for e in errors {
+                self.log(format!("Model load failed: {e}"));
+            }
+            self.custom_meshes = models;
+        }
+        for (name, data) in &self.custom_meshes {
+            self.world.mesh_meta.insert(
+                name.clone(),
+                frame_engine::world::MeshMeta {
+                    half_extents: data.half_extents,
+                },
+            );
+        }
+        if !self.custom_meshes.is_empty() {
+            self.log(format!("Loaded {} model(s)", self.custom_meshes.len()));
+        }
+        let refs: Vec<&frame_engine::assets::MeshData> = self.custom_meshes.values().collect();
+        if let Some(gpu) = &mut self.gpu {
+            gpu.set_custom_meshes(&refs);
+        }
+        self.rebuild_thumbnails();
+    }
+
     fn enter_editor(&mut self, name: String, scene_path: std::path::PathBuf) {
         self.current_scene_path = Some(scene_path);
         self.selected = None;
@@ -2206,6 +2642,7 @@ impl App {
         }
         self.log(format!("Opened project '{name}'"));
         self.project_name = Some(name);
+        self.load_project_assets();
     }
     /// The current view-projection matrix: an orbit around the focus normally, or
     /// a free camera from `cam_eye` while flying.
@@ -2724,7 +3161,9 @@ impl ApplicationHandler for App {
                     .collect();
                 let selected = self.selected;
                 // Per-primitive instance buckets from the world (see build_instances).
-                let (instances, group_counts) = build_instances(&self.world, selected, &colliding);
+                let custom_names: Vec<String> = self.custom_meshes.keys().cloned().collect();
+                let (instances, group_counts) =
+                    build_instances(&self.world, selected, &colliding, &custom_names);
                 let (width, height) = match &self.window {
                     Some(window) => {
                         let size = window.inner_size();
@@ -2802,6 +3241,16 @@ impl ApplicationHandler for App {
                 // never has to borrow `self`.
                 let mut console_tab = self.console_tab;
                 let log_lines = std::mem::take(&mut self.log_lines);
+                // Assets tab state, lifted so the closure stays off self.
+                let assets_root = self
+                    .current_scene_path
+                    .as_ref()
+                    .and_then(|p| p.parent())
+                    .map(|p| p.join("assets"));
+                let mut assets_subdir = std::mem::take(&mut self.assets_subdir);
+                let mut new_asset_folder = std::mem::take(&mut self.new_asset_folder);
+                let thumbnails = self.thumbnails.clone();
+                let mut move_pending = std::mem::take(&mut self.move_pending);
                 let script_library = std::mem::take(&mut self.world.script_library);
                 let new_script_name = std::mem::take(&mut self.new_script_name);
                 let script_filter = std::mem::take(&mut self.script_filter);
@@ -2886,6 +3335,7 @@ impl ApplicationHandler for App {
                     open_script,
                     script_status,
                     script_warnings,
+                    custom_mesh_names: self.custom_meshes.keys().cloned().collect(),
                     git_summary: std::mem::take(&mut self.git_summary),
                     // Reset each frame; the Viewport tab sets it if it's visible.
                     viewport_rect: None,
@@ -2910,6 +3360,9 @@ impl ApplicationHandler for App {
                                     ui.menu_button("File", |ui| {
                                         if ui.button("Open scene…").clicked() {
                                             menu_action = Some(MenuAction::OpenScene);
+                                        }
+                                        if ui.button("Import model…").clicked() {
+                                            menu_action = Some(MenuAction::ImportModel);
                                         }
                                         ui.separator();
                                         if ui.button("Save scene").clicked() {
@@ -2986,6 +3439,11 @@ impl ApplicationHandler for App {
                                             ConsoleTab::Terminal,
                                             "Terminal",
                                         );
+                                        ui.selectable_value(
+                                            &mut console_tab,
+                                            ConsoleTab::Assets,
+                                            "Assets",
+                                        );
                                     });
                                     ui.separator();
                                     match console_tab {
@@ -3004,6 +3462,16 @@ impl ApplicationHandler for App {
                                         }
                                         ConsoleTab::Terminal => {
                                             ui.weak("(terminal goes here)");
+                                        }
+                                        ConsoleTab::Assets => {
+                                            assets_tab_ui(
+                                                ui,
+                                                assets_root.as_deref(),
+                                                &mut assets_subdir,
+                                                &mut new_asset_folder,
+                                                &thumbnails,
+                                                &mut move_pending,
+                                            );
                                         }
                                     }
                                 });
@@ -3030,6 +3498,9 @@ impl ApplicationHandler for App {
                         (Vec::new(), egui::TexturesDelta::default(), 1.0)
                     };
                 self.console_tab = console_tab;
+                self.assets_subdir = assets_subdir;
+                self.new_asset_folder = new_asset_folder;
+                self.move_pending = move_pending;
                 self.log_lines = log_lines;
                 // Drain the dock layout and the tabs' state back onto self.
                 self.dock_state = dock_state;
@@ -3107,6 +3578,7 @@ impl ApplicationHandler for App {
                 // fires whether or not an entity is selected.
                 match menu_action {
                     Some(MenuAction::OpenScene) => self.open_scene(),
+                    Some(MenuAction::ImportModel) => self.import_model(),
                     Some(MenuAction::SaveScene) => self.save_scene(),
                     Some(MenuAction::SaveSceneAs) => self.save_scene_as(),
                     Some(MenuAction::ReloadScene) => self.reload_scene(),
@@ -3128,7 +3600,7 @@ impl ApplicationHandler for App {
                 if let Some(gpu) = &mut self.gpu {
                     gpu.render(
                         &instances,
-                        group_counts,
+                        &group_counts,
                         &text_instances,
                         view_proj,
                         &egui_paint_jobs,
@@ -3227,6 +3699,55 @@ struct ProjectManifest {
     description: String,
     #[serde(default)]
     version: String,
+}
+
+/// Load every .obj in a project's assets folder into a name -> mesh map.
+/// Parse failures get logged by the caller through the returned errors list.
+fn load_project_models(
+    root: &std::path::Path,
+) -> (
+    std::collections::BTreeMap<String, frame_engine::assets::MeshData>,
+    Vec<String>,
+) {
+    let mut models = std::collections::BTreeMap::new();
+    let mut errors = Vec::new();
+    scan_models_dir(&root.join("assets"), &mut models, &mut errors);
+    (models, errors)
+}
+
+/// Walk a folder and its subfolders for .obj files, parsing each into the map.
+/// Models are named by file stem wherever they sit, so two files with the same
+/// stem in different folders collide and the later one wins.
+fn scan_models_dir(
+    dir: &std::path::Path,
+    models: &mut std::collections::BTreeMap<String, frame_engine::assets::MeshData>,
+    errors: &mut Vec<String>,
+) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return; // no folder yet, nothing to load
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            scan_models_dir(&path, models, errors);
+            continue;
+        }
+        if path.extension().and_then(|e| e.to_str()) != Some("obj") {
+            continue;
+        }
+        let Some(name) = path.file_stem().and_then(|s| s.to_str()).map(String::from) else {
+            continue;
+        };
+        match std::fs::read_to_string(&path) {
+            Ok(text) => match frame_engine::assets::parse_obj(&text) {
+                Ok(data) => {
+                    models.insert(name, data);
+                }
+                Err(e) => errors.push(format!("{name}.obj: {e}")),
+            },
+            Err(e) => errors.push(format!("{name}.obj: {e}")),
+        }
+    }
 }
 
 /// Read a project's manifest, or a default one if it has none yet.
@@ -3414,10 +3935,11 @@ fn build_instances(
     world: &World,
     selected: Option<usize>,
     colliding: &std::collections::HashSet<usize>,
-) -> (Vec<InstanceRaw>, [u32; 3]) {
-    let mut cube_i: Vec<InstanceRaw> = Vec::new();
-    let mut sphere_i: Vec<InstanceRaw> = Vec::new();
-    let mut plane_i: Vec<InstanceRaw> = Vec::new();
+    custom_names: &[String],
+) -> (Vec<InstanceRaw>, Vec<u32>) {
+    // One bucket per mesh: the three primitives, then the imported models in
+    // the same sorted name order the mesh buffer uses.
+    let mut buckets: Vec<Vec<InstanceRaw>> = vec![Vec::new(); 3 + custom_names.len()];
     for (id, slot) in world.positions.iter().enumerate() {
         let Some(p) = slot.as_ref() else { continue };
         let color = world.colors.get(id).copied().unwrap_or_default();
@@ -3439,23 +3961,21 @@ fn build_instances(
             selected: if Some(id) == selected { 1.0 } else { 0.0 },
             scale: [scale.x, scale.y, scale.z],
         };
-        match mesh {
-            Mesh::Cube => cube_i.push(raw),
-            Mesh::Sphere => sphere_i.push(raw),
-            Mesh::Plane => plane_i.push(raw),
-            // Imported models draw as a cube placeholder for now. Real
-            // rendering comes with the custom mesh registry in stage two.
-            Mesh::Custom(_) => cube_i.push(raw),
-        }
+        let bucket = match &mesh {
+            Mesh::Cube => 0,
+            Mesh::Sphere => 1,
+            Mesh::Plane => 2,
+            // An imported model draws with its own vertices. A name with no
+            // loaded model falls back to the cube.
+            Mesh::Custom(name) => match custom_names.iter().position(|n| n == name) {
+                Some(i) => 3 + i,
+                None => 0,
+            },
+        };
+        buckets[bucket].push(raw);
     }
-    let group_counts = [
-        cube_i.len() as u32,
-        sphere_i.len() as u32,
-        plane_i.len() as u32,
-    ];
-    let mut instances = cube_i;
-    instances.extend(sphere_i);
-    instances.extend(plane_i);
+    let group_counts: Vec<u32> = buckets.iter().map(|b| b.len() as u32).collect();
+    let instances: Vec<InstanceRaw> = buckets.into_iter().flatten().collect();
     (instances, group_counts)
 }
 
@@ -3526,6 +4046,12 @@ fn main() {
         settings_version: String::new(),
         // No scene target until a project is opened.
         current_scene_path: None,
+        custom_meshes: std::collections::BTreeMap::new(),
+        game_custom_names: Vec::new(),
+        assets_subdir: std::path::PathBuf::new(),
+        new_asset_folder: String::new(),
+        thumbnails: std::collections::HashMap::new(),
+        move_pending: None,
         git_summary: None,
         git_refresh_at: std::time::Instant::now(),
         paused: false,
