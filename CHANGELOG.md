@@ -9,6 +9,8 @@ lands and the patch version bumps for fixes and small additions.
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-07-14
+
 ### Added
 
 Engine:
@@ -17,6 +19,8 @@ Engine:
 - A `Static` marker component. A static entity is immovable — collision response never pushes it, so others rest against it (a floor, a wall). A dynamic-vs-static pair pushes only the dynamic entity; dynamic-vs-dynamic splits the push evenly. Serialized with the scene; defaults off, so older scenes are unaffected.
 - Gravity. A `Gravity` marker component and a `gravity` system accelerate marked (non-static) entities downward (−Y) each tick, at a tunable `GRAVITY` strength. Opt-in per entity, so scenes without it are unaffected.
 - Mesh-fitted collision boxes. A `Plane` now has a flat (zero-height) collision box matching what's drawn, so entities rest on its surface rather than on an invisible ledge half an entity-size above it. Cubes and spheres keep their full box.
+- An assets module with a hand rolled OBJ parser. Covers v, vn and f lines with all four corner forms, negative indices, comments, fan triangulation of larger faces, and computed flat normals when a face has none. Parsed models get normalised to unit size like the primitives, so a model at scale 1 comes out cube sized with its own proportions. No new dependencies.
+- `Mesh::Custom(name)` for imported models, and a `mesh_meta` map on the world holding each model's half extents, so collision fits a box to the model's real shape. Works like `script_library` does for scripts. `Mesh` drops `Copy` to carry the name.
 - `World` and `ComponentStorage` now derive `Clone`, and the plain-data components (`Position`, `Velocity`, `Color`, `Scale`) derive `PartialEq`, so the editor can snapshot and compare a world. No behaviour change on their own; they back the editor's undo/redo.
 
 Editor (frame-editor):
@@ -33,6 +37,9 @@ Editor (frame-editor):
 - Unknown-variable warnings in the Script Editor. A semantic pass walks the compiled script for variable references and flags, in amber with line and column, any name that is neither part of the script API nor declared locally with `let` — catching the typos (`poz`, `hti`) that Rhai would otherwise fail on silently at run time, thirty times a second. The status line reads "No problems" only when both syntax and names are clean.
 - A translate gizmo. Selecting an entity draws three axis arms over it in the viewport (X red, Y green, Z blue); dragging an arm moves the entity along that world axis, tracking the cursor at any camera angle. The hovered or grabbed arm highlights, arms hold a roughly constant on-screen size at any camera distance, grabbing an arm takes priority over camera pan and picking, and a whole drag is one undo step.
 - A Source Control tab. A read-only dockable panel showing the open project's git state: current branch, upstream with ahead/behind counts, and the working tree's changed files — modified/new/deleted/renamed/conflicted, amber for unstaged and green for staged. Read-only by design: it opens the repository, reads, and drops, with no network access and no credentials; commits and pushes stay in the terminal or a git client. Projects not inside a git repository get a friendly note instead.
+- Launcher quality of life. Project cards gain a Delete button with a two step confirmation that removes the project folder from disk and drops it from the recents list. The controls overlay's visibility persists across runs in a small editor.ron under the config directory, so hiding it once keeps it hidden. Opening a project now starts paused, so scenes get arranged before Space runs them. The Play window still runs right away.
+- Model import. File > Import model copies a Wavefront OBJ into the project's assets folder, parses it and uploads it to the GPU. Projects scan their assets folder (and subfolders) on open. Imported models render with their own vertices, appear in the Inspector mesh picker, work in the Play window, and get collision boxes fitted to their real proportions. Blender exports load with default settings.
+- An Assets tab. A third tab in the bottom console browses the project's assets folder as tiles, each model drawn as a small CPU rendered preview with its name underneath. Folders can be opened and created, and a move and paste flow shifts files between them.
 
 ## [0.2.0] - 2026-07-05
 
@@ -115,6 +122,7 @@ Editor (frame-editor):
 
 - The editor can crash on window close during GPU teardown. It does not affect editing or saved scenes.
 
-[Unreleased]: https://github.com/outerframehq/frame-engine/compare/0.2.0...HEAD
+[Unreleased]: https://github.com/outerframehq/frame-engine/compare/0.3.0...HEAD
+[0.3.0]: https://github.com/outerframehq/frame-engine/compare/0.2.0...0.3.0
 [0.2.0]: https://github.com/outerframehq/frame-engine/compare/0.1.0...0.2.0
 [0.1.0]: https://github.com/outerframehq/frame-engine/releases/tag/0.1.0

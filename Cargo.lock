@@ -870,7 +870,7 @@ dependencies = [
 
 [[package]]
 name = "frame-editor"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "bytemuck",
  "chrono",
@@ -895,7 +895,7 @@ dependencies = [
 
 [[package]]
 name = "frame-engine"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "ron",
  "serde",

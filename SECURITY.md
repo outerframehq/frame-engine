@@ -20,8 +20,9 @@ snapshots that stay downloadable but no longer receive updates.
 
 | Version | Supported | Stability | Last updated |
 | ------- | --------- | --------- | ------------ |
+| 0.3.0  | yes       | stable    | 2026-07-14   |
 | 0.2.0  | yes       | stable    | 2026-07-05   |
-| 0.1.0  | yes       | stable    | 2026-06-27   |
+| 0.1.0  | no        | snapshot  | 2026-06-27   |
 
 "Best effort" means I'll try to push fixes while a version is still recent, but
 it's an intention, not a guaranteed support window. The reliable way to stay

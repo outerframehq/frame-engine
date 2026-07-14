@@ -27,7 +27,7 @@ Frame Engine is a learning project as much as a tool: I am still growing my own 
 
 **For a stable build, download a tagged release rather than cloning `main`.** Releases are cut at points where the project is known to build and run, so a release is your dependable copy. Tagged releases are on the project's Releases page.
 
-The latest release is **0.2.0**. The capabilities listed below reflect current `main`, which may be ahead of that release.
+The latest release is **0.3.0**. The capabilities listed below reflect current `main`, which may be ahead of that release.
 
 ## Status
 
@@ -41,6 +41,7 @@ Early development, past the toy stage, with a working engine and a usable editor
 - A movement system that advances entities each tick, and an input system that drives `Controlled` entities from held WASD keys.
 - Per-entity colour and scale, stored as component data and serialized with the scene.
 - A per-entity `Mesh` primitive (cube, sphere, or plane), stored as component data and serialized with the scene; defaults to cube, so older scenes load unchanged.
+- A hand rolled OBJ importer: an assets module parses Wavefront OBJ text (Blender's export works with default settings), normalises models to unit size, and reports their half extents so collision fits their real shape. Imported models are a `Mesh::Custom(name)` on an entity.
 - AABB collision, detection and response: a `collision` system records which entity boxes overlap each run (feeding the `hit` script flag and the editor's red tint), and a `resolve_collisions` system pushes overlapping entities apart along their least-overlapping axis after movement. A `Static` marker keeps an entity immovable, so others rest against it. Boxes are axis-aligned scale-boxes derived from a shared `ENTITY_SIZE`, the world-space size the editor also renders and picks against.
 - Per-entity scripting: an entity can carry a `Script` that names a shared library script (source held once on the world, in a name-to-source map), with a `ScriptRuntime` trait and a `run_scripts` system forming the seam. The engine stores script source as data and runs nothing itself — the interpreter lives in the editor, the same way rendering does.
 - A graphics-free input abstraction (which buttons are held), fed by the editor and read by systems, so input can drive the simulation without the engine knowing about windowing.
@@ -60,6 +61,7 @@ Early development, past the toy stage, with a working engine and a usable editor
 - A Script Editor: a dockable tab where the shared script library is written — a sidebar of script names beside a single code editor with a line-number gutter and live checks: a status line flags parse errors (line and column) in red, and unknown variables — names that aren't part of the script API or a local `let` — in amber, catching the typos Rhai would otherwise fail on silently at run time. Scripts see structured values (`pos.x`, `vel`, `color.r`, with vector arithmetic) alongside the older flat names, run live through a Rhai backend, and are assigned to entities from the Inspector. See [SCRIPTING.md](SCRIPTING.md) for how to write them.
 - A translate gizmo: selecting an entity draws three axis arms in the viewport (X red, Y green, Z blue); drag an arm to move the entity along that axis, at any camera angle, as a single undo step.
 - A Source Control tab: a read-only view of the open project's git state — branch, upstream with ahead/behind counts, and changed files (amber unstaged, green staged). No network, no credentials; commits and pushes stay in your terminal or git client.
+- Model import and an Assets tab: File > Import model brings a Blender OBJ export into the project, renders it, lists it in the mesh picker, and fits collision to it. The Assets tab in the bottom console shows the project's assets as tiles with rendered previews, with folders and a move flow to organise them.
 - A dockable panel layout built with `egui` and `egui_dock`. The Viewport, Scene, Inspector, and Script Editor are tabs you can drag, tab together, and split apart; the Viewport is a transparent tab so the 3D shows through. Alongside them:
   - a top toolbar showing the editor's logo and working File/Edit/View/Help menus, each item mirroring a keyboard shortcut (open/save/reload scene, close project, quit; spawn, despawn, clear selection; play/pause, step, controls overlay),
   - a Scene tab (lists entities, click to select) and an Inspector tab (edit the selected entity's position, velocity, colour, and scale, pick its mesh primitive, toggle whether it is `Controlled` or `Static`, and assign a library script through a searchable picker, all written straight back into the world),
@@ -70,7 +72,7 @@ Early development, past the toy stage, with a working engine and a usable editor
 
 Play a project in a separate, clean game window — its own window and GPU surface running the world with no editor chrome, the simulation live and WASD driving `Controlled` entities.
 
-Currently at the frontier: richer authoring (prefabs, rotation); per-entity appearance beyond colour, scale, and mesh (material, textures); collision refinements (tighter or rotated boxes, richer script queries, a broad phase); and a deeper script API (what a script can reach: the entity hit, its own id, markers, input).
+Currently at the frontier: richer authoring (prefabs, rotation); materials and textures on imported models; collision refinements (tighter or rotated boxes, richer script queries, a broad phase); and a deeper script API (what a script can reach: the entity hit, its own id, markers, input).
 
 ## Principles
 
