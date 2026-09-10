@@ -51,6 +51,9 @@ These are set for you every tick. Read them, write them, or both.
 | `is_static` | Has the `Static` marker | read-only | `true` if collision response won't move this entity. |
 | `has_gravity` | Has the `Gravity` marker | read-only | `true` if this entity falls. |
 | `input_up` / `input_down` / `input_left` / `input_right` | Movement keys held | read-only | `true` while that key is held. Same for every entity's script this tick, not specific to one. |
+| `spawn_at` | Where a new entity appears | read/write | `spawn_at.x/.y/.z`. Defaults to this entity's own position. |
+| `spawn`   | Request a new entity        | read/write | Set `true` to spawn one at `spawn_at`, at the end of this tick. Resets to `false` at the start of every script run, so it has to be set again each time you want another one. |
+| `despawn_id` | Request an entity removed | read/write | An entity id, or `-1.0` for no request. Can be this entity's own `id`, or any other, `hit_id` included. |
 | `pos`     | Position                  | read/write | `pos.x`, `pos.y`, `pos.z`. Where the entity is.    |
 | `vel`     | Velocity (per tick)       | read/write | `vel.x`, `vel.y`, `vel.z`. Added to position each tick. |
 | `scale`   | Scale (per axis)          | read/write | `scale.x`, `scale.y`, `scale.z`. `1.0` is normal size. |
@@ -230,6 +233,54 @@ use without checking `hit` first.
 
 Change any number and watch it update while the simulation plays. The `* 0.08`
 kind of number is speed; the `* 50.0` kind is size or distance.
+
+## Spawning and despawning
+
+`spawn` and `despawn_id` are different from everything else above: they're not
+a value the entity holds, they're a request. Setting `spawn = true;` doesn't
+create anything immediately — it tells the engine "spawn one, once this script
+finishes running." Same idea for `despawn_id`.
+
+This matters because `spawn` resets to `false` at the start of every script run.
+If a script sets `spawn = true;` unconditionally, with nothing guarding it, it
+spawns a new entity *every tick, forever*, same as any loop with no exit
+condition. Nothing here throttles that for you. Guard it:
+
+```rust
+if t % 30.0 == 0.0 {
+    spawn = true;
+}
+```
+
+**Multiply** — spawn a copy of yourself once a second (30 ticks):
+
+```rust
+if t % 30.0 == 0.0 {
+    spawn_at = pos;
+    spawn = true;
+}
+```
+
+**Self-destruct on contact:**
+
+```rust
+if hit {
+    despawn_id = id;
+}
+```
+
+**Clear away whatever you hit**, instead of yourself:
+
+```rust
+if hit {
+    despawn_id = hit_id;
+}
+```
+
+A newly spawned entity gets the same defaults as one you'd create in the editor
+(no script, no colour beyond the default, `Position` and zero `Velocity`) — it
+doesn't inherit anything from the entity that spawned it, and there's no way yet
+to read back the new entity's own id.
 
 ## When a script has a mistake
 

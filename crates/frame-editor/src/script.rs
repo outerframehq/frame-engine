@@ -4,7 +4,7 @@
 use std::collections::{HashMap, HashSet};
 
 use frame_engine::input::{Button, InputState};
-use frame_engine::world::{ScriptRuntime, World};
+use frame_engine::world::{Position, ScriptRuntime, Velocity, World};
 
 /// A 3D vector exposed to scripts as `Vec3`, with `.x` / `.y` / `.z`. Used for
 /// position, velocity, and scale, so a script can say `pos.x` and do vector maths
@@ -44,7 +44,10 @@ const API_VARS: &[&str] = &[
     "input_right",
     "hit",
     "hit_id",
-    "hit_point", // Structured values (preferred).
+    "hit_point", // Actions — a script requests these, Rust performs them.
+    "spawn_at",
+    "spawn",
+    "despawn_id", // Structured values (preferred).
     "pos",
     "vel",
     "scale",
@@ -358,6 +361,30 @@ impl ScriptRuntime for RhaiRuntime {
         scope.push("hit_id", hit_id); // read-only: the other entity's id, or -1.0
         scope.push("hit_point", hit_point); // read-only: where the collision happened
 
+        // Actions — a script sets these to request something; Rust performs it
+        // once, after the script finishes running, rather than a real function
+        // call. This fits the existing set-a-value/read-it-back architecture
+        // without needing the engine to hand a live &mut World into the Rhai
+        // interpreter mid-script.
+        //
+        // spawn_at defaults to this entity's own position, same convention as
+        // hit_point, so `spawn = true;` alone spawns a copy on the spot. Setting
+        // spawn unconditionally every tick spawns every tick, forever, same as
+        // any other loop with no exit condition — nothing here throttles it.
+        scope.push(
+            "spawn_at",
+            Vec3 {
+                x: px,
+                y: py,
+                z: pz,
+            },
+        );
+        scope.push("spawn", false);
+        // despawn_id: -1.0 means no request, the same sentinel hit_id uses. A
+        // script can pass its own id to despawn itself, or any other id (say,
+        // hit_id) to despawn whatever it just collided with.
+        scope.push("despawn_id", -1.0f64);
+
         // Structured values — the preferred spelling.
         scope.push(
             "pos",
@@ -480,5 +507,30 @@ impl ScriptRuntime for RhaiRuntime {
         let f_yaw = scope.get_value::<f64>("yaw").unwrap_or(yaw);
         rotation.yaw = f_yaw as f32;
         world.rotations.insert(entity, rotation);
+
+        // --- Actions, applied last, after the entity's own state is settled ---
+        if scope.get_value::<bool>("spawn").unwrap_or(false) {
+            let at = scope.get_value::<Vec3>("spawn_at").unwrap_or(Vec3 {
+                x: px,
+                y: py,
+                z: pz,
+            });
+            world.spawn(
+                Position {
+                    x: at.x as f32,
+                    y: at.y as f32,
+                    z: at.z as f32,
+                },
+                Velocity {
+                    dx: 0.0,
+                    dy: 0.0,
+                    dz: 0.0,
+                },
+            );
+        }
+        let despawn_id = scope.get_value::<f64>("despawn_id").unwrap_or(-1.0);
+        if despawn_id >= 0.0 {
+            world.despawn(despawn_id as usize);
+        }
     }
 }
