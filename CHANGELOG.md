@@ -9,6 +9,16 @@ lands and the patch version bumps for fixes and small additions.
 
 ## [Unreleased]
 
+### Added
+
+Engine:
+
+- A `Material` component (an emissive strength, 0.0 to 1.0), per-entity appearance data serialized with the scene; defaults to 0.0, so older scenes load unchanged.
+
+Editor (frame-editor):
+
+- A Material slider in the Inspector, next to Scale, editing an entity's emissive strength. At 1.0 the entity ignores the directional light and renders at flat full colour, useful for a glowing look.
+
 ## [0.3.0] - 2026-07-14
 
 ### Added

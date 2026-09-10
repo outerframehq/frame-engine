@@ -36,7 +36,7 @@ Early development, past the toy stage, with a working engine and a usable editor
 **Engine**
 
 - A deterministic fixed-timestep clock (in `core/`) with spiral-of-death protection, used by both the engine binary and the editor.
-- A hand-rolled ECS world with several component types (position, velocity, colour, a per-axis scale, a `Mesh` primitive, and a `Controlled` marker) and runtime spawn and despawn. Spawn reuses freed slots, so entity ids stay stable and despawned slots are reclaimed.
+- A hand-rolled ECS world with several component types (position, velocity, colour, a per-axis scale, an emissive material strength, a `Mesh` primitive, and a `Controlled` marker) and runtime spawn and despawn. Spawn reuses freed slots, so entity ids stay stable and despawned slots are reclaimed.
 - A generic `ComponentStorage<T>` type, wired into the world. It implements `Default`, and `World` derives `Default`, so a fresh world is built in one place and adding a component type is cheap and uniform.
 - A movement system that advances entities each tick, and an input system that drives `Controlled` entities from held WASD keys.
 - Per-entity colour and scale, stored as component data and serialized with the scene.
@@ -52,7 +52,7 @@ Early development, past the toy stage, with a working engine and a usable editor
 **frame-editor** (companion editor; links to the engine, runs the sim in a window)
 
 - Opens a native window (`winit`) and renders the world on the GPU through `wgpu`.
-- Draws entities as instanced, shaded primitives (cube, sphere, or plane) in real 3D, each in its own colour and size, with a perspective camera and a depth buffer for correct occlusion. Overlapping entities are tinted red, a live view of the engine's collision detection.
+- Draws entities as instanced, shaded primitives (cube, sphere, or plane) in real 3D, each in its own colour, size, and optional glow (an emissive material strength), with a perspective camera and a depth buffer for correct occlusion. Overlapping entities are tinted red, a live view of the engine's collision detection.
 - An orbit, pan, and zoom camera (left-drag pan, scroll zoom, middle-drag orbit).
 - Click-to-pick selection: click an entity to select it. The selected entity is brightened rather than recoloured, so its own colour stays visible while you edit it.
 - Live entity editing: nudge the selection with the arrow keys and Page Up/Down, spawn with `N`, despawn with `Delete`, and drive a `Controlled` entity with WASD while the sim is playing.
@@ -64,7 +64,7 @@ Early development, past the toy stage, with a working engine and a usable editor
 - Model import and an Assets tab: File > Import model brings a Blender OBJ export into the project, renders it, lists it in the mesh picker, and fits collision to it. The Assets tab in the bottom console shows the project's assets as tiles with rendered previews, with folders and a move flow to organise them.
 - A dockable panel layout built with `egui` and `egui_dock`. The Viewport, Scene, Inspector, and Script Editor are tabs you can drag, tab together, and split apart; the Viewport is a transparent tab so the 3D shows through. Alongside them:
   - a top toolbar showing the editor's logo and working File/Edit/View/Help menus, each item mirroring a keyboard shortcut (open/save/reload scene, close project, quit; spawn, despawn, clear selection; play/pause, step, controls overlay),
-  - a Scene tab (lists entities, click to select) and an Inspector tab (edit the selected entity's position, velocity, colour, and scale, pick its mesh primitive, toggle whether it is `Controlled` or `Static`, and assign a library script through a searchable picker, all written straight back into the world),
+  - a Scene tab (lists entities, click to select) and an Inspector tab (edit the selected entity's position, velocity, colour, scale, and emissive strength, pick its mesh primitive, toggle whether it is `Controlled` or `Static`, and assign a library script through a searchable picker, all written straight back into the world),
   - a fixed bottom console dock with an Output tab showing a live log and a Terminal placeholder.
 - Runs the simulation live on the engine's fixed-timestep clock, so the sim ticks at a true 30 per second independent of the window's repaint rate, with play, pause, and step controls.
 - Undo and redo (Ctrl+Z / Ctrl+Y), built on full-world snapshots. Spawning, despawning, nudging, and Inspector edits are undoable; a drag or a held key is a single step.
@@ -72,7 +72,7 @@ Early development, past the toy stage, with a working engine and a usable editor
 
 Play a project in a separate, clean game window — its own window and GPU surface running the world with no editor chrome, the simulation live and WASD driving `Controlled` entities.
 
-Currently at the frontier: richer authoring (prefabs, rotation); materials and textures on imported models; collision refinements (tighter or rotated boxes, richer script queries, a broad phase); and a deeper script API (what a script can reach: the entity hit, its own id, markers, input).
+Currently at the frontier: richer authoring (prefabs, rotation); a fuller material model (textures, roughness, metalness) on imported models; collision refinements (tighter or rotated boxes, richer script queries, a broad phase); and a deeper script API (what a script can reach: the entity hit, its own id, markers, input).
 
 ## Principles
 
