@@ -3,6 +3,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use frame_engine::input::{Button, InputState};
 use frame_engine::world::{ScriptRuntime, World};
 
 /// A 3D vector exposed to scripts as `Vec3`, with `.x` / `.y` / `.z`. Used for
@@ -37,6 +38,10 @@ const API_VARS: &[&str] = &[
     "is_controlled",
     "is_static",
     "has_gravity",
+    "input_up",
+    "input_down",
+    "input_left",
+    "input_right",
     "hit",
     "hit_id",
     "hit_point", // Structured values (preferred).
@@ -128,6 +133,13 @@ pub struct RhaiRuntime {
     // cached so we don't retry it every tick.
     compiled: HashMap<String, Option<rhai::AST>>,
     time: f64,
+    // Snapshotted once per tick in begin_tick, from the InputState the host
+    // (the editor) supplies. Shared context, the same for every entity's
+    // script this tick, so it lives here rather than being looked up per run.
+    input_up: bool,
+    input_down: bool,
+    input_left: bool,
+    input_right: bool,
 }
 
 impl RhaiRuntime {
@@ -138,6 +150,10 @@ impl RhaiRuntime {
             engine,
             compiled: HashMap::new(),
             time: 0.0,
+            input_up: false,
+            input_down: false,
+            input_left: false,
+            input_right: false,
         }
     }
 
@@ -230,8 +246,12 @@ fn resolve(original: f64, structured: f64, flat: f64) -> f64 {
 }
 
 impl ScriptRuntime for RhaiRuntime {
-    fn begin_tick(&mut self) {
+    fn begin_tick(&mut self, input: &InputState) {
         self.time += 1.0;
+        self.input_up = input.is_held(Button::Up);
+        self.input_down = input.is_held(Button::Down);
+        self.input_left = input.is_held(Button::Left);
+        self.input_right = input.is_held(Button::Right);
     }
 
     fn run(&mut self, world: &mut World, entity: usize) {
@@ -328,6 +348,12 @@ impl ScriptRuntime for RhaiRuntime {
         scope.push("is_controlled", world.controlled.get(entity).is_some());
         scope.push("is_static", world.statics.get(entity).is_some());
         scope.push("has_gravity", world.gravities.get(entity).is_some());
+        // Read-only: which movement buttons are currently held, snapshotted
+        // once per tick in begin_tick. Shared context, not per-entity data.
+        scope.push("input_up", self.input_up);
+        scope.push("input_down", self.input_down);
+        scope.push("input_left", self.input_left);
+        scope.push("input_right", self.input_right);
         scope.push("hit", hit); // read-only: colliding with anything this tick
         scope.push("hit_id", hit_id); // read-only: the other entity's id, or -1.0
         scope.push("hit_point", hit_point); // read-only: where the collision happened

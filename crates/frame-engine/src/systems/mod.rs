@@ -213,8 +213,12 @@ pub fn gravity(world: &mut World) {
     }
 }
 
-pub fn run_scripts(world: &mut World, runtime: &mut dyn ScriptRuntime) {
-    runtime.begin_tick();
+pub fn run_scripts(
+    world: &mut World,
+    runtime: &mut dyn ScriptRuntime,
+    input: &crate::input::InputState,
+) {
+    runtime.begin_tick(input);
     let ids: Vec<usize> = world
         .scripts
         .iter()

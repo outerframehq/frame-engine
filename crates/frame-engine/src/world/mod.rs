@@ -254,9 +254,13 @@ impl World {
 
 pub trait ScriptRuntime {
     /// Called once per tick, before any entity's script runs. Lets a runtime
-    /// advance shared per-tick state (such as a clock exposed to scripts).
-    /// Optional — the default does nothing.
-    fn begin_tick(&mut self) {}
+    /// advance shared per-tick state (such as a clock exposed to scripts), and
+    /// hands it the currently-held input, since that's also shared context, the
+    /// same for every entity, rather than something specific to one. Optional —
+    /// the default does nothing.
+    fn begin_tick(&mut self, input: &crate::input::InputState) {
+        let _ = input;
+    }
 
     /// Run one entity's script for this tick, applying its effects to `world`.
     fn run(&mut self, world: &mut World, entity: usize);

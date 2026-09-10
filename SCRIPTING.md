@@ -50,6 +50,7 @@ These are set for you every tick. Read them, write them, or both.
 | `is_controlled` | Has the `Controlled` marker | read-only | `true` if this entity is driven by WASD. |
 | `is_static` | Has the `Static` marker | read-only | `true` if collision response won't move this entity. |
 | `has_gravity` | Has the `Gravity` marker | read-only | `true` if this entity falls. |
+| `input_up` / `input_down` / `input_left` / `input_right` | Movement keys held | read-only | `true` while that key is held. Same for every entity's script this tick, not specific to one. |
 | `pos`     | Position                  | read/write | `pos.x`, `pos.y`, `pos.z`. Where the entity is.    |
 | `vel`     | Velocity (per tick)       | read/write | `vel.x`, `vel.y`, `vel.z`. Added to position each tick. |
 | `scale`   | Scale (per axis)          | read/write | `scale.x`, `scale.y`, `scale.z`. `1.0` is normal size. |
@@ -195,6 +196,20 @@ if !is_static {
     vel.x = sin(t * 0.05) * 0.5;
 }
 ```
+
+**React to input** — a script-driven entity, without needing `Controlled`:
+
+```rust
+if input_up {
+    color.g = 1.0;
+} else {
+    color.g = 0.2;
+}
+```
+
+`input_up`/`down`/`left`/`right` reflect the same WASD keys `Controlled`
+entities already move by, held this tick. They're shared context, the same
+for every entity's script, not tied to which one is selected or playing.
 
 `hit_id` is `-1.0` when not colliding, so `if hit_id >= 0.0` is another way to
 ask the same thing `hit` does, with the id available too if you need it.
