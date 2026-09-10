@@ -32,8 +32,9 @@ pub struct Rgb {
 /// SCRIPTING.md.
 const API_VARS: &[&str] = &[
     // Read-only context.
-    "t", "hit", // Structured values (preferred).
-    "pos", "vel", "scale", "color", // Flat values (the original spelling, still supported).
+    "t", "hit", "hit_id", // Structured values (preferred).
+    "pos", "vel", "scale", "color",    // Single-value component data.
+    "emissive", // Flat values (the original spelling, still supported).
     "px", "py", "pz", "dx", "dy", "dz", "sx", "sy", "sz", "cr", "cg", "cb",
 ];
 
@@ -255,18 +256,36 @@ impl ScriptRuntime for RhaiRuntime {
         };
         let mut scale = world.scales.get(entity).copied().unwrap_or_default();
         let mut color = world.colors.get(entity).copied().unwrap_or_default();
+        let mut material = world.materials.get(entity).copied().unwrap_or_default();
         let (sx, sy, sz) = (scale.x as f64, scale.y as f64, scale.z as f64);
         let (cr, cg, cb) = (color.r as f64, color.g as f64, color.b as f64);
+        let emissive = material.emissive as f64;
         // Whether this entity is part of any overlapping pair this tick, from the
         // engine's collision system (which runs before scripts). Read-only.
-        let hit = world
+        // hit_id is the other entity's id when colliding, or -1.0 when not — a
+        // sentinel rather than an Option, to keep the script vocabulary simple.
+        // If this entity overlaps more than one other at once, only the first
+        // pair found is reported; hit itself still reflects any of them.
+        let hit_pair = world
             .collisions
             .iter()
-            .any(|&(a, b)| a == entity || b == entity);
+            .find(|&&(a, b)| a == entity || b == entity);
+        let hit = hit_pair.is_some();
+        let hit_id = match hit_pair {
+            Some(&(a, b)) => {
+                if a == entity {
+                    b as f64
+                } else {
+                    a as f64
+                }
+            }
+            None => -1.0,
+        };
 
         let mut scope = rhai::Scope::new();
         scope.push("t", self.time); // read-only context
         scope.push("hit", hit); // read-only: colliding with anything this tick
+        scope.push("hit_id", hit_id); // read-only: the other entity's id, or -1.0
 
         // Structured values — the preferred spelling.
         scope.push(
@@ -301,6 +320,9 @@ impl ScriptRuntime for RhaiRuntime {
                 b: cb,
             },
         );
+
+        // Single-value component data. No vector/struct type needed for one number.
+        scope.push("emissive", emissive);
 
         // Flat values — the original spelling, kept so existing scripts still run.
         scope.push("px", px);
@@ -377,5 +399,10 @@ impl ScriptRuntime for RhaiRuntime {
         color.g = resolve(cg, color_s.g, f_cg) as f32;
         color.b = resolve(cb, color_s.b, f_cb) as f32;
         world.colors.insert(entity, color);
+
+        // No structured/flat split needed here, there's only one spelling.
+        let f_emissive = scope.get_value::<f64>("emissive").unwrap_or(emissive);
+        material.emissive = f_emissive as f32;
+        world.materials.insert(entity, material);
     }
 }

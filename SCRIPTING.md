@@ -50,7 +50,9 @@ These are set for you every tick. Read them, write them, or both.
 | `vel`     | Velocity (per tick)       | read/write | `vel.x`, `vel.y`, `vel.z`. Added to position each tick. |
 | `scale`   | Scale (per axis)          | read/write | `scale.x`, `scale.y`, `scale.z`. `1.0` is normal size. |
 | `color`   | Colour                    | read/write | `color.r`, `color.g`, `color.b`, each `0.0`–`1.0`. |
+| `emissive`| Glow strength             | read/write | `0.0` is normal shading, `1.0` ignores the light and renders flat. |
 | `hit`     | Colliding this tick       | read-only  | `true` if this entity's box overlaps another's.    |
+| `hit_id`  | Which entity, if hit      | read-only  | The other entity's id, or `-1.0` if not colliding. If this entity overlaps more than one other at once, only one is reported. |
 
 Anything you don't set keeps its current value. `t` and `hit` are read-only —
 writing to them does nothing.
@@ -64,6 +66,8 @@ vel = vec3(0.0, 0.5, 0.0);    // build one from scratch
 ```
 
 `color` works the same way with `.r` / `.g` / `.b`, and `rgb(r, g, b)` builds one.
+
+`emissive` is a single number, not a vector, so it's used directly: `emissive = 1.0;`.
 
 ### The older flat names
 
@@ -121,6 +125,12 @@ color.g = 0.1;
 color.b = 0.1;
 ```
 
+**Glow** — pulse between normal shading and full brightness:
+
+```rust
+emissive = 0.5 + sin(t * 0.1) * 0.5;
+```
+
 **React** to position — fall until low, then rise (a rough bounce):
 
 ```rust
@@ -143,6 +153,17 @@ if hit {
 tints overlapping entities red, so you can see it happening). It's a plain
 detection flag — nothing pushes the entities apart, so what happens next is
 entirely up to your script.
+
+**React only to one entity** — check `hit_id` against a known id:
+
+```rust
+if hit_id == 3.0 {
+    color.r = 1.0;
+}
+```
+
+`hit_id` is `-1.0` when not colliding, so `if hit_id >= 0.0` is another way to
+ask the same thing `hit` does, with the id available too if you need it.
 
 Change any number and watch it update while the simulation plays. The `* 0.08`
 kind of number is speed; the `* 50.0` kind is size or distance.
