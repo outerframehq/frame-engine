@@ -3169,7 +3169,7 @@ impl ApplicationHandler for App {
                     .world
                     .collisions
                     .iter()
-                    .flat_map(|&(a, b)| [a, b])
+                    .flat_map(|&(a, b, _)| [a, b])
                     .collect();
                 let selected = self.selected;
                 // Per-primitive instance buckets from the world (see build_instances).

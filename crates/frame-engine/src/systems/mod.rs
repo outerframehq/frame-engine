@@ -32,7 +32,9 @@ fn half_extents(
     }
 }
 
-/// Detect which entity boxes overlap and record the pairs on the world.
+/// Detect which entity boxes overlap and record the pairs on the world, each
+/// with a contact point: the centre of the region where the two boxes
+/// overlap, in world space.
 ///
 /// This is detection only — a *trigger*, not physics. It finds overlaps and
 /// writes them to `world.collisions`; it never moves anything or changes a
@@ -74,7 +76,16 @@ pub fn collision(world: &mut World) {
                 && min_a[2] <= max_b[2]
                 && max_a[2] >= min_b[2];
             if overlap {
-                world.collisions.push((*id_a, *id_b));
+                // The contact point is the centre of the region the two boxes
+                // share: per axis, the midpoint between the later of the two
+                // mins and the earlier of the two maxes.
+                let mut point = [0.0f32; 3];
+                for axis in 0..3 {
+                    let lo = min_a[axis].max(min_b[axis]);
+                    let hi = max_a[axis].min(max_b[axis]);
+                    point[axis] = (lo + hi) * 0.5;
+                }
+                world.collisions.push((*id_a, *id_b, point));
             }
         }
     }
@@ -99,7 +110,12 @@ pub fn resolve_collisions(world: &mut World) {
         let s = world.scales.get(id).copied().unwrap_or_default();
         let mesh = world.meshes.get(id).cloned().unwrap_or_default();
         let is_static = world.statics.get(id).is_some();
-        boxes.push((id, [p.x, p.y, p.z], half_extents(&mesh, s, &world.mesh_meta), is_static));
+        boxes.push((
+            id,
+            [p.x, p.y, p.z],
+            half_extents(&mesh, s, &world.mesh_meta),
+            is_static,
+        ));
     }
 
     // Accumulate corrections keyed by entity, then apply them all at once.

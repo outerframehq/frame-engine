@@ -138,10 +138,12 @@ pub struct World {
     #[serde(default)]
     pub script_library: std::collections::BTreeMap<String, String>,
     /// Pairs of entity ids whose boxes overlap, as of the last time the
-    /// collision system ran. Transient, derived state — recomputed each run and
-    /// never saved with the scene, so it's skipped by serde and defaults empty.
+    /// collision system ran, each with the contact point: the centre of the
+    /// region where the two boxes overlap, in world space. Transient, derived
+    /// state — recomputed each run and never saved with the scene, so it's
+    /// skipped by serde and defaults empty.
     #[serde(skip)]
-    pub collisions: Vec<(usize, usize)>,
+    pub collisions: Vec<(usize, usize, [f32; 3])>,
 }
 
 impl Default for Scale {

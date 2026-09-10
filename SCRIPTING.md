@@ -54,11 +54,12 @@ These are set for you every tick. Read them, write them, or both.
 | `emissive`| Glow strength             | read/write | `0.0` is normal shading, `1.0` ignores the light and renders flat. |
 | `hit`     | Colliding this tick       | read-only  | `true` if this entity's box overlaps another's.    |
 | `hit_id`  | Which entity, if hit      | read-only  | The other entity's id, or `-1.0` if not colliding. If this entity overlaps more than one other at once, only one is reported. |
+| `hit_point`| Where the hit happened   | read-only  | `hit_point.x/.y/.z`. The centre of the overlap, in world space. Reads as this entity's own position when not colliding. |
 
 Anything you don't set keeps its current value. `t` and `hit` are read-only —
 writing to them does nothing.
 
-`pos`, `vel`, and `scale` are **vectors**, so you can do maths on them whole:
+`pos`, `vel`, `scale`, and `hit_point` are **vectors**, so you can do maths on them whole:
 
 ```rust
 pos = pos + vel * 2.0;        // add, subtract, multiply or divide by a number
@@ -177,6 +178,20 @@ or just a marker while you're testing.
 
 `hit_id` is `-1.0` when not colliding, so `if hit_id >= 0.0` is another way to
 ask the same thing `hit` does, with the id available too if you need it.
+
+**Flash on contact** — jump to the exact spot the collision happened:
+
+```rust
+if hit {
+    pos = hit_point;
+    emissive = 1.0;
+}
+```
+
+`hit_point` is the centre of the overlap between the two boxes, not either
+entity's own position, so it's a genuine "where," not just "who." When not
+colliding it reads back as this entity's own position, so it's always safe to
+use without checking `hit` first.
 
 Change any number and watch it update while the simulation plays. The `* 0.08`
 kind of number is speed; the `* 50.0` kind is size or distance.

@@ -32,10 +32,28 @@ pub struct Rgb {
 /// SCRIPTING.md.
 const API_VARS: &[&str] = &[
     // Read-only context.
-    "t", "id", "hit", "hit_id", // Structured values (preferred).
-    "pos", "vel", "scale", "color",    // Single-value component data.
+    "t",
+    "id",
+    "hit",
+    "hit_id",
+    "hit_point", // Structured values (preferred).
+    "pos",
+    "vel",
+    "scale",
+    "color",    // Single-value component data.
     "emissive", // Flat values (the original spelling, still supported).
-    "px", "py", "pz", "dx", "dy", "dz", "sx", "sy", "sz", "cr", "cg", "cb",
+    "px",
+    "py",
+    "pz",
+    "dx",
+    "dy",
+    "dz",
+    "sx",
+    "sy",
+    "sz",
+    "cr",
+    "cg",
+    "cb",
 ];
 
 /// A problem found in a script's source, shaped for the editor to display: a
@@ -264,15 +282,17 @@ impl ScriptRuntime for RhaiRuntime {
         // engine's collision system (which runs before scripts). Read-only.
         // hit_id is the other entity's id when colliding, or -1.0 when not — a
         // sentinel rather than an Option, to keep the script vocabulary simple.
+        // hit_point is the contact point in world space, or the entity's own
+        // position when not colliding, so it's always a valid Vec3 to read.
         // If this entity overlaps more than one other at once, only the first
         // pair found is reported; hit itself still reflects any of them.
         let hit_pair = world
             .collisions
             .iter()
-            .find(|&&(a, b)| a == entity || b == entity);
+            .find(|&&(a, b, _)| a == entity || b == entity);
         let hit = hit_pair.is_some();
         let hit_id = match hit_pair {
-            Some(&(a, b)) => {
+            Some(&(a, b, _)) => {
                 if a == entity {
                     b as f64
                 } else {
@@ -281,12 +301,25 @@ impl ScriptRuntime for RhaiRuntime {
             }
             None => -1.0,
         };
+        let hit_point = match hit_pair {
+            Some(&(_, _, point)) => Vec3 {
+                x: point[0] as f64,
+                y: point[1] as f64,
+                z: point[2] as f64,
+            },
+            None => Vec3 {
+                x: px,
+                y: py,
+                z: pz,
+            },
+        };
 
         let mut scope = rhai::Scope::new();
         scope.push("t", self.time); // read-only context
         scope.push("id", entity as f64); // read-only: this entity's own id
         scope.push("hit", hit); // read-only: colliding with anything this tick
         scope.push("hit_id", hit_id); // read-only: the other entity's id, or -1.0
+        scope.push("hit_point", hit_point); // read-only: where the collision happened
 
         // Structured values — the preferred spelling.
         scope.push(
