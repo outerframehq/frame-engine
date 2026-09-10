@@ -34,6 +34,9 @@ const API_VARS: &[&str] = &[
     // Read-only context.
     "t",
     "id",
+    "is_controlled",
+    "is_static",
+    "has_gravity",
     "hit",
     "hit_id",
     "hit_point", // Structured values (preferred).
@@ -317,6 +320,11 @@ impl ScriptRuntime for RhaiRuntime {
         let mut scope = rhai::Scope::new();
         scope.push("t", self.time); // read-only context
         scope.push("id", entity as f64); // read-only: this entity's own id
+        // Read-only: which markers this entity carries. Presence-only checks,
+        // same as the engine's own systems, no need to look up a value.
+        scope.push("is_controlled", world.controlled.get(entity).is_some());
+        scope.push("is_static", world.statics.get(entity).is_some());
+        scope.push("has_gravity", world.gravities.get(entity).is_some());
         scope.push("hit", hit); // read-only: colliding with anything this tick
         scope.push("hit_id", hit_id); // read-only: the other entity's id, or -1.0
         scope.push("hit_point", hit_point); // read-only: where the collision happened
