@@ -19,6 +19,7 @@ struct InstanceInput {
     @location(3) color: vec3<f32>,
     @location(4) selected: f32,
     @location(5) scale: vec3<f32>,
+    @location(6) emissive: f32,
 };
 
 struct VertexOutput {
@@ -26,6 +27,7 @@ struct VertexOutput {
     @location(0) color: vec3<f32>,
     @location(1) selected: f32,
     @location(2) shade: f32,
+    @location(3) emissive: f32,
 };
 
 // World size of a primitive at scale 1. Primitives are generated at ~unit size
@@ -51,14 +53,18 @@ fn vs_main(vertex: VertexInput, instance: InstanceInput) -> VertexOutput {
     out.color = instance.color;
     out.selected = instance.selected;
     out.shade = shade;
+    out.emissive = instance.emissive;
     return out;
 }
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
-    // Each entity draws in its own colour. The selected entity is brightened
-    // toward white so it stands out without hiding the colour you're editing.
-    let lit = in.color * in.shade;
+    // Each entity draws in its own colour. Emissive blends between normal
+    // shading and full unlit brightness, so a high emissive value makes an
+    // entity glow, ignoring the directional light. The selected entity is
+    // then brightened toward white so it stands out.
+    let shaded = in.color * in.shade;
+    let lit = mix(shaded, in.color, in.emissive);
     let highlighted = mix(lit, vec3<f32>(1.0, 1.0, 1.0), 0.3 * in.selected);
     return vec4<f32>(highlighted, 1.0);
 }

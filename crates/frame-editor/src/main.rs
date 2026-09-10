@@ -187,11 +187,13 @@ struct InstanceRaw {
     color: [f32; 3],
     selected: f32,
     scale: [f32; 3],
+    emissive: f32,
 }
 impl InstanceRaw {
     // Locations 0-1 belong to the mesh vertex buffer (MeshVertex); the instance
     // attributes continue from 2.
-    const ATTRIBS: [wgpu::VertexAttribute; 4] = [
+    const ATTRIBS: [wgpu::VertexAttribute; 5] = [
+        // was 4
         wgpu::VertexAttribute {
             format: wgpu::VertexFormat::Float32x3,
             offset: 0,
@@ -211,6 +213,11 @@ impl InstanceRaw {
             format: wgpu::VertexFormat::Float32x3,
             offset: std::mem::size_of::<[f32; 7]>() as wgpu::BufferAddress, // 28
             shader_location: 5,
+        },
+        wgpu::VertexAttribute {
+            format: wgpu::VertexFormat::Float32,
+            offset: std::mem::size_of::<[f32; 10]>() as wgpu::BufferAddress, // 40
+            shader_location: 6,
         },
     ];
     fn layout() -> wgpu::VertexBufferLayout<'static> {
@@ -903,6 +910,7 @@ type EditedEntity = (
     frame_engine::world::Color,
     bool,
     frame_engine::world::Scale,
+    frame_engine::world::Material,
     Option<String>,
     Mesh,
     bool,
@@ -1241,6 +1249,7 @@ fn inspector_tab_ui(
             color,
             controlled,
             scale,
+            material,
             script_source,
             mesh,
             is_static,
@@ -1290,6 +1299,9 @@ fn inspector_tab_ui(
                         .range(0.1..=100.0)
                         .prefix("z "),
                 );
+                ui.add_space(4.0);
+                ui.label("Material");
+                ui.add(egui::Slider::new(&mut material.emissive, 0.0..=1.0).text("emissive"));
             });
             ui.add_space(4.0);
             ui.label("Mesh");
@@ -3292,6 +3304,7 @@ impl ApplicationHandler for App {
                         self.world.colors.get(id).copied().unwrap_or_default(),
                         self.world.controlled.get(id).is_some(),
                         self.world.scales.get(id).copied().unwrap_or_default(),
+                        self.world.materials.get(id).copied().unwrap_or_default(),
                         self.world.scripts.get(id).map(|s| s.uses.clone()),
                         self.world.meshes.get(id).cloned().unwrap_or_default(),
                         self.world.statics.get(id).is_some(),
@@ -3533,6 +3546,7 @@ impl ApplicationHandler for App {
                     color,
                     controlled,
                     scale,
+                    material,
                     script_source,
                     mesh,
                     is_static,
@@ -3547,6 +3561,7 @@ impl ApplicationHandler for App {
                     }
                     self.world.colors.insert(id, color);
                     self.world.scales.insert(id, scale);
+                    self.world.materials.insert(id, material);
                     self.world.meshes.insert(id, mesh);
                     if controlled {
                         self.world.controlled.insert(id, Controlled);
@@ -3945,6 +3960,7 @@ fn build_instances(
         let color = world.colors.get(id).copied().unwrap_or_default();
         let scale = world.scales.get(id).copied().unwrap_or_default();
         let mesh = world.meshes.get(id).cloned().unwrap_or_default();
+        let material = world.materials.get(id).copied().unwrap_or_default(); // NEW
         let rgb = if colliding.contains(&id) {
             const T: f32 = 0.6; // how far toward red
             [
@@ -3960,6 +3976,7 @@ fn build_instances(
             color: rgb,
             selected: if Some(id) == selected { 1.0 } else { 0.0 },
             scale: [scale.x, scale.y, scale.z],
+            emissive: material.emissive, // NEW
         };
         let bucket = match &mesh {
             Mesh::Cube => 0,

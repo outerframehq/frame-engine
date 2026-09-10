@@ -82,6 +82,31 @@ pub struct MeshMeta {
     pub half_extents: [f32; 3],
 }
 
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq)]
+pub struct Scale {
+    pub x: f32,
+    pub y: f32,
+    pub z: f32,
+}
+
+// NEW: the Material component itself. Same shape as Scale/Color — plain,
+// Copy, per-entity data.
+/// Per-entity emissive strength: 0.0 is fully lit by the directional light
+/// (normal shading), 1.0 ignores it entirely and renders at full color, as
+/// if glowing. A tunable knob per entity, same footing as Color and Scale.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq)]
+pub struct Material {
+    pub emissive: f32,
+}
+
+impl Default for Material {
+    fn default() -> Self {
+        // 0.0 = normal shading, matches every entity's appearance before
+        // Material existed.
+        Material { emissive: 0.0 }
+    }
+}
+
 #[derive(Serialize, Deserialize, Default, Clone)]
 pub struct World {
     pub positions: ComponentStorage<Position>,
@@ -102,6 +127,9 @@ pub struct World {
     pub scales: ComponentStorage<Scale>,
     #[serde(default)]
     pub meshes: ComponentStorage<Mesh>,
+    // NEW: materials storage, right next to scales/meshes.
+    #[serde(default)]
+    pub materials: ComponentStorage<Material>,
     #[serde(default)]
     pub scripts: ComponentStorage<Script>,
     /// Named, reusable scripts shared across entities. Entities reference these
@@ -114,13 +142,6 @@ pub struct World {
     /// never saved with the scene, so it's skipped by serde and defaults empty.
     #[serde(skip)]
     pub collisions: Vec<(usize, usize)>,
-}
-
-#[derive(Serialize, Deserialize, Clone, Copy, PartialEq)]
-pub struct Scale {
-    pub x: f32,
-    pub y: f32,
-    pub z: f32,
 }
 
 impl Default for Scale {
@@ -163,6 +184,8 @@ impl World {
         self.colors.insert(id, Color::default());
         self.scales.insert(id, Scale::default());
         self.meshes.insert(id, Mesh::default());
+        // NEW: give every spawned entity a Material, same as Color/Scale/Mesh.
+        self.materials.insert(id, Material::default());
         id
     }
 
@@ -175,6 +198,8 @@ impl World {
             self.controlled.remove(id);
             self.scales.remove(id);
             self.meshes.remove(id);
+            // NEW: clean up materials too, same as scales/meshes.
+            self.materials.remove(id);
             self.scripts.remove(id);
         }
     }
