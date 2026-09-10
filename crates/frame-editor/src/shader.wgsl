@@ -20,6 +20,7 @@ struct InstanceInput {
     @location(4) selected: f32,
     @location(5) scale: vec3<f32>,
     @location(6) emissive: f32,
+    @location(7) yaw: f32,
 };
 
 struct VertexOutput {
@@ -37,15 +38,32 @@ const MESH_SIZE: f32 = 8.0;
 
 @vertex
 fn vs_main(vertex: VertexInput, instance: InstanceInput) -> VertexOutput {
-    // Per-axis scale (component-wise), then place at the entity's position.
-    let world_pos = instance.position + vertex.position * MESH_SIZE * instance.scale;
+    // Per-axis scale (component-wise), then yaw around the world's vertical
+    // (Y) axis, then place at the entity's position. Scale first so rotation
+    // spins the already-sized shape rather than an elongated axis.
+    let scaled = vertex.position * MESH_SIZE * instance.scale;
+    let cos_y = cos(instance.yaw);
+    let sin_y = sin(instance.yaw);
+    let rotated = vec3<f32>(
+        scaled.x * cos_y - scaled.z * sin_y,
+        scaled.y,
+        scaled.x * sin_y + scaled.z * cos_y,
+    );
+    let world_pos = instance.position + rotated;
 
     // Fixed-direction shading so shapes read as 3D as you orbit. We use the
-    // mesh's own normals directly. A diagonal scale leaves an axis-aligned cube
-    // normal untouched, and a uniformly-scaled sphere keeps correct normals too;
-    // a *non-uniformly* scaled sphere shades approximately, which is fine here.
+    // mesh's own normals, rotated the same way the shape was, so shading
+    // stays correct as an entity turns. A diagonal scale leaves an
+    // axis-aligned cube normal untouched, and a uniformly-scaled sphere keeps
+    // correct normals too; a *non-uniformly* scaled sphere shades
+    // approximately, which is fine here.
+    let rotated_normal = vec3<f32>(
+        vertex.normal.x * cos_y - vertex.normal.z * sin_y,
+        vertex.normal.y,
+        vertex.normal.x * sin_y + vertex.normal.z * cos_y,
+    );
     let light_dir = normalize(vec3<f32>(0.4, 0.8, 0.6));
-    let diffuse = max(dot(normalize(vertex.normal), light_dir), 0.0);
+    let diffuse = max(dot(normalize(rotated_normal), light_dir), 0.0);
     let shade = 0.4 + 0.6 * diffuse; // ambient floor + diffuse
 
     var out: VertexOutput;

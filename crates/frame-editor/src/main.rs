@@ -188,12 +188,12 @@ struct InstanceRaw {
     selected: f32,
     scale: [f32; 3],
     emissive: f32,
+    yaw: f32,
 }
 impl InstanceRaw {
     // Locations 0-1 belong to the mesh vertex buffer (MeshVertex); the instance
     // attributes continue from 2.
-    const ATTRIBS: [wgpu::VertexAttribute; 5] = [
-        // was 4
+    const ATTRIBS: [wgpu::VertexAttribute; 6] = [
         wgpu::VertexAttribute {
             format: wgpu::VertexFormat::Float32x3,
             offset: 0,
@@ -218,6 +218,11 @@ impl InstanceRaw {
             format: wgpu::VertexFormat::Float32,
             offset: std::mem::size_of::<[f32; 10]>() as wgpu::BufferAddress, // 40
             shader_location: 6,
+        },
+        wgpu::VertexAttribute {
+            format: wgpu::VertexFormat::Float32,
+            offset: std::mem::size_of::<[f32; 11]>() as wgpu::BufferAddress, // 44
+            shader_location: 7,
         },
     ];
     fn layout() -> wgpu::VertexBufferLayout<'static> {
@@ -911,6 +916,7 @@ type EditedEntity = (
     bool,
     frame_engine::world::Scale,
     frame_engine::world::Material,
+    frame_engine::world::Rotation,
     Option<String>,
     Mesh,
     bool,
@@ -1250,6 +1256,7 @@ fn inspector_tab_ui(
             controlled,
             scale,
             material,
+            rotation,
             script_source,
             mesh,
             is_static,
@@ -1303,6 +1310,19 @@ fn inspector_tab_ui(
                 ui.label("Material");
                 ui.add(egui::Slider::new(&mut material.emissive, 0.0..=1.0).text("emissive"));
             });
+            ui.add_space(4.0);
+            ui.label("Rotation");
+            let mut yaw_degrees = rotation.yaw.to_degrees();
+            if ui
+                .add(
+                    egui::DragValue::new(&mut yaw_degrees)
+                        .speed(1.0)
+                        .suffix("°"),
+                )
+                .changed()
+            {
+                rotation.yaw = yaw_degrees.to_radians();
+            }
             ui.add_space(4.0);
             ui.label("Mesh");
             let mesh_label: String = match mesh {
@@ -3305,6 +3325,7 @@ impl ApplicationHandler for App {
                         self.world.controlled.get(id).is_some(),
                         self.world.scales.get(id).copied().unwrap_or_default(),
                         self.world.materials.get(id).copied().unwrap_or_default(),
+                        self.world.rotations.get(id).copied().unwrap_or_default(),
                         self.world.scripts.get(id).map(|s| s.uses.clone()),
                         self.world.meshes.get(id).cloned().unwrap_or_default(),
                         self.world.statics.get(id).is_some(),
@@ -3547,6 +3568,7 @@ impl ApplicationHandler for App {
                     controlled,
                     scale,
                     material,
+                    rotation,
                     script_source,
                     mesh,
                     is_static,
@@ -3562,6 +3584,7 @@ impl ApplicationHandler for App {
                     self.world.colors.insert(id, color);
                     self.world.scales.insert(id, scale);
                     self.world.materials.insert(id, material);
+                    self.world.rotations.insert(id, rotation);
                     self.world.meshes.insert(id, mesh);
                     if controlled {
                         self.world.controlled.insert(id, Controlled);
@@ -3960,7 +3983,8 @@ fn build_instances(
         let color = world.colors.get(id).copied().unwrap_or_default();
         let scale = world.scales.get(id).copied().unwrap_or_default();
         let mesh = world.meshes.get(id).cloned().unwrap_or_default();
-        let material = world.materials.get(id).copied().unwrap_or_default(); // NEW
+        let material = world.materials.get(id).copied().unwrap_or_default();
+        let rotation = world.rotations.get(id).copied().unwrap_or_default();
         let rgb = if colliding.contains(&id) {
             const T: f32 = 0.6; // how far toward red
             [
@@ -3976,7 +4000,8 @@ fn build_instances(
             color: rgb,
             selected: if Some(id) == selected { 1.0 } else { 0.0 },
             scale: [scale.x, scale.y, scale.z],
-            emissive: material.emissive, // NEW
+            emissive: material.emissive,
+            yaw: rotation.yaw,
         };
         let bucket = match &mesh {
             Mesh::Cube => 0,

@@ -107,6 +107,24 @@ impl Default for Material {
     }
 }
 
+/// Per-entity yaw rotation, in radians, around the world's vertical (Y) axis.
+/// Starts at a single angle rather than a full 3D orientation (pitch and roll
+/// too), the same "start minimal, grow later" path Material took with just
+/// emissive. 0.0 is unrotated, matching every entity's appearance before
+/// Rotation existed. Collision boxes stay axis-aligned and unrotated; a
+/// rotated entity's hitbox is a known, already-documented limitation, not a
+/// new one this introduces.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq)]
+pub struct Rotation {
+    pub yaw: f32,
+}
+
+impl Default for Rotation {
+    fn default() -> Self {
+        Rotation { yaw: 0.0 }
+    }
+}
+
 #[derive(Serialize, Deserialize, Default, Clone)]
 pub struct World {
     pub positions: ComponentStorage<Position>,
@@ -130,6 +148,8 @@ pub struct World {
     // NEW: materials storage, right next to scales/meshes.
     #[serde(default)]
     pub materials: ComponentStorage<Material>,
+    #[serde(default)]
+    pub rotations: ComponentStorage<Rotation>,
     #[serde(default)]
     pub scripts: ComponentStorage<Script>,
     /// Named, reusable scripts shared across entities. Entities reference these
@@ -188,6 +208,7 @@ impl World {
         self.meshes.insert(id, Mesh::default());
         // NEW: give every spawned entity a Material, same as Color/Scale/Mesh.
         self.materials.insert(id, Material::default());
+        self.rotations.insert(id, Rotation::default());
         id
     }
 
@@ -201,6 +222,7 @@ impl World {
             self.scales.remove(id);
             self.meshes.remove(id);
             self.materials.remove(id);
+            self.rotations.remove(id);
             self.scripts.remove(id);
             //Static and Gravity are markers, easy to forget  here since they
             // have no value to look at.Left out, a freed slot could keep an
