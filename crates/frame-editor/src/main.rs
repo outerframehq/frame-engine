@@ -1394,6 +1394,15 @@ fn scripts_tab_ui(
     open_script: &mut Option<String>,
     script_status: &Option<Result<(), script::ScriptError>>,
     script_warnings: &[script::ScriptError],
+    // In-progress rename text buffer for the open script. `None` means not
+    // currently renaming; `Some((original_name, buffer))` tracks which script
+    // it belongs to, so navigating to a different script clears stale state
+    // instead of showing an old buffer for the wrong name.
+    renaming: &mut Option<(String, String)>,
+    // Set once, the frame a rename actually completes, so the caller (which has
+    // access to the world, this function doesn't) can rewrite every entity's
+    // Script.uses that pointed at the old name. Read and cleared by the caller.
+    renamed: &mut Option<(String, String)>,
 ) {
     let mut delete: Option<String> = None;
     // LEFT: the script list and the "new script" box, in a resizable sidebar.
@@ -1436,10 +1445,57 @@ fn scripts_tab_ui(
         .cloned();
     match open {
         Some(name) => {
+            // Stale rename state (started on a different script, or the user
+            // navigated away mid-rename) is cleared rather than shown for the
+            // wrong entry.
+            if renaming.as_ref().is_some_and(|(orig, _)| orig != &name) {
+                *renaming = None;
+            }
             ui.horizontal(|ui| {
-                ui.strong(&name);
-                if ui.small_button("Delete").clicked() {
-                    delete = Some(name.clone());
+                match renaming {
+                    Some((_, buffer)) => {
+                        ui.add(
+                            egui::TextEdit::singleline(buffer)
+                                .desired_width(160.0),
+                        );
+                        let new_name = buffer.trim().to_string();
+                        // Same name (or empty) just cancels quietly; a name
+                        // that collides with a DIFFERENT existing script is
+                        // refused rather than silently overwriting it.
+                        let collides =
+                            !new_name.is_empty() && new_name != name && script_library.contains_key(&new_name);
+                        if ui
+                            .add_enabled(!new_name.is_empty() && !collides, egui::Button::new("Confirm"))
+                            .clicked()
+                        {
+                            if new_name != name {
+                                if let Some(source) = script_library.remove(&name) {
+                                    script_library.insert(new_name.clone(), source);
+                                    *open_script = Some(new_name.clone());
+                                    *renamed = Some((name.clone(), new_name));
+                                }
+                            }
+                            *renaming = None;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            *renaming = None;
+                        }
+                        if collides {
+                            ui.colored_label(
+                                egui::Color32::from_rgb(0xe0, 0x6c, 0x6c),
+                                "already used",
+                            );
+                        }
+                    }
+                    None => {
+                        ui.strong(&name);
+                        if ui.small_button("Rename").clicked() {
+                            *renaming = Some((name.clone(), name.clone()));
+                        }
+                        if ui.small_button("Delete").clicked() {
+                            delete = Some(name.clone());
+                        }
+                    }
                 }
             });
             match script_status {
@@ -1513,6 +1569,9 @@ fn scripts_tab_ui(
         if open_script.as_ref() == Some(&name) {
             *open_script = None;
         }
+        if renaming.as_ref().is_some_and(|(orig, _)| orig == &name) {
+            *renaming = None;
+        }
     }
 }
 
@@ -1527,6 +1586,10 @@ struct EditorTabViewer {
     new_script_name: String,
     script_filter: String,
     open_script: Option<String>,
+    // In-progress script rename, and the completed-this-frame signal for the
+    // caller to rewrite entity references. See scripts_tab_ui.
+    renaming: Option<(String, String)>,
+    renamed: Option<(String, String)>,
     script_status: Option<Result<(), script::ScriptError>>,
     script_warnings: Vec<script::ScriptError>,
     // Names of the project's imported models, for the mesh picker.
@@ -1605,6 +1668,8 @@ impl egui_dock::TabViewer for EditorTabViewer {
                 &mut self.open_script,
                 &self.script_status,
                 &self.script_warnings,
+                &mut self.renaming,
+                &mut self.renamed,
             ),
             Tab::Source => source_tab_ui(ui, &self.git_summary),
         }
@@ -1745,6 +1810,9 @@ struct App {
     script_filter: String,
     // Which library script is open in the Script Editor's centre pane (by name).
     open_script: Option<String>,
+    // In-progress script rename (original name, edit buffer), persists between
+    // frames the same way open_script does. See scripts_tab_ui.
+    renaming: Option<(String, String)>,
     // GPU texture for the toolbar logo, uploaded once on the first frame.
     logo_texture: Option<egui::TextureHandle>,
 }
@@ -3287,6 +3355,7 @@ impl ApplicationHandler for App {
                 let new_script_name = std::mem::take(&mut self.new_script_name);
                 let script_filter = std::mem::take(&mut self.script_filter);
                 let open_script = std::mem::take(&mut self.open_script);
+                let renaming = std::mem::take(&mut self.renaming);
                 // Compile-check the open script once per frame, before the egui
                 // pass (the runtime lives on `self`, which the egui closure can't
                 // borrow). This reflects the source as of frame start; an edit
@@ -3367,6 +3436,8 @@ impl ApplicationHandler for App {
                     new_script_name,
                     script_filter,
                     open_script,
+                    renaming,
+                    renamed: None,
                     script_status,
                     script_warnings,
                     custom_mesh_names: self.custom_meshes.keys().cloned().collect(),
@@ -3544,6 +3615,22 @@ impl ApplicationHandler for App {
                 self.new_script_name = viewer.new_script_name;
                 self.script_filter = viewer.script_filter;
                 self.open_script = viewer.open_script;
+                self.renaming = viewer.renaming;
+                if let Some((old_name, new_name)) = viewer.renamed {
+                    // Rewrite every entity's Script.uses that pointed at the old
+                    // name, so a rename doesn't orphan references the way a
+                    // delete deliberately can. The library key itself was
+                    // already swapped in scripts_tab_ui; this is the part that
+                    // needed world access, which that function doesn't have.
+                    for slot in self.world.scripts.iter_mut() {
+                        if let Some(script) = slot {
+                            if script.uses == old_name {
+                                script.uses = new_name.clone();
+                            }
+                        }
+                    }
+                    self.log(format!("Renamed script '{old_name}' to '{new_name}'"));
+                }
                 self.selected = viewer.selection;
                 let edited = viewer.edited;
                 // Coalesce Inspector edits into one undo step per gesture: snapshot
@@ -4145,6 +4232,7 @@ fn main() {
         new_script_name: String::new(),
         script_filter: String::new(),
         open_script: None,
+        renaming: None,
         script_runtime: script::RhaiRuntime::new(),
         logo_texture: None,
     };
