@@ -14,10 +14,20 @@ lands and the patch version bumps for fixes and small additions.
 Engine:
 
 - A `Material` component (an emissive strength, 0.0 to 1.0), per-entity appearance data serialized with the scene; defaults to 0.0, so older scenes load unchanged.
+- A `Rotation` component: a single yaw angle, in radians, around the world's vertical axis. Not full 3D orientation yet, pitch and roll aren't tracked. Serialized with the scene; defaults to 0.0, so older scenes load unchanged.
+- A contact point on collision detection. `World.collisions` now carries the centre of the overlap alongside each colliding pair, computed per axis as the midpoint between the two boxes' shared region, not just which two entities are involved.
 
 Editor (frame-editor):
 
 - A Material slider in the Inspector, next to Scale, editing an entity's emissive strength. At 1.0 the entity ignores the directional light and renders at flat full colour, useful for a glowing look.
+- A Rotation control in the Inspector, shown in degrees. The engine stores radians internally; conversion happens only at the editing boundary.
+- A much deeper script API. Scripts can now read their own entity id, whether they carry the `Controlled`, `Static`, or `Gravity` marker, and which movement keys are currently held. On collision, scripts can read which entity was hit and the contact point where it happened. `yaw` is now read/write from scripts, alongside the existing position, velocity, scale, colour, and emissive values. Scripts can also request a new entity be spawned (at a position, defaulting to their own) or an existing one despawned by id, an action rather than a value, applied once after the script finishes running for that tick. See SCRIPTING.md for the full list and worked examples.
+
+### Fixed
+
+Engine:
+
+- `despawn` now clears the `Static` and `Gravity` markers too. Since `spawn` reuses the first freed slot rather than always growing, a new entity landing on a slot that used to be `Static` or `Gravity` could previously inherit that marker without ever being given it.
 
 ## [0.3.0] - 2026-07-14
 
@@ -26,7 +36,7 @@ Editor (frame-editor):
 Engine:
 
 - Collision response. A `resolve_collisions` system pushes overlapping entities apart along their least-overlapping axis (the minimum translation vector) after movement, so they stop interpenetrating, and zeros the velocity heading into a surface so a fallen entity rests instead of accumulating speed (a script-driven bounce, already moving away, is preserved). Detection-only collision (the `hit` flag) is unchanged; this adds the automatic separation on top.
-- A `Static` marker component. A static entity is immovable — collision response never pushes it, so others rest against it (a floor, a wall). A dynamic-vs-static pair pushes only the dynamic entity; dynamic-vs-dynamic splits the push evenly. Serialized with the scene; defaults off, so older scenes are unaffected.
+- A `Static` marker component. A static entity is immovable: collision response never pushes it, so others rest against it (a floor, a wall). A dynamic-vs-static pair pushes only the dynamic entity; dynamic-vs-dynamic splits the push evenly. Serialized with the scene; defaults off, so older scenes are unaffected.
 - Gravity. A `Gravity` marker component and a `gravity` system accelerate marked (non-static) entities downward (−Y) each tick, at a tunable `GRAVITY` strength. Opt-in per entity, so scenes without it are unaffected.
 - Mesh-fitted collision boxes. A `Plane` now has a flat (zero-height) collision box matching what's drawn, so entities rest on its surface rather than on an invisible ledge half an entity-size above it. Cubes and spheres keep their full box.
 - An assets module with a hand rolled OBJ parser. Covers v, vn and f lines with all four corner forms, negative indices, comments, fan triangulation of larger faces, and computed flat normals when a face has none. Parsed models get normalised to unit size like the primitives, so a model at scale 1 comes out cube sized with its own proportions. No new dependencies.
@@ -39,14 +49,14 @@ Editor (frame-editor):
 - Projects. A project is a folder holding a scene file named after the project (the file's stem is the project name) and a `project.ron` manifest (description and version). Create a named project, or open an existing one by picking its folder.
 - A recent-projects list on the launcher, sorted by most-recently-edited and remembered across runs. Each project is a full-width card showing its name, description, last-edited date, and version, with Edit, Play, and Settings actions.
 - A project-settings window, opened from a card, to edit the name, version, and description. It saves when the window closes (its X or the Save button); renaming the project renames its scene file. Description and version are stored in the project's `project.ron`.
-- Play a project in a separate, clean game window: its own window and GPU surface running a copy of the project's world — the 3D scene only, no editor chrome — with the simulation running and WASD driving `Controlled` entities. Close the window or press Esc to return to the launcher.
+- Play a project in a separate, clean game window: its own window and GPU surface running a copy of the project's world (the 3D scene only, no editor chrome) with the simulation running and WASD driving `Controlled` entities. Close the window or press Esc to return to the launcher.
 - A Static (immovable) checkbox in the Inspector, marking an entity so collision response leaves it in place, and a Gravity (falls) checkbox marking an entity to be pulled downward.
 - Undo and redo (Ctrl+Z / Ctrl+Y or Ctrl+Shift+Z, and Edit > Undo/Redo), built on full-world snapshots. Spawning, despawning, position nudges, and Inspector edits are undoable; a drag or a held key coalesces into a single step. (Script-editor text typing isn't yet an independent step.)
-- A flythrough camera. Hold Alt to enter a free camera seeded from the current orbit view: the mouse looks around and WASD flies through the scene, with the cursor grabbed. Left-click picks the entity at screen-centre and makes it the pivot for when orbit resumes; releasing Alt returns to orbit. Known limitation: releasing Alt doesn't yet restore the exact pre-Alt view — orbit resumes from where flight ended.
+- A flythrough camera. Hold Alt to enter a free camera seeded from the current orbit view: the mouse looks around and WASD flies through the scene, with the cursor grabbed. Left-click picks the entity at screen-centre and makes it the pivot for when orbit resumes; releasing Alt returns to orbit. Known limitation: releasing Alt doesn't yet restore the exact pre-Alt view; orbit resumes from where flight ended.
 - Structured script values. Scripts now see `pos`, `vel`, and `scale` as a `Vec3` (`.x`/`.y`/`.z`) and `color` as an `Rgb` (`.r`/`.g`/`.b`), with vector arithmetic (`pos = pos + vel * 2.0`), `length()`, and `vec3()`/`rgb()` constructors. The original flat names (`px`, `dz`, `cr`, ...) still work, so existing scripts run unchanged; if a script sets both spellings of the same value, the structured one wins. SCRIPTING.md now teaches the structured spelling.
-- Unknown-variable warnings in the Script Editor. A semantic pass walks the compiled script for variable references and flags, in amber with line and column, any name that is neither part of the script API nor declared locally with `let` — catching the typos (`poz`, `hti`) that Rhai would otherwise fail on silently at run time, thirty times a second. The status line reads "No problems" only when both syntax and names are clean.
+- Unknown-variable warnings in the Script Editor. A semantic pass walks the compiled script for variable references and flags, in amber with line and column, any name that is neither part of the script API nor declared locally with `let`, catching the typos (`poz`, `hti`) that Rhai would otherwise fail on silently at run time, thirty times a second. The status line reads "No problems" only when both syntax and names are clean.
 - A translate gizmo. Selecting an entity draws three axis arms over it in the viewport (X red, Y green, Z blue); dragging an arm moves the entity along that world axis, tracking the cursor at any camera angle. The hovered or grabbed arm highlights, arms hold a roughly constant on-screen size at any camera distance, grabbing an arm takes priority over camera pan and picking, and a whole drag is one undo step.
-- A Source Control tab. A read-only dockable panel showing the open project's git state: current branch, upstream with ahead/behind counts, and the working tree's changed files — modified/new/deleted/renamed/conflicted, amber for unstaged and green for staged. Read-only by design: it opens the repository, reads, and drops, with no network access and no credentials; commits and pushes stay in the terminal or a git client. Projects not inside a git repository get a friendly note instead.
+- A Source Control tab. A read-only dockable panel showing the open project's git state: current branch, upstream with ahead/behind counts, and the working tree's changed files, modified/new/deleted/renamed/conflicted, amber for unstaged and green for staged. Read-only by design: it opens the repository, reads, and drops, with no network access and no credentials; commits and pushes stay in the terminal or a git client. Projects not inside a git repository get a friendly note instead.
 - Launcher quality of life. Project cards gain a Delete button with a two step confirmation that removes the project folder from disk and drops it from the recents list. The controls overlay's visibility persists across runs in a small editor.ron under the config directory, so hiding it once keeps it hidden. Opening a project now starts paused, so scenes get arranged before Space runs them. The Play window still runs right away.
 - Model import. File > Import model copies a Wavefront OBJ into the project's assets folder, parses it and uploads it to the GPU. Projects scan their assets folder (and subfolders) on open. Imported models render with their own vertices, appear in the Inspector mesh picker, work in the Play window, and get collision boxes fitted to their real proportions. Blender exports load with default settings.
 - An Assets tab. A third tab in the bottom console browses the project's assets folder as tiles, each model drawn as a small CPU rendered preview with its name underneath. Folders can be opened and created, and a move and paste flow shifts files between them.
@@ -68,7 +78,7 @@ Engine:
 - A `Script` component that names a shared behaviour, plus a `script_library` on the world (script name to source) so a script's source lives once and every entity that uses it changes together.
 - A `ScriptRuntime` trait (the seam a host implements to run scripts) and a `run_scripts` system. The engine stores script source as data and owns the seam; it interprets nothing itself.
 - A `Mesh` component (Cube, Sphere, or Plane primitive), per-entity appearance data serialized with the scene; defaults to Cube, so older scenes load unchanged.
-- AABB collision detection: an `ENTITY_SIZE` constant and a `collision` system that records overlapping entity-box pairs on the world as triggers — detection only, with no physics response. The boxes are scale-boxes (shape-agnostic), and the result is transient (never saved with the scene).
+- AABB collision detection: an `ENTITY_SIZE` constant and a `collision` system that records overlapping entity-box pairs on the world as triggers, detection only, with no physics response. The boxes are scale-boxes (shape-agnostic), and the result is transient (never saved with the scene).
 
 Editor (frame-editor):
 
@@ -82,7 +92,7 @@ Editor (frame-editor):
 - Entity scripts now run, through a Rhai backend in the editor.
 - A Script Editor tab in the centre area: a sidebar of script names beside one large code editor with a line-number gutter, for writing and editing the shared script library.
 - Assign a script to the selected entity from the Inspector, through a searchable, filterable picker.
-- Live syntax checking in the Script Editor: the open script is compile-checked and a status line shows the syntax error's line, column, and message, or confirms it parses. (Syntax only — Rhai surfaces unknown-variable and type errors at run time.)
+- Live syntax checking in the Script Editor: the open script is compile-checked and a status line shows the syntax error's line, column, and message, or confirms it parses. (Syntax only; Rhai surfaces unknown-variable and type errors at run time.)
 - Entities render as their chosen primitive (cube, sphere, or plane), and a Mesh dropdown in the Inspector picks the shape per entity.
 - Overlapping entities are tinted red in the viewport, a live view of the engine's collision detection.
 - Scripts can read whether their entity is colliding this tick, via a read-only `hit` variable. Collision detection now runs first in the tick loop so scripts see it deterministically.

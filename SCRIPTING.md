@@ -3,7 +3,7 @@
 Any entity can carry a **script**: a small piece of code that runs every tick and
 changes that entity. Scripts live in a shared **library**: you write one in the
 editor's **Script Editor** tab, then attach it to an entity from the
-**Inspector** — select an entity, open its **Script** picker, and choose the
+**Inspector**: select an entity, open its **Script** picker, and choose the
 script by name. Because scripts are shared, one script can drive many entities,
 and editing it in the Script Editor updates every entity that uses it at once.
 Changes take effect live, with no rebuild. This page is the reference for what
@@ -21,7 +21,7 @@ while n > 0 { n -= 1; }   // loops
 // line comments
 ```
 
-Numbers are floating point. The usual maths is available — `+ - * / %`, and
+Numbers are floating point. The usual maths is available: `+ - * / %`, and
 functions like `sin`, `cos`, `sqrt`, `abs`, `min`, `max`, `floor`, `ceil`. Full
 language details are in the [Rhai book](https://rhai.rs/book/).
 
@@ -36,7 +36,7 @@ You don't need most of it. Most useful scripts are one or two lines.
   your code runs, and any variables you changed are written back into the world.
 - It's **deterministic**: the same tick produces the same result every time.
 
-So a script isn't a one-off — it's a rule that re-runs 30 times a second. That's
+So a script isn't a one-off. It's a rule that re-runs 30 times a second. That's
 why time-based maths (below) makes things move.
 
 ## Variables you can use
@@ -64,7 +64,7 @@ These are set for you every tick. Read them, write them, or both.
 | `hit_id`  | Which entity, if hit      | read-only  | The other entity's id, or `-1.0` if not colliding. If this entity overlaps more than one other at once, only one is reported. |
 | `hit_point`| Where the hit happened   | read-only  | `hit_point.x/.y/.z`. The centre of the overlap, in world space. Reads as this entity's own position when not colliding. |
 
-Anything you don't set keeps its current value. `t` and `hit` are read-only —
+Anything you don't set keeps its current value. `t` and `hit` are read-only;
 writing to them does nothing.
 
 `pos`, `vel`, `scale`, and `hit_point` are **vectors**, so you can do maths on them whole:
@@ -83,11 +83,11 @@ vel = vec3(0.0, 0.5, 0.0);    // build one from scratch
 ### The older flat names
 
 Before vectors, each axis was its own variable: `px` `py` `pz`, `dx` `dy` `dz`,
-`sx` `sy` `sz`, `cr` `cg` `cb`. **These still work** — old scripts keep running —
+`sx` `sy` `sz`, `cr` `cg` `cb`. **These still work** (old scripts keep running),
 but `pos.x` is the preferred spelling, and new examples use it. If you set both
 spellings of the same value in one script, the vector one wins.
 
-## Position vs velocity — the one thing to understand
+## Position vs velocity: the one thing to understand
 
 There are two ways to make something move, and they behave differently:
 
@@ -115,7 +115,7 @@ pos.y = sin(t * 0.08) * 50.0;
 pos.z = sin(t * 0.1) * 20.0;
 ```
 
-**Pulse** — breathe in and out by scaling:
+**Pulse**, breathe in and out by scaling:
 
 ```rust
 let s = 1.0 + sin(t * 0.1) * 0.5;
@@ -136,19 +136,19 @@ color.g = 0.1;
 color.b = 0.1;
 ```
 
-**Glow** — pulse between normal shading and full brightness:
+**Glow**, pulse between normal shading and full brightness:
 
 ```rust
 emissive = 0.5 + sin(t * 0.1) * 0.5;
 ```
 
-**Spin** — turn steadily around the vertical axis:
+**Spin**, turn steadily around the vertical axis:
 
 ```rust
 yaw = yaw + 0.02;
 ```
 
-**React** to position — fall until low, then rise (a rough bounce):
+**React** to position, fall until low, then rise (a rough bounce):
 
 ```rust
 if pos.z > 60.0 {
@@ -158,7 +158,7 @@ if pos.z > 60.0 {
 }
 ```
 
-**Halt on contact** — stop dead whenever you overlap another entity:
+**Halt on contact**, stop dead whenever you overlap another entity:
 
 ```rust
 if hit {
@@ -168,10 +168,10 @@ if hit {
 
 `hit` is `true` on any tick this entity's box overlaps another's (the editor also
 tints overlapping entities red, so you can see it happening). It's a plain
-detection flag — nothing pushes the entities apart, so what happens next is
+detection flag. Nothing pushes the entities apart, so what happens next is
 entirely up to your script.
 
-**React only to one entity** — check `hit_id` against a known id:
+**React only to one entity**, check `hit_id` against a known id:
 
 ```rust
 if hit_id == 3.0 {
@@ -179,7 +179,7 @@ if hit_id == 3.0 {
 }
 ```
 
-**Single out one entity** — check `id` before doing something:
+**Single out one entity**, check `id` before doing something:
 
 ```rust
 if id == 0.0 {
@@ -191,7 +191,7 @@ Since the same library script can run on many entities at once, `id` is what
 lets one of them behave differently from the rest, a leader, a special case,
 or just a marker while you're testing.
 
-**Behave differently by marker** — a shared "wander" script that only actually
+**Behave differently by marker**, a shared "wander" script that only actually
 moves entities that aren't pinned in place:
 
 ```rust
@@ -200,7 +200,7 @@ if !is_static {
 }
 ```
 
-**React to input** — a script-driven entity, without needing `Controlled`:
+**React to input**, a script-driven entity, without needing `Controlled`:
 
 ```rust
 if input_up {
@@ -217,7 +217,7 @@ for every entity's script, not tied to which one is selected or playing.
 `hit_id` is `-1.0` when not colliding, so `if hit_id >= 0.0` is another way to
 ask the same thing `hit` does, with the id available too if you need it.
 
-**Flash on contact** — jump to the exact spot the collision happened:
+**Flash on contact**, jump to the exact spot the collision happened:
 
 ```rust
 if hit {
@@ -238,7 +238,7 @@ kind of number is speed; the `* 50.0` kind is size or distance.
 
 `spawn` and `despawn_id` are different from everything else above: they're not
 a value the entity holds, they're a request. Setting `spawn = true;` doesn't
-create anything immediately — it tells the engine "spawn one, once this script
+create anything immediately, it tells the engine "spawn one, once this script
 finishes running." Same idea for `despawn_id`.
 
 This matters because `spawn` resets to `false` at the start of every script run.
@@ -252,7 +252,7 @@ if t % 30.0 == 0.0 {
 }
 ```
 
-**Multiply** — spawn a copy of yourself once a second (30 ticks):
+**Multiply**, spawn a copy of yourself once a second (30 ticks):
 
 ```rust
 if t % 30.0 == 0.0 {
@@ -278,20 +278,20 @@ if hit {
 ```
 
 A newly spawned entity gets the same defaults as one you'd create in the editor
-(no script, no colour beyond the default, `Position` and zero `Velocity`) — it
+(no script, no colour beyond the default, `Position` and zero `Velocity`). It
 doesn't inherit anything from the entity that spawned it, and there's no way yet
 to read back the new entity's own id.
 
 ## When a script has a mistake
 
-A script that doesn't compile (a typo, an unfinished line) simply does nothing —
-the entity keeps whatever state it already had, and the error is reported once in
+A script that doesn't compile (a typo, an unfinished line) simply does nothing.
+The entity keeps whatever state it already had, and the error is reported once in
 the editor's Output console. Fix the text and it picks up again automatically. You
 can't crash the editor with a bad script, so experiment freely.
 
 The Script Editor also checks for a subtler mistake: **using a name that doesn't
 exist**. Writing `poz.x = 5.0;` (or `hti`, or any variable you never declared
-with `let`) is perfectly valid Rhai — it just fails quietly at run time, thirty
+with `let`) is perfectly valid Rhai, it just fails quietly at run time, thirty
 times a second, doing nothing. The editor flags those names as you type, with
 their line and column, so a typo shows up immediately instead of leaving you
 wondering why nothing moved.
