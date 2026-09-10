@@ -2,6 +2,62 @@ mod storage;
 use serde::{Deserialize, Serialize};
 pub use storage::ComponentStorage;
 
+/// Type-erased storage for one runtime-registered component type, so `World`
+/// can hold arbitrary component types it was never compiled knowing about.
+/// Each concrete `ComponentStorage<T>` implements this by delegating to
+/// itself; the trait is what lets `World` hold a mix of them behind one
+/// `HashMap`.
+trait ErasedStorage: std::any::Any {
+    /// Remove this entity's value, if it has one, without needing to know T.
+    /// This is what `despawn` calls: it can't know every registered type, so
+    /// it can't downcast, but it can still ask every storage to forget an id.
+    fn remove_erased(&mut self, id: usize);
+    fn as_any(&self) -> &dyn std::any::Any;
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any;
+    fn clone_box(&self) -> Box<dyn ErasedStorage>;
+}
+
+impl<T: Clone + 'static> ErasedStorage for ComponentStorage<T> {
+    fn remove_erased(&mut self, id: usize) {
+        self.remove(id);
+    }
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+    fn clone_box(&self) -> Box<dyn ErasedStorage> {
+        Box::new(self.clone())
+    }
+}
+
+impl Clone for Box<dyn ErasedStorage> {
+    fn clone(&self) -> Self {
+        self.clone_box()
+    }
+}
+
+/// One runtime-registered component slot, keyed by name in `World::dynamic`.
+/// `type_id` is checked on every access, so a name can never silently be read
+/// back as the wrong type; `type_name` exists purely so that mismatch can be
+/// reported in a way a person can actually read.
+struct DynamicEntry {
+    type_id: std::any::TypeId,
+    type_name: &'static str,
+    storage: Box<dyn ErasedStorage>,
+}
+
+impl Clone for DynamicEntry {
+    fn clone(&self) -> Self {
+        DynamicEntry {
+            type_id: self.type_id,
+            type_name: self.type_name,
+            storage: self.storage.clone_box(),
+        }
+    }
+}
+
 /// The world-space size of an entity at scale 1, in world units. This is a
 /// simulation fact (it's what collision boxes are built from), so it lives in
 /// the engine. The editor's rendering and picking must use the same value:
@@ -164,6 +220,21 @@ pub struct World {
     /// skipped by serde and defaults empty.
     #[serde(skip)]
     pub collisions: Vec<(usize, usize, [f32; 3])>,
+    /// Runtime-registered component storage, keyed by name, for a component
+    /// type the engine was never compiled knowing about. This is the seam a
+    /// host (a private game layer, an editor plugin) uses to attach its own
+    /// per-entity data without needing to add a field to `World` itself, the
+    /// same problem `Material` and `Rotation` would otherwise have to solve
+    /// by becoming public engine code just to exist.
+    ///
+    /// Deliberately does not serialize with the scene yet. `Box<dyn Any>`
+    /// can't be serialized generically without either a real dependency just
+    /// for this (breaking the engine's zero-new-dependencies rule) or a
+    /// hand-rolled per-type registry of serialize functions, a real future
+    /// step, not an oversight here. A registered component resets on reload,
+    /// the same way `collisions` above is transient by design.
+    #[serde(skip)]
+    dynamic: std::collections::HashMap<String, DynamicEntry>,
 }
 
 impl Default for Scale {
@@ -229,7 +300,96 @@ impl World {
             // old marker and hand it to whatever spawns into that slot next
             self.statics.remove(id);
             self.gravities.remove(id);
+            // Every registered dynamic component too, without needing to know
+            // any of their types: remove_erased is exactly what that's for.
+            for entry in self.dynamic.values_mut() {
+                entry.storage.remove_erased(id);
+            }
         }
+    }
+
+    /// Attach a value for a runtime-registered component, keyed by name, to an
+    /// entity. The first insert under a given name fixes that name's type for
+    /// the rest of the world's life; a later insert under the same name with a
+    /// different `T` is refused (returns `false`) rather than corrupting the
+    /// slot. Returns `true` on success.
+    pub fn insert_dynamic<T: Clone + 'static>(&mut self, name: &str, id: usize, value: T) -> bool {
+        let entry = self
+            .dynamic
+            .entry(name.to_string())
+            .or_insert_with(|| DynamicEntry {
+                type_id: std::any::TypeId::of::<T>(),
+                type_name: std::any::type_name::<T>(),
+                storage: Box::new(ComponentStorage::<T>::default()),
+            });
+        if entry.type_id != std::any::TypeId::of::<T>() {
+            return false;
+        }
+        match entry
+            .storage
+            .as_any_mut()
+            .downcast_mut::<ComponentStorage<T>>()
+        {
+            Some(storage) => {
+                storage.insert(id, value);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Read a runtime-registered component's value for an entity. `None` if
+    /// the name isn't registered yet, the entity doesn't have a value under
+    /// it, or `T` doesn't match the type that name was first registered with.
+    pub fn get_dynamic<T: Clone + 'static>(&self, name: &str, id: usize) -> Option<&T> {
+        let entry = self.dynamic.get(name)?;
+        if entry.type_id != std::any::TypeId::of::<T>() {
+            return None;
+        }
+        entry
+            .storage
+            .as_any()
+            .downcast_ref::<ComponentStorage<T>>()?
+            .get(id)
+    }
+
+    /// The mutable counterpart to `get_dynamic`.
+    pub fn get_dynamic_mut<T: Clone + 'static>(&mut self, name: &str, id: usize) -> Option<&mut T> {
+        let entry = self.dynamic.get_mut(name)?;
+        if entry.type_id != std::any::TypeId::of::<T>() {
+            return None;
+        }
+        entry
+            .storage
+            .as_any_mut()
+            .downcast_mut::<ComponentStorage<T>>()?
+            .get_mut(id)
+    }
+
+    /// Remove a runtime-registered component's value for an entity, if it has
+    /// one, from the given name's storage specifically. Does nothing if the
+    /// name isn't registered or `T` doesn't match its type; `despawn` uses
+    /// `remove_erased` instead, since it needs to clear every registered
+    /// storage without knowing any of their types.
+    pub fn remove_dynamic<T: Clone + 'static>(&mut self, name: &str, id: usize) {
+        if let Some(entry) = self.dynamic.get_mut(name) {
+            if entry.type_id == std::any::TypeId::of::<T>() {
+                if let Some(storage) = entry
+                    .storage
+                    .as_any_mut()
+                    .downcast_mut::<ComponentStorage<T>>()
+                {
+                    storage.remove(id);
+                }
+            }
+        }
+    }
+
+    /// The type name a registered slot was first created with, for a friendly
+    /// error message if a host ever mismatches its own type against a name it
+    /// registered earlier (with a different type, in a different build, say).
+    pub fn dynamic_type_name(&self, name: &str) -> Option<&'static str> {
+        self.dynamic.get(name).map(|entry| entry.type_name)
     }
 
     /// Serialize the whole world to a RON file.
