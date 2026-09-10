@@ -198,9 +198,13 @@ impl World {
             self.controlled.remove(id);
             self.scales.remove(id);
             self.meshes.remove(id);
-            // NEW: clean up materials too, same as scales/meshes.
             self.materials.remove(id);
             self.scripts.remove(id);
+            //Static and Gravity are markers, easy to forget  here since they
+            // have no value to look at.Left out, a freed slot could keep an
+            // old marker and hand it to whatever spawns into that slot next
+            self.statics.remove(id);
+            self.gravities.remove(id);
         }
     }
 
