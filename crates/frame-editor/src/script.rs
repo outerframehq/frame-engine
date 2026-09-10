@@ -32,7 +32,7 @@ pub struct Rgb {
 /// SCRIPTING.md.
 const API_VARS: &[&str] = &[
     // Read-only context.
-    "t", "hit", "hit_id", // Structured values (preferred).
+    "t", "id", "hit", "hit_id", // Structured values (preferred).
     "pos", "vel", "scale", "color",    // Single-value component data.
     "emissive", // Flat values (the original spelling, still supported).
     "px", "py", "pz", "dx", "dy", "dz", "sx", "sy", "sz", "cr", "cg", "cb",
@@ -284,6 +284,7 @@ impl ScriptRuntime for RhaiRuntime {
 
         let mut scope = rhai::Scope::new();
         scope.push("t", self.time); // read-only context
+        scope.push("id", entity as f64); // read-only: this entity's own id
         scope.push("hit", hit); // read-only: colliding with anything this tick
         scope.push("hit_id", hit_id); // read-only: the other entity's id, or -1.0
 

@@ -46,6 +46,7 @@ These are set for you every tick. Read them, write them, or both.
 | Variable  | Meaning                   | Access     | Notes                                              |
 |-----------|---------------------------|------------|----------------------------------------------------|
 | `t`       | Tick counter              | read-only  | Increases by 1 each tick. `t / 30.0` is seconds.   |
+| `id`      | This entity's own id      | read-only  | Useful for singling out one entity, or debug logging. |
 | `pos`     | Position                  | read/write | `pos.x`, `pos.y`, `pos.z`. Where the entity is.    |
 | `vel`     | Velocity (per tick)       | read/write | `vel.x`, `vel.y`, `vel.z`. Added to position each tick. |
 | `scale`   | Scale (per axis)          | read/write | `scale.x`, `scale.y`, `scale.z`. `1.0` is normal size. |
@@ -161,6 +162,18 @@ if hit_id == 3.0 {
     color.r = 1.0;
 }
 ```
+
+**Single out one entity** — check `id` before doing something:
+
+```rust
+if id == 0.0 {
+    emissive = 1.0;
+}
+```
+
+Since the same library script can run on many entities at once, `id` is what
+lets one of them behave differently from the rest, a leader, a special case,
+or just a marker while you're testing.
 
 `hit_id` is `-1.0` when not colliding, so `if hit_id >= 0.0` is another way to
 ask the same thing `hit` does, with the id available too if you need it.
