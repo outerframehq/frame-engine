@@ -55,6 +55,7 @@ These are set for you every tick. Read them, write them, or both.
 | `scale`   | Scale (per axis)          | read/write | `scale.x`, `scale.y`, `scale.z`. `1.0` is normal size. |
 | `color`   | Colour                    | read/write | `color.r`, `color.g`, `color.b`, each `0.0`–`1.0`. |
 | `emissive`| Glow strength             | read/write | `0.0` is normal shading, `1.0` ignores the light and renders flat. |
+| `yaw`     | Facing direction          | read/write | Radians, around the world's vertical (Y) axis. The Inspector shows this in degrees, but scripts work in radians. |
 | `hit`     | Colliding this tick       | read-only  | `true` if this entity's box overlaps another's.    |
 | `hit_id`  | Which entity, if hit      | read-only  | The other entity's id, or `-1.0` if not colliding. If this entity overlaps more than one other at once, only one is reported. |
 | `hit_point`| Where the hit happened   | read-only  | `hit_point.x/.y/.z`. The centre of the overlap, in world space. Reads as this entity's own position when not colliding. |
@@ -72,7 +73,8 @@ vel = vec3(0.0, 0.5, 0.0);    // build one from scratch
 
 `color` works the same way with `.r` / `.g` / `.b`, and `rgb(r, g, b)` builds one.
 
-`emissive` is a single number, not a vector, so it's used directly: `emissive = 1.0;`.
+`emissive` and `yaw` are single numbers, not vectors, so they're used directly:
+`emissive = 1.0;`, `yaw = yaw + 0.02;`.
 
 ### The older flat names
 
@@ -134,6 +136,12 @@ color.b = 0.1;
 
 ```rust
 emissive = 0.5 + sin(t * 0.1) * 0.5;
+```
+
+**Spin** — turn steadily around the vertical axis:
+
+```rust
+yaw = yaw + 0.02;
 ```
 
 **React** to position — fall until low, then rise (a rough bounce):

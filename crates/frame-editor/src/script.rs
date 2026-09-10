@@ -43,8 +43,9 @@ const API_VARS: &[&str] = &[
     "pos",
     "vel",
     "scale",
-    "color",    // Single-value component data.
-    "emissive", // Flat values (the original spelling, still supported).
+    "color", // Single-value component data.
+    "emissive",
+    "yaw", // Flat values (the original spelling, still supported).
     "px",
     "py",
     "pz",
@@ -278,9 +279,11 @@ impl ScriptRuntime for RhaiRuntime {
         let mut scale = world.scales.get(entity).copied().unwrap_or_default();
         let mut color = world.colors.get(entity).copied().unwrap_or_default();
         let mut material = world.materials.get(entity).copied().unwrap_or_default();
+        let mut rotation = world.rotations.get(entity).copied().unwrap_or_default();
         let (sx, sy, sz) = (scale.x as f64, scale.y as f64, scale.z as f64);
         let (cr, cg, cb) = (color.r as f64, color.g as f64, color.b as f64);
         let emissive = material.emissive as f64;
+        let yaw = rotation.yaw as f64;
         // Whether this entity is part of any overlapping pair this tick, from the
         // engine's collision system (which runs before scripts). Read-only.
         // hit_id is the other entity's id when colliding, or -1.0 when not — a
@@ -365,6 +368,7 @@ impl ScriptRuntime for RhaiRuntime {
 
         // Single-value component data. No vector/struct type needed for one number.
         scope.push("emissive", emissive);
+        scope.push("yaw", yaw);
 
         // Flat values — the original spelling, kept so existing scripts still run.
         scope.push("px", px);
@@ -446,5 +450,9 @@ impl ScriptRuntime for RhaiRuntime {
         let f_emissive = scope.get_value::<f64>("emissive").unwrap_or(emissive);
         material.emissive = f_emissive as f32;
         world.materials.insert(entity, material);
+
+        let f_yaw = scope.get_value::<f64>("yaw").unwrap_or(yaw);
+        rotation.yaw = f_yaw as f32;
+        world.rotations.insert(entity, rotation);
     }
 }
