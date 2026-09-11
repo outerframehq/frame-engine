@@ -392,6 +392,14 @@ impl World {
         self.dynamic.get(name).map(|entry| entry.type_name)
     }
 
+    /// Every name currently registered as a runtime component, regardless of
+    /// type or which entities have a value under it. What a script host scans
+    /// to know which dynamic component names might exist to expose, since it
+    /// has no other way to enumerate a private plugin's own component types.
+    pub fn dynamic_names(&self) -> Vec<String> {
+        self.dynamic.keys().cloned().collect()
+    }
+
     /// Serialize the whole world to a RON file.
     pub fn save_to_file(
         &self,

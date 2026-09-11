@@ -220,7 +220,14 @@ impl RhaiRuntime {
         let mut seen: HashSet<String> = HashSet::new();
         let mut out = Vec::new();
         for (name, pos) in used {
-            if API_VARS.contains(&name.as_str()) || declared.contains(&name) {
+            // `custom_<name>` variables are dynamic component access (see run,
+            // below): the actual set of valid names depends on what's
+            // registered in the world at the time, which a static list like
+            // API_VARS can't express, so the prefix itself is what's checked.
+            if API_VARS.contains(&name.as_str())
+                || declared.contains(&name)
+                || name.starts_with("custom_")
+            {
                 continue;
             }
             if !seen.insert(name.clone()) {
@@ -229,7 +236,7 @@ impl RhaiRuntime {
             out.push(ScriptError {
                 line: pos.line(),
                 column: pos.position(),
-                message: format!("unknown variable '{name}' — not part of the script API"),
+                message: format!("unknown variable '{name}', not part of the script API"),
             });
         }
         out
@@ -303,6 +310,24 @@ impl ScriptRuntime for RhaiRuntime {
         let mut color = world.colors.get(entity).copied().unwrap_or_default();
         let mut material = world.materials.get(entity).copied().unwrap_or_default();
         let mut rotation = world.rotations.get(entity).copied().unwrap_or_default();
+        // Dynamic (runtime-registered) components this entity currently has a
+        // value under, gathered before the scope is built. A script can only
+        // read/write a name it's already been given; there's no way for it to
+        // originate a brand-new name purely from script code, since Rhai
+        // silently no-ops an assignment to a variable that was never pushed
+        // into scope, the same documented behaviour that already makes a
+        // typo'd variable name fail quietly. Seeding a new dynamic value has
+        // to happen from Rust first (World::insert_dynamic).
+        let custom: Vec<(String, f64)> = world
+            .dynamic_names()
+            .into_iter()
+            .filter_map(|name| {
+                world
+                    .get_dynamic::<f64>(&name, entity)
+                    .copied()
+                    .map(|value| (name, value))
+            })
+            .collect();
         let (sx, sy, sz) = (scale.x as f64, scale.y as f64, scale.z as f64);
         let (cr, cg, cb) = (color.r as f64, color.g as f64, color.b as f64);
         let emissive = material.emissive as f64;
@@ -422,6 +447,10 @@ impl ScriptRuntime for RhaiRuntime {
         // Single-value component data. No vector/struct type needed for one number.
         scope.push("emissive", emissive);
         scope.push("yaw", yaw);
+        // Dynamic component values, one per name this entity already has.
+        for (name, value) in &custom {
+            scope.push(format!("custom_{name}"), *value);
+        }
 
         // Flat values — the original spelling, kept so existing scripts still run.
         scope.push("px", px);
@@ -507,6 +536,14 @@ impl ScriptRuntime for RhaiRuntime {
         let f_yaw = scope.get_value::<f64>("yaw").unwrap_or(yaw);
         rotation.yaw = f_yaw as f32;
         world.rotations.insert(entity, rotation);
+
+        // Dynamic component write-back: same unconditional re-insert as every
+        // other single value above, no change-detection needed.
+        for (name, original) in &custom {
+            let var = format!("custom_{name}");
+            let new_value = scope.get_value::<f64>(&var).unwrap_or(*original);
+            world.insert_dynamic::<f64>(name, entity, new_value);
+        }
 
         // --- Actions, applied last, after the entity's own state is settled ---
         if scope.get_value::<bool>("spawn").unwrap_or(false) {
