@@ -181,6 +181,27 @@ impl Default for Rotation {
     }
 }
 
+/// Per-entity health: how much damage this entity can take before dying.
+/// Starts as a single tracked number, the same "start minimal, grow later"
+/// path Material took with just emissive: no damage system, no death or
+/// despawn behaviour, and no maximum tracked yet. Those are deliberately
+/// separate, later steps once something actually needs them; for now this is
+/// just data a host (a system, a script, an editor control) can read and
+/// change.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq)]
+pub struct Health {
+    pub current: f32,
+}
+
+impl Default for Health {
+    fn default() -> Self {
+        // 100.0 is a common, arbitrary starting point, not a rule the engine
+        // enforces. Nothing currently reads this as "full" versus "damaged"
+        // without a maximum to compare it against.
+        Health { current: 100.0 }
+    }
+}
+
 #[derive(Serialize, Deserialize, Default, Clone)]
 pub struct World {
     pub positions: ComponentStorage<Position>,
@@ -206,6 +227,8 @@ pub struct World {
     pub materials: ComponentStorage<Material>,
     #[serde(default)]
     pub rotations: ComponentStorage<Rotation>,
+    #[serde(default)]
+    pub healths: ComponentStorage<Health>,
     #[serde(default)]
     pub scripts: ComponentStorage<Script>,
     /// Named, reusable scripts shared across entities. Entities reference these
@@ -280,6 +303,7 @@ impl World {
         // NEW: give every spawned entity a Material, same as Color/Scale/Mesh.
         self.materials.insert(id, Material::default());
         self.rotations.insert(id, Rotation::default());
+        self.healths.insert(id, Health::default());
         id
     }
 
@@ -294,6 +318,7 @@ impl World {
             self.meshes.remove(id);
             self.materials.remove(id);
             self.rotations.remove(id);
+            self.healths.remove(id);
             self.scripts.remove(id);
             //Static and Gravity are markers, easy to forget  here since they
             // have no value to look at.Left out, a freed slot could keep an
