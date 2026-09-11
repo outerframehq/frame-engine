@@ -36,7 +36,9 @@ Early development, past the toy stage, with a working engine and a usable editor
 **Engine**
 
 - A deterministic fixed-timestep clock (in `core/`) with spiral-of-death protection, used by both the engine binary and the editor.
-- A hand-rolled ECS world with several component types (position, velocity, colour, a per-axis scale, an emissive material strength, a yaw rotation, a `Mesh` primitive, and a `Controlled` marker) and runtime spawn and despawn, both reachable from a script as well as the editor. Spawn reuses freed slots, so entity ids stay stable and despawned slots are reclaimed.
+- A hand-rolled ECS world with several component types (position, velocity, colour, a per-axis scale, an emissive material strength, a yaw rotation, health, a `Mesh` primitive, and a `Controlled` marker) and runtime spawn and despawn, both reachable from a script as well as the editor. Spawn reuses freed slots, so entity ids stay stable and despawned slots are reclaimed.
+- Runtime component registration: `World` can hold component types it wasn't compiled knowing about, through a generic, string-keyed `insert_dynamic`/`get_dynamic` API. Doesn't serialize with the scene yet; a registered component resets on reload. Scripts can reach these too, through `custom_<name>` variables.
+- A `Substance` schema (melting point, durability, conductivity, and more) and a name-keyed registry for it on `World`, the shape for a wood, a stone, or a metal. No actual substances are defined yet, and no blending logic exists; both are deliberately later steps.
 - A generic `ComponentStorage<T>` type, wired into the world. It implements `Default`, and `World` derives `Default`, so a fresh world is built in one place and adding a component type is cheap and uniform.
 - A movement system that advances entities each tick, and an input system that drives `Controlled` entities from held WASD keys.
 - Per-entity colour and scale, stored as component data and serialized with the scene.
@@ -48,6 +50,7 @@ Early development, past the toy stage, with a working engine and a usable editor
 - Scene serialization to and from a human-readable RON file (`serde` and RON), with backward compatibility for scenes saved before newer fields like colour and scale existed.
 - A read-only ASCII debug renderer that draws the world as a grid.
 - A library and binary split, so the engine is importable by other crates.
+- A first, minimal slice of multiplayer, in `net/`: an authoritative `Server` broadcasting every entity's position to connected clients over raw TCP, and a receiving `Client` that applies whatever arrives into a local `World`. Positions only, one direction only, no interest management, and not yet wired into a running process, all deliberately left for later. This replaces an earlier lockstep plan, a better fit for a small closed session than a persistent, always-joinable world; see [DESIGN.md](DESIGN.md) for why.
 
 **frame-editor** (companion editor; links to the engine, runs the sim in a window)
 
@@ -58,7 +61,7 @@ Early development, past the toy stage, with a working engine and a usable editor
 - Live entity editing: nudge the selection with the arrow keys and Page Up/Down, spawn with `N`, despawn with `Delete`, and drive a `Controlled` entity with WASD while the sim is playing.
 - A project launcher: the editor opens on a launcher to create a named project, open one by folder, or reopen a recent one from a list of cards (name, description, last-edited date, version, and Edit / Play / Settings actions). A project is a folder holding a scene file named after it and a `project.ron` manifest (description, version); Settings edits those and renames the scene file.
 - Scene save and load: opening a project loads its scene, `F5` saves it and `F9` reloads it, and the File menu also opens or saves a scene to any path through a native file dialog.
-- A Script Editor: a dockable tab where the shared script library is written, a sidebar of script names beside a single code editor with a line-number gutter and live checks: a status line flags parse errors (line and column) in red, and unknown variables (names that aren't part of the script API or a local `let`) in amber, catching the typos Rhai would otherwise fail on silently at run time. Scripts see structured values (`pos.x`, `vel`, `color.r`, with vector arithmetic) alongside the older flat names, plus their own id, whether they carry the `Controlled`/`Static`/`Gravity` marker, which movement keys are held, and, on collision, which entity was hit and where. Scripts can also request a new entity be spawned or an existing one despawned. All of it runs live through a Rhai backend and is assigned to entities from the Inspector. See [SCRIPTING.md](SCRIPTING.md) for how to write them.
+- A Script Editor: a dockable tab where the shared script library is written, a sidebar of script names beside a single code editor with a line-number gutter and live checks: a status line flags parse errors (line and column) in red, and unknown variables (names that aren't part of the script API or a local `let`) in amber, catching the typos Rhai would otherwise fail on silently at run time. Scripts can be renamed as well as deleted; renaming rewrites every entity's reference to the old name, so it doesn't orphan anything. Scripts see structured values (`pos.x`, `vel`, `color.r`, with vector arithmetic) alongside the older flat names, plus their own id, whether they carry the `Controlled`/`Static`/`Gravity` marker, which movement keys are held, and, on collision, which entity was hit and where. Scripts can also request a new entity be spawned or an existing one despawned, and read or write runtime-registered dynamic component values through `custom_<name>` variables. All of it runs live through a Rhai backend and is assigned to entities from the Inspector. See [SCRIPTING.md](SCRIPTING.md) for how to write them.
 - A translate gizmo: selecting an entity draws three axis arms in the viewport (X red, Y green, Z blue); drag an arm to move the entity along that axis, at any camera angle, as a single undo step.
 - A Source Control tab: a read-only view of the open project's git state, branch, upstream with ahead/behind counts, and changed files (amber unstaged, green staged). No network, no credentials; commits and pushes stay in your terminal or git client.
 - Model import and an Assets tab: File > Import model brings a Blender OBJ export into the project, renders it, lists it in the mesh picker, and fits collision to it. The Assets tab in the bottom console shows the project's assets as tiles with rendered previews, with folders and a move flow to organise them.
@@ -72,7 +75,7 @@ Early development, past the toy stage, with a working engine and a usable editor
 
 Play a project in a separate, clean game window: its own window and GPU surface running the world with no editor chrome, the simulation live and WASD driving `Controlled` entities.
 
-Currently at the frontier: richer authoring (prefabs); a fuller material model (textures, roughness, metalness) on imported models; collision refinements (tighter or rotated boxes, a broad phase); and script rename support (deleting a library script is safe, but renaming isn't supported yet). Rotation, and the script API's original "what a script can reach" list (the entity hit and where, its own id, markers, input, spawn/despawn), are done for now.
+Currently at the frontier: richer authoring (prefabs); a fuller material model (textures, roughness, metalness) on imported models; collision refinements (tighter or rotated boxes, a broad phase); and wiring the new `net::Server`/`net::Client` into an actual running process. Rotation, script rename support, and the script API's original "what a script can reach" list (the entity hit and where, its own id, markers, input, spawn/despawn), are done for now.
 
 ## Principles
 
@@ -95,6 +98,7 @@ crates/
 │       ├── world/      simulation state (entities, components, storage)
 │       ├── systems/    logic that runs each tick
 │       ├── input/      graphics-free input abstraction (held buttons)
+│       ├── net/        multiplayer: an authoritative Server and a Client
 │       ├── render/     read-only ASCII debug view
 │       ├── lib.rs      library root, exposes the engine to other crates
 │       └── main.rs     binary runner, drives the tick loop

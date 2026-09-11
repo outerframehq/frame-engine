@@ -16,12 +16,19 @@ Engine:
 - A `Material` component (an emissive strength, 0.0 to 1.0), per-entity appearance data serialized with the scene; defaults to 0.0, so older scenes load unchanged.
 - A `Rotation` component: a single yaw angle, in radians, around the world's vertical axis. Not full 3D orientation yet, pitch and roll aren't tracked. Serialized with the scene; defaults to 0.0, so older scenes load unchanged.
 - A contact point on collision detection. `World.collisions` now carries the centre of the overlap alongside each colliding pair, computed per axis as the midpoint between the two boxes' shared region, not just which two entities are involved.
+- `despawn` now clears any runtime-registered dynamic components too, alongside the built-in ones.
+- Runtime component registration. `World` can now hold component types it was never compiled knowing about, through `insert_dynamic`/`get_dynamic`/`get_dynamic_mut`/`remove_dynamic`, generic over `T: Clone + 'static` and keyed by string name. Doesn't serialize with the scene yet; a registered component resets on reload.
+- A `Health` component: a single current value, defaulting to 100.0. No maximum, damage system, or death behaviour yet, those are separate, later steps.
+- A `Substance` schema and a `substances` registry on `World`, name-keyed the same way `mesh_meta` and `script_library` are. Carries physical properties (melting point, durability, conductivity, and more), every field `Option<f32>` so `None` can mean a property genuinely doesn't apply. No actual substances are defined, and no blending/mixing logic exists yet, both deliberately left for later.
+- A first, minimal slice of multiplayer, in a new `net/` module: an authoritative `Server` (bind, accept clients, broadcast every entity's position to all of them) and a receiving `Client` (connect, poll, apply whatever arrives into a local `World`), over raw TCP with a length-prefixed `serde`/RON wire format. Positions only, one direction only, no interest management, and not yet wired into a running process, all deliberately out of scope for this first pass. This also reflects a course correction from lockstep (the earlier long-term aim) to an authoritative-server model, a better fit for a persistent, always-joinable world; see DESIGN.md for the reasoning.
 
 Editor (frame-editor):
 
 - A Material slider in the Inspector, next to Scale, editing an entity's emissive strength. At 1.0 the entity ignores the directional light and renders at flat full colour, useful for a glowing look.
 - A Rotation control in the Inspector, shown in degrees. The engine stores radians internally; conversion happens only at the editing boundary.
 - A much deeper script API. Scripts can now read their own entity id, whether they carry the `Controlled`, `Static`, or `Gravity` marker, and which movement keys are currently held. On collision, scripts can read which entity was hit and the contact point where it happened. `yaw` is now read/write from scripts, alongside the existing position, velocity, scale, colour, and emissive values. Scripts can also request a new entity be spawned (at a position, defaulting to their own) or an existing one despawned by id, an action rather than a value, applied once after the script finishes running for that tick. See SCRIPTING.md for the full list and worked examples.
+- Scripts can now read and write runtime-registered dynamic component values too, through `custom_<name>` variables, f64 only. A script can only access a name it already has a value under; it can't originate a brand-new dynamic name purely from script code.
+- Script rename support in the Script Editor. Renaming rewrites every entity's reference to the old name, so unlike deleting a script (which deliberately leaves dangling references for the runtime to skip safely), a rename doesn't orphan anything.
 
 ### Fixed
 
