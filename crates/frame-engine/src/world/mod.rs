@@ -138,6 +138,54 @@ pub struct MeshMeta {
     pub half_extents: [f32; 3],
 }
 
+/// The physical properties of one kind of substance (a wood, a stone, a
+/// metal), keyed by name in `World::substances`, the same shared-registry
+/// shape `mesh_meta` and `script_library` already use: many entities can be
+/// made of the same substance, so it's a name they reference, not data each
+/// entity carries its own copy of.
+///
+/// This is deliberately just the shape, not a materials list. No named
+/// substances (a copper, a granite) are defined here; those are game content,
+/// meant to live in a project's own data rather than the engine, the same
+/// reasoning that keeps the actual quirks, gods, and material names of any
+/// specific game out of this repo.
+///
+/// Every field is `Option<f32>`, and `None` means the substance genuinely
+/// doesn't have that property (a liquid has no yield strength; flint doesn't
+/// melt, it shatters), not a gap to be filled in later. A default `Substance`
+/// (every field `None`) is a real, valid, empty substance, not a placeholder.
+///
+/// No blending/mixing logic yet: combining substances into a new one (the
+/// freeform metal-mixing the design calls for) is real math deserving its own
+/// pass, not folded into the schema itself.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Default)]
+pub struct Substance {
+    pub melting_point_c: Option<f32>,
+    pub boiling_point_c: Option<f32>,
+    /// For a combustible that burns rather than melts (wood), not both.
+    pub ignition_point_c: Option<f32>,
+    /// A relative, unitless hardness/wear-resistance scale. Not calibrated
+    /// against anything yet; comparing two substances' numbers is meaningful,
+    /// the numbers alone aren't.
+    pub durability: Option<f32>,
+    /// Resistance to deformation under load, distinct from durability (a
+    /// gear can resist scratching but still bend under repeated stress).
+    pub yield_strength: Option<f32>,
+    /// How easily it can be shaped once heated, independent of hardness.
+    pub malleability: Option<f32>,
+    pub specific_heat: Option<f32>,
+    pub thermal_conductivity: Option<f32>,
+    pub electrical_conductivity: Option<f32>,
+    /// Magnetic strength; `None` means not magnetic at all, rather than a
+    /// separate bool plus a strength value.
+    pub magnetism: Option<f32>,
+    pub corrosion_resistance: Option<f32>,
+    pub density: Option<f32>,
+    pub flammability: Option<f32>,
+    pub explosive_potential: Option<f32>,
+    pub toxicity: Option<f32>,
+}
+
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq)]
 pub struct Scale {
     pub x: f32,
@@ -218,6 +266,11 @@ pub struct World {
     /// script_library does for scripts.
     #[serde(default)]
     pub mesh_meta: std::collections::BTreeMap<String, MeshMeta>,
+    /// Physical substance definitions, keyed by name, the same shared-registry
+    /// shape as `mesh_meta` and `script_library`. Empty by default; no
+    /// substances are defined here, only the shape they'd take.
+    #[serde(default)]
+    pub substances: std::collections::BTreeMap<String, Substance>,
     #[serde(default)]
     pub scales: ComponentStorage<Scale>,
     #[serde(default)]
