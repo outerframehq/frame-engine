@@ -40,9 +40,11 @@
 //! - A client still has no way to learn which entity in a broadcast is its
 //!   own; it can drive it, but can't yet tell which dot on screen is
 //!   "itself" from the snapshot alone. A real future step, not solved here.
-//! - When a client disconnects, its entity is not despawned; it's left
-//!   behind in the world. Cleaning up a dropped connection's entity, and
-//!   reconnecting at all, are both real, separate later steps.
+//! - When a client disconnects, its entity is despawned along with the
+//!   connection, detected either from a closed read (in `receive_input`) or
+//!   a failed write (in `broadcast_positions`), whichever notices first.
+//!   Reconnecting to the same entity rather than always getting a new one on
+//!   a fresh connection is still a real, separate later step.
 //! - Raw TCP via `std::net`, no async runtime, no new dependency, consistent
 //!   with how the rest of the engine is built. Non-blocking sockets, so a
 //!   tick loop can poll without ever stalling on the network.
@@ -203,11 +205,12 @@ impl Server {
     /// as one full snapshot. Meant to be called once per tick, after the
     /// world has been advanced. A client whose write fails (disconnected,
     /// buffer full past what a slice this size handles) is dropped from the
-    /// list rather than allowed to stall the broadcast for everyone else;
-    /// its spawned entity is deliberately left behind in the world, real
-    /// cleanup on disconnect is a later step, not solved here, the same way
-    /// a real reconnect story isn't either.
-    pub fn broadcast_positions(&mut self, world: &World) {
+    /// list, and the entity the server spawned for it on connect is
+    /// despawned along with it, so a disconnect no longer leaves an orphaned
+    /// entity behind forever. A real reconnect story, letting a client
+    /// resume the same entity rather than always getting a new one, is still
+    /// a later step, not solved here.
+    pub fn broadcast_positions(&mut self, world: &mut World) {
         let positions: Vec<PositionUpdate> = world
             .positions
             .iter()
@@ -232,8 +235,13 @@ impl Server {
         else {
             return;
         };
-        self.clients
-            .retain_mut(|client| write_framed(&mut client.stream, payload.as_bytes()).is_ok());
+        self.clients.retain_mut(|client| {
+            let ok = write_framed(&mut client.stream, payload.as_bytes()).is_ok();
+            if !ok {
+                world.despawn(client.entity);
+            }
+            ok
+        });
     }
 
     /// Read whatever input each connected client has sent since the last
@@ -242,16 +250,35 @@ impl Server {
     /// different one; the pairing was fixed once, on connect, by
     /// `accept_new_clients`, and never changes. Meant to be called once per
     /// tick, same as the other two methods here.
+    ///
+    /// A client whose connection has closed (a clean read of zero bytes, or
+    /// any other read error) is removed here and its entity despawned right
+    /// away, rather than waiting for a write to it to eventually fail in
+    /// `broadcast_positions`. That write-side check still exists too, as a
+    /// second detection path for a connection that goes bad without the read
+    /// side ever seeing it happen first.
     pub fn receive_input(&mut self, world: &mut World) {
-        for client in &mut self.clients {
+        let mut disconnected: Vec<usize> = Vec::new();
+        for (i, client) in self.clients.iter_mut().enumerate() {
             let mut chunk = [0u8; 4096];
+            let mut closed = false;
             loop {
                 match client.stream.read(&mut chunk) {
-                    Ok(0) => break, // connection closed by the client
+                    Ok(0) => {
+                        closed = true;
+                        break;
+                    }
                     Ok(n) => client.buffer.extend_from_slice(&chunk[..n]),
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                    Err(_) => break,
+                    Err(_) => {
+                        closed = true;
+                        break;
+                    }
                 }
+            }
+            if closed {
+                disconnected.push(i);
+                continue; // nothing left to read input for on a dead connection
             }
             let entity = client.entity;
             drain_framed(&mut client.buffer, |payload| {
@@ -268,6 +295,12 @@ impl Server {
                 input.set(Button::Right, upload.right);
                 systems::input_movement_for(world, entity, &input);
             });
+        }
+        // Removed back to front, so an earlier index is never invalidated by
+        // removing a later one first.
+        for i in disconnected.into_iter().rev() {
+            let client = self.clients.remove(i);
+            world.despawn(client.entity);
         }
     }
 

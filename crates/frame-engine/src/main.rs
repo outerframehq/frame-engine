@@ -138,7 +138,7 @@ fn run_server(addr: &str) {
             tick += 1;
             systems::movement(&mut world);
         }
-        server.broadcast_positions(&world);
+        server.broadcast_positions(&mut world);
         if tick % 30 == 0 {
             println!(
                 "Tick {tick}, {} client(s) connected.",
