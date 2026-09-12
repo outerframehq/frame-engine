@@ -36,13 +36,13 @@ fn half_extents(
 /// with a contact point: the centre of the region where the two boxes
 /// overlap, in world space.
 ///
-/// This is detection only — a *trigger*, not physics. It finds overlaps and
+/// This is detection only, a *trigger*, not physics. It finds overlaps and
 /// writes them to `world.collisions`; it never moves anything or changes a
 /// velocity. Responding to a collision (separating, bouncing) is a deliberately
 /// separate, later concern.
 ///
 /// Each entity's box is axis-aligned, centred on its position, with half-extents
-/// of `ENTITY_SIZE * 0.5 * scale` per axis — the same scale-box the editor picks
+/// of `ENTITY_SIZE * 0.5 * scale` per axis, the same scale-box the editor picks
 /// against. It ignores the actual mesh shape, so a sphere and a cube of equal
 /// scale collide identically. The sweep is O(n^2) over live entities, which is
 /// fine at these counts; a broad phase is a later concern if entity counts grow.
@@ -100,7 +100,7 @@ pub fn collision(world: &mut World) {
 ///
 /// Corrections are gathered against a snapshot and applied together, so the pass
 /// is deterministic and order-independent within a tick. It is a single pass, so
-/// deep stacks may take a few ticks to settle — fine at these scales. Uses the
+/// deep stacks may take a few ticks to settle, fine at these scales. Uses the
 /// same axis-aligned scale-boxes as `collision`.
 pub fn resolve_collisions(world: &mut World) {
     // Snapshot each live entity's centre, half-extents, and static flag.
@@ -276,5 +276,35 @@ pub fn input_movement(world: &mut World, input: &InputState) {
             position.x += dx;
             position.y += dy;
         }
+    }
+}
+
+/// Like `input_movement`, but drives exactly one entity rather than every
+/// `Controlled` entity at once, from that entity's own input specifically.
+/// What a multiplayer server needs: each client's input can only ever move
+/// the one entity the server assigned that connection, never anyone else's,
+/// since there's nothing in the message a client sends that could name a
+/// different one.
+pub fn input_movement_for(world: &mut World, entity: usize, input: &InputState) {
+    let mut dx = 0.0;
+    let mut dy = 0.0;
+    if input.is_held(Button::Left) {
+        dx -= INPUT_SPEED;
+    }
+    if input.is_held(Button::Right) {
+        dx += INPUT_SPEED;
+    }
+    if input.is_held(Button::Up) {
+        dy += INPUT_SPEED;
+    }
+    if input.is_held(Button::Down) {
+        dy -= INPUT_SPEED;
+    }
+    if dx == 0.0 && dy == 0.0 {
+        return;
+    }
+    if let Some(position) = world.positions.get_mut(entity) {
+        position.x += dx;
+        position.y += dy;
     }
 }

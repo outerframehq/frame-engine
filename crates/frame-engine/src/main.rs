@@ -1,4 +1,5 @@
 use frame_engine::core::Clock;
+use frame_engine::input::{Button, InputState};
 use frame_engine::net::{Client, Server};
 use frame_engine::world::{Position, Velocity, World};
 use frame_engine::{render, systems};
@@ -10,8 +11,9 @@ const MAX_CATCHUP_TICKS: u32 = 5;
 /// no-networking behaviour exactly as it was. `server` and `client` are the
 /// new modes, the first real use of `net::Server`/`net::Client`: run one
 /// instance as `server`, another as `client`, and a position broadcast
-/// actually crossing the network becomes something you can watch happen in
-/// two terminals rather than something sitting unused in the source tree.
+/// crossing the network, and a client's input reaching the server and
+/// actually moving something, both become things you can watch happen in
+/// two terminals rather than code sitting unused in the source tree.
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
@@ -110,10 +112,9 @@ fn run_standalone() {
 }
 
 /// Run as the authoritative side: owns the real simulation, accepts client
-/// connections, and broadcasts every entity's position to whichever clients
-/// are connected. The tick loop is otherwise identical to standalone mode;
-/// the only additions are accepting new clients and broadcasting once per
-/// tick batch.
+/// connections (spawning a fresh `Controlled` entity for each one), applies
+/// whatever input each client uploads to that client's own entity, and
+/// broadcasts every entity's position to whichever clients are connected.
 fn run_server(addr: &str) {
     println!("Frame Engine starting as a server, listening on {addr}.");
 
@@ -130,7 +131,8 @@ fn run_server(addr: &str) {
     let mut world = default_world();
 
     loop {
-        server.accept_new_clients();
+        server.accept_new_clients(&mut world);
+        server.receive_input(&mut world);
         let owed = clock.advance(true);
         for _ in 0..owed {
             tick += 1;
@@ -149,9 +151,15 @@ fn run_server(addr: &str) {
 /// Run as a receiving client: no simulation of its own, just whatever a
 /// server broadcasts, applied and occasionally printed so a position update
 /// arriving over the network is something you can actually watch happen.
-/// The clock here paces the printing only, the same rhythm standalone and
-/// server mode already use; nothing in this mode advances the world on its
-/// own between polls.
+/// Also uploads held input every tick, so the other real half of this
+/// slice, a client's input actually reaching the server and moving
+/// something, is exercised too, not just the broadcast direction.
+///
+/// There is no real keyboard here, this is a headless debug binary, so the
+/// input is a fixed, fake pattern (holding Right the whole time) rather than
+/// anything interactive: enough to prove the pipe moves an entity, not a
+/// stand-in for real play. The clock paces the printing only; nothing in
+/// this mode advances the world locally between polls.
 fn run_client(addr: &str) {
     println!("Frame Engine connecting as a client to {addr}.");
 
@@ -166,9 +174,12 @@ fn run_client(addr: &str) {
     let mut clock = Clock::new(TICK_RATE, MAX_CATCHUP_TICKS);
     let mut tick: u64 = 0;
     let mut world = World::new();
+    let mut input = InputState::new();
+    input.set(Button::Right, true);
 
     loop {
         client.poll(&mut world);
+        client.send_input(&input);
         let owed = clock.advance(true);
         for _ in 0..owed {
             tick += 1;
