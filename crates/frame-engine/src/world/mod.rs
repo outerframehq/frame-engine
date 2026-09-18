@@ -115,7 +115,7 @@ pub struct Color {
 
 /// The primitive shape an entity is drawn as. Per-entity appearance data, on the
 /// same footing as `Color` and `Scale`: the engine stores and serializes it but
-/// never draws — the editor turns it into geometry. Defaults to `Cube`, so
+/// never draws. The editor turns it into geometry. Defaults to `Cube`, so
 /// scenes saved before meshes existed load and look exactly as they did.
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
 pub enum Mesh {
@@ -136,6 +136,22 @@ pub enum Mesh {
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq)]
 pub struct MeshMeta {
     pub half_extents: [f32; 3],
+}
+
+/// A plugin's manifest (its `plugin.ron`), one per folder under a project's
+/// `plugins/` directory. Purely descriptive: the plugin's actual content is
+/// its Rhai scripts, merged straight into `script_library` under a
+/// `<plugin-name>/` prefix, not held here. This is the record of which
+/// plugins a project depends on, keyed by name in `World::installed_plugins`,
+/// worth remembering and saving with the scene the same reasoning
+/// `mesh_meta` already gets saved for.
+#[derive(Serialize, Deserialize, Clone, Default, PartialEq)]
+pub struct PluginManifest {
+    pub name: String,
+    pub version: String,
+    pub author: String,
+    #[serde(default)]
+    pub description: String,
 }
 
 /// The physical properties of one kind of substance (a wood, a stone, a
@@ -193,7 +209,7 @@ pub struct Scale {
     pub z: f32,
 }
 
-// NEW: the Material component itself. Same shape as Scale/Color — plain,
+// The Material component itself. Same shape as Scale/Color, plain,
 // Copy, per-entity data.
 /// Per-entity emissive strength: 0.0 is fully lit by the directional light
 /// (normal shading), 1.0 ignores it entirely and renders at full color, as
@@ -266,6 +282,13 @@ pub struct World {
     /// script_library does for scripts.
     #[serde(default)]
     pub mesh_meta: std::collections::BTreeMap<String, MeshMeta>,
+    /// Installed plugins, keyed by name, the same shared-registry shape as
+    /// `mesh_meta` and `script_library`. What actually makes a plugin
+    /// "installed" is its scripts already being merged into
+    /// `script_library` under a `<plugin-name>/` prefix; this map is just
+    /// the record of which plugins a project depends on.
+    #[serde(default)]
+    pub installed_plugins: std::collections::BTreeMap<String, PluginManifest>,
     /// Physical substance definitions, keyed by name, the same shared-registry
     /// shape as `mesh_meta` and `script_library`. Empty by default; no
     /// substances are defined here, only the shape they'd take.
@@ -285,14 +308,14 @@ pub struct World {
     #[serde(default)]
     pub scripts: ComponentStorage<Script>,
     /// Named, reusable scripts shared across entities. Entities reference these
-    /// by name (Step 2). Plain data — name -> Rhai source — so the engine stays
+    /// by name. Plain data, name to Rhai source, so the engine stays
     /// VM-free and the library saves and loads with the scene.
     #[serde(default)]
     pub script_library: std::collections::BTreeMap<String, String>,
     /// Pairs of entity ids whose boxes overlap, as of the last time the
     /// collision system ran, each with the contact point: the centre of the
     /// region where the two boxes overlap, in world space. Transient, derived
-    /// state — recomputed each run and never saved with the scene, so it's
+    /// state, recomputed each run and never saved with the scene, so it's
     /// skipped by serde and defaults empty.
     #[serde(skip)]
     pub collisions: Vec<(usize, usize, [f32; 3])>,
@@ -315,7 +338,7 @@ pub struct World {
 
 impl Default for Scale {
     fn default() -> Self {
-        // 1.0 on every axis = unscaled. Deriving Default would give 0.0 — a
+        // 1.0 on every axis = unscaled. Deriving Default would give 0.0, a
         // zero-size, invisible entity.
         Scale {
             x: 1.0,
@@ -502,7 +525,7 @@ pub trait ScriptRuntime {
     /// Called once per tick, before any entity's script runs. Lets a runtime
     /// advance shared per-tick state (such as a clock exposed to scripts), and
     /// hands it the currently-held input, since that's also shared context, the
-    /// same for every entity, rather than something specific to one. Optional —
+    /// same for every entity, rather than something specific to one. Optional,
     /// the default does nothing.
     fn begin_tick(&mut self, input: &crate::input::InputState) {
         let _ = input;

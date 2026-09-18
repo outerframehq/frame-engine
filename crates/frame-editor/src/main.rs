@@ -1454,18 +1454,19 @@ fn scripts_tab_ui(
             ui.horizontal(|ui| {
                 match renaming {
                     Some((_, buffer)) => {
-                        ui.add(
-                            egui::TextEdit::singleline(buffer)
-                                .desired_width(160.0),
-                        );
+                        ui.add(egui::TextEdit::singleline(buffer).desired_width(160.0));
                         let new_name = buffer.trim().to_string();
                         // Same name (or empty) just cancels quietly; a name
                         // that collides with a DIFFERENT existing script is
                         // refused rather than silently overwriting it.
-                        let collides =
-                            !new_name.is_empty() && new_name != name && script_library.contains_key(&new_name);
+                        let collides = !new_name.is_empty()
+                            && new_name != name
+                            && script_library.contains_key(&new_name);
                         if ui
-                            .add_enabled(!new_name.is_empty() && !collides, egui::Button::new("Confirm"))
+                            .add_enabled(
+                                !new_name.is_empty() && !collides,
+                                egui::Button::new("Confirm"),
+                            )
                             .clicked()
                         {
                             if new_name != name {
@@ -2712,6 +2713,18 @@ impl App {
                 self.log(format!("Model load failed: {e}"));
             }
             self.custom_meshes = models;
+
+            let (manifests, scripts, errors) = load_project_plugins(&root);
+            for e in errors {
+                self.log(format!("Plugin load failed: {e}"));
+            }
+            if !manifests.is_empty() {
+                self.log(format!("Loaded {} plugin(s)", manifests.len()));
+            }
+            self.world.installed_plugins = manifests;
+            for (name, source) in scripts {
+                self.world.script_library.insert(name, source);
+            }
         }
         for (name, data) in &self.custom_meshes {
             self.world.mesh_meta.insert(
@@ -3828,6 +3841,72 @@ struct ProjectManifest {
 
 /// Load every .obj in a project's assets folder into a name -> mesh map.
 /// Parse failures get logged by the caller through the returned errors list.
+/// Load every plugin in a project's `plugins/` folder: each subfolder with a
+/// `plugin.ron` manifest and a `scripts/` folder of `.rhai` files. Returns
+/// the manifests found (for `World::installed_plugins`), each plugin's
+/// scripts as name-to-source pairs ready to merge into `script_library`
+/// (name-spaced `<plugin-name>/<script-stem>`, so two different plugins'
+/// scripts can never collide, and it's visible at a glance in the script
+/// picker which scripts came from a plugin versus which were written by
+/// hand), and any errors encountered, the same three-part shape
+/// `load_project_models` already uses.
+///
+/// A folder with no `plugin.ron` is skipped quietly rather than treated as
+/// an error, it just isn't a plugin folder. Reload merges and updates,
+/// deliberately: it doesn't currently remove a script whose plugin, or whose
+/// specific script file, has since been deleted from disk, a real limitation
+/// worth knowing rather than a silent gap.
+fn load_project_plugins(
+    root: &std::path::Path,
+) -> (
+    std::collections::BTreeMap<String, frame_engine::world::PluginManifest>,
+    std::collections::BTreeMap<String, String>,
+    Vec<String>,
+) {
+    let mut manifests = std::collections::BTreeMap::new();
+    let mut scripts = std::collections::BTreeMap::new();
+    let mut errors = Vec::new();
+    let Ok(entries) = std::fs::read_dir(root.join("plugins")) else {
+        return (manifests, scripts, errors); // no plugins folder yet, nothing to load
+    };
+    for entry in entries.flatten() {
+        let plugin_dir = entry.path();
+        if !plugin_dir.is_dir() {
+            continue;
+        }
+        let manifest_text = match std::fs::read_to_string(plugin_dir.join("plugin.ron")) {
+            Ok(text) => text,
+            Err(_) => continue, // no manifest here, not a plugin folder
+        };
+        let manifest: frame_engine::world::PluginManifest = match ron::from_str(&manifest_text) {
+            Ok(manifest) => manifest,
+            Err(e) => {
+                errors.push(format!("{}: invalid plugin.ron: {e}", plugin_dir.display()));
+                continue;
+            }
+        };
+        if let Ok(script_entries) = std::fs::read_dir(plugin_dir.join("scripts")) {
+            for script_entry in script_entries.flatten() {
+                let script_path = script_entry.path();
+                if script_path.extension().and_then(|e| e.to_str()) != Some("rhai") {
+                    continue;
+                }
+                let Some(stem) = script_path.file_stem().and_then(|s| s.to_str()) else {
+                    continue;
+                };
+                match std::fs::read_to_string(&script_path) {
+                    Ok(source) => {
+                        scripts.insert(format!("{}/{stem}", manifest.name), source);
+                    }
+                    Err(e) => errors.push(format!("{}: {e}", script_path.display())),
+                }
+            }
+        }
+        manifests.insert(manifest.name.clone(), manifest);
+    }
+    (manifests, scripts, errors)
+}
+
 fn load_project_models(
     root: &std::path::Path,
 ) -> (
