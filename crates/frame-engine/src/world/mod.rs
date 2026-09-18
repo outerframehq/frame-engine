@@ -141,10 +141,7 @@ pub struct MeshMeta {
 /// A plugin's manifest (its `plugin.ron`), one per folder under a project's
 /// `plugins/` directory. Purely descriptive: the plugin's actual content is
 /// its Rhai scripts, merged straight into `script_library` under a
-/// `<plugin-name>/` prefix, not held here. This is the record of which
-/// plugins a project depends on, keyed by name in `World::installed_plugins`,
-/// worth remembering and saving with the scene the same reasoning
-/// `mesh_meta` already gets saved for.
+/// `<plugin-name>/` prefix when the plugin is enabled, not held here.
 #[derive(Serialize, Deserialize, Clone, Default, PartialEq)]
 pub struct PluginManifest {
     pub name: String,
@@ -152,6 +149,25 @@ pub struct PluginManifest {
     pub author: String,
     #[serde(default)]
     pub description: String,
+}
+
+/// One installed plugin, keyed by name in `World::installed_plugins`: its
+/// manifest, re-read fresh from disk on every scan, and whether the project
+/// currently has it turned on. `enabled` is deliberately kept separate from
+/// the manifest, since it's the project's own choice, not the plugin's own
+/// data, and re-scanning must preserve it rather than reset it. Defaults
+/// off: a newly discovered plugin, like a freshly dropped-in mod, stays off
+/// until switched on, never auto-activated.
+///
+/// This is scoped deliberately small for now: a plugin only supplies
+/// scripts, it has no way to add its own Inspector fields, menu items, or
+/// panels to the editor itself. That's a real, intended next step (giving a
+/// plugin an actual editor-extension surface, not just entity behaviour),
+/// not something this shape rules out, just not built yet.
+#[derive(Serialize, Deserialize, Clone, Default, PartialEq)]
+pub struct InstalledPlugin {
+    pub manifest: PluginManifest,
+    pub enabled: bool,
 }
 
 /// The physical properties of one kind of substance (a wood, a stone, a
@@ -285,10 +301,10 @@ pub struct World {
     /// Installed plugins, keyed by name, the same shared-registry shape as
     /// `mesh_meta` and `script_library`. What actually makes a plugin
     /// "installed" is its scripts already being merged into
-    /// `script_library` under a `<plugin-name>/` prefix; this map is just
-    /// the record of which plugins a project depends on.
+    /// `script_library`, only for the ones marked enabled; this map is the
+    /// record of which plugins a project depends on and which are turned on.
     #[serde(default)]
-    pub installed_plugins: std::collections::BTreeMap<String, PluginManifest>,
+    pub installed_plugins: std::collections::BTreeMap<String, InstalledPlugin>,
     /// Physical substance definitions, keyed by name, the same shared-registry
     /// shape as `mesh_meta` and `script_library`. Empty by default; no
     /// substances are defined here, only the shape they'd take.

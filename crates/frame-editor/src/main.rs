@@ -903,6 +903,7 @@ enum MenuAction {
     TogglePause,
     StepOnce,
     ToggleHelp,
+    OpenEditorSettings,
     About,
     Quit,
 }
@@ -1814,6 +1815,12 @@ struct App {
     // In-progress script rename (original name, edit buffer), persists between
     // frames the same way open_script does. See scripts_tab_ui.
     renaming: Option<(String, String)>,
+    // Whether the Plugins slide-down panel is currently shown, toggled from
+    // its toolbar tab. Persists between frames the same way console_tab does.
+    plugins_panel_open: bool,
+    // Whether the Editor Settings window is currently open, toggled from
+    // Edit > Editor settings….
+    editor_settings_open: bool,
     // GPU texture for the toolbar logo, uploaded once on the first frame.
     logo_texture: Option<egui::TextureHandle>,
 }
@@ -2477,13 +2484,23 @@ impl App {
             self.log("That project has no scene to play".to_string());
             return;
         };
-        let world = match World::load_from_file(&scene) {
+        let mut world = match World::load_from_file(&scene) {
             Ok(world) => world,
             Err(e) => {
                 self.log(format!("Could not play project: {e}"));
                 return;
             }
         };
+        // Plugins are re-scanned fresh here too, same reasoning as the model
+        // load just below: the scene file only has whatever was true as of
+        // the last save, and Play should reflect what's really on disk now
+        // (a plugin edited or dropped in since), not a stale snapshot.
+        // Enabled/disabled choices already saved in the scene are kept.
+        let (manifests, scripts, errors) = load_project_plugins(&root);
+        for e in errors {
+            self.log(format!("Plugin load failed: {e}"));
+        }
+        merge_plugins_into_world(&mut world, manifests, scripts);
         let name = scene
             .file_stem()
             .and_then(|s| s.to_str())
@@ -2719,12 +2736,9 @@ impl App {
                 self.log(format!("Plugin load failed: {e}"));
             }
             if !manifests.is_empty() {
-                self.log(format!("Loaded {} plugin(s)", manifests.len()));
+                self.log(format!("Found {} plugin(s)", manifests.len()));
             }
-            self.world.installed_plugins = manifests;
-            for (name, source) in scripts {
-                self.world.script_library.insert(name, source);
-            }
+            merge_plugins_into_world(&mut self.world, manifests, scripts);
         }
         for (name, data) in &self.custom_meshes {
             self.world.mesh_meta.insert(
@@ -2742,6 +2756,46 @@ impl App {
             gpu.set_custom_meshes(&refs);
         }
         self.rebuild_thumbnails();
+    }
+
+    /// Turn one plugin on or off. Enabling re-scans that plugin's scripts
+    /// folder and merges them into script_library; disabling removes every
+    /// script currently in the library under that plugin's prefix. An
+    /// entity that has one of those scripts assigned when it's disabled
+    /// keeps a dangling reference, the same safe handling a deleted
+    /// hand-written script already gets: the runtime skips it, the
+    /// Inspector flags it.
+    fn set_plugin_enabled(&mut self, plugin_name: &str, enabled: bool) {
+        if let Some(installed) = self.world.installed_plugins.get_mut(plugin_name) {
+            installed.enabled = enabled;
+        }
+        let prefix = format!("{plugin_name}/");
+        if enabled {
+            if let Some(root) = self
+                .current_scene_path
+                .as_ref()
+                .and_then(|p| p.parent())
+                .map(|p| p.to_path_buf())
+            {
+                let (_, scripts, errors) = load_project_plugins(&root);
+                for e in errors {
+                    self.log(format!("Plugin load failed: {e}"));
+                }
+                for (name, source) in scripts {
+                    if name.starts_with(&prefix) {
+                        self.world.script_library.insert(name, source);
+                    }
+                }
+            }
+        } else {
+            self.world
+                .script_library
+                .retain(|k, _| !k.starts_with(&prefix));
+        }
+        self.log(format!(
+            "{} plugin '{plugin_name}'",
+            if enabled { "Enabled" } else { "Disabled" }
+        ));
     }
 
     fn enter_editor(&mut self, name: String, scene_path: std::path::PathBuf) {
@@ -3432,6 +3486,19 @@ impl ApplicationHandler for App {
                 }
                 let logo = self.logo_texture.clone();
                 let paused = self.paused;
+                let mut plugins_panel_open = self.plugins_panel_open;
+                let mut editor_settings_open = self.editor_settings_open;
+                // A snapshot, not a live borrow: the closure below can't hold
+                // a reference into self.world. A checkbox toggle is detected
+                // here and applied after the pass via plugin_toggle, the same
+                // lift-then-write-back pattern menu_action and delete use.
+                let installed_plugins: Vec<(String, frame_engine::world::InstalledPlugin)> = self
+                    .world
+                    .installed_plugins
+                    .iter()
+                    .map(|(name, plugin)| (name.clone(), plugin.clone()))
+                    .collect();
+                let mut plugin_toggle: Option<(String, bool)> = None;
                 let mut menu_action: Option<MenuAction> = None;
                 // Move the dock's per-frame state into the viewer, and lift the
                 // dock layout off `self` (swapping in a throwaway) so the egui
@@ -3459,12 +3526,14 @@ impl ApplicationHandler for App {
                     viewport_rect: None,
                     gizmo: gizmo_draw,
                 };
-                let (egui_paint_jobs, egui_textures_delta, egui_ppp) =
-                    if let (Some(state), Some(window)) =
-                        (self.egui_state.as_mut(), self.window.as_ref())
-                    {
-                        let raw_input = state.take_egui_input(window);
-                        let full_output = self.egui_ctx.run_ui(raw_input, |ui| {
+                let (egui_paint_jobs, egui_textures_delta, egui_ppp) = if let (
+                    Some(state),
+                    Some(window),
+                ) =
+                    (self.egui_state.as_mut(), self.window.as_ref())
+                {
+                    let raw_input = state.take_egui_input(window);
+                    let full_output = self.egui_ctx.run_ui(raw_input, |ui| {
                             // Top toolbar strip — fixed height, placeholder menu.
                             egui::Panel::top("toolbar").resizable(false).show(ui, |ui| {
                                 ui.horizontal(|ui| {
@@ -3518,6 +3587,10 @@ impl ApplicationHandler for App {
                                         if ui.button("Clear selection").clicked() {
                                             menu_action = Some(MenuAction::ClearSelection);
                                         }
+                                        ui.separator();
+                                        if ui.button("Editor settings…").clicked() {
+                                            menu_action = Some(MenuAction::OpenEditorSettings);
+                                        }
                                     });
                                     ui.menu_button("View", |ui| {
                                         let play_pause = if paused { "Play" } else { "Pause" };
@@ -3537,8 +3610,93 @@ impl ApplicationHandler for App {
                                             menu_action = Some(MenuAction::About);
                                         }
                                     });
+                                    // A toggle, not a dropdown, since clicking it
+                                    // opens or closes the plugins panel directly
+                                    // rather than showing a list of items.
+                                    if ui
+                                        .selectable_label(plugins_panel_open, "Plugins")
+                                        .clicked()
+                                    {
+                                        plugins_panel_open = !plugins_panel_open;
+                                    }
                                 });
                             });
+                            // The Plugins slide-down: only shown when toggled on
+                            // from the toolbar tab above. A Panel::top stacks
+                            // directly below the toolbar and shrinks whatever's
+                            // left for the dock area (the Viewport included)
+                            // beneath it, the same way the toolbar and console
+                            // panels already claim their own space.
+                            if plugins_panel_open {
+                                egui::Panel::top("plugins_panel")
+                                    .resizable(false)
+                                    .default_size(110.0)
+                                    .show(ui, |ui| {
+                                        let enabled: Vec<&(String, frame_engine::world::InstalledPlugin)> =
+                                            installed_plugins.iter().filter(|(_, p)| p.enabled).collect();
+                                        if enabled.is_empty() {
+                                            ui.weak(
+                                                "No plugins enabled. Turn some on from Edit > Editor settings…",
+                                            );
+                                        } else {
+                                            egui::ScrollArea::horizontal().show(ui, |ui| {
+                                                ui.horizontal(|ui| {
+                                                    for (_, plugin) in &enabled {
+                                                        ui.group(|ui| {
+                                                            ui.set_min_width(160.0);
+                                                            ui.vertical(|ui| {
+                                                                ui.strong(&plugin.manifest.name);
+                                                                ui.weak(format!(
+                                                                    "v{} by {}",
+                                                                    plugin.manifest.version,
+                                                                    plugin.manifest.author
+                                                                ));
+                                                                if !plugin.manifest.description.is_empty() {
+                                                                    ui.label(&plugin.manifest.description);
+                                                                }
+                                                            });
+                                                        });
+                                                    }
+                                                });
+                                            });
+                                        }
+                                    });
+                            }
+                            // Editor Settings: a floating window, opened from
+                            // Edit > Editor settings…. Just plugin toggles for
+                            // now; a home for more editor-wide configuration
+                            // later, the same way Project Settings grew on the
+                            // launcher.
+                            if editor_settings_open {
+                                egui::Window::new("Editor Settings")
+                                    .collapsible(false)
+                                    .open(&mut editor_settings_open)
+                                    .show(ui.ctx(), |ui| {
+                                        ui.heading("Plugins");
+                                        ui.add_space(4.0);
+                                        if installed_plugins.is_empty() {
+                                            ui.weak("No plugins found in this project's plugins/ folder.");
+                                        }
+                                        for (name, plugin) in &installed_plugins {
+                                            ui.horizontal(|ui| {
+                                                let mut on = plugin.enabled;
+                                                if ui.checkbox(&mut on, &plugin.manifest.name).changed() {
+                                                    plugin_toggle = Some((name.clone(), on));
+                                                }
+                                                ui.weak(format!(
+                                                    "v{} by {}",
+                                                    plugin.manifest.version, plugin.manifest.author
+                                                ));
+                                            });
+                                            if !plugin.manifest.description.is_empty() {
+                                                ui.weak(&plugin.manifest.description);
+                                            }
+                                            ui.add_space(4.0);
+                                        }
+                                        ui.separator();
+                                        ui.weak("More editor configuration will live here over time.");
+                                    });
+                            }
                             // Bottom console dock — Output (the live log) and a
                             // Terminal placeholder. Full width; drag its top edge
                             // to resize.
@@ -3608,14 +3766,19 @@ impl ApplicationHandler for App {
                                         .show_inside(ui, &mut viewer);
                                 });
                         });
-                        state.handle_platform_output(window, full_output.platform_output);
-                        let ppp = full_output.pixels_per_point;
-                        let jobs = self.egui_ctx.tessellate(full_output.shapes, ppp);
-                        (jobs, full_output.textures_delta, ppp)
-                    } else {
-                        (Vec::new(), egui::TexturesDelta::default(), 1.0)
-                    };
+                    state.handle_platform_output(window, full_output.platform_output);
+                    let ppp = full_output.pixels_per_point;
+                    let jobs = self.egui_ctx.tessellate(full_output.shapes, ppp);
+                    (jobs, full_output.textures_delta, ppp)
+                } else {
+                    (Vec::new(), egui::TexturesDelta::default(), 1.0)
+                };
                 self.console_tab = console_tab;
+                self.plugins_panel_open = plugins_panel_open;
+                self.editor_settings_open = editor_settings_open;
+                if let Some((name, enabled)) = plugin_toggle {
+                    self.set_plugin_enabled(&name, enabled);
+                }
                 self.assets_subdir = assets_subdir;
                 self.new_asset_folder = new_asset_folder;
                 self.move_pending = move_pending;
@@ -3729,6 +3892,7 @@ impl ApplicationHandler for App {
                     Some(MenuAction::TogglePause) => self.toggle_pause(),
                     Some(MenuAction::StepOnce) => self.step_once(),
                     Some(MenuAction::ToggleHelp) => self.toggle_help(),
+                    Some(MenuAction::OpenEditorSettings) => self.editor_settings_open = true,
                     Some(MenuAction::About) => {
                         self.log("Frame Editor — a hand-rolled Rust simulation engine and editor.");
                     }
@@ -3866,8 +4030,14 @@ fn load_project_plugins(
     let mut manifests = std::collections::BTreeMap::new();
     let mut scripts = std::collections::BTreeMap::new();
     let mut errors = Vec::new();
-    let Ok(entries) = std::fs::read_dir(root.join("plugins")) else {
-        return (manifests, scripts, errors); // no plugins folder yet, nothing to load
+    let plugins_dir = root.join("plugins");
+    // Creates the folder if it's missing (a brand new project, or an older
+    // one that predates plugins existing at all), so it's sitting there
+    // ready to drag a plugin into without anyone having to make it by hand.
+    // A no-op if it already exists.
+    let _ = std::fs::create_dir_all(&plugins_dir);
+    let Ok(entries) = std::fs::read_dir(&plugins_dir) else {
+        return (manifests, scripts, errors);
     };
     for entry in entries.flatten() {
         let plugin_dir = entry.path();
@@ -3905,6 +4075,45 @@ fn load_project_plugins(
         manifests.insert(manifest.name.clone(), manifest);
     }
     (manifests, scripts, errors)
+}
+
+/// Merge freshly-scanned plugin manifests and scripts into `world`,
+/// preserving whatever enabled/disabled state it already has for a plugin
+/// it's seen before, and defaulting a newly discovered one to disabled, the
+/// same "off until you turn it on" default a mod manager uses. Only an
+/// enabled plugin's scripts actually enter script_library. Shared by
+/// load_project_assets (editing a project) and start_play (a fresh load for
+/// the Play window), since both face the same problem: reconcile what's
+/// really on disk right now with a world that's already been loaded.
+fn merge_plugins_into_world(
+    world: &mut World,
+    manifests: std::collections::BTreeMap<String, frame_engine::world::PluginManifest>,
+    scripts: std::collections::BTreeMap<String, String>,
+) {
+    let mut installed = std::collections::BTreeMap::new();
+    for (name, manifest) in manifests {
+        let enabled = world
+            .installed_plugins
+            .get(&name)
+            .map(|p| p.enabled)
+            .unwrap_or(false);
+        installed.insert(
+            name,
+            frame_engine::world::InstalledPlugin { manifest, enabled },
+        );
+    }
+    world.installed_plugins = installed;
+    for (name, source) in scripts {
+        let owner = name.split('/').next().unwrap_or("");
+        let enabled = world
+            .installed_plugins
+            .get(owner)
+            .map(|p| p.enabled)
+            .unwrap_or(false);
+        if enabled {
+            world.script_library.insert(name, source);
+        }
+    }
 }
 
 fn load_project_models(
@@ -4312,6 +4521,8 @@ fn main() {
         script_filter: String::new(),
         open_script: None,
         renaming: None,
+        plugins_panel_open: false,
+        editor_settings_open: false,
         script_runtime: script::RhaiRuntime::new(),
         logo_texture: None,
     };
