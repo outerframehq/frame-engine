@@ -130,13 +130,85 @@ a script whose plugin, or whose specific script file, has been deleted from
 disk since the last load. If you remove a plugin, the scripts it added will
 still be listed until the project is closed and reopened fresh.
 
+## Custom Inspector fields
+
+A plugin can add its own field to the Inspector, a slider or a drag box tied
+to one of its own values. Declare it in `plugin.ron`:
+
+```ron
+(
+    name: "mywander",
+    version: "0.1.0",
+    author: "your name",
+    description: "A couple of simple wander behaviours.",
+    fields: [
+        (name: "mywander/speed", label: "Wander speed", min: Some(0.0), max: Some(5.0)),
+    ],
+)
+```
+
+`name` must match a dynamic component name your own scripts already use with
+`insert_dynamic`/`get_dynamic` (see SCRIPTING.md's `custom_<name>` variables).
+`label` is what shows next to the control in the Inspector. `min`/`max` are
+both optional; giving both draws a slider, leaving either out (or both) falls
+back to a plain, unbounded drag box.
+
+A field only ever appears for an entity that **already has a value** under
+that name. It can't originate one. If nothing on the entity has ever called
+`insert_dynamic("mywander/speed", …)`, the field simply doesn't show up, the
+same rule the `custom_<name>` script variables already follow, and for the
+same reason: a plugin describes a field, it doesn't get to decide an entity
+suddenly has data it never had.
+
+Values are always `f64`, the same type the script bridge uses. That's what
+lets a script and the Inspector genuinely share one value rather than two
+different types quietly registered under the same name.
+
+This is deliberately data, not code. Rhai has no bindings to the editor's UI
+library, and a plugin field is never plugin code running during rendering;
+it's a description the editor itself reads and draws.
+
+## Menu actions
+
+A plugin can also add buttons to its own card in the Plugins panel (the tab
+next to Help). Declare them in `plugin.ron`:
+
+```ron
+(
+    name: "mywander",
+    version: "0.1.0",
+    author: "your name",
+    description: "A couple of simple wander behaviours.",
+    actions: [
+        (label: "Run patrol now", kind: RunScript(script: "mywander/patrol")),
+        (label: "Toggle alert mode", kind: ToggleValue(name: "mywander/alert")),
+    ],
+)
+```
+
+Two kinds exist:
+
+- **`RunScript(script: "…")`**: runs the named script (its full name,
+  including the `<plugin-name>/` prefix) once, immediately, for every entity
+  that currently has it assigned. The same thing a normal tick already does
+  for that entity, just triggered right now instead of waiting for the next
+  one.
+- **`ToggleValue(name: "…")`**: flips a dynamic value between `0.0` and `1.0`
+  (above `0.5` becomes `0.0`, otherwise `1.0`) for every entity that already
+  has a value under that name. Same "can't originate a value" rule as fields.
+
+That's the complete list. A menu action is not a callback and can't run
+arbitrary plugin code, it names one of these two kinds, and the editor is the
+only thing that ever decides what happens and does it.
+
 ## What plugins can't do yet
 
-Right now a plugin only supplies scripts, and Editor Settings only offers an
-on/off switch for each one. A plugin has no way to add its own Inspector
-fields, menu items, or panels to the editor itself. Giving plugins that kind
-of real editor-extension surface is a genuine, intended direction, not
-something the current format rules out, just not built yet.
+Fields and menu actions cover two of the three pieces of a real
+editor-extension surface. The third, **panels**, custom UI a plugin draws its
+own layout into, doesn't exist yet. It's a genuine, intended direction, and
+the hardest of the three to do safely: closer to designing a small
+declarative description format than reusing something that already exists
+the way fields and actions did.
 
 ## Sharing a plugin
 
