@@ -170,6 +170,13 @@ pub struct PluginManifest {
     /// means, never arbitrary plugin code triggered by a click.
     #[serde(default)]
     pub actions: Vec<PluginAction>,
+    /// Panels this plugin declares: titled, global sections shown in the
+    /// Plugins panel regardless of what entity (if any) is selected, since
+    /// none of it is tied to one. Not a new widget type, a panel just
+    /// groups fields and actions the editor already knows how to draw, the
+    /// same "data, not code" reasoning as everything else here.
+    #[serde(default)]
+    pub panels: Vec<PluginPanel>,
 }
 
 /// One custom Inspector field a plugin declares. `name` must match a dynamic
@@ -222,6 +229,41 @@ pub enum PluginActionKind {
     /// that name. Like `fields`, this can't originate a value on an entity
     /// that doesn't already have one.
     ToggleValue { name: String },
+    /// Like `ToggleValue`, but for a global value (`World.globals`) rather
+    /// than a per-entity one. Natural for a panel, which isn't tied to any
+    /// one entity to begin with.
+    ToggleGlobal { name: String },
+}
+
+/// One global value's field in a panel: the same shape `PluginField` uses
+/// for a per-entity field (a name, a label, an optional min/max range), but
+/// `name` here is a key into `World.globals` instead of a dynamic component,
+/// and the field isn't tied to any entity. The field only appears if that
+/// name already has a value in `globals`, the same "can't originate a
+/// value" rule every other declared field and action here follows.
+#[derive(Serialize, Deserialize, Clone, Default, PartialEq)]
+pub struct PluginPanelField {
+    pub name: String,
+    pub label: String,
+    #[serde(default)]
+    pub min: Option<f64>,
+    #[serde(default)]
+    pub max: Option<f64>,
+}
+
+/// One panel a plugin declares: a titled, global section in the Plugins
+/// panel. Self-contained rather than referencing the plugin's top-level
+/// `fields`/`actions` by index or name, so there's nothing fragile to keep
+/// in sync if either list changes; a panel simply lists its own fields and
+/// actions directly, reusing the exact same types (`PluginPanelField`,
+/// `PluginAction`) the rest of this system already draws.
+#[derive(Serialize, Deserialize, Clone, Default, PartialEq)]
+pub struct PluginPanel {
+    pub title: String,
+    #[serde(default)]
+    pub fields: Vec<PluginPanelField>,
+    #[serde(default)]
+    pub actions: Vec<PluginAction>,
 }
 
 /// One installed plugin, keyed by name in `World::installed_plugins`: its
@@ -446,6 +488,19 @@ pub struct World {
     /// record of which plugins a project depends on and which are turned on.
     #[serde(default)]
     pub installed_plugins: std::collections::BTreeMap<String, InstalledPlugin>,
+    /// Flat, global values, not tied to any entity, keyed by name. What a
+    /// plugin panel's fields and `ToggleGlobal` actions read and write.
+    /// Unlike the per-entity dynamic component system (`insert_dynamic`/
+    /// `get_dynamic`), this needs no type erasure: everything that reads or
+    /// writes a global value is `f64`, the same scope the per-entity system
+    /// already settled into in practice, so there's no reason to carry the
+    /// extra complexity of `Box<dyn Any>` for something that's only ever one
+    /// type. A plain map also serializes for free, no special mirroring the
+    /// way `dynamic_f64` needed for the per-entity case. Public since there's
+    /// no invariant here to protect the way `dynamic`/`dynamic_f64` have to
+    /// stay in sync with each other.
+    #[serde(default)]
+    pub globals: std::collections::BTreeMap<String, f64>,
     /// Physical substance definitions, keyed by name, the same shared-registry
     /// shape as `mesh_meta` and `script_library`. Empty by default; no
     /// substances are defined here, only the shape they'd take.

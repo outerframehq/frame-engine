@@ -2909,6 +2909,12 @@ impl App {
                     if toggled == 1 { "y" } else { "ies" }
                 ));
             }
+            frame_engine::world::PluginActionKind::ToggleGlobal { name } => {
+                let current = self.world.globals.get(&name).copied().unwrap_or(0.0);
+                let new_value = if current > 0.5 { 0.0 } else { 1.0 };
+                self.world.globals.insert(name.clone(), new_value);
+                self.log(format!("Toggled global '{name}'"));
+            }
         }
     }
 
@@ -3640,6 +3646,13 @@ impl ApplicationHandler for App {
                     .collect();
                 let mut plugin_toggle: Option<(String, bool)> = None;
                 let mut plugin_action: Option<frame_engine::world::PluginActionKind> = None;
+                // A snapshot, edited in place by panel field sliders and
+                // written back wholesale after the pass. Global values
+                // aren't tied to any entity, so there's none of the
+                // entity-capture care the per-entity custom fields needed,
+                // there's nothing here that could end up applied to the
+                // wrong target.
+                let mut globals_edit = self.world.globals.clone();
                 let mut menu_action: Option<MenuAction> = None;
                 // Move the dock's per-frame state into the viewer, and lift the
                 // dock layout off `self` (swapping in a throwaway) so the egui
@@ -3807,6 +3820,53 @@ impl ApplicationHandler for App {
                                                                         plugin_action = Some(action.kind.clone());
                                                                     }
                                                                 }
+                                                                // Panels: titled, global sections, not
+                                                                // tied to this or any entity. A field only
+                                                                // shows if globals_edit already has a
+                                                                // value under its name; it can't
+                                                                // originate one, same rule as everywhere
+                                                                // else in this system.
+                                                                for panel in &plugin.manifest.panels {
+                                                                    ui.separator();
+                                                                    ui.strong(&panel.title);
+                                                                    for field in &panel.fields {
+                                                                        if let Some(value) =
+                                                                            globals_edit.get_mut(&field.name)
+                                                                        {
+                                                                            ui.horizontal(|ui| {
+                                                                                ui.label(field.label.as_str());
+                                                                                match (field.min, field.max) {
+                                                                                    (Some(lo), Some(hi)) => {
+                                                                                        ui.add(egui::Slider::new(
+                                                                                            value,
+                                                                                            lo..=hi,
+                                                                                        ));
+                                                                                    }
+                                                                                    _ => {
+                                                                                        let mut drag =
+                                                                                            egui::DragValue::new(value)
+                                                                                                .speed(0.1);
+                                                                                        if let Some(lo) = field.min {
+                                                                                            drag = drag
+                                                                                                .range(lo..=f64::MAX);
+                                                                                        }
+                                                                                        if let Some(hi) = field.max {
+                                                                                            drag = drag
+                                                                                                .range(f64::MIN..=hi);
+                                                                                        }
+                                                                                        ui.add(drag);
+                                                                                    }
+                                                                                }
+                                                                            });
+                                                                        }
+                                                                    }
+                                                                    for action in &panel.actions {
+                                                                        if ui.button(&action.label).clicked() {
+                                                                            plugin_action =
+                                                                                Some(action.kind.clone());
+                                                                        }
+                                                                    }
+                                                                }
                                                             });
                                                         });
                                                     }
@@ -3935,6 +3995,11 @@ impl ApplicationHandler for App {
                 if let Some(kind) = plugin_action {
                     self.run_plugin_action(kind);
                 }
+                // Written back unconditionally, the same way plugin
+                // enable/disable isn't part of undo either: global panel
+                // values live outside the Inspector's per-entity editing
+                // gesture, so there's nothing here for undo to coalesce.
+                self.world.globals = globals_edit;
                 self.assets_subdir = assets_subdir;
                 self.new_asset_folder = new_asset_folder;
                 self.move_pending = move_pending;
