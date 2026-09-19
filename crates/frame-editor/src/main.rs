@@ -2,7 +2,9 @@ const LOGO_PNG: &[u8] = include_bytes!("../assets/frame-editor.png");
 use frame_engine::core::Clock;
 use frame_engine::input::{Button, InputState};
 use frame_engine::systems;
-use frame_engine::world::{Controlled, Gravity, Mesh, Position, Script, Static, Velocity, World};
+use frame_engine::world::{
+    Controlled, Gravity, Mesh, Position, Script, ScriptRuntime, Static, Velocity, World,
+};
 use glam::{Mat4, Vec3, Vec4};
 use std::sync::Arc;
 use wgpu::util::DeviceExt;
@@ -1240,6 +1242,28 @@ fn scene_tab_ui(ui: &mut egui::Ui, entity_ids: &[usize], selection: &mut Option<
         });
 }
 
+/// One custom Inspector field for the currently selected entity, lifted out
+/// for `inspector_tab_ui` to edit and written back to `World::insert_dynamic`
+/// after the pass, the same lift-then-write pattern every other field here
+/// already uses. A plain struct rather than a tuple, since `min`/`max` make
+/// a bare `(String, String, f64)` awkward to read at either end.
+#[derive(Clone, PartialEq)]
+struct EditableCustomField {
+    /// Which entity this value belongs to, captured at the same time as the
+    /// value itself. Needed because the write-back happens after the pass,
+    /// by which point self.selected may already have moved to a different
+    /// entity (the user clicked a new one in Scene this same frame); using
+    /// that instead of a captured id could silently write a value onto the
+    /// wrong entity.
+    entity: usize,
+    /// The dynamic component name; what gets passed to `insert_dynamic`.
+    name: String,
+    label: String,
+    value: f64,
+    min: Option<f64>,
+    max: Option<f64>,
+}
+
 /// Inspector tab: the selected entity's properties.
 fn inspector_tab_ui(
     ui: &mut egui::Ui,
@@ -1247,6 +1271,9 @@ fn inspector_tab_ui(
     script_library: &std::collections::BTreeMap<String, String>,
     script_filter: &mut String,
     custom_mesh_names: &[String],
+    // Plugin-declared custom fields the selected entity currently has a
+    // value under. Empty for an entity with none.
+    custom_fields: &mut [EditableCustomField],
 ) {
     match edited {
         Some((
@@ -1376,6 +1403,30 @@ fn inspector_tab_ui(
                     if !script_library.contains_key(name) {
                         ui.weak(format!("(uses missing script '{name}')"));
                     }
+                }
+            }
+            if !custom_fields.is_empty() {
+                ui.add_space(8.0);
+                ui.label("Plugin Fields");
+                for field in custom_fields.iter_mut() {
+                    ui.horizontal(|ui| {
+                        ui.label(field.label.as_str());
+                        match (field.min, field.max) {
+                            (Some(lo), Some(hi)) => {
+                                ui.add(egui::Slider::new(&mut field.value, lo..=hi));
+                            }
+                            _ => {
+                                let mut drag = egui::DragValue::new(&mut field.value).speed(0.1);
+                                if let Some(lo) = field.min {
+                                    drag = drag.range(lo..=f64::MAX);
+                                }
+                                if let Some(hi) = field.max {
+                                    drag = drag.range(f64::MIN..=hi);
+                                }
+                                ui.add(drag);
+                            }
+                        }
+                    });
                 }
             }
         }
@@ -1584,6 +1635,9 @@ struct EditorTabViewer {
     entity_ids: Vec<usize>,
     selection: Option<usize>,
     edited: Option<EditedEntity>,
+    // Plugin-declared custom fields for the selected entity. See
+    // EditableCustomField.
+    custom_fields: Vec<EditableCustomField>,
     script_library: std::collections::BTreeMap<String, String>,
     new_script_name: String,
     script_filter: String,
@@ -1662,6 +1716,7 @@ impl egui_dock::TabViewer for EditorTabViewer {
                 &self.script_library,
                 &mut self.script_filter,
                 &self.custom_mesh_names,
+                &mut self.custom_fields,
             ),
             Tab::Scripts => scripts_tab_ui(
                 ui,
@@ -2798,6 +2853,65 @@ impl App {
         ));
     }
 
+    /// Run a clicked plugin action. `PluginActionKind` is a closed enum, so
+    /// this match is the complete list of everything a plugin action can
+    /// ever cause; there is no path from here into arbitrary plugin code.
+    fn run_plugin_action(&mut self, kind: frame_engine::world::PluginActionKind) {
+        match kind {
+            frame_engine::world::PluginActionKind::RunScript { script } => {
+                // Every entity currently assigned this exact script, run
+                // once, right now, through the same ScriptRuntime::run a
+                // normal tick already uses for it. Shared per-tick state
+                // (such as held input) reflects whatever the last real tick
+                // set, not a fresh begin_tick, since this isn't a tick of
+                // its own.
+                let ids: Vec<usize> = self
+                    .world
+                    .scripts
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(id, slot)| slot.as_ref().filter(|s| s.uses == script).map(|_| id))
+                    .collect();
+                if ids.is_empty() {
+                    self.log(format!("No entity currently uses script '{script}'"));
+                    return;
+                }
+                for id in &ids {
+                    self.script_runtime.run(&mut self.world, *id);
+                }
+                self.log(format!(
+                    "Ran '{script}' once for {} entit{}",
+                    ids.len(),
+                    if ids.len() == 1 { "y" } else { "ies" }
+                ));
+            }
+            frame_engine::world::PluginActionKind::ToggleValue { name } => {
+                // Every live entity that already has a value under this
+                // name; toggling can't originate one on an entity that
+                // doesn't, the same rule fields and scripts both follow.
+                let ids: Vec<usize> = self
+                    .world
+                    .positions
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(id, slot)| slot.as_ref().map(|_| id))
+                    .collect();
+                let mut toggled = 0usize;
+                for id in ids {
+                    if let Some(value) = self.world.get_dynamic::<f64>(&name, id).copied() {
+                        let new_value = if value > 0.5 { 0.0 } else { 1.0 };
+                        self.world.insert_dynamic::<f64>(&name, id, new_value);
+                        toggled += 1;
+                    }
+                }
+                self.log(format!(
+                    "Toggled '{name}' on {toggled} entit{}",
+                    if toggled == 1 { "y" } else { "ies" }
+                ));
+            }
+        }
+    }
+
     fn enter_editor(&mut self, name: String, scene_path: std::path::PathBuf) {
         self.current_scene_path = Some(scene_path);
         self.selected = None;
@@ -3468,6 +3582,32 @@ impl ApplicationHandler for App {
                         self.world.gravities.get(id).is_some(),
                     ))
                 });
+                // For each enabled plugin's declared fields, keep the ones
+                // the selected entity actually has a value under. A field
+                // can't originate a value it doesn't already have, the same
+                // rule the custom_<name> script variables follow.
+                let custom_fields: Vec<EditableCustomField> = match self.selected {
+                    Some(id) => self
+                        .world
+                        .installed_plugins
+                        .values()
+                        .filter(|plugin| plugin.enabled)
+                        .flat_map(|plugin| plugin.manifest.fields.iter())
+                        .filter_map(|field| {
+                            self.world.get_dynamic::<f64>(&field.name, id).map(|value| {
+                                EditableCustomField {
+                                    entity: id,
+                                    name: field.name.clone(),
+                                    label: field.label.clone(),
+                                    value: *value,
+                                    min: field.min,
+                                    max: field.max,
+                                }
+                            })
+                        })
+                        .collect(),
+                    None => Vec::new(),
+                };
                 // Upload the logo to the GPU on the first frame, then reuse the handle.
                 if self.logo_texture.is_none() {
                     let rgba = image::load_from_memory(LOGO_PNG)
@@ -3499,6 +3639,7 @@ impl ApplicationHandler for App {
                     .map(|(name, plugin)| (name.clone(), plugin.clone()))
                     .collect();
                 let mut plugin_toggle: Option<(String, bool)> = None;
+                let mut plugin_action: Option<frame_engine::world::PluginActionKind> = None;
                 let mut menu_action: Option<MenuAction> = None;
                 // Move the dock's per-frame state into the viewer, and lift the
                 // dock layout off `self` (swapping in a throwaway) so the egui
@@ -3506,12 +3647,14 @@ impl ApplicationHandler for App {
                 // Snapshot of the selected entity's editable state before the UI
                 // pass, so we can tell if the Inspector changed it this frame.
                 let edited_before = edited.clone();
+                let custom_fields_before = custom_fields.clone();
                 let mut dock_state =
                     std::mem::replace(&mut self.dock_state, egui_dock::DockState::new(Vec::new()));
                 let mut viewer = EditorTabViewer {
                     entity_ids,
                     selection: new_selection,
                     edited,
+                    custom_fields,
                     script_library,
                     new_script_name,
                     script_filter,
@@ -3654,6 +3797,16 @@ impl ApplicationHandler for App {
                                                                 if !plugin.manifest.description.is_empty() {
                                                                     ui.label(&plugin.manifest.description);
                                                                 }
+                                                                // A button per declared action. Clicking
+                                                                // one only ever records which kind was
+                                                                // chosen; the editor decides what that
+                                                                // means and does it after this pass, the
+                                                                // plugin itself never runs anything here.
+                                                                for action in &plugin.manifest.actions {
+                                                                    if ui.button(&action.label).clicked() {
+                                                                        plugin_action = Some(action.kind.clone());
+                                                                    }
+                                                                }
                                                             });
                                                         });
                                                     }
@@ -3779,6 +3932,9 @@ impl ApplicationHandler for App {
                 if let Some((name, enabled)) = plugin_toggle {
                     self.set_plugin_enabled(&name, enabled);
                 }
+                if let Some(kind) = plugin_action {
+                    self.run_plugin_action(kind);
+                }
                 self.assets_subdir = assets_subdir;
                 self.new_asset_folder = new_asset_folder;
                 self.move_pending = move_pending;
@@ -3809,11 +3965,14 @@ impl ApplicationHandler for App {
                 }
                 self.selected = viewer.selection;
                 let edited = viewer.edited;
+                let custom_fields = viewer.custom_fields;
                 // Coalesce Inspector edits into one undo step per gesture: snapshot
                 // on the first frame the values change, and reset when they stop.
                 // (This runs before the write-back below, so the world is still in
-                // its pre-edit state when we snapshot it.)
-                let inspector_changed = edited != edited_before;
+                // its pre-edit state when we snapshot it.) Plugin fields count as
+                // part of the same gesture as everything else in the Inspector.
+                let inspector_changed =
+                    edited != edited_before || custom_fields != custom_fields_before;
                 if inspector_changed && !self.inspector_editing {
                     self.push_undo();
                     self.inspector_editing = true;
@@ -3872,6 +4031,14 @@ impl ApplicationHandler for App {
                             self.world.scripts.remove(id);
                         }
                     }
+                }
+                // Plugin field edits write back the same unconditional way
+                // every other single value in the Inspector does, each to
+                // the entity captured alongside it, not whatever's currently
+                // selected (which may have already changed this same frame).
+                for field in &custom_fields {
+                    self.world
+                        .insert_dynamic::<f64>(&field.name, field.entity, field.value);
                 }
                 // A menu item clicked this frame runs the same action method the
                 // keyboard uses — one command, two triggers. This sits at

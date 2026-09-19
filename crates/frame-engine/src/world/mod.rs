@@ -149,6 +149,79 @@ pub struct PluginManifest {
     pub author: String,
     #[serde(default)]
     pub description: String,
+    /// Custom Inspector fields this plugin declares. Each names a dynamic
+    /// component (the same key `insert_dynamic`/`get_dynamic` use) and a
+    /// label to show next to it. `#[serde(default)]` so a plugin.ron written
+    /// before this existed still parses as an empty list.
+    ///
+    /// This is deliberately data, not code: a plugin can't run arbitrary UI,
+    /// it can only describe a field for the editor itself to draw. Rhai has
+    /// no bindings to egui, and giving it any would be a much bigger trust
+    /// boundary than anything else a script can do, reading and writing
+    /// typed World data through a defined, safe surface. Declaring a field
+    /// this way, and the editor being the only thing that ever actually
+    /// renders anything, keeps a bad plugin's worst case the same as a bad
+    /// script's: it does nothing useful, it doesn't get to act like part of
+    /// the editor's own chrome.
+    #[serde(default)]
+    pub fields: Vec<PluginField>,
+    /// Menu actions this plugin declares. Same reasoning as `fields`: a
+    /// button the editor draws and the editor alone decides what running it
+    /// means, never arbitrary plugin code triggered by a click.
+    #[serde(default)]
+    pub actions: Vec<PluginAction>,
+}
+
+/// One custom Inspector field a plugin declares. `name` must match a dynamic
+/// component name the plugin (or its scripts) already uses with
+/// `insert_dynamic`/`get_dynamic`; the field only appears in the Inspector
+/// for an entity that already has a value under that name; there's no way
+/// for the field itself to originate one; the same rule the `custom_<name>`
+/// script variables already follow, for the same reason. Values are always
+/// `f64`, matching the type the script bridge already uses for dynamic
+/// values, so a value a script sets and a value the Inspector edits are the
+/// same underlying data, not two incompatible types registered under one
+/// name.
+#[derive(Serialize, Deserialize, Clone, Default, PartialEq)]
+pub struct PluginField {
+    pub name: String,
+    pub label: String,
+    /// An inclusive range for the Inspector's slider. `None` on either side
+    /// falls back to a plain drag box with no limit on that side.
+    #[serde(default)]
+    pub min: Option<f64>,
+    #[serde(default)]
+    pub max: Option<f64>,
+}
+
+/// One menu action a plugin declares: a label, and one of a small, fixed set
+/// of things the editor knows how to do with it. Not a callback, not a
+/// script the editor runs blind: `PluginActionKind` is a closed enum, so
+/// every action a plugin can ever cause is one this codebase has explicitly
+/// implemented and reviewed, the same "data, not code" reasoning `fields`
+/// already uses.
+#[derive(Serialize, Deserialize, Clone, PartialEq)]
+pub struct PluginAction {
+    pub label: String,
+    pub kind: PluginActionKind,
+}
+
+/// What a `PluginAction` actually does when clicked. Both variants act on
+/// every entity that already qualifies, never a single arbitrary target a
+/// plugin gets to pick at click time.
+#[derive(Serialize, Deserialize, Clone, PartialEq)]
+pub enum PluginActionKind {
+    /// Run one of this plugin's own scripts (by its full name, including the
+    /// `<plugin-name>/` prefix) once, immediately, for every entity that
+    /// currently has it assigned via `Script.uses`. The same execution a
+    /// normal tick already does for that entity, just triggered once, right
+    /// now, instead of waiting for the next tick.
+    RunScript { script: String },
+    /// Toggle a named dynamic value between 0.0 and 1.0 (above 0.5 becomes
+    /// 0.0, otherwise 1.0) for every entity that currently has a value under
+    /// that name. Like `fields`, this can't originate a value on an entity
+    /// that doesn't already have one.
+    ToggleValue { name: String },
 }
 
 /// One installed plugin, keyed by name in `World::installed_plugins`: its
