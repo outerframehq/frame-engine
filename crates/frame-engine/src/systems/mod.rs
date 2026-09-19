@@ -2,6 +2,24 @@ use crate::input::{Button, InputState};
 use crate::world::ScriptRuntime;
 use crate::world::World;
 
+/// Expand an axis-aligned box's half-extents to bound the same box after it's
+/// rotated by `yaw` around the world's vertical (Y) axis. This is a
+/// conservative over-approximation, an axis-aligned box that fully contains
+/// the rotated one, not true oriented-box precision. Two entities whose real
+/// rotated shapes don't actually touch can still be reported as colliding
+/// once both are turned; that's the honest cost of staying axis-aligned
+/// rather than doing real oriented-box math, a bigger, separate step. Y
+/// (height) is untouched, since rotation is yaw-only.
+fn expand_for_yaw(half: [f32; 3], yaw: f32) -> [f32; 3] {
+    let (sin, cos) = yaw.sin_cos();
+    let (sin, cos) = (sin.abs(), cos.abs());
+    [
+        half[0] * cos + half[2] * sin,
+        half[1],
+        half[0] * sin + half[2] * cos,
+    ]
+}
+
 /// Half extents of an entity's axis aligned collision box, per axis. A Plane
 /// is a flat floor tile so its box is flat in Y (zero height) to match what is
 /// drawn, otherwise things rest on an invisible ledge half an ENTITY_SIZE above
@@ -55,7 +73,8 @@ pub fn collision(world: &mut World) {
         let Some(p) = slot.as_ref() else { continue };
         let s = world.scales.get(id).copied().unwrap_or_default();
         let mesh = world.meshes.get(id).cloned().unwrap_or_default();
-        let [hx, hy, hz] = half_extents(&mesh, s, &world.mesh_meta);
+        let yaw = world.rotations.get(id).map(|r| r.yaw).unwrap_or(0.0);
+        let [hx, hy, hz] = expand_for_yaw(half_extents(&mesh, s, &world.mesh_meta), yaw);
         boxes.push((
             id,
             [p.x - hx, p.y - hy, p.z - hz],
@@ -110,10 +129,11 @@ pub fn resolve_collisions(world: &mut World) {
         let s = world.scales.get(id).copied().unwrap_or_default();
         let mesh = world.meshes.get(id).cloned().unwrap_or_default();
         let is_static = world.statics.get(id).is_some();
+        let yaw = world.rotations.get(id).map(|r| r.yaw).unwrap_or(0.0);
         boxes.push((
             id,
             [p.x, p.y, p.z],
-            half_extents(&mesh, s, &world.mesh_meta),
+            expand_for_yaw(half_extents(&mesh, s, &world.mesh_meta), yaw),
             is_static,
         ));
     }

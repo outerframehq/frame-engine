@@ -949,7 +949,7 @@ fn source_tab_ui(ui: &mut egui::Ui, summary: &Option<GitSummary>) {
             });
             let state = match (ahead, behind) {
                 (0, 0) => "Up to date with upstream".to_string(),
-                (a, 0) => format!("{a} commit(s) ahead — ready to push"),
+                (a, 0) => format!("{a} commit(s) ahead, ready to push"),
                 (0, b) => format!("{b} commit(s) behind — pull to catch up"),
                 (a, b) => format!("{a} ahead, {b} behind — diverged"),
             };

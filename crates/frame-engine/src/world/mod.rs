@@ -483,14 +483,30 @@ pub struct World {
     /// same problem `Material` and `Rotation` would otherwise have to solve
     /// by becoming public engine code just to exist.
     ///
-    /// Deliberately does not serialize with the scene yet. `Box<dyn Any>`
-    /// can't be serialized generically without either a real dependency just
-    /// for this (breaking the engine's zero-new-dependencies rule) or a
-    /// hand-rolled per-type registry of serialize functions, a real future
-    /// step, not an oversight here. A registered component resets on reload,
-    /// the same way `collisions` above is transient by design.
+    /// Does not serialize with the scene directly. `Box<dyn Any>` can't be
+    /// serialized generically without either a real dependency just for this
+    /// (breaking the engine's zero-new-dependencies rule) or a hand-rolled
+    /// per-type registry of serialize functions for every type a host might
+    /// ever register, genuinely open-ended future work, not solved here. A
+    /// registered value of any type other than `f64` still resets on reload,
+    /// the same way `collisions` above is transient by design. `f64` values
+    /// specifically do survive, through `dynamic_f64` below, since `f64` is
+    /// the one type actually in use anywhere today, the script bridge's
+    /// `custom_<name>` variables and the Inspector's plugin fields are both
+    /// `f64` only.
     #[serde(skip)]
     dynamic: std::collections::HashMap<String, DynamicEntry>,
+    /// The `f64` half of `dynamic`, kept in sync with it by `insert_dynamic`
+    /// and `remove_dynamic` whenever the concrete type happens to be `f64`,
+    /// and the only part of `dynamic` that actually serializes. On load,
+    /// `load_from_file` rebuilds that part of `dynamic` from this field, so
+    /// `get_dynamic::<f64>` reads correctly afterward without a caller
+    /// needing to know any of this happened. A real generic solution
+    /// (any `T`, not just `f64`) is still open; this closes the gap for the
+    /// type that's genuinely used today rather than leaving persistence
+    /// entirely unsolved.
+    #[serde(default)]
+    dynamic_f64: std::collections::BTreeMap<String, ComponentStorage<f64>>,
 }
 
 impl Default for Scale {
@@ -563,6 +579,13 @@ impl World {
             for entry in self.dynamic.values_mut() {
                 entry.storage.remove_erased(id);
             }
+            // dynamic_f64 mirrors part of dynamic (see its own doc comment);
+            // clear it here too, or a despawned entity's persisted value
+            // could resurrect if a later spawn reuses this same freed slot,
+            // the exact bug already fixed once for Static and Gravity.
+            for storage in self.dynamic_f64.values_mut() {
+                storage.remove(id);
+            }
         }
     }
 
@@ -583,17 +606,30 @@ impl World {
         if entry.type_id != std::any::TypeId::of::<T>() {
             return false;
         }
-        match entry
+        let inserted = match entry
             .storage
             .as_any_mut()
             .downcast_mut::<ComponentStorage<T>>()
         {
             Some(storage) => {
-                storage.insert(id, value);
+                storage.insert(id, value.clone());
                 true
             }
             None => false,
+        };
+        // f64 mirrors into dynamic_f64 too, so it survives a save/reload;
+        // see dynamic_f64's own doc comment for why only f64 gets this yet.
+        // Only on an actual successful insert above, never on the type
+        // mismatch this function already bailed out of.
+        if inserted {
+            if let Some(v) = (&value as &dyn std::any::Any).downcast_ref::<f64>() {
+                self.dynamic_f64
+                    .entry(name.to_string())
+                    .or_default()
+                    .insert(id, *v);
+            }
         }
+        inserted
     }
 
     /// Read a runtime-registered component's value for an entity. `None` if
@@ -641,6 +677,13 @@ impl World {
                 }
             }
         }
+        // Mirrors insert_dynamic's own mirroring, so dynamic_f64 never keeps
+        // a value the type-erased map itself no longer has.
+        if std::any::TypeId::of::<T>() == std::any::TypeId::of::<f64>() {
+            if let Some(storage) = self.dynamic_f64.get_mut(name) {
+                storage.remove(id);
+            }
+        }
     }
 
     /// The type name a registered slot was first created with, for a friendly
@@ -673,7 +716,21 @@ impl World {
         path: impl AsRef<std::path::Path>,
     ) -> Result<World, Box<dyn std::error::Error>> {
         let text = std::fs::read_to_string(path)?;
-        let world = ron::from_str(&text)?;
+        let mut world: World = ron::from_str(&text)?;
+        // `dynamic` itself never serializes (see its own doc comment);
+        // rebuild the f64 half of it from `dynamic_f64`, which does, so
+        // `get_dynamic::<f64>` reads correctly straight after a load without
+        // a caller needing to know any of this happened.
+        for (name, storage) in world.dynamic_f64.clone() {
+            world.dynamic.insert(
+                name,
+                DynamicEntry {
+                    type_id: std::any::TypeId::of::<f64>(),
+                    type_name: std::any::type_name::<f64>(),
+                    storage: Box::new(storage),
+                },
+            );
+        }
         Ok(world)
     }
 }

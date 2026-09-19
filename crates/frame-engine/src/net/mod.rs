@@ -37,9 +37,6 @@
 //! - No prediction or reconciliation. A client's own movement will visibly
 //!   lag by however long a round trip takes: correct, but not smooth. Smoothing
 //!   that out is a real, separate problem.
-//! - A client still has no way to learn which entity in a broadcast is its
-//!   own; it can drive it, but can't yet tell which dot on screen is
-//!   "itself" from the snapshot alone. A real future step, not solved here.
 //! - When a client disconnects, its entity is despawned along with the
 //!   connection, detected either from a closed read (in `receive_input`) or
 //!   a failed write (in `broadcast_positions`), whichever notices first.
@@ -86,6 +83,20 @@ struct PositionUpdate {
 #[derive(Serialize, Deserialize)]
 struct Snapshot {
     positions: Vec<PositionUpdate>,
+}
+
+/// Everything a `Server` can send a `Client`, wrapped in one tagged type so
+/// `Client::poll` can tell them apart. `Welcome` is sent exactly once, right
+/// after a client connects; `Snapshot` is sent every tick after that.
+#[derive(Serialize, Deserialize)]
+enum ServerMessage {
+    /// Which entity is this client's own. A client has no way to claim or
+    /// guess this itself; the server decides on connect and tells it once,
+    /// here, rather than leaving it to infer from a snapshot alone.
+    Welcome {
+        entity: usize,
+    },
+    Snapshot(Snapshot),
 }
 
 /// One input message, sent client to server: which of the four movement
@@ -188,11 +199,30 @@ impl Server {
                             },
                         );
                         world.controlled.insert(entity, Controlled);
-                        self.clients.push(ConnectedClient {
-                            stream,
-                            entity,
-                            buffer: Vec::new(),
-                        });
+                        let mut stream = stream;
+                        // Sent once, immediately, so the client knows which
+                        // entity is its own from the start rather than
+                        // guessing from a snapshot. If this write fails the
+                        // client is dropped here too; a connection that
+                        // can't even receive its own welcome isn't one worth
+                        // keeping around for the regular broadcast to fail
+                        // on later.
+                        let welcome = ServerMessage::Welcome { entity };
+                        let sent =
+                            ron::ser::to_string_pretty(&welcome, ron::ser::PrettyConfig::default())
+                                .ok()
+                                .and_then(|payload| {
+                                    write_framed(&mut stream, payload.as_bytes()).ok()
+                                });
+                        if sent.is_some() {
+                            self.clients.push(ConnectedClient {
+                                stream,
+                                entity,
+                                buffer: Vec::new(),
+                            });
+                        } else {
+                            world.despawn(entity);
+                        }
                     }
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
@@ -231,7 +261,8 @@ impl Server {
         // compact format is a genuine future optimisation, deliberately not
         // solved here, correctness matters more than bandwidth for a first
         // slice proving the pipe works at all.
-        let Ok(payload) = ron::ser::to_string_pretty(&snapshot, ron::ser::PrettyConfig::default())
+        let message = ServerMessage::Snapshot(snapshot);
+        let Ok(payload) = ron::ser::to_string_pretty(&message, ron::ser::PrettyConfig::default())
         else {
             return;
         };
@@ -322,6 +353,10 @@ pub struct Client {
     // split across several calls to poll, or several messages can arrive in
     // one call; this buffer is what lets both be handled correctly.
     buffer: Vec<u8>,
+    // The entity the server said is this client's own, learned from its
+    // one-time Welcome message. None until that message has actually
+    // arrived, which may take a poll or two after connecting.
+    own_entity: Option<usize>,
 }
 
 impl Client {
@@ -333,7 +368,15 @@ impl Client {
         Ok(Client {
             stream,
             buffer: Vec::new(),
+            own_entity: None,
         })
+    }
+
+    /// Which entity the server said is this client's own, once its Welcome
+    /// message has arrived (may be `None` for the first poll or two right
+    /// after connecting, before that message has been received).
+    pub fn own_entity(&self) -> Option<usize> {
+        self.own_entity
     }
 
     /// Send this tick's held input to the server. The client only ever
@@ -374,22 +417,28 @@ impl Client {
         }
         // A burst of several snapshots arriving in one read is applied in
         // order, oldest first, same as if each had arrived on its own tick.
+        let own_entity = &mut self.own_entity;
         drain_framed(&mut self.buffer, |payload| {
             let Ok(text) = std::str::from_utf8(payload) else {
                 return;
             };
-            let Ok(snapshot) = ron::from_str::<Snapshot>(text) else {
+            let Ok(message) = ron::from_str::<ServerMessage>(text) else {
                 return;
             };
-            for update in snapshot.positions {
-                world.positions.insert(
-                    update.id,
-                    Position {
-                        x: update.x,
-                        y: update.y,
-                        z: update.z,
-                    },
-                );
+            match message {
+                ServerMessage::Welcome { entity } => *own_entity = Some(entity),
+                ServerMessage::Snapshot(snapshot) => {
+                    for update in snapshot.positions {
+                        world.positions.insert(
+                            update.id,
+                            Position {
+                                x: update.x,
+                                y: update.y,
+                                z: update.z,
+                            },
+                        );
+                    }
+                }
             }
         });
     }
