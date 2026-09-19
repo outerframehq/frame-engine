@@ -291,6 +291,74 @@ pub struct Substance {
     pub toxicity: Option<f32>,
 }
 
+impl Substance {
+    /// Blend two substances into a new one, freeform: no fixed recipes, any
+    /// two substances in any ratio. `ratio` is `self`'s share, clamped to
+    /// 0.0 to 1.0; `other` gets the rest.
+    ///
+    /// For each property: if both have a value, they're weighted by `ratio`.
+    /// If only one has a value, the missing side is treated as 0.0 rather
+    /// than dropping the property, so mixing in a trace of something
+    /// magnetic gives a small amount of magnetism, not none. If neither has
+    /// a value, the result doesn't either; a blend can't invent a property
+    /// neither input had.
+    ///
+    /// This is deliberately one simple linear blend for every property,
+    /// including melting point, which in reality often doesn't blend
+    /// linearly at all (a real alloy's melting point can sit well below
+    /// either component, a eutectic point). Real-world accuracy isn't the
+    /// goal here, the values in this system are already deliberately
+    /// different from reality elsewhere in the design, so a uniform, honest
+    /// rule beats a "more realistic" one that would only be realistic for
+    /// some properties and not others.
+    pub fn blend(&self, other: &Substance, ratio: f32) -> Substance {
+        let ratio = ratio.clamp(0.0, 1.0);
+        Substance {
+            melting_point_c: blend_field(self.melting_point_c, other.melting_point_c, ratio),
+            boiling_point_c: blend_field(self.boiling_point_c, other.boiling_point_c, ratio),
+            ignition_point_c: blend_field(self.ignition_point_c, other.ignition_point_c, ratio),
+            durability: blend_field(self.durability, other.durability, ratio),
+            yield_strength: blend_field(self.yield_strength, other.yield_strength, ratio),
+            malleability: blend_field(self.malleability, other.malleability, ratio),
+            specific_heat: blend_field(self.specific_heat, other.specific_heat, ratio),
+            thermal_conductivity: blend_field(
+                self.thermal_conductivity,
+                other.thermal_conductivity,
+                ratio,
+            ),
+            electrical_conductivity: blend_field(
+                self.electrical_conductivity,
+                other.electrical_conductivity,
+                ratio,
+            ),
+            magnetism: blend_field(self.magnetism, other.magnetism, ratio),
+            corrosion_resistance: blend_field(
+                self.corrosion_resistance,
+                other.corrosion_resistance,
+                ratio,
+            ),
+            density: blend_field(self.density, other.density, ratio),
+            flammability: blend_field(self.flammability, other.flammability, ratio),
+            explosive_potential: blend_field(
+                self.explosive_potential,
+                other.explosive_potential,
+                ratio,
+            ),
+            toxicity: blend_field(self.toxicity, other.toxicity, ratio),
+        }
+    }
+}
+
+/// Blend one property between two substances. Both present blends by ratio;
+/// one present treats the missing side as 0.0 rather than dropping the
+/// property; neither present stays `None`.
+fn blend_field(a: Option<f32>, b: Option<f32>, ratio: f32) -> Option<f32> {
+    match (a, b) {
+        (None, None) => None,
+        (a, b) => Some(a.unwrap_or(0.0) * ratio + b.unwrap_or(0.0) * (1.0 - ratio)),
+    }
+}
+
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq)]
 pub struct Scale {
     pub x: f32,
