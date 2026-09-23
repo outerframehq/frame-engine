@@ -197,18 +197,68 @@ Two kinds exist:
   (above `0.5` becomes `0.0`, otherwise `1.0`) for every entity that already
   has a value under that name. Same "can't originate a value" rule as fields.
 
+A third kind, `ToggleGlobal`, exists too, covered in Panels below, since it's
+the one that makes sense there rather than on its own.
+
 That's the complete list. A menu action is not a callback and can't run
-arbitrary plugin code, it names one of these two kinds, and the editor is the
+arbitrary plugin code, it names one of these kinds, and the editor is the
 only thing that ever decides what happens and does it.
 
-## What plugins can't do yet
+## Panels
 
-Fields and menu actions cover two of the three pieces of a real
-editor-extension surface. The third, **panels**, custom UI a plugin draws its
-own layout into, doesn't exist yet. It's a genuine, intended direction, and
-the hardest of the three to do safely: closer to designing a small
-declarative description format than reusing something that already exists
-the way fields and actions did.
+Fields are tied to an entity. Actions show up per plugin, but a plugin might
+want a section that's genuinely **not** about any one entity, a settings
+panel, a status display, a set of toggles that apply globally. That's what a
+panel is: a titled section in the Plugins panel, shown regardless of what's
+selected, or whether anything is.
+
+```ron
+(
+    name: "mywander",
+    version: "0.1.0",
+    author: "your name",
+    description: "A couple of simple wander behaviours.",
+    panels: [
+        (
+            title: "Wander settings",
+            fields: [
+                (name: "mywander/global_speed", label: "Global speed", min: Some(0.0), max: Some(5.0)),
+            ],
+            actions: [
+                (label: "Toggle wandering", kind: ToggleGlobal(name: "mywander/enabled")),
+            ],
+        ),
+    ],
+)
+```
+
+A panel is self-contained: its own `fields` and its own `actions`, not
+references into the plugin's top-level lists. That's deliberate, so
+reordering or editing one list can never silently break the other.
+
+Panel fields work like Inspector fields, a slider or a drag box, `min`/`max`
+optional, but read from a **global value** (a flat, world-wide store keyed by
+name) instead of a per-entity one. The same "can't originate a value" rule
+still applies: a panel field only shows up once something has already set
+that global value, the field itself can't invent one. `ToggleGlobal` is the
+global-value equivalent of `ToggleValue`, same 0.0/1.0 flip, just not tied to
+any entity.
+
+Global values are always `f64`, the only type used anywhere in this system.
+There's no reason for anything reading or writing a panel value to be more
+complicated than that.
+
+## What plugins can do now
+
+Fields, actions, and panels together cover the full editor-extension surface
+this format set out to build: a plugin can add its own Inspector control, its
+own buttons, and its own titled, global section, all without running any code
+of its own inside the editor. What it still can't do: draw truly custom
+layout, arbitrary widgets beyond a slider/drag-box and a button, or anything
+outside this fixed, small set of primitives. That's a deliberate boundary, not
+a gap waiting to be filled; going further would mean giving Rhai real
+bindings into the editor's UI library, a much bigger trust boundary than
+anything this system does today.
 
 ## Sharing a plugin
 
