@@ -1,9 +1,11 @@
 const LOGO_PNG: &[u8] = include_bytes!("../assets/frame-editor.png");
+use bytemuck::Zeroable;
 use frame_engine::core::Clock;
 use frame_engine::input::{Button, InputState};
 use frame_engine::systems;
 use frame_engine::world::{
-    Controlled, Gravity, Mesh, Position, Script, ScriptRuntime, Static, Velocity, World,
+    Controlled, Gravity, Light, LightKind, Mesh, Position, Script, ScriptRuntime, Static, Velocity,
+    World,
 };
 use glam::{Mat4, Vec3, Vec4};
 use std::sync::Arc;
@@ -45,6 +47,30 @@ const GIZMO_PICK_PX: f32 = 10.0;
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 struct CameraUniform {
     view_proj: [[f32; 4]; 4],
+}
+// One light's data handed to the shader. Must match the `Light` struct in
+// shader.wgsl field-for-field, including the deliberate use of [f32; 4]
+// (rather than [f32; 3]) everywhere, purely to keep every light a clean
+// 16-byte-aligned multiple in the uniform buffer, sidestepping WGSL's
+// alignment rules for vec3.
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct LightRaw {
+    // xyz: direction toward the light (directional) or world position
+    // (point). w unused.
+    position_or_direction: [f32; 4],
+    // x: kind, 0.0 directional, 1.0 point. y: range (point only). z:
+    // intensity, 0.0 marks an unused slot. w unused.
+    params: [f32; 4],
+}
+// A fixed number of simultaneously active lights sent to the shader every
+// frame, unused slots zeroed (intensity 0.0), matching MAX_LIGHTS in
+// shader.wgsl.
+const MAX_LIGHTS: usize = 4;
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct LightsUniform {
+    lights: [LightRaw; MAX_LIGHTS],
 }
 // Per-vertex mesh geometry: a position in the primitive's local (roughly unit)
 // space and its surface normal. One shared vertex buffer holds every primitive's
@@ -488,7 +514,8 @@ struct GpuState {
     mesh_vertex_buffer: wgpu::Buffer,
     mesh_ranges: Vec<std::ops::Range<u32>>,
     camera_buffer: wgpu::Buffer,
-    camera_bind_group: wgpu::BindGroup,
+    lights_buffer: wgpu::Buffer,
+    scene_bind_group: wgpu::BindGroup,
     depth_view: wgpu::TextureView,
     egui_renderer: egui_wgpu::Renderer,
 }
@@ -525,27 +552,57 @@ impl GpuState {
             contents: bytemuck::cast_slice(&[camera_uniform]),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
-        let camera_bind_group_layout =
+        // Zeroed lights (every slot's intensity 0.0, so the shader's loop
+        // contributes nothing from any of them) until the first real frame
+        // fills this in from the world's Light entities.
+        let lights_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("lights buffer"),
+            contents: bytemuck::cast_slice(&[LightsUniform {
+                lights: [LightRaw::zeroed(); MAX_LIGHTS],
+            }]),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        let scene_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("camera bind group layout"),
-                entries: &[wgpu::BindGroupLayoutEntry {
-                    binding: 0,
-                    visibility: wgpu::ShaderStages::VERTEX,
-                    ty: wgpu::BindingType::Buffer {
-                        ty: wgpu::BufferBindingType::Uniform,
-                        has_dynamic_offset: false,
-                        min_binding_size: None,
+                label: Some("scene bind group layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::VERTEX,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
                     },
-                    count: None,
-                }],
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        // Lighting is computed per fragment now, not per
+                        // vertex, so only the fragment stage needs this.
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
             });
-        let camera_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: Some("camera bind group"),
-            layout: &camera_bind_group_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: camera_buffer.as_entire_binding(),
-            }],
+        let scene_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("scene bind group"),
+            layout: &scene_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: camera_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: lights_buffer.as_entire_binding(),
+                },
+            ],
         });
         // --- Primitive geometry: one shared vertex buffer, built once ---
         // Concatenate every primitive's vertices and remember each one's range,
@@ -557,7 +614,7 @@ impl GpuState {
         let entity_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("entity pipeline layout"),
-                bind_group_layouts: &[Some(&camera_bind_group_layout)],
+                bind_group_layouts: &[Some(&scene_bind_group_layout)],
                 immediate_size: 0,
             });
         let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -644,7 +701,8 @@ impl GpuState {
             mesh_vertex_buffer,
             mesh_ranges,
             camera_buffer,
-            camera_bind_group,
+            lights_buffer,
+            scene_bind_group,
             depth_view,
             egui_renderer,
         }
@@ -675,6 +733,7 @@ impl GpuState {
         group_counts: &[u32],
         text_instances: &[TextInstance],
         view_proj: [[f32; 4]; 4],
+        lights: &[LightRaw; MAX_LIGHTS],
         egui_paint_jobs: &[egui::epaint::ClippedPrimitive],
         egui_textures_delta: &egui::TexturesDelta,
         egui_ppp: f32,
@@ -684,6 +743,11 @@ impl GpuState {
             &self.camera_buffer,
             0,
             bytemuck::cast_slice(&[camera_uniform]),
+        );
+        self.queue.write_buffer(
+            &self.lights_buffer,
+            0,
+            bytemuck::cast_slice(&[LightsUniform { lights: *lights }]),
         );
         // egui: upload any new/changed textures before we start encoding.
         for (id, image_delta) in &egui_textures_delta.set {
@@ -779,7 +843,7 @@ impl GpuState {
             // primitive with any instances, draw its vertex range for its
             // contiguous slice of instances.
             render_pass.set_pipeline(&self.render_pipeline);
-            render_pass.set_bind_group(0, &self.camera_bind_group, &[]);
+            render_pass.set_bind_group(0, &self.scene_bind_group, &[]);
             if let Some(buffer) = &instance_buffer {
                 render_pass.set_vertex_buffer(0, self.mesh_vertex_buffer.slice(..));
                 let stride = std::mem::size_of::<InstanceRaw>() as wgpu::BufferAddress;
@@ -911,20 +975,27 @@ enum MenuAction {
 }
 /// The selected entity's editable state, lifted out of the world for the
 /// Inspector to edit and written back after the egui pass.
-type EditedEntity = (
-    usize,
-    Position,
-    Velocity,
-    frame_engine::world::Color,
-    bool,
-    frame_engine::world::Scale,
-    frame_engine::world::Material,
-    frame_engine::world::Rotation,
-    Option<String>,
-    Mesh,
-    bool,
-    bool,
-);
+/// The selected entity's editable state, lifted out of the world for the
+/// Inspector to edit and written back after the egui pass. A named struct
+/// rather than a plain tuple: std's auto-derived PartialEq/Clone/etc. for
+/// tuples only go up to 12 elements, and this grew past that once Light was
+/// added as a 13th. A named struct has no such cap.
+#[derive(Clone, PartialEq)]
+struct EditedEntity {
+    id: usize,
+    pos: Position,
+    vel: Velocity,
+    color: frame_engine::world::Color,
+    controlled: bool,
+    scale: frame_engine::world::Scale,
+    material: frame_engine::world::Material,
+    rotation: frame_engine::world::Rotation,
+    script_source: Option<String>,
+    mesh: Mesh,
+    is_static: bool,
+    has_gravity: bool,
+    light: Option<Light>,
+}
 
 /// Source Control tab: a read-only view of the open project's git state —
 /// branch, ahead/behind its upstream, and the changed files. No push, pull, or
@@ -1276,7 +1347,7 @@ fn inspector_tab_ui(
     custom_fields: &mut [EditableCustomField],
 ) {
     match edited {
-        Some((
+        Some(EditedEntity {
             id,
             pos,
             vel,
@@ -1289,7 +1360,8 @@ fn inspector_tab_ui(
             mesh,
             is_static,
             has_gravity,
-        )) => {
+            light,
+        }) => {
             ui.label(format!("Entity {id}"));
             ui.add_space(4.0);
             ui.label("Position");
@@ -1374,6 +1446,75 @@ fn inspector_tab_ui(
             ui.checkbox(controlled, "Controlled (WASD)");
             ui.checkbox(is_static, "Static (immovable)");
             ui.checkbox(has_gravity, "Gravity (falls)");
+            ui.add_space(8.0);
+            ui.label("Light");
+            let mut has_light = light.is_some();
+            if ui.checkbox(&mut has_light, "Light source").changed() {
+                *light = if has_light {
+                    Some(Light::default())
+                } else {
+                    None
+                };
+            }
+            if let Some(l) = light {
+                let mut is_point = matches!(l.kind, LightKind::Point { .. });
+                egui::ComboBox::from_id_salt("light_kind_picker")
+                    .selected_text(if is_point { "Point" } else { "Directional" })
+                    .show_ui(ui, |ui| {
+                        if ui
+                            .selectable_value(&mut is_point, false, "Directional")
+                            .clicked()
+                            || ui.selectable_value(&mut is_point, true, "Point").clicked()
+                        {
+                            // Switching kind starts that kind fresh rather than
+                            // trying to carry a direction into a range or back;
+                            // the two don't correspond to each other.
+                            l.kind = if is_point {
+                                LightKind::Point { range: 200.0 }
+                            } else {
+                                LightKind::Directional {
+                                    direction: [0.4, 0.8, 0.6],
+                                }
+                            };
+                        }
+                    });
+                match &mut l.kind {
+                    LightKind::Directional { direction } => {
+                        ui.horizontal(|ui| {
+                            ui.label("Direction");
+                            ui.add(
+                                egui::DragValue::new(&mut direction[0])
+                                    .speed(0.01)
+                                    .prefix("x: "),
+                            );
+                            ui.add(
+                                egui::DragValue::new(&mut direction[1])
+                                    .speed(0.01)
+                                    .prefix("y: "),
+                            );
+                            ui.add(
+                                egui::DragValue::new(&mut direction[2])
+                                    .speed(0.01)
+                                    .prefix("z: "),
+                            );
+                        });
+                    }
+                    LightKind::Point { range } => {
+                        ui.horizontal(|ui| {
+                            ui.label("Range");
+                            ui.add(egui::DragValue::new(range).speed(1.0).range(0.0..=f32::MAX));
+                        });
+                    }
+                }
+                ui.horizontal(|ui| {
+                    ui.label("Intensity");
+                    ui.add(
+                        egui::DragValue::new(&mut l.intensity)
+                            .speed(0.05)
+                            .range(0.0..=f32::MAX),
+                    );
+                });
+            }
             ui.add_space(8.0);
             ui.label("Script");
             if script_library.is_empty() {
@@ -2312,6 +2453,7 @@ impl App {
                 &[0, 0, 0],
                 &[],
                 Mat4::IDENTITY.to_cols_array_2d(),
+                &[LightRaw::zeroed(); MAX_LIGHTS],
                 &jobs,
                 &tex_delta,
                 ppp,
@@ -2619,10 +2761,12 @@ impl App {
             }
             None => return,
         };
-        let (instances, group_counts) = match &self.game_world {
+        let (instances, group_counts, lights) = match &self.game_world {
             Some(world) => {
                 let empty = std::collections::HashSet::new();
-                build_instances(world, None, &empty, &self.game_custom_names)
+                let (instances, group_counts) =
+                    build_instances(world, None, &empty, &self.game_custom_names);
+                (instances, group_counts, build_lights(world))
             }
             None => return,
         };
@@ -2642,6 +2786,7 @@ impl App {
                 &group_counts,
                 &[],
                 view_proj,
+                &lights,
                 &[],
                 &egui::TexturesDelta::default(),
                 1.0,
@@ -3451,6 +3596,7 @@ impl ApplicationHandler for App {
                 let custom_names: Vec<String> = self.custom_meshes.keys().cloned().collect();
                 let (instances, group_counts) =
                     build_instances(&self.world, selected, &colliding, &custom_names);
+                let lights = build_lights(&self.world);
                 let (width, height) = match &self.window {
                     Some(window) => {
                         let size = window.inner_size();
@@ -3573,20 +3719,21 @@ impl ApplicationHandler for App {
                     .collect();
                 let new_selection = self.selected;
                 let edited = self.selected.and_then(|id| {
-                    Some((
+                    Some(EditedEntity {
                         id,
-                        *self.world.positions.get(id)?,
-                        *self.world.velocities.get(id)?,
-                        self.world.colors.get(id).copied().unwrap_or_default(),
-                        self.world.controlled.get(id).is_some(),
-                        self.world.scales.get(id).copied().unwrap_or_default(),
-                        self.world.materials.get(id).copied().unwrap_or_default(),
-                        self.world.rotations.get(id).copied().unwrap_or_default(),
-                        self.world.scripts.get(id).map(|s| s.uses.clone()),
-                        self.world.meshes.get(id).cloned().unwrap_or_default(),
-                        self.world.statics.get(id).is_some(),
-                        self.world.gravities.get(id).is_some(),
-                    ))
+                        pos: *self.world.positions.get(id)?,
+                        vel: *self.world.velocities.get(id)?,
+                        color: self.world.colors.get(id).copied().unwrap_or_default(),
+                        controlled: self.world.controlled.get(id).is_some(),
+                        scale: self.world.scales.get(id).copied().unwrap_or_default(),
+                        material: self.world.materials.get(id).copied().unwrap_or_default(),
+                        rotation: self.world.rotations.get(id).copied().unwrap_or_default(),
+                        script_source: self.world.scripts.get(id).map(|s| s.uses.clone()),
+                        mesh: self.world.meshes.get(id).cloned().unwrap_or_default(),
+                        is_static: self.world.statics.get(id).is_some(),
+                        has_gravity: self.world.gravities.get(id).is_some(),
+                        light: self.world.lights.get(id).copied(),
+                    })
                 });
                 // For each enabled plugin's declared fields, keep the ones
                 // the selected entity actually has a value under. A field
@@ -4047,7 +4194,7 @@ impl ApplicationHandler for App {
                 // Push any inspector edits back into the world. The render this
                 // frame already used the old values; the change shows next frame
                 // (same one-frame path as the keyboard nudge).
-                if let Some((
+                if let Some(EditedEntity {
                     id,
                     pos,
                     vel,
@@ -4060,7 +4207,8 @@ impl ApplicationHandler for App {
                     mesh,
                     is_static,
                     has_gravity,
-                )) = edited
+                    light,
+                }) = edited
                 {
                     if let Some(p) = self.world.positions.get_mut(id) {
                         *p = pos;
@@ -4087,6 +4235,14 @@ impl ApplicationHandler for App {
                         self.world.gravities.insert(id, Gravity);
                     } else {
                         self.world.gravities.remove(id);
+                    }
+                    match light {
+                        Some(l) => {
+                            self.world.lights.insert(id, l);
+                        }
+                        None => {
+                            self.world.lights.remove(id);
+                        }
                     }
                     match script_source {
                         Some(uses) => {
@@ -4137,6 +4293,7 @@ impl ApplicationHandler for App {
                         &group_counts,
                         &text_instances,
                         view_proj,
+                        &lights,
                         &egui_paint_jobs,
                         &egui_textures_delta,
                         egui_ppp,
@@ -4626,6 +4783,48 @@ fn build_instances(
     let group_counts: Vec<u32> = buckets.iter().map(|b| b.len() as u32).collect();
     let instances: Vec<InstanceRaw> = buckets.into_iter().flatten().collect();
     (instances, group_counts)
+}
+
+/// Gather up to MAX_LIGHTS active Light entities from the world into the
+/// fixed-size array the shader's uniform buffer expects, in entity id order.
+/// A Light entity beyond the cap is silently not drawn, a real, named
+/// limitation rather than an unbounded per-frame cost. Unused slots are
+/// left zeroed (intensity 0.0), which the shader's loop reads as "nothing
+/// here".
+fn build_lights(world: &World) -> [LightRaw; MAX_LIGHTS] {
+    let mut out = [LightRaw::zeroed(); MAX_LIGHTS];
+    let mut count = 0usize;
+    for (id, slot) in world.lights.iter().enumerate() {
+        if count >= MAX_LIGHTS {
+            break;
+        }
+        let Some(light) = slot.as_ref() else {
+            continue;
+        };
+        let (position_or_direction, kind_flag, range) = match light.kind {
+            LightKind::Directional { direction } => {
+                ([direction[0], direction[1], direction[2], 0.0], 0.0, 0.0)
+            }
+            LightKind::Point { range } => {
+                // Position has no Default (every entity is meant to be
+                // spawned with an explicit one), so a Point light on a
+                // slot with no position at all falls back to the world
+                // origin rather than relying on one.
+                let p = world.positions.get(id).copied().unwrap_or(Position {
+                    x: 0.0,
+                    y: 0.0,
+                    z: 0.0,
+                });
+                ([p.x, p.y, p.z, 0.0], 1.0, range)
+            }
+        };
+        out[count] = LightRaw {
+            position_or_direction,
+            params: [kind_flag, range, light.intensity, 0.0],
+        };
+        count += 1;
+    }
+    out
 }
 
 fn default_world() -> World {

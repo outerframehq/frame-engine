@@ -444,6 +444,67 @@ impl Default for Rotation {
     }
 }
 
+/// What kind of light source an entity with a `Light` component is.
+/// Deliberately not reusing `Rotation` for a directional light's direction:
+/// `Rotation` is yaw-only (a turn around the world's vertical axis), and a
+/// light angled down from the sky needs pitch too, a genuinely different
+/// thing from how an entity itself is turned.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq)]
+pub enum LightKind {
+    /// An infinitely-distant light with a fixed direction, like a sun. No
+    /// falloff with distance. `direction` points toward the light (the same
+    /// convention the engine's original hard-coded directional term always
+    /// used), not the direction the light travels.
+    Directional { direction: [f32; 3] },
+    /// A light at the entity's own `Position`, with a limited `range`: a
+    /// simple linear falloff to zero at that distance, not a
+    /// physically-accurate inverse-square falloff, a deliberately simple
+    /// first pass.
+    Point { range: f32 },
+}
+
+impl Default for LightKind {
+    fn default() -> Self {
+        // Matches the engine's original hard-coded light_dir exactly, so a
+        // scene's first Light, added with defaults, reproduces the old
+        // fixed shading rather than looking different from day one.
+        LightKind::Directional {
+            direction: [0.4, 0.8, 0.6],
+        }
+    }
+}
+
+/// Per-entity light source. Optional, like `Static` or `Gravity`: most
+/// entities have none, added only to the ones that should actually
+/// illuminate the scene. A small, fixed number of active lights are combined
+/// additively in the shader (see the renderer); beyond that cap, additional
+/// lights are simply not drawn, a real, named limitation rather than an
+/// unbounded cost.
+///
+/// A scene saved before this existed has no `Light` entities at all, and
+/// will render flatter than before, ambient only, no directional shading,
+/// until one is added. That's a real, one-time visible change on upgrade,
+/// not hidden behind an implicit fallback light the shader would otherwise
+/// need to invent.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq)]
+pub struct Light {
+    pub kind: LightKind,
+    /// A brightness multiplier. 1.0 matches the strength of the original
+    /// hard-coded directional light this replaces; a scene with several
+    /// active lights will usually want each dimmer than that, or the
+    /// combined shading blows out past full white.
+    pub intensity: f32,
+}
+
+impl Default for Light {
+    fn default() -> Self {
+        Light {
+            kind: LightKind::default(),
+            intensity: 1.0,
+        }
+    }
+}
+
 /// Per-entity health: how much damage this entity can take before dying.
 /// Starts as a single tracked number, the same "start minimal, grow later"
 /// path Material took with just emissive: no damage system, no death or
@@ -477,6 +538,10 @@ pub struct World {
     pub statics: ComponentStorage<Static>,
     #[serde(default)]
     pub gravities: ComponentStorage<Gravity>,
+    /// Optional per-entity light sources, the same "most entities have
+    /// none" shape as `statics`/`gravities` above.
+    #[serde(default)]
+    pub lights: ComponentStorage<Light>,
     /// Metadata for imported meshes, keyed by mesh name. Works like
     /// script_library does for scripts.
     #[serde(default)]
@@ -629,6 +694,7 @@ impl World {
             // old marker and hand it to whatever spawns into that slot next
             self.statics.remove(id);
             self.gravities.remove(id);
+            self.lights.remove(id);
             // Every registered dynamic component too, without needing to know
             // any of their types: remove_erased is exactly what that's for.
             for entry in self.dynamic.values_mut() {
