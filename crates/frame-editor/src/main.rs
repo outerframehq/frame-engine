@@ -4,8 +4,8 @@ use frame_engine::core::Clock;
 use frame_engine::input::{Button, InputState};
 use frame_engine::systems;
 use frame_engine::world::{
-    Controlled, Gravity, Light, LightKind, Mesh, Position, Script, ScriptRuntime, Static, Velocity,
-    World,
+    Controlled, Gravity, Light, LightKind, Mesh, Position, Script, ScriptRuntime, Sound, Static,
+    Velocity, World,
 };
 use glam::{Mat4, Vec3, Vec4};
 use std::sync::Arc;
@@ -995,6 +995,7 @@ struct EditedEntity {
     is_static: bool,
     has_gravity: bool,
     light: Option<Light>,
+    sound: Option<Sound>,
 }
 
 /// Source Control tab: a read-only view of the open project's git state —
@@ -1361,6 +1362,7 @@ fn inspector_tab_ui(
             is_static,
             has_gravity,
             light,
+            sound,
         }) => {
             ui.label(format!("Entity {id}"));
             ui.add_space(4.0);
@@ -1514,6 +1516,28 @@ fn inspector_tab_ui(
                             .range(0.0..=f32::MAX),
                     );
                 });
+            }
+            ui.add_space(8.0);
+            ui.label("Sound");
+            let mut has_sound = sound.is_some();
+            if ui.checkbox(&mut has_sound, "Sound source").changed() {
+                *sound = if has_sound {
+                    Some(Sound::default())
+                } else {
+                    None
+                };
+            }
+            if let Some(s) = sound {
+                ui.horizontal(|ui| {
+                    ui.label("File");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut s.name)
+                            .hint_text("e.g. footstep.wav, under assets/"),
+                    );
+                });
+                if ui.button("Play now").clicked() {
+                    s.play = true;
+                }
             }
             ui.add_space(8.0);
             ui.label("Script");
@@ -2019,6 +2043,15 @@ struct App {
     editor_settings_open: bool,
     // GPU texture for the toolbar logo, uploaded once on the first frame.
     logo_texture: Option<egui::TextureHandle>,
+    // The kira audio backend. None if the host's audio device couldn't be
+    // opened (a headless CI box, say); Sound components still exist and
+    // edit fine, they just never actually play without a manager.
+    audio_manager: Option<kira::AudioManager<kira::DefaultBackend>>,
+    // Loaded sound files, keyed by their name as a Sound component names
+    // them, so the same file is decoded once and every play() after that is
+    // a cheap Arc-backed clone (see StaticSoundData's own docs), not a
+    // re-read from disk every time a Sound fires.
+    sound_cache: std::collections::HashMap<String, kira::sound::static_sound::StaticSoundData>,
 }
 impl App {
     /// Append a line to the in-editor log (shown in the console Output tab) and
@@ -2744,6 +2777,14 @@ impl App {
     /// (always running), draw it with the shared 3D pipeline, and no egui/overlay.
     fn render_game(&mut self) {
         let owed = self.game_clock.advance(true);
+        // Same project the editor has open, so sound files resolve under its
+        // assets/ folder the same way build_instances' custom meshes do.
+        let assets_root = self
+            .current_scene_path
+            .as_ref()
+            .and_then(|p| p.parent())
+            .map(|p| p.join("assets"));
+        let mut sound_messages = Vec::new();
         for _ in 0..owed {
             if let Some(world) = self.game_world.as_mut() {
                 systems::collision(world);
@@ -2752,7 +2793,19 @@ impl App {
                 systems::gravity(world);
                 systems::movement(world);
                 systems::resolve_collisions(world);
+                sound_messages.extend(update_sounds(
+                    world,
+                    self.audio_manager.as_mut(),
+                    &mut self.sound_cache,
+                    assets_root.as_deref(),
+                ));
             }
+        }
+        // Logged after the loop, once world's borrow above has ended. self.log
+        // needs &mut self, which would conflict with the still-live `world`
+        // borrow if called from inside the loop.
+        for msg in sound_messages {
+            self.log(msg);
         }
         let (width, height) = match &self.game_window {
             Some(w) => {
@@ -3565,6 +3618,15 @@ impl ApplicationHandler for App {
                     self.cam_eye += mv.normalize_or_zero() * CAM_PAN_SPEED;
                 }
                 let owed = self.clock.advance(!self.paused);
+                // Same folder the Assets tab and imported models resolve
+                // against, computed here too since the tick loop runs before
+                // that local is set up further down.
+                let tick_assets_root = self
+                    .current_scene_path
+                    .as_ref()
+                    .and_then(|p| p.parent())
+                    .map(|p| p.join("assets"));
+                let mut sound_messages = Vec::new();
                 for _ in 0..owed {
                     // Detection runs first each tick, so a script can read whether
                     // its entity is colliding *this* tick (via the `hit` variable)
@@ -3578,6 +3640,18 @@ impl ApplicationHandler for App {
                     systems::gravity(&mut self.world);
                     systems::movement(&mut self.world);
                     systems::resolve_collisions(&mut self.world);
+                    sound_messages.extend(update_sounds(
+                        &mut self.world,
+                        self.audio_manager.as_mut(),
+                        &mut self.sound_cache,
+                        tick_assets_root.as_deref(),
+                    ));
+                }
+                // Logged after the loop ends, once self.world's borrow above
+                // is done. self.log needs &mut self, which would conflict
+                // with a still-live world borrow from inside the loop.
+                for msg in sound_messages {
+                    self.log(msg);
                 }
                 // Refresh collisions once more for the editor's red tint. Inside
                 // the loop, detection ran at each tick's start (before that tick's
@@ -3733,6 +3807,7 @@ impl ApplicationHandler for App {
                         is_static: self.world.statics.get(id).is_some(),
                         has_gravity: self.world.gravities.get(id).is_some(),
                         light: self.world.lights.get(id).copied(),
+                        sound: self.world.sounds.get(id).cloned(),
                     })
                 });
                 // For each enabled plugin's declared fields, keep the ones
@@ -4208,6 +4283,7 @@ impl ApplicationHandler for App {
                     is_static,
                     has_gravity,
                     light,
+                    sound,
                 }) = edited
                 {
                     if let Some(p) = self.world.positions.get_mut(id) {
@@ -4242,6 +4318,14 @@ impl ApplicationHandler for App {
                         }
                         None => {
                             self.world.lights.remove(id);
+                        }
+                    }
+                    match sound {
+                        Some(s) => {
+                            self.world.sounds.insert(id, s);
+                        }
+                        None => {
+                            self.world.sounds.remove(id);
                         }
                     }
                     match script_source {
@@ -4827,6 +4911,80 @@ fn build_lights(world: &World) -> [LightRaw; MAX_LIGHTS] {
     out
 }
 
+/// Turn each entity's pending `Sound.play` request into an actual sound,
+/// clearing the flag once handled either way (a missing file or no audio
+/// device still consumes the request, rather than retrying it every tick
+/// forever). Returns log lines for the caller to print, since logging here
+/// directly would need `&mut self` while `world` is already borrowed from
+/// either `self.world` or `self.game_world`, the same reason this is a
+/// free function taking `world` explicitly rather than an `App` method: a
+/// method could only ever reach `self.world`, never the Play window's
+/// separately-held `self.game_world`.
+///
+/// `assets_root` is the open project's `assets/` folder; a `Sound.name`
+/// resolves under it, the same convention `Mesh::Custom` already uses for
+/// imported models. No audio device (`audio_manager` is `None`) or no
+/// project open (`assets_root` is `None`) both mean requests are quietly
+/// dropped rather than erroring, since a Sound component is still valid
+/// data either way, it just can't play right now.
+fn update_sounds(
+    world: &mut World,
+    mut audio_manager: Option<&mut kira::AudioManager<kira::DefaultBackend>>,
+    sound_cache: &mut std::collections::HashMap<String, kira::sound::static_sound::StaticSoundData>,
+    assets_root: Option<&std::path::Path>,
+) -> Vec<String> {
+    let mut messages = Vec::new();
+    let ids: Vec<usize> = world
+        .sounds
+        .iter()
+        .enumerate()
+        .filter_map(|(id, slot)| slot.as_ref().filter(|s| s.play).map(|_| id))
+        .collect();
+    for id in ids {
+        // Read the name, then immediately clear the request flag: whatever
+        // happens below (missing manager, missing file, decode error), this
+        // one-shot request is spent, not retried next tick.
+        let name = world
+            .sounds
+            .get(id)
+            .map(|s| s.name.clone())
+            .unwrap_or_default();
+        if let Some(s) = world.sounds.get_mut(id) {
+            s.play = false;
+        }
+        let Some(manager) = audio_manager.as_deref_mut() else {
+            continue;
+        };
+        let Some(root) = assets_root else {
+            messages.push(format!(
+                "Sound '{name}' requested on entity {id}, but no project is open."
+            ));
+            continue;
+        };
+        if !sound_cache.contains_key(&name) {
+            let path = root.join(&name);
+            match kira::sound::static_sound::StaticSoundData::from_file(&path) {
+                Ok(data) => {
+                    sound_cache.insert(name.clone(), data);
+                }
+                Err(e) => {
+                    messages.push(format!("Couldn't load sound '{name}': {e:?}"));
+                    continue;
+                }
+            }
+        }
+        // Cheap clone: StaticSoundData shares its decoded audio data through
+        // an Arc, so this doesn't re-read or re-decode the file, it just
+        // hands the manager another handle to the same samples.
+        if let Some(data) = sound_cache.get(&name) {
+            if let Err(e) = manager.play(data.clone()) {
+                messages.push(format!("Couldn't play sound '{name}': {e:?}"));
+            }
+        }
+    }
+    messages
+}
+
 fn default_world() -> World {
     let mut world = World::new();
     world.spawn(
@@ -4956,6 +5114,16 @@ fn main() {
         editor_settings_open: false,
         script_runtime: script::RhaiRuntime::new(),
         logo_texture: None,
+        // A missing/unusable audio device (headless, no default output) is a
+        // real, expected case, not a crash: the editor still runs, sounds
+        // just silently don't play, the same graceful-degradation the game
+        // window already gives a closed window.
+        audio_manager: kira::AudioManager::<kira::DefaultBackend>::new(
+            kira::AudioManagerSettings::default(),
+        )
+        .map_err(|e| eprintln!("Audio device unavailable, sounds won't play: {e:?}"))
+        .ok(),
+        sound_cache: std::collections::HashMap::new(),
     };
     println!("Frame Editor started at the launcher.");
     event_loop.run_app(&mut app).unwrap();

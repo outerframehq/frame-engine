@@ -526,6 +526,26 @@ impl Default for Health {
     }
 }
 
+/// Per-entity sound source. Optional, like `Light`: most entities carry none,
+/// added only to the ones that should actually play audio. `name` names a
+/// sound file the host resolves (the editor looks it up under the project's
+/// assets folder), the same naming-by-string convention `Mesh::Custom` and
+/// scripts already use rather than the engine holding any actual audio data
+/// itself, keeping the engine graphics- and audio-free.
+///
+/// `play` is a one-shot request flag, the same pattern `spawn`/`despawn_id`
+/// already use for scripts: setting it to `true` (from a script, the editor,
+/// or any other host) asks for the sound to be played once; whatever system
+/// actually plays it clears the flag back to `false` after doing so, every
+/// tick. The engine itself never plays anything, it only carries this
+/// request; a host (the editor's `update_sounds`) is what turns `play` into
+/// an actual sound.
+#[derive(Serialize, Deserialize, Clone, Default, PartialEq)]
+pub struct Sound {
+    pub name: String,
+    pub play: bool,
+}
+
 #[derive(Serialize, Deserialize, Default, Clone)]
 pub struct World {
     pub positions: ComponentStorage<Position>,
@@ -542,6 +562,10 @@ pub struct World {
     /// none" shape as `statics`/`gravities` above.
     #[serde(default)]
     pub lights: ComponentStorage<Light>,
+    /// Optional per-entity sound sources, the same "most entities have none"
+    /// shape as `lights`/`statics`/`gravities` above.
+    #[serde(default)]
+    pub sounds: ComponentStorage<Sound>,
     /// Metadata for imported meshes, keyed by mesh name. Works like
     /// script_library does for scripts.
     #[serde(default)]
@@ -695,6 +719,7 @@ impl World {
             self.statics.remove(id);
             self.gravities.remove(id);
             self.lights.remove(id);
+            self.sounds.remove(id);
             // Every registered dynamic component too, without needing to know
             // any of their types: remove_erased is exactly what that's for.
             for entry in self.dynamic.values_mut() {
