@@ -2,10 +2,11 @@ const LOGO_PNG: &[u8] = include_bytes!("../assets/frame-editor.png");
 use bytemuck::Zeroable;
 use frame_engine::core::Clock;
 use frame_engine::input::{Button, InputState};
+use frame_engine::physics::Physics;
 use frame_engine::systems;
 use frame_engine::world::{
-    Controlled, Gravity, Light, LightKind, Mesh, Position, Script, ScriptRuntime, Sound, Static,
-    Velocity, World,
+    Controlled, Gravity, Light, LightKind, Mesh, Position, RigidBody, Script, ScriptRuntime,
+    Sound, Static, Velocity, World,
 };
 use glam::{Mat4, Vec3, Vec4};
 use std::sync::Arc;
@@ -994,6 +995,12 @@ struct EditedEntity {
     mesh: Mesh,
     is_static: bool,
     has_gravity: bool,
+    // Whether rapier3d simulates this entity instead of the hand-rolled
+    // movement/gravity/collision systems. Needs `is_static` or `has_gravity`
+    // to actually do anything (see `physics::Physics`); ticking this alone
+    // is a harmless no-op, not an error, the same "retried every tick"
+    // tolerance `Physics::sync_new_and_removed` already has for it.
+    is_rigid_body: bool,
     light: Option<Light>,
     sound: Option<Sound>,
 }
@@ -1361,6 +1368,7 @@ fn inspector_tab_ui(
             mesh,
             is_static,
             has_gravity,
+            is_rigid_body,
             light,
             sound,
         }) => {
@@ -1448,6 +1456,12 @@ fn inspector_tab_ui(
             ui.checkbox(controlled, "Controlled (WASD)");
             ui.checkbox(is_static, "Static (immovable)");
             ui.checkbox(has_gravity, "Gravity (falls)");
+            ui.checkbox(is_rigid_body, "Physics (rapier3d)")
+                .on_hover_text(
+                    "Simulated by rapier3d instead of the built-in movement/\
+                     gravity/collision. Needs Static or Gravity too; combined \
+                     with Controlled isn't supported yet.",
+                );
             ui.add_space(8.0);
             ui.label("Light");
             let mut has_light = light.is_some();
@@ -1940,6 +1954,11 @@ struct App {
     settings_description: String,
     settings_version: String,
     world: World,
+    // rapier3d state for `world`'s `RigidBody`-marked entities, kept
+    // alongside it the same way `script_runtime` is kept alongside rather
+    // than folded into `World` itself (see `physics::Physics`'s own doc
+    // comment for why).
+    physics: Physics,
     // Undo/redo: full-world snapshots. Pushed before a mutating gesture; undo
     // pops to the redo stack and back. `inspector_editing` coalesces a drag into
     // one snapshot. `ctrl_held`/`shift_held` track modifiers for the shortcuts.
@@ -2020,6 +2039,12 @@ struct App {
     game_window: Option<Arc<Window>>,
     game_gpu: Option<GpuState>,
     game_world: Option<World>,
+    // The Play window's own physics state, separate from `physics` above the
+    // same way `game_world` is separate from `world`. `None` whenever
+    // `game_world` is, created fresh each time Play starts (see
+    // `open_game`/`close_game`) rather than reused, so a previous play
+    // session's simulated bodies never leak into the next one.
+    game_physics: Option<Physics>,
     game_input: InputState,
     game_clock: Clock,
     // Set when the game window asks to close; the actual teardown happens in
@@ -2077,6 +2102,7 @@ impl App {
         if self.paused {
             systems::gravity(&mut self.world);
             systems::movement(&mut self.world);
+            self.physics.step(&mut self.world, 1.0 / TICK_RATE as f32);
             systems::resolve_collisions(&mut self.world);
             self.log("Stepped one tick");
         }
@@ -2758,6 +2784,9 @@ impl App {
         window.request_redraw();
         self.game_gpu = Some(gpu);
         self.game_world = Some(world);
+        // Fresh physics state for this play session; see `game_physics`'s
+        // own doc comment for why it isn't reused across Play runs.
+        self.game_physics = Some(Physics::new(-9.81));
         self.game_input = InputState::new();
         self.game_clock = Clock::new(TICK_RATE, MAX_CATCHUP_TICKS);
         self.game_window = Some(window);
@@ -2769,6 +2798,7 @@ impl App {
     fn close_game(&mut self) {
         self.game_gpu = None;
         self.game_world = None;
+        self.game_physics = None;
         self.game_window = None;
         self.game_input = InputState::new();
     }
@@ -2792,6 +2822,9 @@ impl App {
                 systems::input_movement(world, &self.game_input);
                 systems::gravity(world);
                 systems::movement(world);
+                if let Some(physics) = self.game_physics.as_mut() {
+                    physics.step(world, 1.0 / TICK_RATE as f32);
+                }
                 systems::resolve_collisions(world);
                 sound_messages.extend(update_sounds(
                     world,
@@ -3639,6 +3672,7 @@ impl ApplicationHandler for App {
                     }
                     systems::gravity(&mut self.world);
                     systems::movement(&mut self.world);
+                    self.physics.step(&mut self.world, 1.0 / TICK_RATE as f32);
                     systems::resolve_collisions(&mut self.world);
                     sound_messages.extend(update_sounds(
                         &mut self.world,
@@ -3806,6 +3840,7 @@ impl ApplicationHandler for App {
                         mesh: self.world.meshes.get(id).cloned().unwrap_or_default(),
                         is_static: self.world.statics.get(id).is_some(),
                         has_gravity: self.world.gravities.get(id).is_some(),
+                        is_rigid_body: self.world.rigid_bodies.get(id).is_some(),
                         light: self.world.lights.get(id).copied(),
                         sound: self.world.sounds.get(id).cloned(),
                     })
@@ -4282,6 +4317,7 @@ impl ApplicationHandler for App {
                     mesh,
                     is_static,
                     has_gravity,
+                    is_rigid_body,
                     light,
                     sound,
                 }) = edited
@@ -4311,6 +4347,11 @@ impl ApplicationHandler for App {
                         self.world.gravities.insert(id, Gravity);
                     } else {
                         self.world.gravities.remove(id);
+                    }
+                    if is_rigid_body {
+                        self.world.rigid_bodies.insert(id, RigidBody);
+                    } else {
+                        self.world.rigid_bodies.remove(id);
                     }
                     match light {
                         Some(l) => {
@@ -5034,6 +5075,10 @@ fn main() {
         window: None,
         gpu: None,
         world,
+        // -9.81: the same starting, tunable value `main.rs`'s standalone
+        // demo uses; see `physics::Physics::new`'s own doc comment for why
+        // there's no "correct" figure to match it against.
+        physics: Physics::new(-9.81),
         undo_stack: Vec::new(),
         redo_stack: Vec::new(),
         inspector_editing: false,
@@ -5103,6 +5148,7 @@ fn main() {
         game_window: None,
         game_gpu: None,
         game_world: None,
+        game_physics: None,
         game_input: InputState::new(),
         game_clock: Clock::new(TICK_RATE, MAX_CATCHUP_TICKS),
         game_closing: false,
