@@ -47,8 +47,13 @@ Editor (frame-editor):
 - Multi-light shading. The entity shader now sums up to four active `Light` entities per fragment (not per vertex, so falloff reads correctly across a face) on top of a flat ambient base, additive and clamped to full white. A `Light` beyond the four-light cap is silently not drawn, a real, named limitation rather than an unbounded per-frame cost. A Light section in the Inspector adds or removes the component, picks Directional or Point, and edits direction/range and intensity.
 - Sound playback through `kira`. A Sound section in the Inspector adds or removes the component, names its file, and a "Play now" button sets its `play` flag for a quick manual test. A new `update_sounds` step in both the main editor and the Play window's tick loop turns a pending request into an actual play call: the file is decoded once into a small in-memory cache (`StaticSoundData`, cheap to clone since the decoded samples are shared through an `Arc`) and every later play of the same name reuses it rather than re-reading the file. No audio device (a headless box, say) or no project open both just mean the request is quietly dropped, a `Sound` component is still valid data either way, it only can't actually play right now. Chosen over hand-rolling playback for the same "buy the solved, specialized problem" reasoning as `wgpu` and `rhai`: audio is a genuinely hard, well-trodden problem this project doesn't need to relearn.
 - A Physics (rapier3d) checkbox in the Inspector, next to Static/Gravity, toggling the new `RigidBody` marker. Needs Static or Gravity too to actually do anything, and a hover tooltip says so; ticking it alone is a harmless no-op rather than an error. Both the main editor and the Play window now step their own `Physics` instance each tick (a Play session gets a fresh one every time it starts, never reused across runs), so a physics-simulated entity behaves the same whether you're editing or playing.
+- Reworked the viewport camera controls. Left-click is now selection and gizmo-drag only and never moves the camera; Middle-drag orbits, Shift+Middle-drag pans, scroll zooms, and holding the right mouse button switches to the flythrough camera (previously bound to holding Alt, which collided with GNOME/KDE's own Alt-drag-to-move-window on Linux and conflated camera panning with left-click selection). While flying, scroll now adjusts the WASD fly speed instead of zoom, and the chosen speed carries over into the next flight.
 
 ### Fixed
+
+Editor (frame-editor):
+
+- Flythrough mouselook was Y-inverted (moving the mouse down looked up, and vice versa). Now matches the standard FPS convention: down looks down, up looks up.
 
 Engine:
 

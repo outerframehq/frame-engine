@@ -1998,6 +1998,12 @@ struct App {
     cam_pitch: f32,
     dragging: bool,
     orbiting: bool,
+    // Shift+Middle-drag pans the camera; plain Middle-drag orbits (see above).
+    panning: bool,
+    // Flythrough WASD speed, in world units/sec. Starts at CAM_PAN_SPEED and is
+    // adjusted with the scroll wheel while flying (right mouse button held);
+    // persists at whatever value it was last set to across flights.
+    fly_speed: f32,
     // Translate gizmo state. `gizmo` is recomputed each frame from the selection
     // (None when nothing is selected). `gizmo_drag` is the axis currently being
     // dragged, `gizmo_hover` the one under the cursor — 0 = X, 1 = Y, 2 = Z.
@@ -3380,7 +3386,8 @@ impl ApplicationHandler for App {
         if let DeviceEvent::MouseMotion { delta: (dx, dy) } = event {
             if self.fly_mode {
                 self.cam_yaw += dx as f32 * LOOK_SENS;
-                self.cam_pitch -= dy as f32 * LOOK_SENS;
+                // Un-inverted: moving the mouse down looks down (pitch increases).
+                self.cam_pitch += dy as f32 * LOOK_SENS;
                 self.cam_pitch = self.cam_pitch.clamp(-1.4, 1.4);
                 if let Some(window) = &self.window {
                     window.request_redraw();
@@ -3445,10 +3452,6 @@ impl ApplicationHandler for App {
             WindowEvent::ModifiersChanged(mods) => {
                 self.ctrl_held = mods.state().control_key();
                 self.shift_held = mods.state().shift_key();
-                // Hold Alt for the flythrough camera; release to return to the
-                // standard view. Driven from the modifier state (not a key event)
-                // because a lone Alt press often only reports here on Wayland.
-                self.set_fly(mods.state().alt_key());
             }
             WindowEvent::Focused(false) => {
                 // Losing focus (e.g. Alt+Tab) drops the fly key without a release
@@ -3469,6 +3472,9 @@ impl ApplicationHandler for App {
                                 self.gizmo_drag = Some(axis);
                                 self.gizmo_hover = Some(axis);
                             } else {
+                                // No longer drives camera pan (Shift+Middle does
+                                // that now); kept as plain drag-state tracking in
+                                // case a future box-select wants it.
                                 self.dragging = true;
                                 self.pick();
                             }
@@ -3477,9 +3483,25 @@ impl ApplicationHandler for App {
                             self.gizmo_drag = None;
                         }
                     }
-                    // Middle button held = orbit the camera.
+                    // Middle button held = orbit; Shift+Middle held = pan instead.
                     MouseButton::Middle => {
-                        self.orbiting = pressed;
+                        if pressed {
+                            if self.shift_held {
+                                self.panning = true;
+                            } else {
+                                self.orbiting = true;
+                            }
+                        } else {
+                            self.orbiting = false;
+                            self.panning = false;
+                        }
+                    }
+                    // Right button held = flythrough camera (mouselook plus WASD),
+                    // seeded from the current orbit view. Held rather than a
+                    // modifier key so it can't collide with a window manager's own
+                    // Alt-drag bindings.
+                    MouseButton::Right => {
+                        self.set_fly(pressed);
                     }
                     _ => {}
                 }
@@ -3517,7 +3539,7 @@ impl ApplicationHandler for App {
                     self.cam_yaw += dx * ORBIT_SENS;
                     self.cam_pitch -= dy * ORBIT_SENS;
                     self.cam_pitch = self.cam_pitch.clamp(-1.4, 1.4);
-                } else if self.dragging {
+                } else if self.panning {
                     if let Some(window) = &self.window {
                         let height_px = window.inner_size().height.max(1) as f32;
                         let visible_world_height =
@@ -3529,17 +3551,30 @@ impl ApplicationHandler for App {
                 }
                 self.last_cursor = (position.x, position.y);
             }
-            WindowEvent::MouseWheel { delta, .. } if over_viewport => {
+            WindowEvent::MouseWheel { delta, .. } if over_viewport || self.fly_mode => {
                 let scroll = match delta {
                     MouseScrollDelta::LineDelta(_, y) => y,
                     MouseScrollDelta::PixelDelta(pos) => pos.y as f32,
                 };
-                if scroll > 0.0 {
-                    self.cam_distance /= 1.1;
-                } else if scroll < 0.0 {
-                    self.cam_distance *= 1.1;
+                // While flying, scroll adjusts the flythrough speed instead of
+                // zooming the orbit camera (there's no orbit distance to zoom
+                // while flying). The chosen speed sticks for the rest of the
+                // hold and carries over into the next flight too.
+                if self.fly_mode {
+                    if scroll > 0.0 {
+                        self.fly_speed *= 1.1;
+                    } else if scroll < 0.0 {
+                        self.fly_speed /= 1.1;
+                    }
+                    self.fly_speed = self.fly_speed.clamp(0.1, 200.0);
+                } else {
+                    if scroll > 0.0 {
+                        self.cam_distance /= 1.1;
+                    } else if scroll < 0.0 {
+                        self.cam_distance *= 1.1;
+                    }
+                    self.cam_distance = self.cam_distance.clamp(10.0, 2000.0);
                 }
-                self.cam_distance = self.cam_distance.clamp(10.0, 2000.0);
             }
             WindowEvent::KeyboardInput { event, .. } if matches!(self.mode, AppMode::Editor) => {
                 // Level-triggered movement input (WASD). Updated on both press
@@ -3648,7 +3683,7 @@ impl ApplicationHandler for App {
                     if self.input.is_held(Button::Left) {
                         mv -= right;
                     }
-                    self.cam_eye += mv.normalize_or_zero() * CAM_PAN_SPEED;
+                    self.cam_eye += mv.normalize_or_zero() * self.fly_speed;
                 }
                 let owed = self.clock.advance(!self.paused);
                 // Same folder the Assets tab and imported models resolve
@@ -3730,11 +3765,12 @@ impl ApplicationHandler for App {
                                                     PGUP PGDN  MOVE Z\n\n\
                                                     F5 SAVE   F9 LOAD\n\n\
                                                     ESC  DESELECT\n\n\
-                                                    LMB  SELECT   DRAG PAN\n\n\
+                                                    LMB  SELECT\n\n\
                                                     DRAG ARROWS  MOVE ENTITY\n\n\
                                                     MMB  DRAG ORBIT\n\n\
-                                                    HOLD ALT  FLY CAM\n\n\
-                                                    WHEEL  ZOOM";
+                                                    SHIFT MMB  DRAG PAN\n\n\
+                                                    HOLD RMB  FLY CAM\n\n\
+                                                    WHEEL  ZOOM   WHEEL WHILE FLYING  FLY SPEED";
                     let pixel = 2.0;
                     let lines = help.lines().count() as f32;
                     let line_h = (font::GLYPH_HEIGHT as f32 + 1.0) * pixel;
@@ -5116,6 +5152,8 @@ fn main() {
         cam_pitch: 0.3,
         dragging: false,
         orbiting: false,
+        panning: false,
+        fly_speed: CAM_PAN_SPEED,
         gizmo: None,
         gizmo_drag: None,
         gizmo_hover: None,
