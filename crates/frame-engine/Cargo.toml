@@ -6,3 +6,16 @@ edition = "2024"
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 ron = "0.12"
+# Rigid-body/collider physics, the named exception to the zero-new-deps rule
+# for the same "buy, don't hand-roll" reasoning as wgpu and rhai (see
+# DESIGN.md and Roadmap and Decisions). Pinned to a minor version rather than
+# a wildcard: rapier is still pre-1.0 and its own getting-started guide warns
+# the API still moves between minor releases.
+rapier3d = "0.35"
+# No direct `glam` dependency here on purpose. rapier3d's public API is
+# glam-based internally (see `physics.rs`), but adding our own `glam` here
+# too resolved to a different version than the one rapier vendors through
+# `glamx`, two nominally-identical but distinct types the compiler correctly
+# refused to treat as interchangeable. `physics.rs` reads a rotation back
+# through plain field access instead, which sidesteps needing to name that
+# type at all.

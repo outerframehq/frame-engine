@@ -27,7 +27,11 @@ fn expand_for_yaw(half: [f32; 3], yaw: f32) -> [f32; 3] {
 /// the world's mesh_meta, fitted to the model at import, and falls back to a
 /// full cube box if the metadata is missing. Cubes and spheres use the full
 /// scale box.
-fn half_extents(
+///
+/// `pub(crate)`, not private: `physics::Physics` reuses this to size a
+/// rapier collider the same way, so a rapier-simulated entity's box matches
+/// the one its hand-rolled sibling would have gotten.
+pub(crate) fn half_extents(
     mesh: &crate::world::Mesh,
     scale: crate::world::Scale,
     meta: &std::collections::BTreeMap<String, crate::world::MeshMeta>,
@@ -71,6 +75,12 @@ pub fn collision(world: &mut World) {
     let mut boxes: Vec<(usize, [f32; 3], [f32; 3])> = Vec::new();
     for (id, slot) in world.positions.iter().enumerate() {
         let Some(p) = slot.as_ref() else { continue };
+        // A `RigidBody`-marked entity is detected and resolved by rapier
+        // instead (see `physics::Physics::step`); including it here too
+        // would report the same overlap twice, once from each system.
+        if world.rigid_bodies.get(id).is_some() {
+            continue;
+        }
         let s = world.scales.get(id).copied().unwrap_or_default();
         let mesh = world.meshes.get(id).cloned().unwrap_or_default();
         let yaw = world.rotations.get(id).map(|r| r.yaw).unwrap_or(0.0);
@@ -126,6 +136,11 @@ pub fn resolve_collisions(world: &mut World) {
     let mut boxes: Vec<(usize, [f32; 3], [f32; 3], bool)> = Vec::new();
     for (id, slot) in world.positions.iter().enumerate() {
         let Some(p) = slot.as_ref() else { continue };
+        // Same reasoning as `collision` above: rapier resolves a
+        // `RigidBody`-marked entity's overlaps itself.
+        if world.rigid_bodies.get(id).is_some() {
+            continue;
+        }
         let s = world.scales.get(id).copied().unwrap_or_default();
         let mesh = world.meshes.get(id).cloned().unwrap_or_default();
         let is_static = world.statics.get(id).is_some();
@@ -224,6 +239,9 @@ pub fn gravity(world: &mut World) {
             world.velocities.get(id).is_some()
                 && world.gravities.get(id).is_some()
                 && world.statics.get(id).is_none()
+                // A `RigidBody`-marked entity gets rapier's own gravity
+                // instead (`physics::Physics::new`'s gravity setting).
+                && world.rigid_bodies.get(id).is_none()
         })
         .collect();
     for id in falling {
@@ -251,7 +269,23 @@ pub fn run_scripts(
 }
 
 pub fn movement(world: &mut World) {
-    for (position_slot, velocity_slot) in world.positions.iter_mut().zip(world.velocities.iter()) {
+    // Snapshot which entities rapier owns before the mutable loop below, the
+    // same snapshot-then-apply shape `collision`/`resolve_collisions` already
+    // use, rather than trying to borrow `world.rigid_bodies` while
+    // `world.positions` is mid-iteration.
+    let owned_by_physics: Vec<bool> = (0..world.positions.len())
+        .map(|id| world.rigid_bodies.get(id).is_some())
+        .collect();
+    for (id, (position_slot, velocity_slot)) in world
+        .positions
+        .iter_mut()
+        .zip(world.velocities.iter())
+        .enumerate()
+    {
+        if owned_by_physics.get(id).copied().unwrap_or(false) {
+            // Moved by `physics::Physics::step` instead.
+            continue;
+        }
         if let (Some(position), Some(velocity)) = (position_slot, velocity_slot) {
             position.x += velocity.dx;
             position.y += velocity.dy;

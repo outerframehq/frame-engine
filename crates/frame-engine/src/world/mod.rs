@@ -92,6 +92,23 @@ pub struct Static;
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq)]
 pub struct Gravity;
 
+/// Marks an entity as simulated by the rapier3d physics engine (see the
+/// `physics` module) instead of the hand-rolled `movement`/`gravity`/
+/// `collision`/`resolve_collisions` systems. Opt-in, the same "most entities
+/// have none" shape as `Static`/`Gravity`/`Light`/`Sound`; a marked entity's
+/// `Position` and `Rotation` are written by `physics::Physics::step` and the
+/// hand-rolled systems above skip it entirely, so the two paths never fight
+/// over the same entity in the same tick.
+///
+/// `Static` maps to a fixed rapier body, and `Gravity` without `Static` maps
+/// to a dynamic one; ordinary `movement` (a `Velocity` with neither marker)
+/// has no rapier equivalent yet, so a `RigidBody`-marked entity needs one of
+/// the other two. A `RigidBody`-marked entity that is also `Controlled` is
+/// not yet supported, a named, deliberate limitation (see the `physics`
+/// module), not a silent no-op.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq)]
+pub struct RigidBody;
+
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq)]
 pub struct Position {
     pub x: f32,
@@ -558,6 +575,12 @@ pub struct World {
     pub statics: ComponentStorage<Static>,
     #[serde(default)]
     pub gravities: ComponentStorage<Gravity>,
+    /// Which entities the rapier3d physics engine simulates, the same
+    /// "most entities have none" shape as `statics`/`gravities`. This is
+    /// the scene data (who opts in); the rapier side itself (handles,
+    /// bodies, colliders) is deliberately not here, see `physics::Physics`.
+    #[serde(default)]
+    pub rigid_bodies: ComponentStorage<RigidBody>,
     /// Optional per-entity light sources, the same "most entities have
     /// none" shape as `statics`/`gravities` above.
     #[serde(default)]
@@ -718,6 +741,7 @@ impl World {
             // old marker and hand it to whatever spawns into that slot next
             self.statics.remove(id);
             self.gravities.remove(id);
+            self.rigid_bodies.remove(id);
             self.lights.remove(id);
             self.sounds.remove(id);
             // Every registered dynamic component too, without needing to know

@@ -1,7 +1,8 @@
 use frame_engine::core::Clock;
 use frame_engine::input::{Button, InputState};
 use frame_engine::net::{Client, Server};
-use frame_engine::world::{Position, Velocity, World};
+use frame_engine::physics::Physics;
+use frame_engine::world::{Gravity, Position, RigidBody, Static, Velocity, World};
 use frame_engine::{render, systems};
 
 const TICK_RATE: u32 = 30;
@@ -88,13 +89,49 @@ fn default_world() -> World {
 
 /// The original behaviour: a handful of moving entities, ticked and drawn
 /// locally, no server or client involved. What running the binary with no
-/// arguments still does, unchanged.
+/// arguments still does, unchanged, plus two more entities exercising the
+/// new rapier3d physics slice: a `Static` floor and a `Gravity` box that
+/// falls onto it. Standalone mode only, for now; wiring physics into
+/// `run_server`/`run_client` too is later work, the same "prove it end to
+/// end in one place first" path Sound and Light both took before Multiplayer
+/// (a much bigger step) got its own real exercise.
 fn run_standalone() {
     println!("Frame Engine starting up.");
 
     let mut clock = Clock::new(TICK_RATE, MAX_CATCHUP_TICKS);
     let mut tick: u64 = 0;
     let mut world = default_world();
+    let mut physics = Physics::new(-9.81);
+
+    let floor = world.spawn(
+        Position {
+            x: 0.0,
+            y: -4.0,
+            z: 0.0,
+        },
+        Velocity {
+            dx: 0.0,
+            dy: 0.0,
+            dz: 0.0,
+        },
+    );
+    world.statics.insert(floor, Static);
+    world.rigid_bodies.insert(floor, RigidBody);
+
+    let falling_box = world.spawn(
+        Position {
+            x: 0.0,
+            y: 20.0,
+            z: 0.0,
+        },
+        Velocity {
+            dx: 0.0,
+            dy: 0.0,
+            dz: 0.0,
+        },
+    );
+    world.gravities.insert(falling_box, Gravity);
+    world.rigid_bodies.insert(falling_box, RigidBody);
 
     loop {
         // ask the shared clock how many fixed ticks are owed, then run each.
@@ -103,6 +140,7 @@ fn run_standalone() {
         for _ in 0..owed {
             tick += 1; // add on to tick count
             systems::movement(&mut world); // run the movement system
+            physics.step(&mut world, 1.0 / TICK_RATE as f32);
             if tick % 6 == 0 {
                 println!("Tick {tick}");
                 render::debug_print(&world);
