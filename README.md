@@ -19,6 +19,8 @@ If you build something the engine is missing, a system, a component, a piece of 
 
 Built something with it, or forked it into your own thing? Tag me on X at [@OuterFrameInter](https://x.com/OuterFrameInter), I would love to see it, and that is also the easiest way to reach me if GitHub is not your preferred route.
 
+There is also a Discord server for bug reports, showing off what you have built, and following development: https://discord.gg/ufXDNJnzgf
+
 Frame Engine is a learning project as much as a tool: I am still growing my own Rust as I build the engine and editor in the open, which is part of why the code is written to be read rather than to show off. Considered feedback, on the engine, the editor, or the overall approach, is always welcome.
 
 ## Releases and stability
