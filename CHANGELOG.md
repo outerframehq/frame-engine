@@ -30,6 +30,7 @@ Engine:
 - Jumping for physics characters. A new `Button::Jump`, carried in a new `MoveIntent { dx, dz, jump }` that replaces the plain (dx, dz) pair in `World.move_intents`. A `Controlled` + `RigidBody` + `Gravity` character that is standing on something jumps on a fresh press; holding Jump down doesn't jump again on landing. The jump height is a constant, `physics::JUMP_HEIGHT` (8.0 units, one default entity height), and the launch speed is worked out from it and the gravity, so changing gravity keeps the same height. The hand-rolled `Controlled` path ignores Jump, since it has no idea of standing on the ground. The multiplayer input message gained a `jump` field, defaulting to false so a message without it still reads.
 - Physics characters turn to face the way they're moving. The turn goes the short way round at `physics::TURN_SPEED` (10 radians per second, a half turn in about a third of a second) and stops when there's no input, keeping the last facing. It starts from the entity's own `Rotation`, so a yaw set by a script or the Inspector is kept rather than overwritten. Movement itself is still world-relative. Yaw 0 faces -Z, the same way the camera faces at yaw 0 and the way Up moves.
 - A `World.grounded` map, mirroring whether each physics character was touching the ground as of the last physics step, keyed by entity id. Rebuilt fresh every physics step from the live `Controlled` + `RigidBody` set, so an id only appears here while it's a real character. Exists so a script can read grounded state; see the deeper script API entry below.
+- A `Camera` marker component and a generic `Parent` component (`entity`, plus `offset_x`/`offset_y`/`offset_z`/`offset_yaw`). A new system, `systems::apply_parenting`, runs last each tick and moves every `Parent`-attached entity to its parent's current position plus its local offset, the offset rotating with the parent's yaw so it stays in the same relative spot as the parent turns — mounting a camera underneath a character, say. Not `RigidBody`-aware itself; a dangling parent reference is simply skipped, the same tolerance a stale `Script` reference already gets.
 
 Editor (frame-editor):
 
@@ -58,6 +59,8 @@ Editor (frame-editor):
 - Reworked the viewport camera controls. Left-click is now selection and gizmo-drag only and never moves the camera; Middle-drag orbits, Shift+Middle-drag pans, scroll zooms, and holding the right mouse button switches to the flythrough camera (previously bound to holding Alt, which collided with GNOME/KDE's own Alt-drag-to-move-window on Linux and conflated camera panning with left-click selection). While flying, scroll now adjusts the WASD fly speed instead of zoom, and the chosen speed carries over into the next flight.
 - Dockable panels can now pop out into their own real, separate OS window: right-click the Scene, Inspector, Script Editor, or Source Control tab and choose "Open in new window" to drag it onto a second monitor while the rest of the editor stays on the first. Each popped-out window has its own "Dock back to main window" button, and closing the window (or the main window) also docks it back. The Viewport tab can't be popped out yet — it's the live 3D scene rendered directly behind egui, not a panel, and would need its own duplicated render target to give it a second window. This also forced a related architecture change: every window now shares one Vulkan instance and device instead of each creating its own — see Fixed, below, for why.
 - A much deeper script API: physics characters. Scripts can now read `has_rigidbody`, `grounded`, and `input_jump`, and can drive a `Controlled` + `RigidBody` character directly through `move_dx`/`move_dz`/`move_jump`, requests physics resolves the same way it already resolves keyboard input, wall collisions and gravity included. Scripts now run right after the built-in `Controlled` input each tick instead of before it, specifically so a script sees whatever the keyboard already asked for that tick and can selectively override just the axis it cares about, rather than the keyboard unconditionally overwriting the script's request moments later. See SCRIPTING.md for the full reference and examples.
+- Play mode now has a working camera. Previously it always rendered from the editor's own free orbit camera frozen wherever it was pointing when Play started, not what a player would actually see. Play now renders from the scene's first `Camera`-marked entity (lowest id) when one exists, looking straight along that entity's own yaw; a scene with no `Camera` entity keeps the old orbit-camera fallback unchanged. A Camera checkbox in the Inspector adds or removes the marker, and a new Parent section (checkbox plus parent entity id and offset x/y/z/yaw fields) lets any entity, a camera included, ride along on another — a camera mounted underneath a character, say, so Play shows what the player is meant to see.
+- A live Camera preview in the Inspector. Selecting a Camera entity now shows a small (320x180) image of exactly what that camera sees, updated every frame, right below the Camera checkbox: move it, turn it, or edit the Parent it rides on, and the preview updates immediately, without needing to hit Play. Rendered into its own small offscreen texture with its own camera uniform (so it never disturbs the main viewport's own camera buffer) and registered with egui once at startup; shows the *selected* camera specifically, not necessarily the lowest-id one Play would pick, so more than one Camera entity in a scene can each be previewed on its own. Not available if the Inspector is popped out into its own window — that window has its own, separate GPU renderer that never registered this texture; the Camera checkbox and Parent fields still work there as normal, just without the live image.
 
 ### Changed
 
@@ -76,6 +79,7 @@ Editor (frame-editor):
 
 Editor (frame-editor):
 
+- A camera entity's own Camera preview (and Play mode, when it renders from a Camera) showed nothing usable — a solid, blank-looking colour. Cause: a Camera entity draws an ordinary mesh like anything else (so it can be seen and selected in the main viewport), and its own eye sits inside that mesh's own geometry, so rendering from its point of view was just the inside of its own shape, at any scale. `build_instances` now takes an entity to leave out of the render entirely, and both the Camera preview and Play mode's camera-driven render exclude the active camera's own entity, the same way a first-person game doesn't draw the player's own body from their own eyes. The main viewport is unaffected — it still draws every entity, camera included, as normal.
 - Flythrough mouselook was Y-inverted (moving the mouse down looked up, and vice versa). Now matches the standard FPS convention: down looks down, up looks up.
 - Popping a dockable panel out and then docking it back in segfaulted, reliably, every time. The real cause: each window (main, Play, and now a popped-out tab) was creating its own fully independent Vulkan instance and device, and running more than one of those in a single process is unstable on at least some NVIDIA driver versions — destroying the second instance corrupted driver-internal state badly enough to crash the *next* frame's swapchain acquire on any window, not just the one that closed. Fixed by sharing one Vulkan instance/device/queue across every window instead; each window still gets its own surface, pipelines, and egui renderer.
 
@@ -91,9 +95,20 @@ Engine:
 
 - The tab pop-out feature and the shared-GPU-instance change behind it have only been run on Pop!_OS Linux with an NVIDIA GPU. Other OSes (Windows, macOS), other Linux desktops (X11 vs Wayland), and other GPU vendors (AMD, Intel) haven't been tested and could behave differently — if a popped-out window misbehaves or crashes on a setup other than that, it's a strong first suspect.
 
-## [0.3.0] - 2026-07-14
+## [Prototype] - 2026-06-27 to 2026-07-14
 
-### Added
+Everything built on the original repository before it was reset to a clean
+`0.0.0` baseline ahead of the multiplayer survival game (see
+`Roadmap and Decisions` in the vault for the full story). Originally three
+separate tagged releases, 0.1.0, 0.2.0, and 0.3.0; merged into one entry
+here since those tags and the commit history between them live on the
+archived repo (`frame-engine-prototype-archive`) now, not this one. The
+first real release under this repo's own numbering will be 0.1.0 again,
+starting fresh from `0.0.0`.
+
+### 2026-07-14 (was 0.3.0)
+
+#### Added
 
 Engine:
 
@@ -123,13 +138,13 @@ Editor (frame-editor):
 - Model import. File > Import model copies a Wavefront OBJ into the project's assets folder, parses it and uploads it to the GPU. Projects scan their assets folder (and subfolders) on open. Imported models render with their own vertices, appear in the Inspector mesh picker, work in the Play window, and get collision boxes fitted to their real proportions. Blender exports load with default settings.
 - An Assets tab. A third tab in the bottom console browses the project's assets folder as tiles, each model drawn as a small CPU rendered preview with its name underneath. Folders can be opened and created, and a move and paste flow shifts files between them.
 
-## [0.2.0] - 2026-07-05
+### 2026-07-05 (was 0.2.0)
 
 The first release meant to be genuinely usable: you can build a scene, script it,
 watch it collide, arrange the editor to taste, and save what you made. Past a tech
 demo, though still early.
 
-### Added
+#### Added
 
 Engine:
 
@@ -161,24 +176,24 @@ Editor (frame-editor):
 - Dockable panels (egui_dock): the Viewport, Scene, Inspector, and Script Editor are now tabs that can be dragged, tabbed together, and split apart at runtime. The Viewport is one of them, drawn transparently so the 3D scene shows through, with 3D input routed by the viewport tab's own rect. The toolbar and console stay fixed.
 - Open a scene or save one to a chosen path through a native file dialog (File → Open scene…, Save scene as…), alongside the existing F5/F9 save-and-reload of the current scene.
 
-### Changed
+#### Changed
 
 Engine:
 
 - Spawning now reuses the first freed entity slot instead of always allocating a new id, so ids stay stable and freed slots are reclaimed.
 
-### Fixed
+#### Fixed
 
 Editor (frame-editor):
 
 - The editor no longer segfaults on window close. GPU and window resources are now released while the platform connection is still alive, instead of being dropped after the event loop has already torn down.
 
-## [0.1.0] - 2026-06-27
+### 2026-06-27 (was 0.1.0)
 
 First tagged release: a working simulation engine with a companion 3D editor. Still an
 early tech demo, not ready to build a game with.
 
-### Added
+#### Added
 
 Engine:
 
@@ -200,11 +215,9 @@ Editor (frame-editor):
 - A docked, resizable egui panel layout: a top toolbar, a right inspector dock (Scene list and Inspector), and a bottom console dock (live Output log and a Terminal placeholder).
 - Runs the simulation live on the engine's clock, with play, pause, and step.
 
-### Known issues
+#### Known issues
 
 - The editor can crash on window close during GPU teardown. It does not affect editing or saved scenes.
 
-[Unreleased]: https://github.com/outerframehq/frame-engine/compare/0.3.0...HEAD
-[0.3.0]: https://github.com/outerframehq/frame-engine/compare/0.2.0...0.3.0
-[0.2.0]: https://github.com/outerframehq/frame-engine/compare/0.1.0...0.2.0
-[0.1.0]: https://github.com/outerframehq/frame-engine/releases/tag/0.1.0
+[Unreleased]: https://github.com/outerframehq/frame-engine
+[Prototype]: https://github.com/outerframehq/frame-engine-prototype-archive/compare/0.1.0...0.3.0
