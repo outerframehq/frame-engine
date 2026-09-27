@@ -611,6 +611,48 @@ pub struct MoveIntent {
     pub jump: bool,
 }
 
+/// A reusable snapshot of one entity's "shape": everything that decides what
+/// it looks like and how it behaves, deliberately excluding where it is
+/// (`Position`/`Velocity`, since a prefab is placed wherever the caller
+/// wants) and runtime state (current `Health`, since a fresh instance starts
+/// at full health, not whatever the source entity happened to have when it
+/// was captured).
+///
+/// This is the unlinked-stamp design, Luke's call: a prefab file is a
+/// template copied at spawn time, not a live reference. Editing the file
+/// later, or re-saving over it, never touches an entity already spawned
+/// from it, only future spawns see the change. A linked version (instances
+/// tracking their source prefab, edits propagating, with override handling)
+/// is real, deferred work if that's ever actually needed, not built ahead of
+/// the pain per this project's "no premature abstraction" principle.
+#[derive(Serialize, Deserialize, Clone, Default)]
+pub struct Prefab {
+    pub color: Color,
+    pub scale: Scale,
+    pub mesh: Mesh,
+    pub material: Material,
+    pub rotation: Rotation,
+    #[serde(default)]
+    pub script: Option<Script>,
+    #[serde(default)]
+    pub controlled: bool,
+    /// Named `is_static` rather than `static`, a reserved word.
+    #[serde(default)]
+    pub is_static: bool,
+    #[serde(default)]
+    pub gravity: bool,
+    #[serde(default)]
+    pub rigid_body: bool,
+    #[serde(default)]
+    pub camera: bool,
+    #[serde(default)]
+    pub parent: Option<Parent>,
+    #[serde(default)]
+    pub light: Option<Light>,
+    #[serde(default)]
+    pub sound: Option<Sound>,
+}
+
 #[derive(Serialize, Deserialize, Default, Clone)]
 pub struct World {
     pub positions: ComponentStorage<Position>,
@@ -831,6 +873,83 @@ impl World {
                 storage.remove(id);
             }
         }
+    }
+
+    /// Capture entity `id`'s "shape" into a reusable `Prefab`. Returns `None`
+    /// only if `id` isn't a live entity at all (no `Color`, which every
+    /// spawned entity always has); a missing optional component (no `Light`,
+    /// say) just means the prefab's own field for it is `None`/`false`,
+    /// exactly like the entity it came from.
+    pub fn capture_prefab(&self, id: usize) -> Option<Prefab> {
+        let color = *self.colors.get(id)?;
+        let scale = self.scales.get(id).copied().unwrap_or_default();
+        let mesh = self.meshes.get(id).cloned().unwrap_or_default();
+        let material = self.materials.get(id).copied().unwrap_or_default();
+        let rotation = self.rotations.get(id).copied().unwrap_or_default();
+        Some(Prefab {
+            color,
+            scale,
+            mesh,
+            material,
+            rotation,
+            script: self.scripts.get(id).cloned(),
+            controlled: self.controlled.get(id).is_some(),
+            is_static: self.statics.get(id).is_some(),
+            gravity: self.gravities.get(id).is_some(),
+            rigid_body: self.rigid_bodies.get(id).is_some(),
+            camera: self.cameras.get(id).is_some(),
+            parent: self.parents.get(id).cloned(),
+            light: self.lights.get(id).cloned(),
+            sound: self.sounds.get(id).cloned(),
+        })
+    }
+
+    /// Spawn a fresh entity from a prefab at `position`, zero velocity, full
+    /// health, no reference back to the prefab it came from (the
+    /// unlinked-stamp design, see `Prefab`'s own doc comment). Returns the
+    /// new entity's id, the same as `spawn` does.
+    pub fn spawn_from_prefab(&mut self, prefab: &Prefab, position: Position) -> usize {
+        let id = self.spawn(
+            position,
+            Velocity {
+                dx: 0.0,
+                dy: 0.0,
+                dz: 0.0,
+            },
+        );
+        self.colors.insert(id, prefab.color);
+        self.scales.insert(id, prefab.scale);
+        self.meshes.insert(id, prefab.mesh.clone());
+        self.materials.insert(id, prefab.material);
+        self.rotations.insert(id, prefab.rotation);
+        if let Some(script) = &prefab.script {
+            self.scripts.insert(id, script.clone());
+        }
+        if prefab.controlled {
+            self.controlled.insert(id, Controlled);
+        }
+        if prefab.is_static {
+            self.statics.insert(id, Static);
+        }
+        if prefab.gravity {
+            self.gravities.insert(id, Gravity);
+        }
+        if prefab.rigid_body {
+            self.rigid_bodies.insert(id, RigidBody);
+        }
+        if prefab.camera {
+            self.cameras.insert(id, Camera);
+        }
+        if let Some(parent) = &prefab.parent {
+            self.parents.insert(id, parent.clone());
+        }
+        if let Some(light) = &prefab.light {
+            self.lights.insert(id, light.clone());
+        }
+        if let Some(sound) = &prefab.sound {
+            self.sounds.insert(id, sound.clone());
+        }
+        id
     }
 
     /// Attach a value for a runtime-registered component, keyed by name, to an

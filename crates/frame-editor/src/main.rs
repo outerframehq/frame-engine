@@ -1185,6 +1185,7 @@ enum ConsoleTab {
     Output,
     Terminal,
     Assets,
+    Prefabs,
 }
 /// A command chosen from the toolbar menus this frame, applied after the egui
 /// pass. The menu closure can't borrow `self`, so it stages the choice here and
@@ -1417,6 +1418,36 @@ fn render_thumbnail(data: &frame_engine::assets::MeshData) -> egui::ColorImage {
     egui::ColorImage::from_rgba_unmultiplied([SIZE, SIZE], &pixels)
 }
 
+/// Prefabs tab: one row per saved prefab, each with a Spawn button. Prefabs
+/// are created from the Inspector's "Save as Prefab" field, not here — this
+/// tab is read-only browsing plus the one action, the same shape the Assets
+/// tab has for models it doesn't itself import. Returns the name of the
+/// prefab whose Spawn button was clicked this frame, if any; the caller (who
+/// has world/camera access, this function doesn't) does the actual spawn.
+fn prefabs_tab_ui(
+    ui: &mut egui::Ui,
+    prefabs: &std::collections::BTreeMap<String, frame_engine::world::Prefab>,
+) -> Option<String> {
+    let mut spawn_request = None;
+    if prefabs.is_empty() {
+        ui.weak("No prefabs yet. Select an entity in the Inspector and use \"Save as Prefab\".");
+        return spawn_request;
+    }
+    egui::ScrollArea::vertical()
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            for name in prefabs.keys() {
+                ui.horizontal(|ui| {
+                    ui.label(name);
+                    if ui.button("Spawn").clicked() {
+                        spawn_request = Some(name.clone());
+                    }
+                });
+            }
+        });
+    spawn_request
+}
+
 /// Assets tab: a small browser for the project's assets folder. Folders can be
 /// opened and created; files are listed with a tag for models. Import
 /// happens through File > Import model and File > Import audio (audio lands
@@ -1622,6 +1653,12 @@ fn inspector_tab_ui(
     // GpuState::render_preview). None on the launcher screen, before the
     // window/GPU exist.
     preview_texture_id: Option<egui::TextureId>,
+    // The "Save as Prefab" name field, persisted across frames.
+    new_prefab_name: &mut String,
+    // Set to (entity id, name) when "Save as Prefab" is clicked this frame;
+    // the caller does the actual file write afterward, since this function
+    // only draws UI and has no world/filesystem access.
+    save_prefab_request: &mut Option<(usize, String)>,
 ) {
     match edited {
         Some(EditedEntity {
@@ -1989,6 +2026,33 @@ fn inspector_tab_ui(
                     });
                 }
             }
+            ui.add_space(8.0);
+            ui.label("Prefab");
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::TextEdit::singleline(new_prefab_name)
+                        .hint_text("prefab name")
+                        .desired_width(140.0),
+                );
+                let can_save = !new_prefab_name.trim().is_empty();
+                if ui
+                    .add_enabled(can_save, egui::Button::new("Save as Prefab"))
+                    .on_hover_text(
+                        "Saves this entity's mesh, scale, color, material, \
+                         rotation, script, and physics/light/sound/camera/\
+                         parent settings as a reusable prefab file. Not \
+                         linked afterward — editing the prefab later never \
+                         changes entities already spawned from it, only new \
+                         spawns see the change. Position isn't saved; a \
+                         spawned copy lands wherever you spawn it, at full \
+                         health.",
+                    )
+                    .clicked()
+                {
+                    *save_prefab_request = Some((*id, new_prefab_name.trim().to_string()));
+                    new_prefab_name.clear();
+                }
+            });
         }
         None => {
             ui.weak("No entity selected");
@@ -2229,6 +2293,14 @@ struct EditorTabViewer {
     // Camera preview to draw. `None` before the window/GPU exist yet (the
     // launcher screen), in which case the Inspector just doesn't show one.
     preview_texture_id: Option<egui::TextureId>,
+    // The Inspector's "Save as Prefab" name field, persisted across frames
+    // like new_script_name is.
+    new_prefab_name: String,
+    // Set when "Save as Prefab" is clicked: the entity id captured this same
+    // frame (not re-read from selection afterward — see EditableCustomField's
+    // own doc comment for why that distinction matters) and the name typed
+    // in. Applied by the caller after the pass.
+    save_prefab_request: Option<(usize, String)>,
 }
 
 impl egui_dock::TabViewer for EditorTabViewer {
@@ -2289,6 +2361,8 @@ impl egui_dock::TabViewer for EditorTabViewer {
                 &mut self.custom_fields,
                 self.assets_root.as_deref(),
                 self.preview_texture_id,
+                &mut self.new_prefab_name,
+                &mut self.save_prefab_request,
             ),
             Tab::Scripts => scripts_tab_ui(
                 ui,
@@ -2409,6 +2483,14 @@ struct App {
     // they can be uploaded to any GPU device (editor window and game window).
     // BTreeMap so the name order is stable and sorted.
     custom_meshes: std::collections::BTreeMap<String, frame_engine::assets::MeshData>,
+    // Saved prefabs for the open project, scanned from its prefabs/ folder
+    // the same way custom_meshes is scanned from assets/. Unlinked stamps
+    // (see Prefab's own doc comment): this map is only ever read to spawn a
+    // fresh copy, never mutated to propagate a change to existing entities.
+    prefabs: std::collections::BTreeMap<String, frame_engine::world::Prefab>,
+    // The Inspector's "Save as Prefab" name field, persisted across frames
+    // like new_script_name is.
+    new_prefab_name: String,
     // Names of the game window's uploaded models, same sorted order.
     game_custom_names: Vec<String>,
     // Assets tab browser state: the open subfolder inside assets/ and the
@@ -2673,6 +2755,66 @@ impl App {
         );
         self.selected = Some(id);
         self.log(format!("Spawned entity {id}"));
+    }
+    /// Spawn a fresh entity from a saved prefab at the camera focus, and
+    /// select it — the prefab equivalent of `spawn_at_focus`. Does nothing
+    /// if `name` isn't a prefab this project has (a stale button from a
+    /// frame where the file existed and was since deleted, say).
+    fn spawn_prefab_at_focus(&mut self, name: &str) {
+        let Some(prefab) = self.prefabs.get(name).cloned() else {
+            self.log(format!("No such prefab: '{name}'"));
+            return;
+        };
+        self.push_undo();
+        let id = self.world.spawn_from_prefab(
+            &prefab,
+            Position {
+                x: self.cam_focus_x,
+                y: self.cam_focus_y,
+                z: 0.0,
+            },
+        );
+        self.selected = Some(id);
+        self.log(format!("Spawned entity {id} from prefab '{name}'"));
+    }
+    /// Save entity `id`'s current shape as a reusable prefab file under the
+    /// open project's `prefabs/` folder (created if missing), named `name`.
+    /// Overwrites an existing prefab of the same name; there's no separate
+    /// rename or delete for prefabs yet, only Save. This is the unlinked
+    /// stamp itself: existing entities keep no memory of which prefab, if
+    /// any, they were spawned from, so saving over one never touches them.
+    fn save_entity_as_prefab(&mut self, id: usize, name: &str) {
+        let Some(prefab) = self.world.capture_prefab(id) else {
+            self.log(format!("Couldn't save prefab: entity {id} no longer exists"));
+            return;
+        };
+        let Some(root) = self
+            .current_scene_path
+            .as_ref()
+            .and_then(|p| p.parent())
+            .map(|p| p.to_path_buf())
+        else {
+            self.log("Couldn't save prefab: no project open".to_string());
+            return;
+        };
+        let dir = root.join("prefabs");
+        if let Err(e) = std::fs::create_dir_all(&dir) {
+            self.log(format!("Couldn't save prefab: {e}"));
+            return;
+        }
+        let text = match ron::ser::to_string_pretty(&prefab, ron::ser::PrettyConfig::default()) {
+            Ok(text) => text,
+            Err(e) => {
+                self.log(format!("Couldn't save prefab: {e}"));
+                return;
+            }
+        };
+        if let Err(e) = std::fs::write(dir.join(format!("{name}.ron")), text) {
+            self.log(format!("Couldn't save prefab: {e}"));
+            return;
+        }
+        self.prefabs.insert(name.to_string(), prefab);
+        self.log(format!("Saved prefab '{name}'"));
     }
     /// Despawn the selected entity, if any.
     fn despawn_selected(&mut self) {
@@ -3795,6 +3937,15 @@ impl App {
                 self.log(format!("Found {} plugin(s)", manifests.len()));
             }
             merge_plugins_into_world(&mut self.world, manifests, scripts);
+
+            let (prefabs, errors) = load_project_prefabs(&root);
+            for e in errors {
+                self.log(format!("Prefab load failed: {e}"));
+            }
+            if !prefabs.is_empty() {
+                self.log(format!("Found {} prefab(s)", prefabs.len()));
+            }
+            self.prefabs = prefabs;
         }
         for (name, data) in &self.custom_meshes {
             self.world.mesh_meta.insert(
@@ -4626,6 +4777,14 @@ impl ApplicationHandler for App {
                 let mut new_asset_folder = std::mem::take(&mut self.new_asset_folder);
                 let thumbnails = self.thumbnails.clone();
                 let mut move_pending = std::mem::take(&mut self.move_pending);
+                // Snapshot for the Prefabs tab to read; spawning is staged
+                // here and applied after the pass (spawn_prefab_at_focus
+                // needs self.world and the camera focus point, neither of
+                // which the egui closure can borrow), the same
+                // lift-then-write-back pattern plugin_action already uses.
+                let prefabs = self.prefabs.clone();
+                let mut prefab_spawn_request: Option<String> = None;
+                let mut new_prefab_name = std::mem::take(&mut self.new_prefab_name);
                 let script_library = std::mem::take(&mut self.world.script_library);
                 let new_script_name = std::mem::take(&mut self.new_script_name);
                 let script_filter = std::mem::take(&mut self.script_filter);
@@ -4777,6 +4936,8 @@ impl ApplicationHandler for App {
                     gizmo: gizmo_draw,
                     pop_out_request: None,
                     preview_texture_id: self.gpu.as_ref().map(|g| g.preview_texture_id),
+                    new_prefab_name,
+                    save_prefab_request: None,
                 };
                 let (egui_paint_jobs, egui_textures_delta, egui_ppp) = if let (
                     Some(state),
@@ -5032,6 +5193,11 @@ impl ApplicationHandler for App {
                                             ConsoleTab::Assets,
                                             "Assets",
                                         );
+                                        ui.selectable_value(
+                                            &mut console_tab,
+                                            ConsoleTab::Prefabs,
+                                            "Prefabs",
+                                        );
                                     });
                                     ui.separator();
                                     match console_tab {
@@ -5060,6 +5226,11 @@ impl ApplicationHandler for App {
                                                 &thumbnails,
                                                 &mut move_pending,
                                             );
+                                        }
+                                        ConsoleTab::Prefabs => {
+                                            if let Some(name) = prefabs_tab_ui(ui, &prefabs) {
+                                                prefab_spawn_request = Some(name);
+                                            }
                                         }
                                     }
                                 });
@@ -5138,6 +5309,13 @@ impl ApplicationHandler for App {
                 self.script_filter = viewer.script_filter;
                 self.open_script = viewer.open_script;
                 self.renaming = viewer.renaming;
+                self.new_prefab_name = viewer.new_prefab_name;
+                if let Some((id, name)) = viewer.save_prefab_request.take() {
+                    self.save_entity_as_prefab(id, &name);
+                }
+                if let Some(name) = prefab_spawn_request {
+                    self.spawn_prefab_at_focus(&name);
+                }
                 if let Some((old_name, new_name)) = viewer.renamed {
                     // Rewrite every entity's Script.uses that pointed at the old
                     // name, so a rename doesn't orphan references the way a
@@ -5509,6 +5687,50 @@ fn load_project_plugins(
         manifests.insert(manifest.name.clone(), manifest);
     }
     (manifests, scripts, errors)
+}
+
+/// Load every prefab in a project's `prefabs/` folder: each `.ron` file
+/// directly inside it, named after its file stem (no subfolder, unlike
+/// plugins — a prefab is one file, not a manifest plus scripts). Simpler
+/// than `load_project_plugins` for the same reason: nothing here needs
+/// merging into `World` or an enabled/disabled state, it's just read back to
+/// spawn from later. A file that fails to parse is skipped with an error
+/// rather than aborting the whole scan, the same tolerance
+/// `load_project_plugins` gives a broken `plugin.ron`.
+fn load_project_prefabs(
+    root: &std::path::Path,
+) -> (
+    std::collections::BTreeMap<String, frame_engine::world::Prefab>,
+    Vec<String>,
+) {
+    let mut prefabs = std::collections::BTreeMap::new();
+    let mut errors = Vec::new();
+    let dir = root.join("prefabs");
+    // Creates the folder if missing, the same "ready to use immediately"
+    // treatment plugins/ and assets/ already get.
+    let _ = std::fs::create_dir_all(&dir);
+    let Ok(entries) = std::fs::read_dir(&dir) else {
+        return (prefabs, errors);
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.extension().and_then(|e| e.to_str()) != Some("ron") {
+            continue;
+        }
+        let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            continue;
+        };
+        match std::fs::read_to_string(&path) {
+            Ok(text) => match ron::from_str::<frame_engine::world::Prefab>(&text) {
+                Ok(prefab) => {
+                    prefabs.insert(stem.to_string(), prefab);
+                }
+                Err(e) => errors.push(format!("{}: invalid prefab: {e}", path.display())),
+            },
+            Err(e) => errors.push(format!("{}: {e}", path.display())),
+        }
+    }
+    (prefabs, errors)
 }
 
 /// Merge freshly-scanned plugin manifests and scripts into `world`,
@@ -6103,6 +6325,8 @@ fn main() {
         // No scene target until a project is opened.
         current_scene_path: None,
         custom_meshes: std::collections::BTreeMap::new(),
+        prefabs: std::collections::BTreeMap::new(),
+        new_prefab_name: String::new(),
         game_custom_names: Vec::new(),
         assets_subdir: std::path::PathBuf::new(),
         new_asset_folder: String::new(),
