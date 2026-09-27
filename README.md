@@ -27,7 +27,7 @@ Frame Engine is a learning project as much as a tool: I am still growing my own 
 
 **For a stable build, download a tagged release rather than cloning `main`.** Releases are cut at points where the project is known to build and run, so a release is your dependable copy. Tagged releases are on the project's Releases page.
 
-The latest release is **0.3.0**. The capabilities listed below reflect current `main`, which may be ahead of that release.
+This repo restarted fresh with no tagged releases yet (see [SECURITY.md](SECURITY.md) for why). `Cargo.toml` currently sits at `0.0.0`, a placeholder for this pre-release baseline. The first tagged release will be `0.1.0`. The capabilities listed below reflect current `main`.
 
 ## Status
 
