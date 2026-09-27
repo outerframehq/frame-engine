@@ -1,0 +1,208 @@
+# Changelog
+
+All notable changes to Frame Engine are recorded here.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project aims to follow [Semantic Versioning](https://semver.org/spec/v2.0.0.html)
+once it reaches 1.0. Until then, the minor version bumps when a real new capability
+lands and the patch version bumps for fixes and small additions.
+
+## [Unreleased]
+
+### Added
+
+Engine:
+
+- A `Material` component (an emissive strength, 0.0 to 1.0), per-entity appearance data serialized with the scene; defaults to 0.0, so older scenes load unchanged.
+- A `Rotation` component: a single yaw angle, in radians, around the world's vertical axis. Not full 3D orientation yet, pitch and roll aren't tracked. Serialized with the scene; defaults to 0.0, so older scenes load unchanged.
+- A contact point on collision detection. `World.collisions` now carries the centre of the overlap alongside each colliding pair, computed per axis as the midpoint between the two boxes' shared region, not just which two entities are involved.
+- `despawn` now clears any runtime-registered dynamic components too, alongside the built-in ones.
+- Runtime component registration. `World` can now hold component types it was never compiled knowing about, through `insert_dynamic`/`get_dynamic`/`get_dynamic_mut`/`remove_dynamic`, generic over `T: Clone + 'static` and keyed by string name. Doesn't serialize with the scene yet; a registered component resets on reload.
+- A `Health` component: a single current value, defaulting to 100.0. No maximum, damage system, or death behaviour yet, those are separate, later steps.
+- A `Substance` schema and a `substances` registry on `World`, name-keyed the same way `mesh_meta` and `script_library` are. Carries physical properties (melting point, durability, conductivity, and more), every field `Option<f32>` so `None` can mean a property genuinely doesn't apply. No actual substances are defined; that stays game content. `Substance::blend` mixes two into a new one, freeform, any ratio, no fixed recipes: both present blends by ratio, one present treats the missing side as 0.0 rather than dropping the property, neither present stays `None`.
+- A first, minimal slice of multiplayer, in a new `net/` module: an authoritative `Server` (bind, accept clients, broadcast every entity's position to all of them) and a receiving `Client` (connect, poll, apply whatever arrives into a local `World`), over raw TCP with a length-prefixed `serde`/RON wire format. Positions only, one direction only, no interest management, and not yet wired into a running process, all deliberately out of scope for this first pass. This also reflects a course correction from lockstep (the earlier long-term aim) to an authoritative-server model, a better fit for a persistent, always-joinable world; see DESIGN.md for the reasoning.
+- `net::Server`/`net::Client` wired into the engine's own binary: `cargo run -p frame-engine -- server` or `-- client`, each accepting an optional address. Running with no arguments is unchanged; this is the first real exercise of the multiplayer slice rather than code sitting unused.
+- Client input upload: `Client::send_input` sends which of the four movement buttons are held (never a position or velocity directly), and `Server::receive_input` applies it to that client's own entity, and only that entity, through a new per-entity system, `systems::input_movement_for`, a sibling to the existing `input_movement` which drives every `Controlled` entity from one shared input, the wrong shape once several clients each need their own. A client never chooses its own entity id: the server spawns and assigns one on connect.
+- A disconnected client's entity is now despawned along with the connection, detected either from a closed read (in `receive_input`) or a failed write (in `broadcast_positions`), whichever notices first. Reconnecting to the same entity, rather than always getting a new one, is still open.
+- A `PluginManifest` type and an `InstalledPlugin` wrapper (manifest plus whether the project has it turned on) on a new `installed_plugins` registry on `World`, name-keyed the same way `mesh_meta` and `script_library` are. `enabled` is the project's own choice, kept separate from the manifest so re-scanning never resets it, and defaults off for a newly discovered plugin. See below and PLUGINS.md for the loading and enabling side.
+- A first slice of real rigid-body physics, through a new `rapier3d` dependency (the physics foundation named on the roadmap, a deliberate exception to the zero-new-deps policy for the same reasoning as `wgpu` and `rhai`) and a new `RigidBody` marker component, the same opt-in shape as `Static`/`Gravity`/`Light`/`Sound`. A new `physics` module's `Physics` struct wraps rapier3d's own `PhysicsWorld` plus the entity-id-to-rapier-handle bookkeeping it doesn't provide; `Physics::step` creates a rapier body for any newly marked entity (`Static` maps to a fixed body, `Gravity` without `Static` to a dynamic one), removes one for a despawned or unmarked entity, steps the simulation at the engine's own fixed tick rate, and writes the result back into `Position`/`Rotation`. `movement`/`gravity`/`collision`/`resolve_collisions` now all skip a `RigidBody`-marked entity, so the two systems never both move the same one in a tick. Deliberately narrow for this first pass: rotation is locked to the engine's own yaw-only axis, and physics state doesn't persist with the scene, only which entities opt in does. Exercised for real in standalone mode (`cargo run -p frame-engine` with no arguments): a static floor and a falling box.
+- Physics characters. An entity marked both `Controlled` and `RigidBody` gets a kinematic rapier body driven by rapier3d's `KinematicCharacterController`, instead of being skipped. Each tick, the move the input systems recorded is swept through the world: the character stops at walls, slides along them, steps off ledges and falls, and lands on whatever is below. Add `Gravity` to make it fall; without it the character floats but still collides. `Controlled` with `Static` is contradictory and still skipped. Falling speed and a grounded flag are kept per character inside `Physics`, runtime only. The controller keeps an absolute 0.05 unit gap to the ground, because rapier's default gap is relative to the character's height and made an 8-unit box slowly sink into the floor. A grounded character doesn't push down into the floor each tick, which made the box snag and stutter when walking; rapier's snap-to-ground keeps it on the floor instead. Not yet: pushing dynamic bodies, capsule colliders, or moving relative to the entity's yaw.
+- Jumping for physics characters. A new `Button::Jump`, carried in a new `MoveIntent { dx, dz, jump }` that replaces the plain (dx, dz) pair in `World.move_intents`. A `Controlled` + `RigidBody` + `Gravity` character that is standing on something jumps on a fresh press; holding Jump down doesn't jump again on landing. The jump height is a constant, `physics::JUMP_HEIGHT` (8.0 units, one default entity height), and the launch speed is worked out from it and the gravity, so changing gravity keeps the same height. The hand-rolled `Controlled` path ignores Jump, since it has no idea of standing on the ground. The multiplayer input message gained a `jump` field, defaulting to false so a message without it still reads.
+- Physics characters turn to face the way they're moving. The turn goes the short way round at `physics::TURN_SPEED` (10 radians per second, a half turn in about a third of a second) and stops when there's no input, keeping the last facing. It starts from the entity's own `Rotation`, so a yaw set by a script or the Inspector is kept rather than overwritten. Movement itself is still world-relative. Yaw 0 faces -Z, the same way the camera faces at yaw 0 and the way Up moves.
+
+Editor (frame-editor):
+
+- A Material slider in the Inspector, next to Scale, editing an entity's emissive strength. At 1.0 the entity ignores the directional light and renders at flat full colour, useful for a glowing look.
+- A Rotation control in the Inspector, shown in degrees. The engine stores radians internally; conversion happens only at the editing boundary.
+- A much deeper script API. Scripts can now read their own entity id, whether they carry the `Controlled`, `Static`, or `Gravity` marker, and which movement keys are currently held. On collision, scripts can read which entity was hit and the contact point where it happened. `yaw` is now read/write from scripts, alongside the existing position, velocity, scale, colour, and emissive values. Scripts can also request a new entity be spawned (at a position, defaulting to their own) or an existing one despawned by id, an action rather than a value, applied once after the script finishes running for that tick. See SCRIPTING.md for the full list and worked examples.
+- Scripts can now read and write runtime-registered dynamic component values too, through `custom_<name>` variables, f64 only. A script can only access a name it already has a value under; it can't originate a brand-new dynamic name purely from script code.
+- Script rename support in the Script Editor. Renaming rewrites every entity's reference to the old name, so unlike deleting a script (which deliberately leaves dangling references for the runtime to skip safely), a rename doesn't orphan anything.
+- A plugin loader. A plugin is a folder under a project's `plugins/` directory: a `plugin.ron` manifest plus a `scripts/` folder of `.rhai` files. Opening a project scans it (creating the `plugins/` folder if it doesn't exist yet, so it's there ready to drop something into), merges an enabled plugin's scripts into the project's own `script_library` under a `<plugin-name>/` prefix, and records the manifest in `World.installed_plugins`. A plugin's scripts then show up in the ordinary Inspector script picker exactly like a hand-written one, no separate plugin UI needed to use one. Chosen deliberately over compiled-dylib plugins: Rust has no stable ABI, so a compiled plugin loaded at runtime is fragile across compiler versions in a way this codebase has avoided everywhere else; a Rhai plugin runs inside the exact same sandboxed interpreter every other script already does. See PLUGINS.md.
+- A Plugins toolbar tab and an Editor Settings window. Editor Settings, opened from Edit > Editor settings…, lists every installed plugin with a checkbox, a mod-list style on/off switch, off by default for anything newly discovered. The Plugins tab toggles a panel between the toolbar and the Viewport showing only the currently *enabled* plugins. Disabling a plugin strips its scripts from `script_library`; an entity that had one of those scripts assigned keeps a dangling reference, the same safe handling a deleted script already gets. Play mode now re-scans and re-applies plugins fresh on every launch too, rather than only reflecting whatever was true as of the scene's last save.
+- Custom Inspector fields for plugins. A `plugin.ron` can declare `fields`, each naming a dynamic component (the same key `insert_dynamic`/`get_dynamic` use), a label, and an optional min/max range. A field appears in the Inspector, as a slider or a plain drag box, only for an entity that already has a value under that name; there's no way for the field itself to originate one. Values are `f64`, matching the type the `custom_<name>` script bridge already uses, so a value a script sets and a value the Inspector edits are the same underlying data. This is deliberately data, not code: Rhai has no bindings to egui, and a plugin describes a field for the editor itself to draw rather than running any UI logic of its own.
+- Menu actions for plugins. A `plugin.ron` can also declare `actions`, each a label plus one of two kinds: `RunScript`, which runs one of the plugin's own scripts once, immediately, for every entity currently assigned it; or `ToggleValue`, which flips a named dynamic value between 0.0 and 1.0 for every entity that already has one. Buttons for a plugin's declared actions appear in its card in the Plugins panel. `PluginActionKind` is a closed enum, the complete list of everything a plugin action can ever cause; clicking one never runs arbitrary plugin code, the editor is the only thing that decides what happens and does it.
+- Panels for plugins, the last piece of the editor-extension surface. A `plugin.ron` can declare `panels`, each a title plus its own self-contained `fields` and `actions`, shown as a titled section in the Plugins panel regardless of what entity (if any) is selected. Panel fields and a new `ToggleGlobal` action kind read and write `World.globals`, a plain name-keyed `f64` store for values not tied to any entity, deliberately not the type-erased dynamic-component system, since everything touching this whole system is `f64` in practice.
+- A `Light` component: `LightKind::Directional` (a fixed direction, no falloff, like a sun) or `LightKind::Point` (at the entity's own position, with a linear falloff to zero at a set range), plus an intensity multiplier. Serialized with the scene; a scene with no `Light` entities renders flatter than before (ambient only) until one is added, a real one-time visible change on upgrade rather than an implicit fallback light the shader would otherwise have to invent.
+- A `Sound` component: a file name (resolved under the project's `assets/` folder, the same convention `Mesh::Custom` uses) and a one-shot `play` request flag, the same request-and-clear pattern spawn/despawn already use for scripts. The engine only ever carries the request; it holds no audio data and plays nothing itself, the host does that (see below).
+
+Editor (frame-editor):
+
+- Multi-light shading. The entity shader now sums up to four active `Light` entities per fragment (not per vertex, so falloff reads correctly across a face) on top of a flat ambient base, additive and clamped to full white. A `Light` beyond the four-light cap is silently not drawn, a real, named limitation rather than an unbounded per-frame cost. A Light section in the Inspector adds or removes the component, picks Directional or Point, and edits direction/range and intensity.
+- Sound playback through `kira`. A Sound section in the Inspector adds or removes the component, names its file, and a "Play now" button sets its `play` flag for a quick manual test. A new `update_sounds` step in both the main editor and the Play window's tick loop turns a pending request into an actual play call: the file is decoded once into a small in-memory cache (`StaticSoundData`, cheap to clone since the decoded samples are shared through an `Arc`) and every later play of the same name reuses it rather than re-reading the file. No audio device (a headless box, say) or no project open both just mean the request is quietly dropped, a `Sound` component is still valid data either way, it only can't actually play right now. Chosen over hand-rolling playback for the same "buy the solved, specialized problem" reasoning as `wgpu` and `rhai`: audio is a genuinely hard, well-trodden problem this project doesn't need to relearn.
+- A Physics (rapier3d) checkbox in the Inspector, next to Static/Gravity, toggling the new `RigidBody` marker. Needs Static, Gravity or Controlled too to actually do anything, and a hover tooltip says so; ticking it alone is a harmless no-op rather than an error. Both the main editor and the Play window now step their own `Physics` instance each tick (a Play session gets a fresh one every time it starts, never reused across runs), so a physics-simulated entity behaves the same whether you're editing or playing.
+- Space is now Jump, in both the main editor window and the Play window.
+- Audio import. File > Import audio… picks one or more WAV, OGG, MP3 or FLAC files (the formats `kira` is built with). Each is decoded once first, so a broken or unsupported file gets a clear message at import instead of failing the first time it plays. It's copied into whichever folder is open in the Assets tab, the assets root by default. If a file with the same name already exists anywhere under `assets/`, that file is replaced in place, and its cached decode is dropped so the new version plays.
+- The Inspector's Sound "File" field is now a dropdown of every audio file in the project, listed fresh each time it opens, so a file added outside the editor shows up too. A warning shows if the chosen file can't be found.
+- Drag and drop import. Dropping `.obj` or audio files on the main editor window imports them the same way as the File menu. winit 0.30 only sends dropped files on Windows, macOS and X11, so this does nothing on a native Wayland session yet.
+- Reworked the viewport camera controls. Left-click is now selection and gizmo-drag only and never moves the camera; Middle-drag orbits, Shift+Middle-drag pans, scroll zooms, and holding the right mouse button switches to the flythrough camera (previously bound to holding Alt, which collided with GNOME/KDE's own Alt-drag-to-move-window on Linux and conflated camera panning with left-click selection). While flying, scroll now adjusts the WASD fly speed instead of zoom, and the chosen speed carries over into the next flight.
+- Dockable panels can now pop out into their own real, separate OS window: right-click the Scene, Inspector, Script Editor, or Source Control tab and choose "Open in new window" to drag it onto a second monitor while the rest of the editor stays on the first. Each popped-out window has its own "Dock back to main window" button, and closing the window (or the main window) also docks it back. The Viewport tab can't be popped out yet — it's the live 3D scene rendered directly behind egui, not a panel, and would need its own duplicated render target to give it a second window. This also forced a related architecture change: every window now shares one Vulkan instance and device instead of each creating its own — see Fixed, below, for why.
+
+### Changed
+
+Engine:
+
+- Up and Down input now move a `Controlled` entity forward and back along Z (Up is -Z, the direction the editor camera faces at yaw 0) instead of up and down along Y. Left and Right are unchanged on X. This is a visible change for any existing scene with a `Controlled` entity, and it applies to both `input_movement` and `input_movement_for`, so multiplayer clients get it too. It clears the way for real gravity on Y: a character that climbs when you press Up would fight it.
+- A `Controlled` entity that is also `RigidBody` no longer has its position moved directly by input. The input systems now record the move as an intent in a new `World.move_intents` map (transient, never saved with the scene) for the physics step to resolve. The physics step resolves it through a character controller (see Added).
+- Physics gravity is now `physics::GRAVITY_Y` (-43.6 units/s^2), one shared constant, instead of -9.81 written out in three places. Treating an 8-unit entity as about 1.8 m tall makes one unit about 0.22 m, so -9.81 was about 4x too weak for this engine's scale and made everything fall slowly. Dynamic bodies now fall about 4x faster than before. The hand-rolled `Gravity` system (`world::GRAVITY`) is separate and unchanged.
+
+Editor (frame-editor):
+
+- Play/pause in the main editor window moved from Space to P, since Space is now Jump. The View menu's Play/Pause item is unchanged, and the controls overlay, README and DESIGN list the new keys.
+- A `Sound` now finds its file by name anywhere under `assets/`, the same way a model does, instead of only at the exact path it names. A sound file can be moved between asset folders without breaking the entities that use it. An exact path is still tried first, so older scenes that stored one keep working.
+
+### Fixed
+
+Editor (frame-editor):
+
+- Flythrough mouselook was Y-inverted (moving the mouse down looked up, and vice versa). Now matches the standard FPS convention: down looks down, up looks up.
+- Popping a dockable panel out and then docking it back in segfaulted, reliably, every time. The real cause: each window (main, Play, and now a popped-out tab) was creating its own fully independent Vulkan instance and device, and running more than one of those in a single process is unstable on at least some NVIDIA driver versions — destroying the second instance corrupted driver-internal state badly enough to crash the *next* frame's swapchain acquire on any window, not just the one that closed. Fixed by sharing one Vulkan instance/device/queue across every window instead; each window still gets its own surface, pipelines, and egui renderer.
+
+Engine:
+
+- A physics body's collider and its drawn mesh turned opposite ways for the same yaw. The shader turns a mesh clockwise seen from above, and rapier turns counter-clockwise, so a non-square body with a non-zero yaw collided at a different angle to the one it was drawn at. Cubes hid it. Yaw now goes through one conversion in `physics.rs` in both directions, and the collider and the mesh line up. This also confirms, against the rapier3d 0.35.3 source, that `RigidBodyBuilder::rotation` takes an axis-angle vector.
+- `despawn` now clears the `Static` and `Gravity` markers too. Since `spawn` reuses the first freed slot rather than always growing, a new entity landing on a slot that used to be `Static` or `Gravity` could previously inherit that marker without ever being given it.
+- Collision now accounts for an entity's `Rotation`, expanding its axis-aligned box conservatively to bound the rotated shape (not true oriented-box precision) in both `collision` and `resolve_collisions`, so detection and response agree.
+- `f64`-typed dynamic components now survive a save and reload, through a `dynamic_f64` field kept in sync by `insert_dynamic`/`remove_dynamic`. A registered value of any other type still resets on reload; full generic persistence stays open.
+- A `Client` can now learn which entity is its own, through a one-time `Welcome` message the server sends on connect and a new `own_entity()` method.
+
+### Known issues
+
+- The tab pop-out feature and the shared-GPU-instance change behind it have only been run on Pop!_OS Linux with an NVIDIA GPU. Other OSes (Windows, macOS), other Linux desktops (X11 vs Wayland), and other GPU vendors (AMD, Intel) haven't been tested and could behave differently — if a popped-out window misbehaves or crashes on a setup other than that, it's a strong first suspect.
+
+## [0.3.0] - 2026-07-14
+
+### Added
+
+Engine:
+
+- Collision response. A `resolve_collisions` system pushes overlapping entities apart along their least-overlapping axis (the minimum translation vector) after movement, so they stop interpenetrating, and zeros the velocity heading into a surface so a fallen entity rests instead of accumulating speed (a script-driven bounce, already moving away, is preserved). Detection-only collision (the `hit` flag) is unchanged; this adds the automatic separation on top.
+- A `Static` marker component. A static entity is immovable: collision response never pushes it, so others rest against it (a floor, a wall). A dynamic-vs-static pair pushes only the dynamic entity; dynamic-vs-dynamic splits the push evenly. Serialized with the scene; defaults off, so older scenes are unaffected.
+- Gravity. A `Gravity` marker component and a `gravity` system accelerate marked (non-static) entities downward (−Y) each tick, at a tunable `GRAVITY` strength. Opt-in per entity, so scenes without it are unaffected.
+- Mesh-fitted collision boxes. A `Plane` now has a flat (zero-height) collision box matching what's drawn, so entities rest on its surface rather than on an invisible ledge half an entity-size above it. Cubes and spheres keep their full box.
+- An assets module with a hand rolled OBJ parser. Covers v, vn and f lines with all four corner forms, negative indices, comments, fan triangulation of larger faces, and computed flat normals when a face has none. Parsed models get normalised to unit size like the primitives, so a model at scale 1 comes out cube sized with its own proportions. No new dependencies.
+- `Mesh::Custom(name)` for imported models, and a `mesh_meta` map on the world holding each model's half extents, so collision fits a box to the model's real shape. Works like `script_library` does for scripts. `Mesh` drops `Copy` to carry the name.
+- `World` and `ComponentStorage` now derive `Clone`, and the plain-data components (`Position`, `Velocity`, `Color`, `Scale`) derive `PartialEq`, so the editor can snapshot and compare a world. No behaviour change on their own; they back the editor's undo/redo.
+
+Editor (frame-editor):
+
+- A project launcher. The editor now opens on a launcher screen to create, open, and manage projects, rather than loading one fixed scene. Creating or opening a project loads its scene and switches into the editor; File > Close project returns to the launcher.
+- Projects. A project is a folder holding a scene file named after the project (the file's stem is the project name) and a `project.ron` manifest (description and version). Create a named project, or open an existing one by picking its folder.
+- A recent-projects list on the launcher, sorted by most-recently-edited and remembered across runs. Each project is a full-width card showing its name, description, last-edited date, and version, with Edit, Play, and Settings actions.
+- A project-settings window, opened from a card, to edit the name, version, and description. It saves when the window closes (its X or the Save button); renaming the project renames its scene file. Description and version are stored in the project's `project.ron`.
+- Play a project in a separate, clean game window: its own window and GPU surface running a copy of the project's world (the 3D scene only, no editor chrome) with the simulation running and WASD driving `Controlled` entities. Close the window or press Esc to return to the launcher.
+- A Static (immovable) checkbox in the Inspector, marking an entity so collision response leaves it in place, and a Gravity (falls) checkbox marking an entity to be pulled downward.
+- Undo and redo (Ctrl+Z / Ctrl+Y or Ctrl+Shift+Z, and Edit > Undo/Redo), built on full-world snapshots. Spawning, despawning, position nudges, and Inspector edits are undoable; a drag or a held key coalesces into a single step. (Script-editor text typing isn't yet an independent step.)
+- A flythrough camera. Hold Alt to enter a free camera seeded from the current orbit view: the mouse looks around and WASD flies through the scene, with the cursor grabbed. Left-click picks the entity at screen-centre and makes it the pivot for when orbit resumes; releasing Alt returns to orbit. Known limitation: releasing Alt doesn't yet restore the exact pre-Alt view; orbit resumes from where flight ended.
+- Structured script values. Scripts now see `pos`, `vel`, and `scale` as a `Vec3` (`.x`/`.y`/`.z`) and `color` as an `Rgb` (`.r`/`.g`/`.b`), with vector arithmetic (`pos = pos + vel * 2.0`), `length()`, and `vec3()`/`rgb()` constructors. The original flat names (`px`, `dz`, `cr`, ...) still work, so existing scripts run unchanged; if a script sets both spellings of the same value, the structured one wins. SCRIPTING.md now teaches the structured spelling.
+- Unknown-variable warnings in the Script Editor. A semantic pass walks the compiled script for variable references and flags, in amber with line and column, any name that is neither part of the script API nor declared locally with `let`, catching the typos (`poz`, `hti`) that Rhai would otherwise fail on silently at run time, thirty times a second. The status line reads "No problems" only when both syntax and names are clean.
+- A translate gizmo. Selecting an entity draws three axis arms over it in the viewport (X red, Y green, Z blue); dragging an arm moves the entity along that world axis, tracking the cursor at any camera angle. The hovered or grabbed arm highlights, arms hold a roughly constant on-screen size at any camera distance, grabbing an arm takes priority over camera pan and picking, and a whole drag is one undo step.
+- A Source Control tab. A read-only dockable panel showing the open project's git state: current branch, upstream with ahead/behind counts, and the working tree's changed files, modified/new/deleted/renamed/conflicted, amber for unstaged and green for staged. Read-only by design: it opens the repository, reads, and drops, with no network access and no credentials; commits and pushes stay in the terminal or a git client. Projects not inside a git repository get a friendly note instead.
+- Launcher quality of life. Project cards gain a Delete button with a two step confirmation that removes the project folder from disk and drops it from the recents list. The controls overlay's visibility persists across runs in a small editor.ron under the config directory, so hiding it once keeps it hidden. Opening a project now starts paused, so scenes get arranged before Space runs them. The Play window still runs right away.
+- Model import. File > Import model copies a Wavefront OBJ into the project's assets folder, parses it and uploads it to the GPU. Projects scan their assets folder (and subfolders) on open. Imported models render with their own vertices, appear in the Inspector mesh picker, work in the Play window, and get collision boxes fitted to their real proportions. Blender exports load with default settings.
+- An Assets tab. A third tab in the bottom console browses the project's assets folder as tiles, each model drawn as a small CPU rendered preview with its name underneath. Folders can be opened and created, and a move and paste flow shifts files between them.
+
+## [0.2.0] - 2026-07-05
+
+The first release meant to be genuinely usable: you can build a scene, script it,
+watch it collide, arrange the editor to taste, and save what you made. Past a tech
+demo, though still early.
+
+### Added
+
+Engine:
+
+- A `Color` component, kept in lockstep with position and velocity and serialized with the scene.
+- An input system and a logical `InputState`, so entities can be driven by held buttons instead of only fixed velocity.
+- A `Controlled` marker (tag) component; the input system now drives every entity that carries it.
+- A `Scale` component (per-axis size factor, x/y/z), kept in lockstep with the other components and serialized with the scene.
+- A `Script` component that names a shared behaviour, plus a `script_library` on the world (script name to source) so a script's source lives once and every entity that uses it changes together.
+- A `ScriptRuntime` trait (the seam a host implements to run scripts) and a `run_scripts` system. The engine stores script source as data and owns the seam; it interprets nothing itself.
+- A `Mesh` component (Cube, Sphere, or Plane primitive), per-entity appearance data serialized with the scene; defaults to Cube, so older scenes load unchanged.
+- AABB collision detection: an `ENTITY_SIZE` constant and a `collision` system that records overlapping entity-box pairs on the world as triggers, detection only, with no physics response. The boxes are scale-boxes (shape-agnostic), and the result is transient (never saved with the scene).
+
+Editor (frame-editor):
+
+- Entities now render in their own color, editable per entity from the Inspector. The selected entity is brightened rather than recolored, so its color stays visible while you edit it.
+- WASD drives the selected entity while the simulation is running.
+- Mark an entity Controlled from the Inspector to drive it with WASD. Step moved to the period key so it no longer shares S with movement.
+- The Frame Editor logo now appears in the toolbar.
+- The editor now has its own application icon, shown by the desktop and taskbar.
+- Resize the selected entity from the Inspector. Picking grows the entity's hit-box with its scale, so a scaled-up cube stays clickable.
+- Toolbar File, Edit, View, and Help menus, wired to the same actions as the keyboard shortcuts: save and reload a scene, quit, spawn and despawn entities, clear the selection, play/pause, step a tick, and toggle the controls overlay.
+- Entity scripts now run, through a Rhai backend in the editor.
+- A Script Editor tab in the centre area: a sidebar of script names beside one large code editor with a line-number gutter, for writing and editing the shared script library.
+- Assign a script to the selected entity from the Inspector, through a searchable, filterable picker.
+- Live syntax checking in the Script Editor: the open script is compile-checked and a status line shows the syntax error's line, column, and message, or confirms it parses. (Syntax only; Rhai surfaces unknown-variable and type errors at run time.)
+- Entities render as their chosen primitive (cube, sphere, or plane), and a Mesh dropdown in the Inspector picks the shape per entity.
+- Overlapping entities are tinted red in the viewport, a live view of the engine's collision detection.
+- Scripts can read whether their entity is colliding this tick, via a read-only `hit` variable. Collision detection now runs first in the tick loop so scripts see it deterministically.
+- Dockable panels (egui_dock): the Viewport, Scene, Inspector, and Script Editor are now tabs that can be dragged, tabbed together, and split apart at runtime. The Viewport is one of them, drawn transparently so the 3D scene shows through, with 3D input routed by the viewport tab's own rect. The toolbar and console stay fixed.
+- Open a scene or save one to a chosen path through a native file dialog (File → Open scene…, Save scene as…), alongside the existing F5/F9 save-and-reload of the current scene.
+
+### Changed
+
+Engine:
+
+- Spawning now reuses the first freed entity slot instead of always allocating a new id, so ids stay stable and freed slots are reclaimed.
+
+### Fixed
+
+Editor (frame-editor):
+
+- The editor no longer segfaults on window close. GPU and window resources are now released while the platform connection is still alive, instead of being dropped after the event loop has already torn down.
+
+## [0.1.0] - 2026-06-27
+
+First tagged release: a working simulation engine with a companion 3D editor. Still an
+early tech demo, not ready to build a game with.
+
+### Added
+
+Engine:
+
+- Deterministic fixed-timestep clock (30 ticks per second) with spiral-of-death protection, in its own `core/` module.
+- Hand-rolled ECS-style world: entities as indices, component data in per-component storage, with runtime spawn and despawn.
+- Generic `ComponentStorage<T>` wired into the world, so adding a component type is one field.
+- `Position` and `Velocity` components (both `Copy`), and a movement system that advances entities each tick.
+- Scene serialization to and from human-readable RON.
+- Read-only ASCII debug renderer for headless use.
+- Library and binary split, so the engine is importable by other crates.
+
+Editor (frame-editor):
+
+- Native window (winit) with a 3D viewport rendered on the GPU (wgpu): instanced shaded cubes, a perspective camera, and a depth buffer for correct occlusion.
+- Orbit, pan, and zoom camera (left-drag pan, scroll zoom, middle-drag orbit).
+- Click-to-pick entity selection with highlight.
+- Live entity editing: move, spawn, and despawn from the keyboard, and edit the selected entity's position and velocity from the Inspector panel, written straight back into the world.
+- Scene save and load (`F5` and `F9`), with a scene loaded on startup.
+- A docked, resizable egui panel layout: a top toolbar, a right inspector dock (Scene list and Inspector), and a bottom console dock (live Output log and a Terminal placeholder).
+- Runs the simulation live on the engine's clock, with play, pause, and step.
+
+### Known issues
+
+- The editor can crash on window close during GPU teardown. It does not affect editing or saved scenes.
+
+[Unreleased]: https://github.com/outerframehq/frame-engine/compare/0.3.0...HEAD
+[0.3.0]: https://github.com/outerframehq/frame-engine/compare/0.2.0...0.3.0
+[0.2.0]: https://github.com/outerframehq/frame-engine/compare/0.1.0...0.2.0
+[0.1.0]: https://github.com/outerframehq/frame-engine/releases/tag/0.1.0

@@ -1,0 +1,28 @@
+[package]
+name = "frame-editor"
+version = "0.0.0"
+edition = "2024"
+
+[dependencies]
+
+image = { version = "0.25", default-features = false, features = ["png"] }
+
+frame-engine = { path = "../frame-engine" }
+winit = "0.30"
+softbuffer = "0.4"
+wgpu = "29.0.3"
+pollster = "0.4.0"
+bytemuck = { version = "1", features = ["derive"] }
+glam = "0.30"
+egui = "0.35"
+egui-winit = "0.35"
+egui-wgpu = "0.35"
+egui_dock = "0.20"
+rfd = "0.17"
+dirs = "6"
+chrono = "0.4"
+serde = { version = "1", features = ["derive"] }
+ron = "0.12"
+rhai = { version = "1.25", features = ["internals"] }
+git2 = "0.21"
+kira = "0.12"

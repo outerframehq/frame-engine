@@ -1,0 +1,5768 @@
+const LOGO_PNG: &[u8] = include_bytes!("../assets/frame-editor.png");
+use bytemuck::Zeroable;
+use frame_engine::core::Clock;
+use frame_engine::input::{Button, InputState};
+use frame_engine::physics::{GRAVITY_Y, Physics};
+use frame_engine::systems;
+use frame_engine::world::{
+    Controlled, Gravity, Light, LightKind, Mesh, Position, RigidBody, Script, ScriptRuntime,
+    Sound, Static, Velocity, World,
+};
+use glam::{Mat4, Vec3, Vec4};
+use std::sync::Arc;
+use wgpu::util::DeviceExt;
+use winit::application::ApplicationHandler;
+use winit::event::{
+    DeviceEvent, DeviceId, ElementState, MouseButton, MouseScrollDelta, WindowEvent,
+};
+use winit::event_loop::{ActiveEventLoop, EventLoop};
+use winit::keyboard::{KeyCode, PhysicalKey};
+use winit::window::{Icon, Window, WindowId};
+mod font;
+mod script;
+const TICK_RATE: u32 = 30;
+const MAX_CATCHUP_TICKS: u32 = 5;
+// Vertical field of view, shared by the projection and the pan maths.
+const FOV_DEGREES: f32 = 45.0;
+// World-space size of an entity, used for picking. Defined once in the engine
+// (it's a simulation fact — collision boxes use it too); we reference it here so
+// pick and collision can't drift. MESH_SIZE in shader.wgsl must match it by hand.
+const QUAD_SIZE: f32 = frame_engine::world::ENTITY_SIZE;
+// How fast middle-drag sweeps the orbit, in radians per pixel.
+const ORBIT_SENS: f32 = 0.005;
+// Mouselook sensitivity for the flythrough camera (radians per pixel of motion).
+const LOOK_SENS: f32 = 0.005;
+// Format of the depth buffer. 32-bit float depth, no stencil.
+const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
+// How far a single nudge moves the selected entity, in world units.
+const EDIT_STEP: f32 = 5.0;
+// How far the WASD free camera pans the focus point per frame (while paused).
+const CAM_PAN_SPEED: f32 = 3.0;
+// Translate gizmo: how long each axis arm is, as a fraction of the distance from
+// the camera to the entity — so it keeps a roughly constant size on screen.
+const GIZMO_SCREEN_FRAC: f32 = 0.15;
+// How close (in pixels) the cursor must be to an arm to grab it.
+const GIZMO_PICK_PX: f32 = 10.0;
+// The camera data handed to the shader. Must match the `Camera` struct in shader.wgsl.
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct CameraUniform {
+    view_proj: [[f32; 4]; 4],
+}
+// One light's data handed to the shader. Must match the `Light` struct in
+// shader.wgsl field-for-field, including the deliberate use of [f32; 4]
+// (rather than [f32; 3]) everywhere, purely to keep every light a clean
+// 16-byte-aligned multiple in the uniform buffer, sidestepping WGSL's
+// alignment rules for vec3.
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct LightRaw {
+    // xyz: direction toward the light (directional) or world position
+    // (point). w unused.
+    position_or_direction: [f32; 4],
+    // x: kind, 0.0 directional, 1.0 point. y: range (point only). z:
+    // intensity, 0.0 marks an unused slot. w unused.
+    params: [f32; 4],
+}
+// A fixed number of simultaneously active lights sent to the shader every
+// frame, unused slots zeroed (intensity 0.0), matching MAX_LIGHTS in
+// shader.wgsl.
+const MAX_LIGHTS: usize = 4;
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct LightsUniform {
+    lights: [LightRaw; MAX_LIGHTS],
+}
+// Per-vertex mesh geometry: a position in the primitive's local (roughly unit)
+// space and its surface normal. One shared vertex buffer holds every primitive's
+// vertices back to back; each entity instance picks which slice to draw.
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct MeshVertex {
+    position: [f32; 3],
+    normal: [f32; 3],
+}
+impl MeshVertex {
+    const ATTRIBS: [wgpu::VertexAttribute; 2] = [
+        wgpu::VertexAttribute {
+            format: wgpu::VertexFormat::Float32x3,
+            offset: 0,
+            shader_location: 0,
+        },
+        wgpu::VertexAttribute {
+            format: wgpu::VertexFormat::Float32x3,
+            offset: std::mem::size_of::<[f32; 3]>() as wgpu::BufferAddress, // 12
+            shader_location: 1,
+        },
+    ];
+    fn layout() -> wgpu::VertexBufferLayout<'static> {
+        wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<MeshVertex>() as wgpu::BufferAddress,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &Self::ATTRIBS,
+        }
+    }
+}
+
+// --- Primitive geometry, generated once on the CPU ---
+// Each primitive is built at roughly unit size (half-extent 0.5 / radius 0.5),
+// centred on the origin, so the shader scales them all by the same MESH_SIZE and
+// a default entity comes out exactly the size the cube always was. These are
+// ordered to match the engine's `Mesh` enum: Cube, Sphere, Plane.
+
+// A unit cube: 36 vertices (6 faces x 2 triangles), each face flat-shaded with
+// one outward normal. This reproduces the cube the shader used to synthesise, so
+// existing scenes look identical.
+fn cube_vertices() -> Vec<MeshVertex> {
+    // 8 corners of a cube with half-extent 0.5.
+    const C: [[f32; 3]; 8] = [
+        [-0.5, -0.5, -0.5],
+        [0.5, -0.5, -0.5],
+        [0.5, 0.5, -0.5],
+        [-0.5, 0.5, -0.5],
+        [-0.5, -0.5, 0.5],
+        [0.5, -0.5, 0.5],
+        [0.5, 0.5, 0.5],
+        [-0.5, 0.5, 0.5],
+    ];
+    // Each face: six corner indices (two triangles) and one outward normal.
+    const FACES: [([usize; 6], [f32; 3]); 6] = [
+        ([4, 5, 6, 6, 7, 4], [0.0, 0.0, 1.0]),  // +Z front
+        ([1, 0, 3, 3, 2, 1], [0.0, 0.0, -1.0]), // -Z back
+        ([5, 1, 2, 2, 6, 5], [1.0, 0.0, 0.0]),  // +X right
+        ([0, 4, 7, 7, 3, 0], [-1.0, 0.0, 0.0]), // -X left
+        ([3, 2, 6, 6, 7, 3], [0.0, 1.0, 0.0]),  // +Y top
+        ([0, 1, 5, 5, 4, 0], [0.0, -1.0, 0.0]), // -Y bottom
+    ];
+    let mut verts = Vec::with_capacity(36);
+    for (indices, normal) in FACES {
+        for i in indices {
+            verts.push(MeshVertex {
+                position: C[i],
+                normal,
+            });
+        }
+    }
+    verts
+}
+
+// A UV sphere of radius 0.5, built as rings of quads. The surface normal at any
+// point on a sphere centred on the origin is just its (unit) direction, so the
+// normal is the unit position and the position is that scaled by the radius. The
+// poles produce a few degenerate (zero-area) triangles, which draw nothing.
+fn sphere_vertices() -> Vec<MeshVertex> {
+    use std::f32::consts::PI;
+    const LAT: u32 = 12; // rings from pole to pole
+    const LON: u32 = 18; // segments around
+    const RADIUS: f32 = 0.5;
+    let point = |theta: f32, phi: f32| -> [f32; 3] {
+        [
+            theta.sin() * phi.cos(),
+            theta.cos(),
+            theta.sin() * phi.sin(),
+        ]
+    };
+    let vert = |unit: [f32; 3]| MeshVertex {
+        position: [unit[0] * RADIUS, unit[1] * RADIUS, unit[2] * RADIUS],
+        normal: unit,
+    };
+    let mut verts = Vec::new();
+    for lat in 0..LAT {
+        let t0 = PI * lat as f32 / LAT as f32;
+        let t1 = PI * (lat + 1) as f32 / LAT as f32;
+        for lon in 0..LON {
+            let p0 = 2.0 * PI * lon as f32 / LON as f32;
+            let p1 = 2.0 * PI * (lon + 1) as f32 / LON as f32;
+            let a = point(t0, p0);
+            let b = point(t1, p0);
+            let c = point(t1, p1);
+            let d = point(t0, p1);
+            // two triangles per quad: (a, b, c) and (a, c, d)
+            verts.push(vert(a));
+            verts.push(vert(b));
+            verts.push(vert(c));
+            verts.push(vert(a));
+            verts.push(vert(c));
+            verts.push(vert(d));
+        }
+    }
+    verts
+}
+
+// A flat, horizontal quad in the XZ plane (a floor tile), facing up (+Y),
+// half-extent 0.5 — the same footprint as the cube's base. Back-face culling is
+// off, so it's visible from below too.
+fn plane_vertices() -> Vec<MeshVertex> {
+    let normal = [0.0, 1.0, 0.0];
+    let v = |x: f32, z: f32| MeshVertex {
+        position: [x, 0.0, z],
+        normal,
+    };
+    vec![
+        v(-0.5, -0.5),
+        v(0.5, -0.5),
+        v(0.5, 0.5),
+        v(0.5, 0.5),
+        v(-0.5, 0.5),
+        v(-0.5, -0.5),
+    ]
+}
+
+// Per-entity instance data: world position plus a selected flag (0 or 1).
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct InstanceRaw {
+    position: [f32; 3],
+    color: [f32; 3],
+    selected: f32,
+    scale: [f32; 3],
+    emissive: f32,
+    yaw: f32,
+}
+impl InstanceRaw {
+    // Locations 0-1 belong to the mesh vertex buffer (MeshVertex); the instance
+    // attributes continue from 2.
+    const ATTRIBS: [wgpu::VertexAttribute; 6] = [
+        wgpu::VertexAttribute {
+            format: wgpu::VertexFormat::Float32x3,
+            offset: 0,
+            shader_location: 2,
+        },
+        wgpu::VertexAttribute {
+            format: wgpu::VertexFormat::Float32x3,
+            offset: std::mem::size_of::<[f32; 3]>() as wgpu::BufferAddress, // 12
+            shader_location: 3,
+        },
+        wgpu::VertexAttribute {
+            format: wgpu::VertexFormat::Float32,
+            offset: std::mem::size_of::<[f32; 6]>() as wgpu::BufferAddress, // 24
+            shader_location: 4,
+        },
+        wgpu::VertexAttribute {
+            format: wgpu::VertexFormat::Float32x3,
+            offset: std::mem::size_of::<[f32; 7]>() as wgpu::BufferAddress, // 28
+            shader_location: 5,
+        },
+        wgpu::VertexAttribute {
+            format: wgpu::VertexFormat::Float32,
+            offset: std::mem::size_of::<[f32; 10]>() as wgpu::BufferAddress, // 40
+            shader_location: 6,
+        },
+        wgpu::VertexAttribute {
+            format: wgpu::VertexFormat::Float32,
+            offset: std::mem::size_of::<[f32; 11]>() as wgpu::BufferAddress, // 44
+            shader_location: 7,
+        },
+    ];
+    fn layout() -> wgpu::VertexBufferLayout<'static> {
+        wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<InstanceRaw>() as wgpu::BufferAddress,
+            step_mode: wgpu::VertexStepMode::Instance,
+            attributes: &Self::ATTRIBS,
+        }
+    }
+}
+// A screen-space overlay rectangle (text pixel), positioned directly in NDC.
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct TextInstance {
+    offset: [f32; 2], // bottom-left corner in NDC
+    size: [f32; 2],   // width/height in NDC
+}
+impl TextInstance {
+    const ATTRIBS: [wgpu::VertexAttribute; 2] = [
+        wgpu::VertexAttribute {
+            format: wgpu::VertexFormat::Float32x2,
+            offset: 0,
+            shader_location: 0,
+        },
+        wgpu::VertexAttribute {
+            format: wgpu::VertexFormat::Float32x2,
+            offset: std::mem::size_of::<[f32; 2]>() as wgpu::BufferAddress, // 8
+            shader_location: 1,
+        },
+    ];
+    fn layout() -> wgpu::VertexBufferLayout<'static> {
+        wgpu::VertexBufferLayout {
+            array_stride: std::mem::size_of::<TextInstance>() as wgpu::BufferAddress,
+            step_mode: wgpu::VertexStepMode::Instance,
+            attributes: &Self::ATTRIBS,
+        }
+    }
+}
+// Create (or recreate) the depth texture's view, sized to match the surface.
+// Called once at startup and again on every resize.
+fn create_depth_view(
+    device: &wgpu::Device,
+    config: &wgpu::SurfaceConfiguration,
+) -> wgpu::TextureView {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("depth texture"),
+        size: wgpu::Extent3d {
+            width: config.width.max(1),
+            height: config.height.max(1),
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: DEPTH_FORMAT,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        view_formats: &[],
+    });
+    texture.create_view(&wgpu::TextureViewDescriptor::default())
+}
+// Turn a string into a pile of screen-space quads, one per lit font pixel.
+//
+// Coordinates flow: a font pixel lives at some screen pixel (x right, y DOWN
+// from the top-left), then we convert that pixel rectangle into NDC (x -1..1
+// left..right, y -1..1 bottom..TOP). The Y axis flips, same as project().
+//
+// Knobs:
+//   start_x / start_y : top-left of the text block, in screen pixels
+//   pixel             : how many screen pixels each font dot occupies
+fn build_text(
+    text: &str,
+    start_x: f32,
+    start_y: f32,
+    pixel: f32,
+    screen_w: f32,
+    screen_h: f32,
+) -> Vec<TextInstance> {
+    let mut out = Vec::new();
+    let mut cursor_x = start_x;
+    let mut cursor_y = start_y;
+    for c in text.chars() {
+        if c == '\n' {
+            cursor_x = start_x;
+            cursor_y += (font::GLYPH_HEIGHT as f32 + 1.0) * pixel;
+            continue;
+        }
+        let rows = font::glyph(c);
+        for (row_i, &bits) in rows.iter().enumerate() {
+            for col in 0..font::GLYPH_WIDTH {
+                // bit 4 is the leftmost column, bit 0 the rightmost.
+                let lit = (bits >> (font::GLYPH_WIDTH - 1 - col)) & 1 == 1;
+                if !lit {
+                    continue;
+                }
+                // This font dot's top-left, in screen pixels.
+                let sx = cursor_x + col as f32 * pixel;
+                let sy = cursor_y + row_i as f32 * pixel;
+                // Convert to an NDC rectangle. The quad's offset is its
+                // bottom-left corner and it grows +x (right) and +y (up), so we
+                // anchor at the dot's BOTTOM edge (sy + pixel) after the flip.
+                let ndc_x = sx / screen_w * 2.0 - 1.0;
+                let ndc_y_bottom = 1.0 - (sy + pixel) / screen_h * 2.0;
+                out.push(TextInstance {
+                    offset: [ndc_x, ndc_y_bottom],
+                    size: [pixel / screen_w * 2.0, pixel / screen_h * 2.0],
+                });
+            }
+        }
+        cursor_x += (font::GLYPH_WIDTH as f32 + 1.0) * pixel;
+    }
+    out
+}
+// Build the camera's view-projection matrix from its current state.
+//
+// The eye orbits the focus point at `distance`, swung around by yaw (around the
+// world Y axis) and pitch (elevation). yaw = pitch = 0 puts the eye straight out
+// along +Z, i.e. looking down the -Z axis — the old fixed view.
+fn camera_matrix(
+    focus_x: f32,
+    focus_y: f32,
+    focus_z: f32,
+    distance: f32,
+    yaw: f32,
+    pitch: f32,
+    width: u32,
+    height: u32,
+) -> Mat4 {
+    let aspect = width as f32 / height.max(1) as f32;
+    let target = Vec3::new(focus_x, focus_y, focus_z);
+    let offset = Vec3::new(
+        pitch.cos() * yaw.sin(),
+        pitch.sin(),
+        pitch.cos() * yaw.cos(),
+    ) * distance;
+    let eye = target + offset;
+    let up = Vec3::Y;
+    let view = Mat4::look_at_rh(eye, target, up);
+    let proj = Mat4::perspective_rh(FOV_DEGREES.to_radians(), aspect, 0.1, 10000.0);
+    proj * view
+}
+fn camera_view_proj(
+    focus_x: f32,
+    focus_y: f32,
+    focus_z: f32,
+    distance: f32,
+    yaw: f32,
+    pitch: f32,
+    width: u32,
+    height: u32,
+) -> [[f32; 4]; 4] {
+    camera_matrix(
+        focus_x, focus_y, focus_z, distance, yaw, pitch, width, height,
+    )
+    .to_cols_array_2d()
+}
+// The camera's look direction (eye -> target) for a given yaw/pitch. Matches the
+// orbit convention, so entering fly mode preserves the current heading.
+fn view_forward(yaw: f32, pitch: f32) -> Vec3 {
+    Vec3::new(
+        -(pitch.cos() * yaw.sin()),
+        -pitch.sin(),
+        -(pitch.cos() * yaw.cos()),
+    )
+}
+// Project a world point through the view-projection matrix to screen pixels.
+fn project(vp: Mat4, x: f32, y: f32, z: f32, width: f32, height: f32) -> Option<(f32, f32)> {
+    let clip = vp * Vec4::new(x, y, z, 1.0);
+    if clip.w <= 0.0 {
+        return None;
+    }
+    let ndc_x = clip.x / clip.w;
+    let ndc_y = clip.y / clip.w;
+    let screen_x = (ndc_x * 0.5 + 0.5) * width;
+    let screen_y = (1.0 - (ndc_y * 0.5 + 0.5)) * height;
+    Some((screen_x, screen_y))
+}
+// The translate gizmo, projected to screen. `origin` is the selected entity and
+// `ends` are the tips of its X, Y, Z arms, all in PHYSICAL pixels (the same space
+// as the cursor, so hit-testing is a straight comparison). `len` is how long one
+// arm is in world units, which is what converts a screen drag back into a world
+// move.
+#[derive(Clone, Copy)]
+struct GizmoScreen {
+    origin: (f32, f32),
+    ends: [(f32, f32); 3],
+    len: f32,
+}
+
+// The same gizmo in egui points, ready to paint, plus which arm is lit up.
+#[derive(Clone, Copy)]
+struct GizmoDraw {
+    origin: egui::Pos2,
+    ends: [egui::Pos2; 3],
+    active: Option<usize>,
+}
+
+// Shortest distance from a point to a line segment, in 2D. Used to decide whether
+// the cursor is on a gizmo arm.
+fn dist_to_segment(p: (f32, f32), a: (f32, f32), b: (f32, f32)) -> f32 {
+    let (vx, vy) = (b.0 - a.0, b.1 - a.1);
+    let (wx, wy) = (p.0 - a.0, p.1 - a.1);
+    let len2 = vx * vx + vy * vy;
+    if len2 <= 0.0001 {
+        return (wx * wx + wy * wy).sqrt();
+    }
+    // Project the point onto the segment, clamped to its ends.
+    let t = ((wx * vx + wy * vy) / len2).clamp(0.0, 1.0);
+    let (cx, cy) = (a.0 + vx * t, a.1 + vy * t);
+    ((p.0 - cx).powi(2) + (p.1 - cy).powi(2)).sqrt()
+}
+// Build the shared mesh vertex buffer: the three primitives first, then any
+// imported models, each with its vertex range recorded. Bucket order here must
+// match build_instances: Cube, Sphere, Plane, then customs in the given order
+// (sorted by name at the call sites).
+fn build_mesh_buffer(
+    device: &wgpu::Device,
+    customs: &[&frame_engine::assets::MeshData],
+) -> (wgpu::Buffer, Vec<std::ops::Range<u32>>) {
+    let mut mesh_verts: Vec<MeshVertex> = Vec::new();
+    let mut ranges: Vec<std::ops::Range<u32>> = Vec::new();
+    let push = |verts: Vec<MeshVertex>,
+                mesh_verts: &mut Vec<MeshVertex>,
+                ranges: &mut Vec<std::ops::Range<u32>>| {
+        let start = mesh_verts.len() as u32;
+        mesh_verts.extend(verts);
+        ranges.push(start..mesh_verts.len() as u32);
+    };
+    push(cube_vertices(), &mut mesh_verts, &mut ranges);
+    push(sphere_vertices(), &mut mesh_verts, &mut ranges);
+    push(plane_vertices(), &mut mesh_verts, &mut ranges);
+    for data in customs {
+        let verts: Vec<MeshVertex> = data
+            .vertices
+            .iter()
+            .map(|v| MeshVertex {
+                position: v.position,
+                normal: v.normal,
+            })
+            .collect();
+        push(verts, &mut mesh_verts, &mut ranges);
+    }
+    let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("mesh vertex buffer"),
+        contents: bytemuck::cast_slice(&mesh_verts),
+        usage: wgpu::BufferUsages::VERTEX,
+    });
+    (buffer, ranges)
+}
+
+/// The Vulkan instance/adapter/device/queue, shared across every window this
+/// app opens (main, Play, and any popped-out dock tab). Each window gets its
+/// own Surface, but only ever one Instance and one Device for the whole
+/// process. This isn't a style choice: multiple independent Vulkan instances
+/// created and destroyed in one process is unstable on at least some NVIDIA
+/// driver versions and segfaulted deep inside the driver (not our code) the
+/// moment a second one was torn down -- exactly what popping out a tab and
+/// docking it back did before this. wgpu's handle types (Instance, Adapter,
+/// Device, Queue) are cheap to Clone -- they're just references to the real
+/// underlying object -- so sharing them this way doesn't duplicate GPU work.
+#[derive(Clone)]
+struct SharedGpu {
+    instance: wgpu::Instance,
+    adapter: wgpu::Adapter,
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+}
+
+// All the long-lived GPU objects, bundled so they travel together.
+struct GpuState {
+    surface: wgpu::Surface<'static>,
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    config: wgpu::SurfaceConfiguration,
+    render_pipeline: wgpu::RenderPipeline,
+    text_pipeline: wgpu::RenderPipeline,
+    // One vertex buffer holding every primitive's geometry back to back, plus
+    // each primitive's vertex range within it, ordered Cube, Sphere, Plane
+    // (matching the engine's `Mesh` enum). Built once; static for the app's life.
+    mesh_vertex_buffer: wgpu::Buffer,
+    mesh_ranges: Vec<std::ops::Range<u32>>,
+    camera_buffer: wgpu::Buffer,
+    lights_buffer: wgpu::Buffer,
+    scene_bind_group: wgpu::BindGroup,
+    depth_view: wgpu::TextureView,
+    egui_renderer: egui_wgpu::Renderer,
+}
+impl GpuState {
+    /// Builds a GpuState for one window. `shared` is `None` exactly once per
+    /// process -- for the very first (main) window -- which is when a new
+    /// Instance/Adapter/Device/Queue actually get created; every later
+    /// window (Play, a popped-out tab) passes the SharedGpu that call
+    /// returned, so only a new Surface is created for it. Always returns the
+    /// SharedGpu to use for the next window, whether it was just created or
+    /// passed in unchanged, so callers don't need their own branching.
+    fn new(window: Arc<Window>, shared: Option<&SharedGpu>) -> (GpuState, SharedGpu) {
+        let size = window.inner_size();
+        let (instance, surface, adapter, device, queue) = match shared {
+            Some(shared) => {
+                let surface = shared.instance.create_surface(window.clone()).unwrap();
+                (
+                    shared.instance.clone(),
+                    surface,
+                    shared.adapter.clone(),
+                    shared.device.clone(),
+                    shared.queue.clone(),
+                )
+            }
+            None => {
+                // Vulkan validation layers are on by default in debug
+                // builds; turning them off costs us the layer's debug-time
+                // GPU-usage warnings, not correctness at runtime.
+                let mut instance_desc = wgpu::InstanceDescriptor::new_without_display_handle();
+                instance_desc.flags = wgpu::InstanceFlags::empty();
+                let instance = wgpu::Instance::new(instance_desc);
+                let surface = instance.create_surface(window.clone()).unwrap();
+                let adapter =
+                    pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+                        power_preference: wgpu::PowerPreference::default(),
+                        compatible_surface: Some(&surface),
+                        force_fallback_adapter: false,
+                    }))
+                    .unwrap();
+                let (device, queue) = pollster::block_on(
+                    adapter.request_device(&wgpu::DeviceDescriptor::default()),
+                )
+                .unwrap();
+                (instance, surface, adapter, device, queue)
+            }
+        };
+        let shared_out = SharedGpu {
+            instance,
+            adapter: adapter.clone(),
+            device: device.clone(),
+            queue: queue.clone(),
+        };
+        let config = surface
+            .get_default_config(&adapter, size.width.max(1), size.height.max(1))
+            .unwrap();
+        surface.configure(&device, &config);
+        let depth_view = create_depth_view(&device, &config);
+        // egui's renderer. It draws in its own pass with no depth attachment,
+        // so RendererOptions::default() (depth_stencil_format: None) is correct.
+        let egui_renderer = egui_wgpu::Renderer::new(
+            &device,
+            config.format,
+            egui_wgpu::RendererOptions::default(),
+        );
+        let camera_uniform = CameraUniform {
+            view_proj: Mat4::IDENTITY.to_cols_array_2d(),
+        };
+        let camera_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("camera buffer"),
+            contents: bytemuck::cast_slice(&[camera_uniform]),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        // Zeroed lights (every slot's intensity 0.0, so the shader's loop
+        // contributes nothing from any of them) until the first real frame
+        // fills this in from the world's Light entities.
+        let lights_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("lights buffer"),
+            contents: bytemuck::cast_slice(&[LightsUniform {
+                lights: [LightRaw::zeroed(); MAX_LIGHTS],
+            }]),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        let scene_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("scene bind group layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::VERTEX,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        // Lighting is computed per fragment now, not per
+                        // vertex, so only the fragment stage needs this.
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+        let scene_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("scene bind group"),
+            layout: &scene_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: camera_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: lights_buffer.as_entire_binding(),
+                },
+            ],
+        });
+        // --- Primitive geometry: one shared vertex buffer, built once ---
+        // Concatenate every primitive's vertices and remember each one's range,
+        // in the engine's Mesh order (Cube, Sphere, Plane). At draw time we bind
+        // this buffer and draw the range for whichever primitive an entity uses.
+        let (mesh_vertex_buffer, mesh_ranges) = build_mesh_buffer(&device, &[]);
+        // --- Entity pipeline (world-space, camera-driven) ---
+        let entity_shader = device.create_shader_module(wgpu::include_wgsl!("shader.wgsl"));
+        let entity_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("entity pipeline layout"),
+                bind_group_layouts: &[Some(&scene_bind_group_layout)],
+                immediate_size: 0,
+            });
+        let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("entity pipeline"),
+            layout: Some(&entity_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &entity_shader,
+                entry_point: Some("vs_main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                buffers: &[MeshVertex::layout(), InstanceRaw::layout()],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &entity_shader,
+                entry_point: Some("fs_main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: config.format,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            // Entities test AND write depth: nearer fragments win and record
+            // their depth, so a later-drawn far fragment is correctly discarded.
+            // This is what makes a solid cube (front faces hide back faces).
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::Less),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+        // --- Text/overlay pipeline (screen-space, no camera) ---
+        let text_shader = device.create_shader_module(wgpu::include_wgsl!("text.wgsl"));
+        let text_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("text pipeline layout"),
+            bind_group_layouts: &[], // no camera — positions are already in NDC
+            immediate_size: 0,
+        });
+        let text_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("text pipeline"),
+            layout: Some(&text_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &text_shader,
+                entry_point: Some("vs_main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                buffers: &[TextInstance::layout()],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &text_shader,
+                entry_point: Some("fs_main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: config.format,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            // The overlay is screen furniture: it must ALWAYS draw on top and
+            // never write depth (Always = ignore the test, write disabled).
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::Always),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+        (
+            GpuState {
+                surface,
+                device,
+                queue,
+                config,
+                render_pipeline,
+                text_pipeline,
+                mesh_vertex_buffer,
+                mesh_ranges,
+                camera_buffer,
+                lights_buffer,
+                scene_bind_group,
+                depth_view,
+                egui_renderer,
+            },
+            shared_out,
+        )
+    }
+    // Rebuild the mesh vertex buffer with the current set of imported models.
+    // Called when a project loads or a model gets imported. Cheap and rare.
+    fn set_custom_meshes(&mut self, customs: &[&frame_engine::assets::MeshData]) {
+        let (buffer, ranges) = build_mesh_buffer(&self.device, customs);
+        self.mesh_vertex_buffer = buffer;
+        self.mesh_ranges = ranges;
+    }
+    fn resize(&mut self, width: u32, height: u32) {
+        if width > 0 && height > 0 {
+            self.config.width = width;
+            self.config.height = height;
+            self.surface.configure(&self.device, &self.config);
+            // Depth buffer must track the window size, or the test reads garbage.
+            self.depth_view = create_depth_view(&self.device, &self.config);
+        }
+    }
+    // Draw one frame: entities (world-space cubes) then text (screen overlay).
+    fn render(
+        &mut self,
+        instances: &[InstanceRaw],
+        // How many instances belong to each primitive, in Cube, Sphere, Plane
+        // order. `instances` is laid out in that same order, so these counts also
+        // give each primitive's contiguous slice of the instance buffer.
+        group_counts: &[u32],
+        text_instances: &[TextInstance],
+        view_proj: [[f32; 4]; 4],
+        lights: &[LightRaw; MAX_LIGHTS],
+        egui_paint_jobs: &[egui::epaint::ClippedPrimitive],
+        egui_textures_delta: &egui::TexturesDelta,
+        egui_ppp: f32,
+    ) {
+        let camera_uniform = CameraUniform { view_proj };
+        self.queue.write_buffer(
+            &self.camera_buffer,
+            0,
+            bytemuck::cast_slice(&[camera_uniform]),
+        );
+        self.queue.write_buffer(
+            &self.lights_buffer,
+            0,
+            bytemuck::cast_slice(&[LightsUniform { lights: *lights }]),
+        );
+        // egui: upload any new/changed textures before we start encoding.
+        for (id, image_delta) in &egui_textures_delta.set {
+            self.egui_renderer
+                .update_texture(&self.device, &self.queue, *id, image_delta);
+        }
+        let egui_screen = egui_wgpu::ScreenDescriptor {
+            size_in_pixels: [self.config.width, self.config.height],
+            pixels_per_point: egui_ppp,
+        };
+        let frame = match self.surface.get_current_texture() {
+            wgpu::CurrentSurfaceTexture::Success(frame)
+            | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
+            _ => {
+                self.surface.configure(&self.device, &self.config);
+                return;
+            }
+        };
+        let instance_buffer = if instances.is_empty() {
+            None
+        } else {
+            Some(
+                self.device
+                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("instance buffer"),
+                        contents: bytemuck::cast_slice(instances),
+                        usage: wgpu::BufferUsages::VERTEX,
+                    }),
+            )
+        };
+        let text_buffer = if text_instances.is_empty() {
+            None
+        } else {
+            Some(
+                self.device
+                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("text buffer"),
+                        contents: bytemuck::cast_slice(text_instances),
+                        usage: wgpu::BufferUsages::VERTEX,
+                    }),
+            )
+        };
+        let view = frame
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("frame encoder"),
+            });
+        // egui: record its vertex/index uploads into the encoder. Must happen
+        // before any render pass is active.
+        let egui_user_buffers = self.egui_renderer.update_buffers(
+            &self.device,
+            &self.queue,
+            &mut encoder,
+            egui_paint_jobs,
+            &egui_screen,
+        );
+        {
+            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("main pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: 0.12,
+                            g: 0.12,
+                            b: 0.16,
+                            a: 1.0,
+                        }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                // Clear depth to 1.0 (farthest) at the start of every frame.
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            // entities — draw each primitive's instances against its own
+            // geometry. The shared mesh buffer sits at slot 0; the per-entity
+            // instance buffer (grouped by primitive) at slot 1. For each
+            // primitive with any instances, draw its vertex range for its
+            // contiguous slice of instances.
+            render_pass.set_pipeline(&self.render_pipeline);
+            render_pass.set_bind_group(0, &self.scene_bind_group, &[]);
+            if let Some(buffer) = &instance_buffer {
+                render_pass.set_vertex_buffer(0, self.mesh_vertex_buffer.slice(..));
+                let stride = std::mem::size_of::<InstanceRaw>() as wgpu::BufferAddress;
+                let mut instance_start = 0u32;
+                for (primitive, count) in group_counts.iter().enumerate() {
+                    if *count > 0 {
+                        // Bind just this group's slice of the instance buffer and
+                        // draw from instance 0, rather than using a non-zero first
+                        // instance (which some backends validate against).
+                        let begin = instance_start as wgpu::BufferAddress * stride;
+                        render_pass.set_vertex_buffer(1, buffer.slice(begin..));
+                        // Skip a group with no matching range. Happens if the
+                        // instance list and mesh buffer briefly disagree.
+                        if let Some(range) = self.mesh_ranges.get(primitive) {
+                            render_pass.draw(range.clone(), 0..*count);
+                        }
+                    }
+                    instance_start += count;
+                }
+            }
+            // text overlay (screen-space, drawn on top, no camera)
+            render_pass.set_pipeline(&self.text_pipeline);
+            if let Some(buffer) = &text_buffer {
+                render_pass.set_vertex_buffer(0, buffer.slice(..));
+                render_pass.draw(0..6, 0..text_instances.len() as u32);
+            }
+        }
+        // egui pass: layered over the scene (load, don't clear), no depth.
+        // egui's renderer requires a RenderPass<'static>, hence forget_lifetime.
+        {
+            let mut egui_pass = encoder
+                .begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("egui pass"),
+                    color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                        view: &view,
+                        resolve_target: None,
+                        depth_slice: None,
+                        ops: wgpu::Operations {
+                            load: wgpu::LoadOp::Load,
+                            store: wgpu::StoreOp::Store,
+                        },
+                    })],
+                    depth_stencil_attachment: None,
+                    timestamp_writes: None,
+                    occlusion_query_set: None,
+                    multiview_mask: None,
+                })
+                .forget_lifetime();
+            self.egui_renderer
+                .render(&mut egui_pass, egui_paint_jobs, &egui_screen);
+        }
+        // egui: free textures it no longer needs, after this frame's draw.
+        for id in &egui_textures_delta.free {
+            self.egui_renderer.free_texture(id);
+        }
+        // egui's upload command buffers must be submitted before the main one.
+        self.queue.submit(
+            egui_user_buffers
+                .into_iter()
+                .chain(std::iter::once(encoder.finish())),
+        );
+        frame.present();
+    }
+}
+/// Which tab is showing in the right-hand inspector dock.
+/// A dockable tool panel, shown as a tab in the right-hand egui_dock area. These
+/// can be dragged, tabbed together, and split apart at runtime. The 3D viewport
+/// is deliberately NOT one of these — it stays the fixed background the docks
+/// leave uncovered, so its input routing and transparency are unchanged.
+#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+enum Tab {
+    Viewport,
+    Scene,
+    Inspector,
+    Scripts,
+    Source,
+}
+/// Which tab is showing in the bottom console dock.
+#[derive(Clone, Copy, PartialEq)]
+enum ConsoleTab {
+    Output,
+    Terminal,
+    Assets,
+}
+/// A command chosen from the toolbar menus this frame, applied after the egui
+/// pass. The menu closure can't borrow `self`, so it stages the choice here and
+/// we dispatch it afterwards — the same lift-then-write-back pattern the
+/// selection and inspector edits use.
+/// Which screen the editor is showing. It starts at the launcher; creating or
+/// opening a project loads its scene and switches to the editor proper.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AppMode {
+    Launcher,
+    Editor,
+}
+
+/// A choice made on the launcher screen this frame, applied after the egui pass
+/// (so the blocking file dialog doesn't run mid-draw) — the same lift-then-act
+/// pattern the toolbar menus use.
+enum LauncherAction {
+    NewProject,
+    OpenProject,
+    OpenRecent(std::path::PathBuf),
+    PlayRecent(std::path::PathBuf),
+    OpenSettings(std::path::PathBuf),
+    ConfirmDelete(std::path::PathBuf),
+    CancelDelete,
+    DeleteProject(std::path::PathBuf),
+}
+
+enum MenuAction {
+    OpenScene,
+    ImportModel,
+    ImportAudio,
+    SaveScene,
+    SaveSceneAs,
+    ReloadScene,
+    CloseProject,
+    Undo,
+    Redo,
+    SpawnEntity,
+    DespawnSelected,
+    ClearSelection,
+    TogglePause,
+    StepOnce,
+    ToggleHelp,
+    OpenEditorSettings,
+    About,
+    Quit,
+}
+/// The selected entity's editable state, lifted out of the world for the
+/// Inspector to edit and written back after the egui pass.
+/// The selected entity's editable state, lifted out of the world for the
+/// Inspector to edit and written back after the egui pass. A named struct
+/// rather than a plain tuple: std's auto-derived PartialEq/Clone/etc. for
+/// tuples only go up to 12 elements, and this grew past that once Light was
+/// added as a 13th. A named struct has no such cap.
+#[derive(Clone, PartialEq)]
+struct EditedEntity {
+    id: usize,
+    pos: Position,
+    vel: Velocity,
+    color: frame_engine::world::Color,
+    controlled: bool,
+    scale: frame_engine::world::Scale,
+    material: frame_engine::world::Material,
+    rotation: frame_engine::world::Rotation,
+    script_source: Option<String>,
+    mesh: Mesh,
+    is_static: bool,
+    has_gravity: bool,
+    // Whether rapier3d simulates this entity instead of the hand-rolled
+    // movement/gravity/collision systems. Needs `is_static` or `has_gravity`
+    // to actually do anything (see `physics::Physics`); ticking this alone
+    // is a harmless no-op, not an error, the same "retried every tick"
+    // tolerance `Physics::sync_new_and_removed` already has for it.
+    is_rigid_body: bool,
+    light: Option<Light>,
+    sound: Option<Sound>,
+}
+
+/// Source Control tab: a read-only view of the open project's git state —
+/// branch, ahead/behind its upstream, and the changed files. No push, pull, or
+/// commit happens here (that's what keeps the editor out of credential
+/// handling); this answers "what state am I in?" and the terminal does the rest.
+fn source_tab_ui(ui: &mut egui::Ui, summary: &Option<GitSummary>) {
+    let Some(s) = summary else {
+        ui.label("This project isn't inside a git repository.");
+        ui.add_space(4.0);
+        ui.weak("Run `git init` in the project folder to start one.");
+        return;
+    };
+    ui.horizontal(|ui| {
+        ui.label("Branch:");
+        ui.strong(&s.branch);
+    });
+    match (&s.upstream, s.ahead_behind) {
+        (Some(up), Some((ahead, behind))) => {
+            ui.horizontal(|ui| {
+                ui.label("Upstream:");
+                ui.strong(up);
+            });
+            let state = match (ahead, behind) {
+                (0, 0) => "Up to date with upstream".to_string(),
+                (a, 0) => format!("{a} commit(s) ahead, ready to push"),
+                (0, b) => format!("{b} commit(s) behind — pull to catch up"),
+                (a, b) => format!("{a} ahead, {b} behind — diverged"),
+            };
+            ui.weak(state);
+            ui.add_space(2.0);
+            ui.weak("(as of the last fetch made outside the editor)");
+        }
+        _ => {
+            ui.weak("No upstream branch configured.");
+        }
+    }
+    ui.separator();
+    if s.files.is_empty() {
+        ui.colored_label(
+            egui::Color32::from_rgb(0x7c, 0xc5, 0x7c),
+            "Working tree clean — nothing to commit",
+        );
+        return;
+    }
+    ui.label(format!("{} change(s):", s.files.len()));
+    ui.add_space(4.0);
+    for f in &s.files {
+        ui.horizontal(|ui| {
+            let (label, color) = if f.staged {
+                (
+                    format!("{} (staged)", f.label),
+                    egui::Color32::from_rgb(0x7c, 0xc5, 0x7c),
+                )
+            } else {
+                (
+                    f.label.to_string(),
+                    egui::Color32::from_rgb(0xd6, 0xa8, 0x4c),
+                )
+            };
+            ui.colored_label(color, label);
+            ui.monospace(&f.path);
+        });
+    }
+}
+
+/// Render a small shaded preview of a model on the CPU. The mesh is already
+/// unit normalised, so a fixed camera angle frames everything: rotate, project
+/// orthographically, z buffer, one light. 64x64 is plenty for a browser tile.
+fn render_thumbnail(data: &frame_engine::assets::MeshData) -> egui::ColorImage {
+    const SIZE: usize = 64;
+    // Flat rgba bytes, filled with the background colour.
+    let mut pixels = vec![0u8; SIZE * SIZE * 4];
+    for px in pixels.chunks_exact_mut(4) {
+        px.copy_from_slice(&[30, 30, 34, 255]);
+    }
+    let mut depth = vec![f32::NEG_INFINITY; SIZE * SIZE];
+
+    // Fixed view: yaw then pitch, looking down -Z after rotation.
+    let (yaw, pitch) = (0.7f32, -0.45f32);
+    let (sy, cy) = yaw.sin_cos();
+    let (sp, cp) = pitch.sin_cos();
+    let rotate = |p: [f32; 3]| {
+        let (x, y, z) = (p[0], p[1], p[2]);
+        let (x1, z1) = (x * cy + z * sy, -x * sy + z * cy);
+        let (y2, z2) = (y * cp - z1 * sp, y * sp + z1 * cp);
+        [x1, y2, z2]
+    };
+    let light = {
+        let l = [0.4f32, 0.7, 0.6];
+        let len = (l[0] * l[0] + l[1] * l[1] + l[2] * l[2]).sqrt();
+        [l[0] / len, l[1] / len, l[2] / len]
+    };
+    // Unit coords sit in -0.5..0.5. Scale by 0.9 to leave a margin.
+    let to_px = |v: f32| (v * 0.9 + 0.5) * SIZE as f32;
+
+    for tri in data.vertices.chunks_exact(3) {
+        let p: Vec<[f32; 3]> = tri.iter().map(|v| rotate(v.position)).collect();
+        let n = {
+            let m = [
+                (tri[0].normal[0] + tri[1].normal[0] + tri[2].normal[0]) / 3.0,
+                (tri[0].normal[1] + tri[1].normal[1] + tri[2].normal[1]) / 3.0,
+                (tri[0].normal[2] + tri[1].normal[2] + tri[2].normal[2]) / 3.0,
+            ];
+            rotate(m)
+        };
+        let shade = (n[0] * light[0] + n[1] * light[1] + n[2] * light[2])
+            .abs()
+            .clamp(0.15, 1.0);
+        let color = [
+            (216.0 * shade) as u8,
+            (206.0 * shade) as u8,
+            (170.0 * shade) as u8,
+            255,
+        ];
+        // Screen space corners. Y flips because pixels count down.
+        let ax = to_px(p[0][0]);
+        let ay = to_px(-p[0][1]);
+        let bx = to_px(p[1][0]);
+        let by = to_px(-p[1][1]);
+        let cx = to_px(p[2][0]);
+        let cyp = to_px(-p[2][1]);
+        let min_x = ax.min(bx).min(cx).floor().max(0.0) as usize;
+        let max_x = (ax.max(bx).max(cx).ceil() as usize).min(SIZE - 1);
+        let min_y = ay.min(by).min(cyp).floor().max(0.0) as usize;
+        let max_y = (ay.max(by).max(cyp).ceil() as usize).min(SIZE - 1);
+        let area = (bx - ax) * (cyp - ay) - (by - ay) * (cx - ax);
+        if area.abs() <= f32::EPSILON {
+            continue;
+        }
+        for py in min_y..=max_y {
+            for px in min_x..=max_x {
+                let (fx, fy) = (px as f32 + 0.5, py as f32 + 0.5);
+                // Barycentric weights. Same sign as the area means inside.
+                let w0 = (bx - fx) * (cyp - fy) - (by - fy) * (cx - fx);
+                let w1 = (cx - fx) * (ay - fy) - (cyp - fy) * (ax - fx);
+                let w2 = (ax - fx) * (by - fy) - (ay - fy) * (bx - fx);
+                let inside =
+                    (w0 >= 0.0 && w1 >= 0.0 && w2 >= 0.0) || (w0 <= 0.0 && w1 <= 0.0 && w2 <= 0.0);
+                if !inside {
+                    continue;
+                }
+                let z = (w0 * p[0][2] + w1 * p[1][2] + w2 * p[2][2]) / area;
+                let i = py * SIZE + px;
+                if z > depth[i] {
+                    depth[i] = z;
+                    pixels[i * 4..i * 4 + 4].copy_from_slice(&color);
+                }
+            }
+        }
+    }
+    egui::ColorImage::from_rgba_unmultiplied([SIZE, SIZE], &pixels)
+}
+
+/// Assets tab: a small browser for the project's assets folder. Folders can be
+/// opened and created; files are listed with a tag for models. Import
+/// happens through File > Import model and File > Import audio (audio lands
+/// in whichever folder is open here), or by dropping files on the window.
+fn assets_tab_ui(
+    ui: &mut egui::Ui,
+    assets_root: Option<&std::path::Path>,
+    subdir: &mut std::path::PathBuf,
+    new_folder: &mut String,
+    thumbnails: &std::collections::HashMap<String, egui::TextureHandle>,
+    move_pending: &mut Option<std::path::PathBuf>,
+) {
+    let Some(root) = assets_root else {
+        ui.weak("Open a project to browse its assets.");
+        return;
+    };
+    let current = root.join(&*subdir);
+    // Header: where we are, plus Up when inside a subfolder.
+    ui.horizontal(|ui| {
+        if !subdir.as_os_str().is_empty() {
+            if ui.button("Up").clicked() {
+                subdir.pop();
+            }
+        }
+        let shown = if subdir.as_os_str().is_empty() {
+            "assets/".to_string()
+        } else {
+            format!("assets/{}/", subdir.display())
+        };
+        ui.monospace(shown);
+        // A marked file pastes into whichever folder is open.
+        if let Some(src) = move_pending.clone() {
+            let file = src
+                .file_name()
+                .and_then(|f| f.to_str())
+                .unwrap_or("file")
+                .to_string();
+            if ui.button(format!("Paste '{file}' here")).clicked() {
+                let dest = current.join(&file);
+                if src != dest {
+                    let _ = std::fs::rename(&src, &dest);
+                }
+                *move_pending = None;
+            }
+            if ui.button("Cancel move").clicked() {
+                *move_pending = None;
+            }
+        }
+    });
+    // New folder row.
+    ui.horizontal(|ui| {
+        ui.add(
+            egui::TextEdit::singleline(new_folder)
+                .hint_text("new folder name")
+                .desired_width(160.0),
+        );
+        let name = new_folder.trim().to_string();
+        let ok = !name.is_empty() && !name.contains(['/', '\\']);
+        if ui
+            .add_enabled(ok, egui::Button::new("New folder"))
+            .clicked()
+        {
+            let _ = std::fs::create_dir_all(current.join(&name));
+            new_folder.clear();
+        }
+    });
+    ui.separator();
+    // Listing: folders first, then files, both sorted by name.
+    let mut dirs: Vec<String> = Vec::new();
+    let mut files: Vec<String> = Vec::new();
+    if let Ok(entries) = std::fs::read_dir(&current) {
+        for entry in entries.flatten() {
+            let Some(name) = entry.file_name().to_str().map(String::from) else {
+                continue;
+            };
+            match entry.file_type() {
+                Ok(t) if t.is_dir() => dirs.push(name),
+                Ok(_) => files.push(name),
+                Err(_) => {}
+            }
+        }
+    } else {
+        ui.weak("No assets folder yet. Importing a model or audio creates it.");
+        return;
+    }
+    dirs.sort();
+    files.sort();
+    if dirs.is_empty() && files.is_empty() {
+        ui.weak("(empty)");
+    }
+    egui::ScrollArea::vertical()
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                for dir in &dirs {
+                    if ui.button(format!("[{dir}]")).clicked() {
+                        subdir.push(dir);
+                    }
+                }
+            });
+            if !dirs.is_empty() && !files.is_empty() {
+                ui.add_space(4.0);
+            }
+            // Files as tiles: preview square, name underneath, Move below.
+            ui.horizontal_wrapped(|ui| {
+                for file in &files {
+                    let stem = file.rsplit_once('.').map(|(st, _)| st).unwrap_or(file);
+                    ui.allocate_ui(egui::vec2(84.0, 112.0), |ui| {
+                        ui.vertical(|ui| {
+                            match thumbnails.get(stem) {
+                                Some(handle) => {
+                                    ui.add(
+                                        egui::Image::new(handle)
+                                            .fit_to_exact_size(egui::vec2(64.0, 64.0)),
+                                    );
+                                }
+                                None => {
+                                    // Not a model, or not loaded. A flat square
+                                    // with the extension keeps the grid even.
+                                    let (rect, _) = ui.allocate_exact_size(
+                                        egui::vec2(64.0, 64.0),
+                                        egui::Sense::hover(),
+                                    );
+                                    ui.painter().rect_filled(
+                                        rect,
+                                        2.0,
+                                        egui::Color32::from_rgb(45, 45, 50),
+                                    );
+                                    let ext = file
+                                        .rsplit_once('.')
+                                        .map(|(_, e)| e.to_uppercase())
+                                        .unwrap_or_default();
+                                    ui.painter().text(
+                                        rect.center(),
+                                        egui::Align2::CENTER_CENTER,
+                                        ext,
+                                        egui::FontId::monospace(12.0),
+                                        egui::Color32::GRAY,
+                                    );
+                                }
+                            }
+                            ui.add(egui::Label::new(egui::RichText::new(file).small()).truncate());
+                            if ui.small_button("Move").clicked() {
+                                *move_pending = Some(current.join(file));
+                            }
+                        });
+                    });
+                }
+            });
+        });
+}
+
+/// Scene tab: the entity list.
+fn scene_tab_ui(ui: &mut egui::Ui, entity_ids: &[usize], selection: &mut Option<usize>) {
+    ui.label(format!("{} entities", entity_ids.len()));
+    ui.separator();
+    egui::ScrollArea::vertical()
+        .auto_shrink([false, false])
+        .show(ui, |ui| {
+            for &id in entity_ids {
+                ui.selectable_value(selection, Some(id), format!("Entity {id}"));
+            }
+        });
+}
+
+/// One custom Inspector field for the currently selected entity, lifted out
+/// for `inspector_tab_ui` to edit and written back to `World::insert_dynamic`
+/// after the pass, the same lift-then-write pattern every other field here
+/// already uses. A plain struct rather than a tuple, since `min`/`max` make
+/// a bare `(String, String, f64)` awkward to read at either end.
+#[derive(Clone, PartialEq)]
+struct EditableCustomField {
+    /// Which entity this value belongs to, captured at the same time as the
+    /// value itself. Needed because the write-back happens after the pass,
+    /// by which point self.selected may already have moved to a different
+    /// entity (the user clicked a new one in Scene this same frame); using
+    /// that instead of a captured id could silently write a value onto the
+    /// wrong entity.
+    entity: usize,
+    /// The dynamic component name; what gets passed to `insert_dynamic`.
+    name: String,
+    label: String,
+    value: f64,
+    min: Option<f64>,
+    max: Option<f64>,
+}
+
+/// Inspector tab: the selected entity's properties.
+fn inspector_tab_ui(
+    ui: &mut egui::Ui,
+    edited: &mut Option<EditedEntity>,
+    script_library: &std::collections::BTreeMap<String, String>,
+    script_filter: &mut String,
+    custom_mesh_names: &[String],
+    // Plugin-declared custom fields the selected entity currently has a
+    // value under. Empty for an entity with none.
+    custom_fields: &mut [EditableCustomField],
+    // The open project's assets folder, for the Sound picker. None when no
+    // project is open.
+    assets_root: Option<&std::path::Path>,
+) {
+    match edited {
+        Some(EditedEntity {
+            id,
+            pos,
+            vel,
+            color,
+            controlled,
+            scale,
+            material,
+            rotation,
+            script_source,
+            mesh,
+            is_static,
+            has_gravity,
+            is_rigid_body,
+            light,
+            sound,
+        }) => {
+            ui.label(format!("Entity {id}"));
+            ui.add_space(4.0);
+            ui.label("Position");
+            ui.horizontal(|ui| {
+                ui.add(egui::DragValue::new(&mut pos.x).speed(1.0).prefix("x "));
+                ui.add(egui::DragValue::new(&mut pos.y).speed(1.0).prefix("y "));
+                ui.add(egui::DragValue::new(&mut pos.z).speed(1.0).prefix("z "));
+            });
+            ui.add_space(4.0);
+            ui.label("Velocity");
+            ui.horizontal(|ui| {
+                ui.add(egui::DragValue::new(&mut vel.dx).speed(0.1).prefix("dx "));
+                ui.add(egui::DragValue::new(&mut vel.dy).speed(0.1).prefix("dy "));
+                ui.add(egui::DragValue::new(&mut vel.dz).speed(0.1).prefix("dz "));
+            });
+            ui.add_space(4.0);
+            ui.label("Color");
+            let mut rgb = [color.r, color.g, color.b];
+            if ui.color_edit_button_rgb(&mut rgb).changed() {
+                color.r = rgb[0];
+                color.g = rgb[1];
+                color.b = rgb[2];
+            }
+            ui.add_space(4.0);
+            ui.label("Scale");
+            ui.horizontal(|ui| {
+                ui.add(
+                    egui::DragValue::new(&mut scale.x)
+                        .speed(0.05)
+                        .range(0.1..=100.0)
+                        .prefix("x "),
+                );
+                ui.add(
+                    egui::DragValue::new(&mut scale.y)
+                        .speed(0.05)
+                        .range(0.1..=100.0)
+                        .prefix("y "),
+                );
+                ui.add(
+                    egui::DragValue::new(&mut scale.z)
+                        .speed(0.05)
+                        .range(0.1..=100.0)
+                        .prefix("z "),
+                );
+                ui.add_space(4.0);
+                ui.label("Material");
+                ui.add(egui::Slider::new(&mut material.emissive, 0.0..=1.0).text("emissive"));
+            });
+            ui.add_space(4.0);
+            ui.label("Rotation");
+            let mut yaw_degrees = rotation.yaw.to_degrees();
+            if ui
+                .add(
+                    egui::DragValue::new(&mut yaw_degrees)
+                        .speed(1.0)
+                        .suffix("°"),
+                )
+                .changed()
+            {
+                rotation.yaw = yaw_degrees.to_radians();
+            }
+            ui.add_space(4.0);
+            ui.label("Mesh");
+            let mesh_label: String = match mesh {
+                Mesh::Cube => "Cube".to_string(),
+                Mesh::Sphere => "Sphere".to_string(),
+                Mesh::Plane => "Plane".to_string(),
+                Mesh::Custom(name) => name.clone(),
+            };
+            egui::ComboBox::from_id_salt("mesh_picker")
+                .selected_text(mesh_label)
+                .show_ui(ui, |ui| {
+                    ui.selectable_value(mesh, Mesh::Cube, "Cube");
+                    ui.selectable_value(mesh, Mesh::Sphere, "Sphere");
+                    ui.selectable_value(mesh, Mesh::Plane, "Plane");
+                    // Imported models come after the primitives.
+                    for name in custom_mesh_names {
+                        ui.selectable_value(mesh, Mesh::Custom(name.clone()), name);
+                    }
+                });
+            ui.add_space(4.0);
+            ui.checkbox(controlled, "Controlled (WASD)");
+            ui.checkbox(is_static, "Static (immovable)");
+            ui.checkbox(has_gravity, "Gravity (falls)");
+            ui.checkbox(is_rigid_body, "Physics (rapier3d)")
+                .on_hover_text(
+                    "Simulated by rapier3d instead of the built-in movement/\
+                     gravity/collision. Needs Static, Gravity or Controlled too. \
+                     With Controlled it's a character: input moves it and it \
+                     stops at walls. Add Gravity to make it fall.",
+                );
+            ui.add_space(8.0);
+            ui.label("Light");
+            let mut has_light = light.is_some();
+            if ui.checkbox(&mut has_light, "Light source").changed() {
+                *light = if has_light {
+                    Some(Light::default())
+                } else {
+                    None
+                };
+            }
+            if let Some(l) = light {
+                let mut is_point = matches!(l.kind, LightKind::Point { .. });
+                egui::ComboBox::from_id_salt("light_kind_picker")
+                    .selected_text(if is_point { "Point" } else { "Directional" })
+                    .show_ui(ui, |ui| {
+                        if ui
+                            .selectable_value(&mut is_point, false, "Directional")
+                            .clicked()
+                            || ui.selectable_value(&mut is_point, true, "Point").clicked()
+                        {
+                            // Switching kind starts that kind fresh rather than
+                            // trying to carry a direction into a range or back;
+                            // the two don't correspond to each other.
+                            l.kind = if is_point {
+                                LightKind::Point { range: 200.0 }
+                            } else {
+                                LightKind::Directional {
+                                    direction: [0.4, 0.8, 0.6],
+                                }
+                            };
+                        }
+                    });
+                match &mut l.kind {
+                    LightKind::Directional { direction } => {
+                        ui.horizontal(|ui| {
+                            ui.label("Direction");
+                            ui.add(
+                                egui::DragValue::new(&mut direction[0])
+                                    .speed(0.01)
+                                    .prefix("x: "),
+                            );
+                            ui.add(
+                                egui::DragValue::new(&mut direction[1])
+                                    .speed(0.01)
+                                    .prefix("y: "),
+                            );
+                            ui.add(
+                                egui::DragValue::new(&mut direction[2])
+                                    .speed(0.01)
+                                    .prefix("z: "),
+                            );
+                        });
+                    }
+                    LightKind::Point { range } => {
+                        ui.horizontal(|ui| {
+                            ui.label("Range");
+                            ui.add(egui::DragValue::new(range).speed(1.0).range(0.0..=f32::MAX));
+                        });
+                    }
+                }
+                ui.horizontal(|ui| {
+                    ui.label("Intensity");
+                    ui.add(
+                        egui::DragValue::new(&mut l.intensity)
+                            .speed(0.05)
+                            .range(0.0..=f32::MAX),
+                    );
+                });
+            }
+            ui.add_space(8.0);
+            ui.label("Sound");
+            let mut has_sound = sound.is_some();
+            if ui.checkbox(&mut has_sound, "Sound source").changed() {
+                *sound = if has_sound {
+                    Some(Sound::default())
+                } else {
+                    None
+                };
+            }
+            if let Some(s) = sound {
+                ui.horizontal(|ui| {
+                    ui.label("File");
+                    let shown = if s.name.is_empty() {
+                        "(none)".to_string()
+                    } else {
+                        s.name.clone()
+                    };
+                    egui::ComboBox::from_id_salt("sound_picker")
+                        .selected_text(shown)
+                        .show_ui(ui, |ui| {
+                            // Listed only while the dropdown is open, so a
+                            // file added outside the editor shows up without
+                            // walking the assets folder every frame.
+                            let names = assets_root.map(list_audio).unwrap_or_default();
+                            if names.is_empty() {
+                                ui.weak("No audio yet. File > Import audio…");
+                            }
+                            for name in names {
+                                let label = name.clone();
+                                ui.selectable_value(&mut s.name, name, label);
+                            }
+                        });
+                });
+                let missing = !s.name.is_empty()
+                    && assets_root.is_some_and(|root| find_audio(root, &s.name).is_none());
+                if missing {
+                    ui.colored_label(
+                        egui::Color32::from_rgb(230, 170, 60),
+                        "File not found under assets/",
+                    );
+                }
+                if ui.button("Play now").clicked() {
+                    s.play = true;
+                }
+            }
+            ui.add_space(8.0);
+            ui.label("Script");
+            if script_library.is_empty() {
+                ui.weak("No scripts yet — add some in the Script Editor tab.");
+            } else {
+                let selected_text = script_source
+                    .clone()
+                    .unwrap_or_else(|| "(none)".to_string());
+                egui::ComboBox::from_id_salt("script_picker")
+                    .selected_text(selected_text)
+                    .show_ui(ui, |ui| {
+                        ui.add(egui::TextEdit::singleline(script_filter).hint_text("filter…"));
+                        ui.separator();
+                        ui.selectable_value(script_source, None, "(none)");
+                        let needle = script_filter.to_lowercase();
+                        for name in script_library.keys() {
+                            if needle.is_empty() || name.to_lowercase().contains(&needle) {
+                                ui.selectable_value(
+                                    script_source,
+                                    Some(name.clone()),
+                                    name.as_str(),
+                                );
+                            }
+                        }
+                    });
+                if let Some(name) = script_source.as_ref() {
+                    if !script_library.contains_key(name) {
+                        ui.weak(format!("(uses missing script '{name}')"));
+                    }
+                }
+            }
+            if !custom_fields.is_empty() {
+                ui.add_space(8.0);
+                ui.label("Plugin Fields");
+                for field in custom_fields.iter_mut() {
+                    ui.horizontal(|ui| {
+                        ui.label(field.label.as_str());
+                        match (field.min, field.max) {
+                            (Some(lo), Some(hi)) => {
+                                ui.add(egui::Slider::new(&mut field.value, lo..=hi));
+                            }
+                            _ => {
+                                let mut drag = egui::DragValue::new(&mut field.value).speed(0.1);
+                                if let Some(lo) = field.min {
+                                    drag = drag.range(lo..=f64::MAX);
+                                }
+                                if let Some(hi) = field.max {
+                                    drag = drag.range(f64::MIN..=hi);
+                                }
+                                ui.add(drag);
+                            }
+                        }
+                    });
+                }
+            }
+        }
+        None => {
+            ui.weak("No entity selected");
+            ui.weak("Click a cube, or pick one in Scene.");
+        }
+    }
+}
+
+/// Script Editor tab: a script name list above one code editor. Laid out
+/// vertically (rather than a left sidebar) so it reads well in a docked column.
+fn scripts_tab_ui(
+    ui: &mut egui::Ui,
+    script_library: &mut std::collections::BTreeMap<String, String>,
+    new_script_name: &mut String,
+    open_script: &mut Option<String>,
+    script_status: &Option<Result<(), script::ScriptError>>,
+    script_warnings: &[script::ScriptError],
+    // In-progress rename text buffer for the open script. `None` means not
+    // currently renaming; `Some((original_name, buffer))` tracks which script
+    // it belongs to, so navigating to a different script clears stale state
+    // instead of showing an old buffer for the wrong name.
+    renaming: &mut Option<(String, String)>,
+    // Set once, the frame a rename actually completes, so the caller (which has
+    // access to the world, this function doesn't) can rewrite every entity's
+    // Script.uses that pointed at the old name. Read and cleared by the caller.
+    renamed: &mut Option<(String, String)>,
+) {
+    let mut delete: Option<String> = None;
+    // LEFT: the script list and the "new script" box, in a resizable sidebar.
+    egui::Panel::left("script_list")
+        .resizable(true)
+        .default_size(200.0)
+        .show(ui, |ui| {
+            ui.label("Scripts");
+            ui.separator();
+            ui.add(
+                egui::TextEdit::singleline(new_script_name)
+                    .hint_text("new script name")
+                    .desired_width(f32::INFINITY),
+            );
+            if ui.button("Add").clicked() {
+                let key = new_script_name.trim().to_string();
+                if !key.is_empty() {
+                    script_library.entry(key.clone()).or_default();
+                    *open_script = Some(key);
+                    new_script_name.clear();
+                }
+            }
+            ui.separator();
+            egui::ScrollArea::vertical()
+                .id_salt("script_name_list")
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    if script_library.is_empty() {
+                        ui.weak("No scripts yet.");
+                    }
+                    for name in script_library.keys() {
+                        ui.selectable_value(open_script, Some(name.clone()), name.as_str());
+                    }
+                });
+        });
+    // RIGHT: the editor for the open script fills the space the sidebar leaves.
+    let open = open_script
+        .as_ref()
+        .filter(|n| script_library.contains_key(*n))
+        .cloned();
+    match open {
+        Some(name) => {
+            // Stale rename state (started on a different script, or the user
+            // navigated away mid-rename) is cleared rather than shown for the
+            // wrong entry.
+            if renaming.as_ref().is_some_and(|(orig, _)| orig != &name) {
+                *renaming = None;
+            }
+            ui.horizontal(|ui| {
+                match renaming {
+                    Some((_, buffer)) => {
+                        ui.add(egui::TextEdit::singleline(buffer).desired_width(160.0));
+                        let new_name = buffer.trim().to_string();
+                        // Same name (or empty) just cancels quietly; a name
+                        // that collides with a DIFFERENT existing script is
+                        // refused rather than silently overwriting it.
+                        let collides = !new_name.is_empty()
+                            && new_name != name
+                            && script_library.contains_key(&new_name);
+                        if ui
+                            .add_enabled(
+                                !new_name.is_empty() && !collides,
+                                egui::Button::new("Confirm"),
+                            )
+                            .clicked()
+                        {
+                            if new_name != name {
+                                if let Some(source) = script_library.remove(&name) {
+                                    script_library.insert(new_name.clone(), source);
+                                    *open_script = Some(new_name.clone());
+                                    *renamed = Some((name.clone(), new_name));
+                                }
+                            }
+                            *renaming = None;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            *renaming = None;
+                        }
+                        if collides {
+                            ui.colored_label(
+                                egui::Color32::from_rgb(0xe0, 0x6c, 0x6c),
+                                "already used",
+                            );
+                        }
+                    }
+                    None => {
+                        ui.strong(&name);
+                        if ui.small_button("Rename").clicked() {
+                            *renaming = Some((name.clone(), name.clone()));
+                        }
+                        if ui.small_button("Delete").clicked() {
+                            delete = Some(name.clone());
+                        }
+                    }
+                }
+            });
+            match script_status {
+                Some(Ok(())) if script_warnings.is_empty() => {
+                    ui.colored_label(egui::Color32::from_rgb(0x7c, 0xc5, 0x7c), "No problems");
+                }
+                Some(Ok(())) => {
+                    // Parses, but uses names the script API doesn't define — the
+                    // script will run and silently do nothing at those lines.
+                    for w in script_warnings {
+                        let loc = match (w.line, w.column) {
+                            (Some(l), Some(c)) => format!("line {l}, col {c}: "),
+                            (Some(l), None) => format!("line {l}: "),
+                            _ => String::new(),
+                        };
+                        ui.colored_label(
+                            egui::Color32::from_rgb(0xd6, 0xa8, 0x4c),
+                            format!("{loc}{}", w.message),
+                        );
+                    }
+                }
+                Some(Err(e)) => {
+                    let loc = match (e.line, e.column) {
+                        (Some(l), Some(c)) => format!("line {l}, col {c}: "),
+                        (Some(l), None) => format!("line {l}: "),
+                        _ => String::new(),
+                    };
+                    ui.colored_label(
+                        egui::Color32::from_rgb(0xe0, 0x6c, 0x6c),
+                        format!("{loc}{}", e.message),
+                    );
+                }
+                None => {}
+            }
+            if let Some(source) = script_library.get_mut(&name) {
+                let row_h = ui.text_style_height(&egui::TextStyle::Monospace);
+                let rows = ((ui.available_height() / row_h).floor() - 1.0).max(3.0) as usize;
+                let line_count = source.matches('\n').count() + 1;
+                let digits = line_count.to_string().len();
+                let gutter: String = (1..=line_count)
+                    .map(|n| format!("{n:>digits$}"))
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                egui::ScrollArea::vertical()
+                    .id_salt("script_editor")
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.horizontal_top(|ui| {
+                            ui.vertical(|ui| {
+                                ui.add_space(2.0);
+                                ui.add(egui::Label::new(
+                                    egui::RichText::new(&gutter).monospace().weak(),
+                                ));
+                            });
+                            ui.add(
+                                egui::TextEdit::multiline(source)
+                                    .code_editor()
+                                    .desired_rows(rows)
+                                    .desired_width(f32::INFINITY),
+                            );
+                        });
+                    });
+            }
+        }
+        None => {
+            ui.weak("Select a script on the left, or add one to begin.");
+        }
+    }
+    if let Some(name) = delete {
+        script_library.remove(&name);
+        if open_script.as_ref() == Some(&name) {
+            *open_script = None;
+        }
+        if renaming.as_ref().is_some_and(|(orig, _)| orig == &name) {
+            *renaming = None;
+        }
+    }
+}
+
+/// Owns the transient per-frame state the dockable tabs read and write, so
+/// egui_dock's `TabViewer::ui` can reach it. Built fresh from the world each
+/// frame and drained back into the world afterwards.
+struct EditorTabViewer {
+    entity_ids: Vec<usize>,
+    selection: Option<usize>,
+    edited: Option<EditedEntity>,
+    // Plugin-declared custom fields for the selected entity. See
+    // EditableCustomField.
+    custom_fields: Vec<EditableCustomField>,
+    script_library: std::collections::BTreeMap<String, String>,
+    new_script_name: String,
+    script_filter: String,
+    open_script: Option<String>,
+    // In-progress script rename, and the completed-this-frame signal for the
+    // caller to rewrite entity references. See scripts_tab_ui.
+    renaming: Option<(String, String)>,
+    renamed: Option<(String, String)>,
+    script_status: Option<Result<(), script::ScriptError>>,
+    script_warnings: Vec<script::ScriptError>,
+    // Names of the project's imported models, for the mesh picker.
+    custom_mesh_names: Vec<String>,
+    // The open project's assets folder, for the Sound picker.
+    assets_root: Option<std::path::PathBuf>,
+    // Read-only git snapshot for the Source Control tab (owned for the frame,
+    // handed back to the App afterwards).
+    git_summary: Option<GitSummary>,
+    // Set by the Viewport tab each frame to its transparent body rect (egui
+    // points). `None` when the Viewport tab isn't visible. Used to route 3D
+    // input: clicks/drags land on the viewport only when the cursor is here.
+    viewport_rect: Option<egui::Rect>,
+    // The translate gizmo to paint over the viewport, if anything is selected.
+    gizmo: Option<GizmoDraw>,
+    // Set by context_menu when the user picks "Open in new window" on a tab;
+    // the caller pops it out (see App::pop_out_tab) after the egui pass, the
+    // same lift-then-write-back pattern menu_action uses.
+    pop_out_request: Option<Tab>,
+}
+
+impl egui_dock::TabViewer for EditorTabViewer {
+    type Tab = Tab;
+
+    fn title(&mut self, tab: &mut Self::Tab) -> egui::WidgetText {
+        match tab {
+            Tab::Viewport => "Viewport",
+            Tab::Scene => "Scene",
+            Tab::Inspector => "Inspector",
+            Tab::Scripts => "Script Editor",
+            Tab::Source => "Source Control",
+        }
+        .into()
+    }
+
+    fn ui(&mut self, ui: &mut egui::Ui, tab: &mut Self::Tab) {
+        match tab {
+            // The viewport draws nothing itself — the 3D scene is rendered behind
+            // egui and shows through this tab's transparent body. We only record
+            // the body rect so window_event can route 3D input to it.
+            Tab::Viewport => {
+                self.viewport_rect = Some(ui.max_rect());
+                // The translate gizmo is painted here, on top of the 3D showing
+                // through, rather than as scene geometry — it's a tool, not part of
+                // the world, and this keeps it out of the render pipeline entirely.
+                if let Some(g) = self.gizmo {
+                    let painter = ui.painter();
+                    // X red, Y green, Z blue — the usual convention.
+                    let colors = [
+                        egui::Color32::from_rgb(0xe0, 0x5c, 0x5c),
+                        egui::Color32::from_rgb(0x6c, 0xc9, 0x6c),
+                        egui::Color32::from_rgb(0x5c, 0x8c, 0xe0),
+                    ];
+                    for axis in 0..3 {
+                        let lit = g.active == Some(axis);
+                        let color = if lit {
+                            egui::Color32::from_rgb(0xff, 0xd5, 0x4c) // grabbed/hovered
+                        } else {
+                            colors[axis]
+                        };
+                        let width = if lit { 3.5 } else { 2.0 };
+                        painter.line_segment(
+                            [g.origin, g.ends[axis]],
+                            egui::Stroke::new(width, color),
+                        );
+                        painter.circle_filled(g.ends[axis], if lit { 6.0 } else { 4.5 }, color);
+                    }
+                }
+            }
+            Tab::Scene => scene_tab_ui(ui, &self.entity_ids, &mut self.selection),
+            Tab::Inspector => inspector_tab_ui(
+                ui,
+                &mut self.edited,
+                &self.script_library,
+                &mut self.script_filter,
+                &self.custom_mesh_names,
+                &mut self.custom_fields,
+                self.assets_root.as_deref(),
+            ),
+            Tab::Scripts => scripts_tab_ui(
+                ui,
+                &mut self.script_library,
+                &mut self.new_script_name,
+                &mut self.open_script,
+                &self.script_status,
+                &self.script_warnings,
+                &mut self.renaming,
+                &mut self.renamed,
+            ),
+            Tab::Source => source_tab_ui(ui, &self.git_summary),
+        }
+    }
+
+    /// These tool panels are always present; don't offer a close button.
+    fn is_closeable(&self, _tab: &Self::Tab) -> bool {
+        false
+    }
+
+    /// Right-click a tab for the option to pop it into its own real, separate
+    /// OS window (draggable to another monitor). Not offered on the Viewport
+    /// tab -- it's the live 3D scene rendered behind egui, not a panel, and
+    /// popping it out would need its own duplicated render target.
+    fn context_menu(
+        &mut self,
+        ui: &mut egui::Ui,
+        tab: &mut Self::Tab,
+        _path: egui_dock::NodePath,
+    ) {
+        if matches!(tab, Tab::Viewport) {
+            return;
+        }
+        if ui.button("Open in new window").clicked() {
+            self.pop_out_request = Some(*tab);
+            ui.close();
+        }
+    }
+
+    /// Leave the Viewport tab's body unpainted so the 3D scene behind egui shows
+    /// through it. Every other tab clears its background normally.
+    fn clear_background(&self, tab: &Self::Tab) -> bool {
+        !matches!(tab, Tab::Viewport)
+    }
+
+    /// No scroll bars over the viewport — it's a fixed window onto the 3D scene.
+    fn scroll_bars(&self, tab: &Self::Tab) -> [bool; 2] {
+        match tab {
+            Tab::Viewport => [false, false],
+            _ => [true, true],
+        }
+    }
+}
+
+/// A dock tab the user has popped out into its own real, separate OS window
+/// (see App::pop_out_tab). Mirrors the same real-second-window shape
+/// game_window/game_gpu already use for Play mode: its own window, its own
+/// GPU surface, and -- unlike the game window, which draws no egui -- its
+/// own small egui Context and input state, since this window's whole job is
+/// drawing one egui panel.
+struct PoppedOutWindow {
+    // Field order matters here: Rust drops struct fields top-to-bottom, and
+    // `gpu`'s wgpu surface holds a handle into `window`, so `gpu` must be
+    // declared (and therefore dropped) first -- the same ordering
+    // close_game's own doc comment spells out for the game window. Getting
+    // this backwards is what caused the dock-back segfault.
+    gpu: GpuState,
+    window: Arc<Window>,
+    egui_ctx: egui::Context,
+    egui_state: egui_winit::State,
+}
+
+struct App {
+    script_runtime: script::RhaiRuntime,
+    window: Option<Arc<Window>>,
+    gpu: Option<GpuState>,
+    // The one Instance/Adapter/Device/Queue for the whole process, set the
+    // first time a GpuState is created (the main window, in `resumed`) and
+    // reused by every later window's GpuState -- see SharedGpu's own doc
+    // comment for why this matters.
+    gpu_shared: Option<SharedGpu>,
+    // Launcher screen vs the editor proper.
+    mode: AppMode,
+    // Name of the open project (its folder name), shown in the window title.
+    project_name: Option<String>,
+    // Remembered projects, most-recently-edited first, shown on the launcher.
+    // Refreshed when the launcher is (re)entered and on open/create.
+    recent_projects: Vec<RecentProject>,
+    // The name typed on the launcher for a new project (becomes its scene file).
+    new_project_name: String,
+    // Project-settings window state (opened from a card's Settings button).
+    settings_open: bool,
+    // A project the user clicked Delete on, awaiting Confirm/Cancel on its card.
+    pending_delete: Option<std::path::PathBuf>,
+    settings_root: Option<std::path::PathBuf>,
+    settings_orig_name: String,
+    settings_name: String,
+    settings_description: String,
+    settings_version: String,
+    world: World,
+    // rapier3d state for `world`'s `RigidBody`-marked entities, kept
+    // alongside it the same way `script_runtime` is kept alongside rather
+    // than folded into `World` itself (see `physics::Physics`'s own doc
+    // comment for why).
+    physics: Physics,
+    // Undo/redo: full-world snapshots. Pushed before a mutating gesture; undo
+    // pops to the redo stack and back. `inspector_editing` coalesces a drag into
+    // one snapshot. `ctrl_held`/`shift_held` track modifiers for the shortcuts.
+    undo_stack: Vec<World>,
+    redo_stack: Vec<World>,
+    inspector_editing: bool,
+    ctrl_held: bool,
+    shift_held: bool,
+    // Where "Save scene" writes and "Reload scene" reads. Set by Open/Save-As
+    // (and defaulted to the startup scene). None means Save prompts for a path.
+    current_scene_path: Option<std::path::PathBuf>,
+    // Imported models for the open project, parsed once and kept CPU side so
+    // they can be uploaded to any GPU device (editor window and game window).
+    // BTreeMap so the name order is stable and sorted.
+    custom_meshes: std::collections::BTreeMap<String, frame_engine::assets::MeshData>,
+    // Names of the game window's uploaded models, same sorted order.
+    game_custom_names: Vec<String>,
+    // Assets tab browser state: the open subfolder inside assets/ and the
+    // pending new folder name.
+    assets_subdir: std::path::PathBuf,
+    new_asset_folder: String,
+    // Rendered previews for the Assets tab, keyed by model name.
+    thumbnails: std::collections::HashMap<String, egui::TextureHandle>,
+    // A file marked for moving, pasted into whichever folder is open.
+    move_pending: Option<std::path::PathBuf>,
+    // Cached git state for the Source Control tab, refreshed on a timer rather
+    // than every frame (statuses() walks the working tree). None = not inside a
+    // git repository, or no project open.
+    git_summary: Option<GitSummary>,
+    git_refresh_at: std::time::Instant,
+    paused: bool,
+    clock: Clock,
+    cam_focus_x: f32,
+    cam_focus_y: f32,
+    cam_distance: f32,
+    cam_yaw: f32,
+    cam_pitch: f32,
+    dragging: bool,
+    orbiting: bool,
+    // Shift+Middle-drag pans the camera; plain Middle-drag orbits (see above).
+    panning: bool,
+    // Flythrough WASD speed, in world units/sec. Starts at CAM_PAN_SPEED and is
+    // adjusted with the scroll wheel while flying (right mouse button held);
+    // persists at whatever value it was last set to across flights.
+    fly_speed: f32,
+    // Translate gizmo state. `gizmo` is recomputed each frame from the selection
+    // (None when nothing is selected). `gizmo_drag` is the axis currently being
+    // dragged, `gizmo_hover` the one under the cursor — 0 = X, 1 = Y, 2 = Z.
+    gizmo: Option<GizmoScreen>,
+    gizmo_drag: Option<usize>,
+    gizmo_hover: Option<usize>,
+    last_cursor: (f64, f64),
+    selected: Option<usize>,
+    show_help: bool,
+    egui_ctx: egui::Context,
+    egui_state: Option<egui_winit::State>,
+    // The layout of the dockable panels (Viewport, Scene, Inspector, Scripts).
+    // egui_dock owns the arrangement and which tab is active; we just persist it.
+    dock_state: egui_dock::DockState<Tab>,
+    // The Viewport tab's on-screen rect (egui points) from last frame, or None if
+    // it wasn't visible. window_event routes 3D input by this instead of by
+    // is_pointer_over_egui, which would read true over the viewport tab.
+    viewport_rect: Option<egui::Rect>,
+    // Flythrough camera: true while the right mouse button is held over the
+    // viewport. The cursor is grabbed and hidden, mouse motion looks around, and
+    // WASD flies. A focus Z lets the camera move in the full look direction.
+    fly_mode: bool,
+    cam_focus_z: f32,
+    // Free-camera eye position, used only while flying. Seeded from the orbit eye
+    // on entry; WASD moves it and mouselook turns it in place (no orbit pivot).
+    cam_eye: Vec3,
+    // Whether an entity was picked during this fly session; if so, orbit resumes
+    // around it on exit.
+    fly_picked: bool,
+    // Active tab in the bottom console dock.
+    console_tab: ConsoleTab,
+    // Lines shown in the console Output tab (also echoed to the terminal).
+    log_lines: Vec<String>,
+    // Which movement buttons (WASD) are currently held, read by the input system.
+    input: InputState,
+    // A separate "clean" game window for Play: its own window + GPU surface,
+    // running a copy of the project's world with no editor chrome. None when not
+    // playing. game_input drives Controlled entities; game_clock ticks the sim.
+    game_window: Option<Arc<Window>>,
+    game_gpu: Option<GpuState>,
+    game_world: Option<World>,
+    // The Play window's own physics state, separate from `physics` above the
+    // same way `game_world` is separate from `world`. `None` whenever
+    // `game_world` is, created fresh each time Play starts (see
+    // `open_game`/`close_game`) rather than reused, so a previous play
+    // session's simulated bodies never leak into the next one.
+    game_physics: Option<Physics>,
+    game_input: InputState,
+    game_clock: Clock,
+    // Set when the game window asks to close; the actual teardown happens in
+    // about_to_wait, outside event dispatch, so dropping the wgpu surface on
+    // Wayland doesn't segfault mid-event.
+    game_closing: bool,
+    // Dock tabs currently popped out into their own window (see
+    // PoppedOutWindow, App::pop_out_tab). The Viewport tab is never a key
+    // here -- it's the live 3D scene, not an egui panel, so popping it out
+    // needs its own separate render-target work, not yet done.
+    popped_out: std::collections::HashMap<Tab, PoppedOutWindow>,
+    // Tabs whose popped-out window asked to close (the OS close button, or
+    // its own "Dock back" button) this cycle. Actually torn down in
+    // about_to_wait, same Wayland-segfault-avoidance reasoning as
+    // game_closing above.
+    popped_out_closing: Vec<Tab>,
+    // Text in the "new script name" box on the Scripts tab (persists between frames).
+    new_script_name: String,
+    // Filter text for the Inspector's script picker (persists between frames).
+    script_filter: String,
+    // Which library script is open in the Script Editor's centre pane (by name).
+    open_script: Option<String>,
+    // In-progress script rename (original name, edit buffer), persists between
+    // frames the same way open_script does. See scripts_tab_ui.
+    renaming: Option<(String, String)>,
+    // Whether the Plugins slide-down panel is currently shown, toggled from
+    // its toolbar tab. Persists between frames the same way console_tab does.
+    plugins_panel_open: bool,
+    // Whether the Editor Settings window is currently open, toggled from
+    // Edit > Editor settings….
+    editor_settings_open: bool,
+    // GPU texture for the toolbar logo, uploaded once on the first frame.
+    logo_texture: Option<egui::TextureHandle>,
+    // The kira audio backend. None if the host's audio device couldn't be
+    // opened (a headless CI box, say); Sound components still exist and
+    // edit fine, they just never actually play without a manager.
+    audio_manager: Option<kira::AudioManager<kira::DefaultBackend>>,
+    // Loaded sound files, keyed by their name as a Sound component names
+    // them, so the same file is decoded once and every play() after that is
+    // a cheap Arc-backed clone (see StaticSoundData's own docs), not a
+    // re-read from disk every time a Sound fires.
+    sound_cache: std::collections::HashMap<String, kira::sound::static_sound::StaticSoundData>,
+}
+impl App {
+    /// Append a line to the in-editor log (shown in the console Output tab) and
+    /// echo it to the terminal. The buffer is capped so it can't grow forever.
+    fn log(&mut self, msg: impl Into<String>) {
+        let msg = msg.into();
+        println!("{msg}");
+        self.log_lines.push(msg);
+        if self.log_lines.len() > 500 {
+            self.log_lines.remove(0);
+        }
+    }
+    // --- Editor actions ---
+    // One definition per action. The keyboard and the menus are just two
+    // triggers that call these; the behaviour lives in exactly one place.
+    /// Toggle the simulation between playing and paused.
+    fn toggle_pause(&mut self) {
+        self.paused = !self.paused;
+        self.log(if self.paused { "Paused" } else { "Playing" });
+    }
+    /// Advance the simulation exactly one tick. Only meaningful while paused.
+    fn step_once(&mut self) {
+        if self.paused {
+            systems::gravity(&mut self.world);
+            systems::movement(&mut self.world);
+            self.physics.step(&mut self.world, 1.0 / TICK_RATE as f32);
+            systems::resolve_collisions(&mut self.world);
+            self.log("Stepped one tick");
+        }
+    }
+    /// Clear the current selection.
+    fn clear_selection(&mut self) {
+        self.selected = None;
+        self.log("Selection cleared");
+    }
+    /// Toggle the on-screen controls overlay. The choice persists across runs.
+    fn toggle_help(&mut self) {
+        self.show_help = !self.show_help;
+        save_prefs(&EditorPrefs {
+            show_help: self.show_help,
+        });
+    }
+    /// Snapshot the world onto the undo stack before a mutating action. Clears
+    /// the redo stack (a new edit invalidates any redo history) and caps history.
+    fn push_undo(&mut self) {
+        const MAX_UNDO: usize = 50;
+        self.undo_stack.push(self.world.clone());
+        if self.undo_stack.len() > MAX_UNDO {
+            self.undo_stack.remove(0);
+        }
+        self.redo_stack.clear();
+    }
+    /// Restore the previous world state, moving the current one onto the redo
+    /// stack.
+    fn undo(&mut self) {
+        if let Some(prev) = self.undo_stack.pop() {
+            self.redo_stack.push(self.world.clone());
+            self.world = prev;
+            self.selected = None;
+            self.log("Undo".to_string());
+        } else {
+            self.log("Nothing to undo".to_string());
+        }
+    }
+    /// Re-apply an undone change.
+    fn redo(&mut self) {
+        if let Some(next) = self.redo_stack.pop() {
+            self.undo_stack.push(self.world.clone());
+            self.world = next;
+            self.selected = None;
+            self.log("Redo".to_string());
+        } else {
+            self.log("Nothing to redo".to_string());
+        }
+    }
+    /// Enter or leave the flythrough camera. Entering grabs and hides the cursor
+    /// so mouse motion becomes look input; leaving restores it. Locked grab gives
+    /// raw motion for smooth mouselook; Confined is a fallback if Locked isn't
+    /// supported (some Wayland setups).
+    fn set_fly(&mut self, on: bool) {
+        if self.fly_mode == on {
+            return;
+        }
+        self.fly_mode = on;
+        if on {
+            // Seed the free camera from the current orbit eye, so flight begins
+            // exactly where the orbit view was.
+            let offset = Vec3::new(
+                self.cam_pitch.cos() * self.cam_yaw.sin(),
+                self.cam_pitch.sin(),
+                self.cam_pitch.cos() * self.cam_yaw.cos(),
+            ) * self.cam_distance;
+            self.cam_eye = Vec3::new(self.cam_focus_x, self.cam_focus_y, self.cam_focus_z) + offset;
+            self.fly_picked = false;
+        } else {
+            // Return to orbit. Pivot around the entity picked while flying, or —
+            // if none — a point straight ahead, so the view doesn't jump. Then
+            // rebuild yaw/pitch/distance so the orbit eye stays where flight left
+            // it (looking at the pivot).
+            if !self.fly_picked {
+                let ahead =
+                    self.cam_eye + view_forward(self.cam_yaw, self.cam_pitch) * self.cam_distance;
+                self.cam_focus_x = ahead.x;
+                self.cam_focus_y = ahead.y;
+                self.cam_focus_z = ahead.z;
+            }
+            let focus = Vec3::new(self.cam_focus_x, self.cam_focus_y, self.cam_focus_z);
+            let offset = self.cam_eye - focus;
+            let dist = offset.length();
+            if dist > 0.001 {
+                self.cam_distance = dist.clamp(10.0, 2000.0);
+                self.cam_pitch = (offset.y / dist).asin().clamp(-1.4, 1.4);
+                self.cam_yaw = offset.x.atan2(offset.z);
+            }
+        }
+        if let Some(window) = &self.window {
+            if on {
+                let _ = window
+                    .set_cursor_grab(winit::window::CursorGrabMode::Locked)
+                    .or_else(|_| window.set_cursor_grab(winit::window::CursorGrabMode::Confined));
+                window.set_cursor_visible(false);
+            } else {
+                let _ = window.set_cursor_grab(winit::window::CursorGrabMode::None);
+                window.set_cursor_visible(true);
+            }
+        }
+    }
+    /// Spawn a new entity at the camera focus and select it.
+    fn spawn_at_focus(&mut self) {
+        self.push_undo();
+        let id = self.world.spawn(
+            Position {
+                x: self.cam_focus_x,
+                y: self.cam_focus_y,
+                z: 0.0,
+            },
+            Velocity {
+                dx: 0.0,
+                dy: 0.0,
+                dz: 0.0,
+            },
+        );
+        self.selected = Some(id);
+        self.log(format!("Spawned entity {id}"));
+    }
+    /// Despawn the selected entity, if any.
+    fn despawn_selected(&mut self) {
+        if let Some(id) = self.selected {
+            self.push_undo();
+            self.world.despawn(id);
+            self.selected = None;
+            self.log(format!("Despawned entity {id}"));
+        }
+    }
+    /// Save the current world to disk.
+    /// Save to the current scene path, or fall back to "Save as…" if there
+    /// isn't one yet.
+    fn save_scene(&mut self) {
+        match self.current_scene_path.clone() {
+            Some(path) => match self.world.save_to_file(&path) {
+                Ok(()) => self.log(format!("Saved scene to {}", path.display())),
+                Err(e) => self.log(format!("Save failed: {e}")),
+            },
+            None => self.save_scene_as(),
+        }
+    }
+
+    /// Ask for a path with a native file dialog, save there, and remember it as
+    /// the current scene.
+    fn save_scene_as(&mut self) {
+        let picked = rfd::FileDialog::new()
+            .add_filter("Frame scene", &["ron"])
+            .set_file_name("scene.ron")
+            .set_title("Save scene as")
+            .save_file();
+        if let Some(path) = picked {
+            match self.world.save_to_file(&path) {
+                Ok(()) => {
+                    self.log(format!("Saved scene to {}", path.display()));
+                    self.current_scene_path = Some(path);
+                }
+                Err(e) => self.log(format!("Save failed: {e}")),
+            }
+        }
+    }
+
+    /// Ask for a scene file with a native file dialog and load it, replacing the
+    /// current world and making it the current scene.
+    fn open_scene(&mut self) {
+        let picked = rfd::FileDialog::new()
+            .add_filter("Frame scene", &["ron"])
+            .set_title("Open scene")
+            .pick_file();
+        if let Some(path) = picked {
+            match World::load_from_file(&path) {
+                Ok(world) => {
+                    self.world = world;
+                    self.selected = None;
+                    self.log(format!("Opened scene from {}", path.display()));
+                    self.current_scene_path = Some(path);
+                }
+                Err(e) => self.log(format!("Open failed: {e}")),
+            }
+        }
+    }
+
+    /// Reload the world from the current scene path, discarding the current one.
+    fn reload_scene(&mut self) {
+        let Some(path) = self.current_scene_path.clone() else {
+            self.log("No scene to reload — open or save one first".to_string());
+            return;
+        };
+        match World::load_from_file(&path) {
+            Ok(world) => {
+                self.world = world;
+                self.selected = None;
+                self.log(format!("Reloaded scene from {}", path.display()));
+            }
+            Err(e) => self.log(format!("Reload failed: {e}")),
+        }
+    }
+
+    /// Draw the launcher screen: an egui-only frame (no simulation, no 3D) with
+    /// buttons to create or open a project. Mirrors the editor's egui→render
+    /// handoff, but renders an empty 3D scene behind the UI.
+    fn draw_launcher(&mut self, event_loop: &ActiveEventLoop) {
+        let mut action: Option<LauncherAction> = None;
+        let recent = self.recent_projects.clone();
+        let mut name_input = std::mem::take(&mut self.new_project_name);
+        // Project-settings window state, lifted so the closure doesn't touch self.
+        let was_settings_open = self.settings_open;
+        let pending_delete = self.pending_delete.clone();
+        let mut settings_open = self.settings_open;
+        let mut s_name = std::mem::take(&mut self.settings_name);
+        let mut s_desc = std::mem::take(&mut self.settings_description);
+        let mut s_version = std::mem::take(&mut self.settings_version);
+        let (jobs, tex_delta, ppp) = if let (Some(state), Some(window)) =
+            (self.egui_state.as_mut(), self.window.as_ref())
+        {
+            let raw_input = state.take_egui_input(window);
+            let full_output = self.egui_ctx.run_ui(raw_input, |ui| {
+                egui::CentralPanel::default().show(ui, |ui| {
+                    ui.add_space(12.0);
+                    ui.heading("Frame Editor");
+                    ui.add_space(10.0);
+                    // Header bar: create a named project, or open an existing one.
+                    ui.horizontal(|ui| {
+                        ui.label("New project:");
+                        ui.add(
+                            egui::TextEdit::singleline(&mut name_input)
+                                .hint_text("name")
+                                .desired_width(200.0),
+                        );
+                        if ui.button("Create…").clicked() {
+                            action = Some(LauncherAction::NewProject);
+                        }
+                        ui.add_space(16.0);
+                        if ui.button("Open existing project…").clicked() {
+                            action = Some(LauncherAction::OpenProject);
+                        }
+                    });
+                    ui.add_space(12.0);
+                    ui.separator();
+                    ui.add_space(8.0);
+
+                    if recent.is_empty() {
+                        ui.weak("No projects yet — create one above to begin.");
+                    } else {
+                        ui.heading("Projects");
+                        ui.add_space(8.0);
+                        egui::ScrollArea::vertical()
+                            .auto_shrink([false, false])
+                            .show(ui, |ui| {
+                                for proj in &recent {
+                                    ui.group(|ui| {
+                                        // Fill the width so each project is a
+                                        // full-width row: name and date on the
+                                        // left, actions pushed to the right.
+                                        ui.set_min_width(ui.available_width());
+                                        ui.horizontal(|ui| {
+                                            ui.vertical(|ui| {
+                                                ui.label(
+                                                    egui::RichText::new(&proj.name)
+                                                        .size(18.0)
+                                                        .strong(),
+                                                );
+                                            });
+                                            ui.with_layout(
+                                                egui::Layout::right_to_left(egui::Align::Center),
+                                                |ui| {
+                                                    if pending_delete.as_deref()
+                                                        == Some(proj.root.as_path())
+                                                    {
+                                                        // Confirm step: this card's
+                                                        // Delete was clicked.
+                                                        if ui.button("Cancel").clicked() {
+                                                            action = Some(
+                                                                LauncherAction::CancelDelete,
+                                                            );
+                                                        }
+                                                        if ui
+                                                            .button(
+                                                                egui::RichText::new(
+                                                                    "Delete folder",
+                                                                )
+                                                                .color(egui::Color32::from_rgb(
+                                                                    0xe0, 0x6c, 0x6c,
+                                                                )),
+                                                            )
+                                                            .clicked()
+                                                        {
+                                                            action = Some(
+                                                                LauncherAction::DeleteProject(
+                                                                    proj.root.clone(),
+                                                                ),
+                                                            );
+                                                        }
+                                                        ui.weak("Deletes the folder and everything in it.");
+                                                    } else {
+                                                        if ui.button("Delete").clicked() {
+                                                            action = Some(
+                                                                LauncherAction::ConfirmDelete(
+                                                                    proj.root.clone(),
+                                                                ),
+                                                            );
+                                                        }
+                                                        if ui.button("Settings").clicked() {
+                                                            action =
+                                                                Some(LauncherAction::OpenSettings(
+                                                                    proj.root.clone(),
+                                                                ));
+                                                        }
+                                                        if ui.button("Play").clicked() {
+                                                            action = Some(LauncherAction::PlayRecent(
+                                                                proj.root.clone(),
+                                                            ));
+                                                        }
+                                                        if ui.button("Edit").clicked() {
+                                                            action = Some(LauncherAction::OpenRecent(
+                                                                proj.root.clone(),
+                                                            ));
+                                                        }
+                                                    }
+                                                },
+                                            );
+                                        });
+                                        if !proj.description.is_empty() {
+                                            ui.add_space(4.0);
+                                            egui::ScrollArea::vertical()
+                                                .id_salt(("card_desc", &proj.root))
+                                                .max_height(60.0)
+                                                .auto_shrink([false, true])
+                                                .show(ui, |ui| {
+                                                    ui.label(&proj.description);
+                                                });
+                                        }
+                                        if !proj.version.is_empty() {
+                                            ui.add_space(6.0);
+                                            ui.horizontal(|ui| {
+                                                ui.weak(format!(
+                                                    "Last edited {}",
+                                                    format_edited(proj.modified)
+                                                ));
+                                                ui.with_layout(
+                                                    egui::Layout::right_to_left(
+                                                        egui::Align::Center,
+                                                    ),
+                                                    |ui| {
+                                                        ui.add_space(4.0);
+                                                        ui.weak(format!("v{}", proj.version));
+                                                    },
+                                                );
+                                            });
+                                        } else {
+                                            ui.add_space(6.0);
+                                            ui.weak(format!(
+                                                "Last edited {}",
+                                                format_edited(proj.modified)
+                                            ));
+                                        }
+                                    });
+                                    ui.add_space(6.0);
+                                }
+                            });
+                    }
+                });
+                // Project-settings window, floating above the launcher. Closing
+                // it (its X or Save) flips `settings_open`, which triggers a save.
+                if settings_open {
+                    let mut keep_open = true;
+                    let mut save_clicked = false;
+                    egui::Window::new("Project settings")
+                        .collapsible(false)
+                        .resizable(false)
+                        .open(&mut keep_open)
+                        .show(ui.ctx(), |ui| {
+                            egui::Grid::new("settings_grid")
+                                .num_columns(2)
+                                .spacing([8.0, 8.0])
+                                .show(ui, |ui| {
+                                    ui.label("Name");
+                                    ui.text_edit_singleline(&mut s_name);
+                                    ui.end_row();
+                                    ui.label("Version");
+                                    ui.text_edit_singleline(&mut s_version);
+                                    ui.end_row();
+                                });
+                            ui.add_space(6.0);
+                            ui.label("Description");
+                            ui.text_edit_multiline(&mut s_desc);
+                            ui.add_space(10.0);
+                            ui.weak("Closing saves. Renaming changes the scene file.");
+                            ui.add_space(6.0);
+                            if ui.button("Save & close").clicked() {
+                                save_clicked = true;
+                            }
+                        });
+                    if !keep_open || save_clicked {
+                        settings_open = false;
+                    }
+                }
+            });
+            state.handle_platform_output(window, full_output.platform_output);
+            let ppp = full_output.pixels_per_point;
+            let jobs = self.egui_ctx.tessellate(full_output.shapes, ppp);
+            (jobs, full_output.textures_delta, ppp)
+        } else {
+            (Vec::new(), egui::TexturesDelta::default(), 1.0)
+        };
+        if let Some(gpu) = &mut self.gpu {
+            gpu.render(
+                &[],
+                &[0, 0, 0],
+                &[],
+                Mat4::IDENTITY.to_cols_array_2d(),
+                &[LightRaw::zeroed(); MAX_LIGHTS],
+                &jobs,
+                &tex_delta,
+                ppp,
+            );
+        }
+        self.new_project_name = name_input;
+        if was_settings_open && !settings_open {
+            // The window closed this frame (X or Save) — persist and refresh.
+            self.save_settings(s_name, s_desc, s_version);
+        } else {
+            self.settings_open = settings_open;
+            self.settings_name = s_name;
+            self.settings_description = s_desc;
+            self.settings_version = s_version;
+        }
+        match action {
+            Some(LauncherAction::NewProject) => self.new_project(),
+            Some(LauncherAction::OpenProject) => self.open_project(),
+            Some(LauncherAction::OpenRecent(root)) => self.open_project_at(root),
+            Some(LauncherAction::PlayRecent(root)) => self.start_play(event_loop, root),
+            Some(LauncherAction::OpenSettings(root)) => self.open_settings(root),
+            Some(LauncherAction::ConfirmDelete(root)) => self.pending_delete = Some(root),
+            Some(LauncherAction::CancelDelete) => self.pending_delete = None,
+            Some(LauncherAction::DeleteProject(root)) => self.delete_project(root),
+            None => {}
+        }
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
+    }
+
+    /// Create a project: take the name typed on the launcher, pick a folder,
+    /// and scaffold `<name>.ron` (a starter scene) into it. The project's name is
+    /// that scene file's stem.
+    fn new_project(&mut self) {
+        let name = self.new_project_name.trim().to_string();
+        if name.is_empty() {
+            self.log("Type a project name first".to_string());
+            return;
+        }
+        if name.contains(['/', '\\']) {
+            self.log("Project name can't contain slashes".to_string());
+            return;
+        }
+        let Some(folder) = rfd::FileDialog::new()
+            .set_title("Choose a folder for the new project")
+            .pick_folder()
+        else {
+            return;
+        };
+        let scene_path = folder.join(format!("{name}.ron"));
+        let world = default_world();
+        match world.save_to_file(&scene_path) {
+            Ok(()) => {
+                write_manifest(
+                    &folder,
+                    &ProjectManifest {
+                        description: String::new(),
+                        version: "0.1.0".to_string(),
+                    },
+                );
+                self.world = world;
+                self.new_project_name.clear();
+                self.add_recent_project(&folder);
+                self.enter_editor(name, scene_path);
+            }
+            Err(e) => self.log(format!("Could not create project: {e}")),
+        }
+    }
+
+    /// Open a project: pick its folder and load the scene inside it.
+    fn open_project(&mut self) {
+        let Some(root) = rfd::FileDialog::new()
+            .set_title("Open a project folder")
+            .pick_folder()
+        else {
+            return;
+        };
+        self.open_project_at(root);
+    }
+
+    /// Open the project at a known folder (the folder picker and the recent
+    /// list both route here). Loads the folder's scene file.
+    fn open_project_at(&mut self, root: std::path::PathBuf) {
+        let Some(scene_path) = find_scene(&root) else {
+            self.log("That folder has no scene to open".to_string());
+            return;
+        };
+        let name = scene_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("Project")
+            .to_string();
+        match World::load_from_file(&scene_path) {
+            Ok(world) => {
+                self.world = world;
+                self.add_recent_project(&root);
+                self.enter_editor(name, scene_path);
+            }
+            Err(e) => self.log(format!("Could not open project: {e}")),
+        }
+    }
+
+    /// Record a project as recently used and refresh the sorted launcher list.
+    fn add_recent_project(&mut self, root: &std::path::Path) {
+        let mut roots = read_recent_projects();
+        roots.retain(|r| r != root);
+        roots.insert(0, root.to_path_buf());
+        roots.truncate(20);
+        write_recent_projects(&roots);
+        self.recent_projects = sorted_recent_projects();
+    }
+
+    /// Close the open project and return to the launcher. Does not save — use
+    /// Save (F5) first to keep changes.
+    fn close_project(&mut self) {
+        self.custom_meshes.clear();
+        if let Some(gpu) = &mut self.gpu {
+            gpu.set_custom_meshes(&[]);
+        }
+        self.mode = AppMode::Launcher;
+        self.project_name = None;
+        self.current_scene_path = None;
+        self.selected = None;
+        self.paused = false;
+        self.world = World::default();
+        self.recent_projects = sorted_recent_projects();
+        if let Some(window) = &self.window {
+            window.set_title("Frame Editor");
+        }
+    }
+
+    /// Open the project-settings window for a project, loading its current name
+    /// (the scene stem) and manifest (description, version) into the fields.
+    fn open_settings(&mut self, root: std::path::PathBuf) {
+        let Some(scene) = find_scene(&root) else {
+            self.log("That folder has no scene to configure".to_string());
+            return;
+        };
+        let name = scene
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("Project")
+            .to_string();
+        let manifest = read_manifest(&root);
+        self.settings_orig_name = name.clone();
+        self.settings_name = name;
+        self.settings_description = manifest.description;
+        self.settings_version = manifest.version;
+        self.settings_root = Some(root);
+        self.settings_open = true;
+    }
+
+    /// Save the project-settings window's fields: write the manifest, and rename
+    /// the scene file if the name changed (the name *is* the scene file's stem).
+    /// Called when the window closes.
+    fn save_settings(&mut self, name: String, description: String, version: String) {
+        let Some(root) = self.settings_root.clone() else {
+            return;
+        };
+        let new_name = name.trim();
+        // Rename the scene file if the name changed and is usable.
+        if !new_name.is_empty()
+            && new_name != self.settings_orig_name
+            && !new_name.contains(['/', '\\'])
+        {
+            let from = root.join(format!("{}.ron", self.settings_orig_name));
+            let to = root.join(format!("{new_name}.ron"));
+            match std::fs::rename(&from, &to) {
+                Ok(()) => self.log(format!("Renamed project to '{new_name}'")),
+                Err(e) => self.log(format!("Could not rename project: {e}")),
+            }
+        }
+        write_manifest(
+            &root,
+            &ProjectManifest {
+                description,
+                version,
+            },
+        );
+        self.settings_open = false;
+        self.settings_root = None;
+        self.recent_projects = sorted_recent_projects();
+    }
+
+    /// Delete a project: remove its folder (and everything in it) from disk and
+    /// drop it from the recent-projects list. Only reachable via the card's
+    /// two-step Delete -> Delete folder confirmation.
+    fn delete_project(&mut self, root: std::path::PathBuf) {
+        self.pending_delete = None;
+        let name = root
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("project")
+            .to_string();
+        match std::fs::remove_dir_all(&root) {
+            Ok(()) => self.log(format!("Deleted project '{name}'")),
+            Err(e) => self.log(format!("Could not delete '{name}': {e}")),
+        }
+        // Rewrite the recents file without this folder, whether or not the
+        // filesystem delete succeeded partially.
+        if let Some(path) = recent_projects_file() {
+            if let Ok(text) = std::fs::read_to_string(&path) {
+                let kept: Vec<&str> = text
+                    .lines()
+                    .filter(|line| {
+                        let line = line.trim();
+                        !line.is_empty() && std::path::Path::new(line) != root.as_path()
+                    })
+                    .collect();
+                let _ = std::fs::write(&path, kept.join("\n"));
+            }
+        }
+        self.recent_projects = sorted_recent_projects();
+    }
+
+    /// Play a project: open a separate, clean game window (its own GPU surface),
+    /// load the project's scene into it, and run the simulation there with no
+    /// editor chrome. Closing the window returns to the launcher.
+    fn start_play(&mut self, event_loop: &ActiveEventLoop, root: std::path::PathBuf) {
+        if self.game_window.is_some() {
+            return; // already playing
+        }
+        let Some(scene) = find_scene(&root) else {
+            self.log("That project has no scene to play".to_string());
+            return;
+        };
+        let mut world = match World::load_from_file(&scene) {
+            Ok(world) => world,
+            Err(e) => {
+                self.log(format!("Could not play project: {e}"));
+                return;
+            }
+        };
+        // Plugins are re-scanned fresh here too, same reasoning as the model
+        // load just below: the scene file only has whatever was true as of
+        // the last save, and Play should reflect what's really on disk now
+        // (a plugin edited or dropped in since), not a stale snapshot.
+        // Enabled/disabled choices already saved in the scene are kept.
+        let (manifests, scripts, errors) = load_project_plugins(&root);
+        for e in errors {
+            self.log(format!("Plugin load failed: {e}"));
+        }
+        merge_plugins_into_world(&mut world, manifests, scripts);
+        let name = scene
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("Game")
+            .to_string();
+        let attributes = Window::default_attributes().with_title(format!("{name} — Play"));
+        let window = match event_loop.create_window(attributes) {
+            Ok(w) => Arc::new(w),
+            Err(e) => {
+                self.log(format!("Could not open game window: {e}"));
+                return;
+            }
+        };
+        let (mut gpu, _shared) = GpuState::new(window.clone(), self.gpu_shared.as_ref());
+        // The game window has its own GpuState (pipelines, buffers,
+        // egui_renderer), so the project's models get parsed and uploaded
+        // for it separately, even though it shares the same underlying
+        // device as the main window now. Play can start from the launcher
+        // with no project open in the editor, so load from the root.
+        let (models, errors) = load_project_models(&root);
+        for e in errors {
+            self.log(format!("Model load failed: {e}"));
+        }
+        self.game_custom_names = models.keys().cloned().collect();
+        let refs: Vec<&frame_engine::assets::MeshData> = models.values().collect();
+        gpu.set_custom_meshes(&refs);
+        window.request_redraw();
+        self.game_gpu = Some(gpu);
+        self.game_world = Some(world);
+        // Fresh physics state for this play session; see `game_physics`'s
+        // own doc comment for why it isn't reused across Play runs.
+        self.game_physics = Some(Physics::new(GRAVITY_Y));
+        self.game_input = InputState::new();
+        self.game_clock = Clock::new(TICK_RATE, MAX_CATCHUP_TICKS);
+        self.game_window = Some(window);
+        self.log(format!("Playing '{name}'"));
+    }
+
+    /// Close the game window and stop playing. GPU state is dropped first (its
+    /// surface holds a window handle) — the same teardown order as on exit.
+    fn close_game(&mut self) {
+        self.game_gpu = None;
+        self.game_world = None;
+        self.game_physics = None;
+        self.game_window = None;
+        self.game_input = InputState::new();
+    }
+
+    /// Advance and render the game window: tick the game world on its own clock
+    /// (always running), draw it with the shared 3D pipeline, and no egui/overlay.
+    fn render_game(&mut self) {
+        let owed = self.game_clock.advance(true);
+        // Same project the editor has open, so sound files resolve under its
+        // assets/ folder the same way build_instances' custom meshes do.
+        let assets_root = self
+            .current_scene_path
+            .as_ref()
+            .and_then(|p| p.parent())
+            .map(|p| p.join("assets"));
+        let mut sound_messages = Vec::new();
+        for _ in 0..owed {
+            if let Some(world) = self.game_world.as_mut() {
+                systems::collision(world);
+                systems::run_scripts(world, &mut self.script_runtime, &self.game_input);
+                systems::input_movement(world, &self.game_input);
+                systems::gravity(world);
+                systems::movement(world);
+                if let Some(physics) = self.game_physics.as_mut() {
+                    physics.step(world, 1.0 / TICK_RATE as f32);
+                }
+                systems::resolve_collisions(world);
+                sound_messages.extend(update_sounds(
+                    world,
+                    self.audio_manager.as_mut(),
+                    &mut self.sound_cache,
+                    assets_root.as_deref(),
+                ));
+            }
+        }
+        // Logged after the loop, once world's borrow above has ended. self.log
+        // needs &mut self, which would conflict with the still-live `world`
+        // borrow if called from inside the loop.
+        for msg in sound_messages {
+            self.log(msg);
+        }
+        let (width, height) = match &self.game_window {
+            Some(w) => {
+                let size = w.inner_size();
+                (size.width.max(1), size.height.max(1))
+            }
+            None => return,
+        };
+        let (instances, group_counts, lights) = match &self.game_world {
+            Some(world) => {
+                let empty = std::collections::HashSet::new();
+                let (instances, group_counts) =
+                    build_instances(world, None, &empty, &self.game_custom_names);
+                (instances, group_counts, build_lights(world))
+            }
+            None => return,
+        };
+        let view_proj = camera_view_proj(
+            self.cam_focus_x,
+            self.cam_focus_y,
+            self.cam_focus_z,
+            self.cam_distance,
+            self.cam_yaw,
+            self.cam_pitch,
+            width,
+            height,
+        );
+        if let Some(gpu) = self.game_gpu.as_mut() {
+            gpu.render(
+                &instances,
+                &group_counts,
+                &[],
+                view_proj,
+                &lights,
+                &[],
+                &egui::TexturesDelta::default(),
+                1.0,
+            );
+        }
+        if let Some(window) = &self.game_window {
+            window.request_redraw();
+        }
+    }
+
+    /// Handle an event addressed to the game window.
+    fn game_window_event(&mut self, event: WindowEvent) {
+        match event {
+            WindowEvent::CloseRequested => self.game_closing = true,
+            WindowEvent::Resized(size) => {
+                if let Some(gpu) = self.game_gpu.as_mut() {
+                    gpu.resize(size.width, size.height);
+                }
+            }
+            WindowEvent::RedrawRequested => self.render_game(),
+            WindowEvent::KeyboardInput { event, .. } => {
+                let pressed = event.state == ElementState::Pressed;
+                if let PhysicalKey::Code(code) = event.physical_key {
+                    match code {
+                        KeyCode::Escape => self.game_closing = true,
+                        KeyCode::KeyW => self.game_input.set(Button::Up, pressed),
+                        KeyCode::KeyA => self.game_input.set(Button::Left, pressed),
+                        KeyCode::KeyS => self.game_input.set(Button::Down, pressed),
+                        KeyCode::KeyD => self.game_input.set(Button::Right, pressed),
+                        KeyCode::Space => self.game_input.set(Button::Jump, pressed),
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Pop a docked tab out into its own real, separate OS window (draggable
+    /// to another monitor), sharing this same running App/World the way the
+    /// game window does. Mirrors start_play's shape: its own Window, its own
+    /// GpuState. The Viewport tab is deliberately never offered this (see
+    /// EditorTabViewer::context_menu) — it's the live 3D scene rendered
+    /// behind egui, not a panel, and popping it out would need its own
+    /// duplicated render target, a separate, bigger piece of work.
+    fn pop_out_tab(&mut self, event_loop: &ActiveEventLoop, tab: Tab) {
+        if matches!(tab, Tab::Viewport) || self.popped_out.contains_key(&tab) {
+            return;
+        }
+        let Some(path) = self.dock_state.find_tab(&tab) else {
+            return; // not currently docked — already popped out, or gone
+        };
+        self.dock_state.remove_tab(path);
+        let title = match tab {
+            Tab::Scene => "Frame Editor — Scene",
+            Tab::Inspector => "Frame Editor — Inspector",
+            Tab::Scripts => "Frame Editor — Script Editor",
+            Tab::Source => "Frame Editor — Source Control",
+            Tab::Viewport => unreachable!("Viewport is never popped out"),
+        };
+        let attributes = Window::default_attributes().with_title(title);
+        let window = match event_loop.create_window(attributes) {
+            Ok(w) => Arc::new(w),
+            Err(e) => {
+                self.log(format!("Could not open a window for this tab: {e}"));
+                // Put it back where it came from rather than losing the tab.
+                self.dock_state.push_to_first_leaf(tab);
+                return;
+            }
+        };
+        // Reuses the main window's shared Instance/Device -- see SharedGpu's
+        // own doc comment for why this window must not create its own.
+        let (gpu, _shared) = GpuState::new(window.clone(), self.gpu_shared.as_ref());
+        let egui_ctx = egui::Context::default();
+        let egui_state = egui_winit::State::new(
+            egui_ctx.clone(),
+            egui::ViewportId::ROOT,
+            window.as_ref(),
+            None,
+            None,
+            None,
+        );
+        window.request_redraw();
+        self.popped_out.insert(
+            tab,
+            PoppedOutWindow {
+                window,
+                gpu,
+                egui_ctx,
+                egui_state,
+            },
+        );
+    }
+
+    /// Close a popped-out tab's window and dock it back into the main one.
+    /// Called from about_to_wait via popped_out_closing, not directly from
+    /// event dispatch — dropping a wgpu surface from inside its own
+    /// CloseRequested handler is the same Wayland segfault close_game's own
+    /// doc comment warns about.
+    fn dock_back_tab(&mut self, tab: Tab) {
+        if let Some(popped) = self.popped_out.remove(&tab) {
+            // Explicit, not just relying on field declaration order: gpu's
+            // wgpu surface holds a handle into window, so it must go first --
+            // same ordering as close_game's own teardown.
+            let PoppedOutWindow {
+                gpu,
+                window,
+                egui_ctx,
+                egui_state,
+            } = popped;
+            // This window rendered and presented a frame as recently as this
+            // same tick (the "Dock back" click itself is drawn and presented
+            // before we ever get here). Presentation is not necessarily
+            // finished just because present() returned -- on Wayland in
+            // particular, destroying the surface/device before the compositor
+            // has actually acknowledged that last frame is a well-known way
+            // to segfault in the driver rather than in our own code. Block
+            // until the GPU has genuinely finished everything queued for
+            // this device before tearing anything down.
+            let _ = gpu.device.poll(wgpu::PollType::Wait {
+                submission_index: None,
+                timeout: None,
+            });
+            drop(gpu);
+            drop(window);
+            drop(egui_ctx);
+            drop(egui_state);
+            self.dock_state.push_to_first_leaf(tab);
+        }
+    }
+
+    /// Draw and present one popped-out tab's own window this frame, reusing
+    /// the very same EditorTabViewer the main dock just drew from, so both
+    /// stay in perfect sync — an edit in a popped-out Inspector and one in a
+    /// still-docked tab this same frame both land in the caller's one
+    /// drain-back afterwards, rather than each window keeping its own,
+    /// possibly conflicting, snapshot of the world.
+    fn render_popped_out(&mut self, tab: Tab, viewer: &mut EditorTabViewer) {
+        let mut dock_back = false;
+        let render_result = {
+            let Some(popped) = self.popped_out.get_mut(&tab) else {
+                return;
+            };
+            let window = popped.window.clone();
+            let raw_input = popped.egui_state.take_egui_input(&window);
+            let full_output = popped.egui_ctx.clone().run_ui(raw_input, |ui| {
+                ui.horizontal(|ui| {
+                    if ui.button("⟵ Dock back to main window").clicked() {
+                        dock_back = true;
+                    }
+                });
+                ui.separator();
+                let mut tab_copy = tab;
+                egui_dock::TabViewer::ui(viewer, ui, &mut tab_copy);
+            });
+            popped
+                .egui_state
+                .handle_platform_output(&window, full_output.platform_output);
+            let ppp = full_output.pixels_per_point;
+            let jobs = popped.egui_ctx.tessellate(full_output.shapes, ppp);
+            (jobs, full_output.textures_delta, ppp)
+        };
+        let (egui_paint_jobs, egui_textures_delta, egui_ppp) = render_result;
+        if let Some(popped) = self.popped_out.get_mut(&tab) {
+            popped.gpu.render(
+                &[],
+                &[],
+                &[],
+                Mat4::IDENTITY.to_cols_array_2d(),
+                &[LightRaw::zeroed(); MAX_LIGHTS],
+                &egui_paint_jobs,
+                &egui_textures_delta,
+                egui_ppp,
+            );
+            popped.window.request_redraw();
+        }
+        if dock_back {
+            self.popped_out_closing.push(tab);
+        }
+    }
+
+    /// Handle an event addressed to one of the popped-out tab windows.
+    fn popped_out_window_event(&mut self, tab: Tab, event: WindowEvent) {
+        if let Some(popped) = self.popped_out.get_mut(&tab) {
+            let _ = popped.egui_state.on_window_event(&popped.window, &event);
+        }
+        match event {
+            WindowEvent::CloseRequested => self.popped_out_closing.push(tab),
+            WindowEvent::Resized(size) => {
+                if let Some(popped) = self.popped_out.get_mut(&tab) {
+                    popped.gpu.resize(size.width, size.height);
+                }
+            }
+            // The real draw happens once per frame, batched with the main
+            // window's own redraw (see render_popped_out, called from its
+            // RedrawRequested arm) so every window paints from the same
+            // EditorTabViewer snapshot. Just make sure another frame is
+            // coming if the window system wants this one repainted on its
+            // own (e.g. after being uncovered on its own monitor).
+            WindowEvent::RedrawRequested => {
+                if let Some(popped) = self.popped_out.get(&tab) {
+                    popped.window.request_redraw();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Switch from the launcher into the editor with a project loaded.
+    // Rebuild the Assets tab previews from the loaded models.
+    fn rebuild_thumbnails(&mut self) {
+        self.thumbnails.clear();
+        for (name, data) in &self.custom_meshes {
+            let image = render_thumbnail(data);
+            let handle = self.egui_ctx.load_texture(
+                format!("thumb-{name}"),
+                image,
+                egui::TextureOptions::LINEAR,
+            );
+            self.thumbnails.insert(name.clone(), handle);
+        }
+    }
+
+    // Import a model: pick an .obj, copy it into the project's assets folder,
+    // parse it, record its half extents, and upload it to the GPU.
+    /// File > Import audio: pick one or more audio files and import each.
+    fn import_audio(&mut self) {
+        if self.current_scene_path.is_none() {
+            self.log("Open a project before importing audio".to_string());
+            return;
+        }
+        let Some(picked) = rfd::FileDialog::new()
+            .add_filter("Audio", AUDIO_EXTENSIONS)
+            .pick_files()
+        else {
+            return; // dialog cancelled
+        };
+        for path in picked {
+            self.import_audio_from(path);
+        }
+    }
+
+    /// Import one audio file into the folder currently open in the Assets
+    /// tab (the assets root by default), so it lands wherever the user is
+    /// working. The file is decoded once first, so a broken or unsupported
+    /// file is caught here with a clear message rather than failing silently
+    /// the first time something tries to play it. A Sound finds its file by
+    /// name anywhere under assets/ (see `find_audio`), so if a file with the
+    /// same name already exists somewhere in there, that file is replaced in
+    /// place instead of adding a second copy the lookup can't tell apart.
+    fn import_audio_from(&mut self, picked: std::path::PathBuf) {
+        let Some(assets) = self
+            .current_scene_path
+            .as_ref()
+            .and_then(|p| p.parent())
+            .map(|p| p.join("assets"))
+        else {
+            self.log("Open a project before importing audio".to_string());
+            return;
+        };
+        let Some(name) = picked
+            .file_name()
+            .and_then(|f| f.to_str())
+            .map(String::from)
+        else {
+            return;
+        };
+        if let Err(e) = kira::sound::static_sound::StaticSoundData::from_file(&picked) {
+            self.log(format!("Could not read audio '{name}': {e:?}"));
+            return;
+        }
+        let existing = find_audio(&assets, &name);
+        let dest = match &existing {
+            Some(path) => path.clone(),
+            None => {
+                let folder = assets.join(&self.assets_subdir);
+                let folder = if folder.is_dir() { folder } else { assets.clone() };
+                if let Err(e) = std::fs::create_dir_all(&folder) {
+                    self.log(format!("Could not create assets folder: {e}"));
+                    return;
+                }
+                folder.join(&name)
+            }
+        };
+        // Copying onto itself fails on some platforms, so skip when the
+        // picked file already is the destination.
+        if picked != dest {
+            if let Err(e) = std::fs::copy(&picked, &dest) {
+                self.log(format!("Could not copy audio into assets: {e}"));
+                return;
+            }
+        }
+        // Drop any cached decode of the old file, so the next play uses the
+        // new one. The cache is keyed by whatever a Sound's name says, which
+        // may be an older path form, so match on the file name part too.
+        self.sound_cache
+            .retain(|key, _| key.rsplit(['/', '\\']).next() != Some(name.as_str()));
+        let shown = dest
+            .strip_prefix(&assets)
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| name.clone());
+        if existing.is_some() {
+            self.log(format!("Replaced audio 'assets/{shown}'"));
+        } else {
+            self.log(format!("Imported audio 'assets/{shown}'"));
+        }
+    }
+
+    /// Import dropped files: .obj as a model, a supported audio format as
+    /// audio, anything else skipped with a message.
+    fn import_dropped(&mut self, path: std::path::PathBuf) {
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| e.to_ascii_lowercase())
+            .unwrap_or_default();
+        if ext == "obj" {
+            self.import_model_from(path);
+        } else if AUDIO_EXTENSIONS.contains(&ext.as_str()) {
+            self.import_audio_from(path);
+        } else {
+            let name = path
+                .file_name()
+                .map(|f| f.to_string_lossy().to_string())
+                .unwrap_or_default();
+            self.log(format!("Can't import '{name}': not a model or a supported audio file"));
+        }
+    }
+
+    fn import_model(&mut self) {
+        if self.current_scene_path.is_none() {
+            self.log("Open a project before importing a model".to_string());
+            return;
+        }
+        let Some(picked) = rfd::FileDialog::new()
+            .add_filter("OBJ model", &["obj"])
+            .pick_file()
+        else {
+            return; // dialog cancelled
+        };
+        self.import_model_from(picked);
+    }
+
+    /// Import one .obj into the project's assets folder. Shared by the File
+    /// menu and drag and drop.
+    fn import_model_from(&mut self, picked: std::path::PathBuf) {
+        let Some(root) = self
+            .current_scene_path
+            .as_ref()
+            .and_then(|p| p.parent())
+            .map(|p| p.to_path_buf())
+        else {
+            self.log("Open a project before importing a model".to_string());
+            return;
+        };
+        let Some(file_name) = picked.file_name().map(|f| f.to_owned()) else {
+            return;
+        };
+        let Some(name) = picked
+            .file_stem()
+            .and_then(|st| st.to_str())
+            .map(String::from)
+        else {
+            return;
+        };
+        let text = match std::fs::read_to_string(&picked) {
+            Ok(t) => t,
+            Err(e) => {
+                self.log(format!("Could not read model: {e}"));
+                return;
+            }
+        };
+        let data = match frame_engine::assets::parse_obj(&text) {
+            Ok(d) => d,
+            Err(e) => {
+                self.log(format!("Could not parse model: {e}"));
+                return;
+            }
+        };
+        let assets = root.join("assets");
+        if let Err(e) = std::fs::create_dir_all(&assets) {
+            self.log(format!("Could not create assets folder: {e}"));
+            return;
+        }
+        let dest = assets.join(&file_name);
+        // Copying onto itself fails on some platforms, so skip when the picked
+        // file is already in the assets folder.
+        if picked != dest {
+            if let Err(e) = std::fs::copy(&picked, &dest) {
+                self.log(format!("Could not copy model into assets: {e}"));
+                return;
+            }
+        }
+        let replaced = self.custom_meshes.contains_key(&name);
+        self.world.mesh_meta.insert(
+            name.clone(),
+            frame_engine::world::MeshMeta {
+                half_extents: data.half_extents,
+            },
+        );
+        self.custom_meshes.insert(name.clone(), data);
+        let refs: Vec<&frame_engine::assets::MeshData> = self.custom_meshes.values().collect();
+        if let Some(gpu) = &mut self.gpu {
+            gpu.set_custom_meshes(&refs);
+        }
+        self.rebuild_thumbnails();
+        if replaced {
+            self.log(format!("Replaced model '{name}'"));
+        } else {
+            self.log(format!("Imported model '{name}'"));
+        }
+    }
+
+    // Parse the open project's models, record their half extents in the
+    // world, and upload them to the editor GPU.
+    fn load_project_assets(&mut self) {
+        self.custom_meshes.clear();
+        if let Some(root) = self
+            .current_scene_path
+            .as_ref()
+            .and_then(|p| p.parent())
+            .map(|p| p.to_path_buf())
+        {
+            let (models, errors) = load_project_models(&root);
+            for e in errors {
+                self.log(format!("Model load failed: {e}"));
+            }
+            self.custom_meshes = models;
+
+            let (manifests, scripts, errors) = load_project_plugins(&root);
+            for e in errors {
+                self.log(format!("Plugin load failed: {e}"));
+            }
+            if !manifests.is_empty() {
+                self.log(format!("Found {} plugin(s)", manifests.len()));
+            }
+            merge_plugins_into_world(&mut self.world, manifests, scripts);
+        }
+        for (name, data) in &self.custom_meshes {
+            self.world.mesh_meta.insert(
+                name.clone(),
+                frame_engine::world::MeshMeta {
+                    half_extents: data.half_extents,
+                },
+            );
+        }
+        if !self.custom_meshes.is_empty() {
+            self.log(format!("Loaded {} model(s)", self.custom_meshes.len()));
+        }
+        let refs: Vec<&frame_engine::assets::MeshData> = self.custom_meshes.values().collect();
+        if let Some(gpu) = &mut self.gpu {
+            gpu.set_custom_meshes(&refs);
+        }
+        self.rebuild_thumbnails();
+    }
+
+    /// Turn one plugin on or off. Enabling re-scans that plugin's scripts
+    /// folder and merges them into script_library; disabling removes every
+    /// script currently in the library under that plugin's prefix. An
+    /// entity that has one of those scripts assigned when it's disabled
+    /// keeps a dangling reference, the same safe handling a deleted
+    /// hand-written script already gets: the runtime skips it, the
+    /// Inspector flags it.
+    fn set_plugin_enabled(&mut self, plugin_name: &str, enabled: bool) {
+        if let Some(installed) = self.world.installed_plugins.get_mut(plugin_name) {
+            installed.enabled = enabled;
+        }
+        let prefix = format!("{plugin_name}/");
+        if enabled {
+            if let Some(root) = self
+                .current_scene_path
+                .as_ref()
+                .and_then(|p| p.parent())
+                .map(|p| p.to_path_buf())
+            {
+                let (_, scripts, errors) = load_project_plugins(&root);
+                for e in errors {
+                    self.log(format!("Plugin load failed: {e}"));
+                }
+                for (name, source) in scripts {
+                    if name.starts_with(&prefix) {
+                        self.world.script_library.insert(name, source);
+                    }
+                }
+            }
+        } else {
+            self.world
+                .script_library
+                .retain(|k, _| !k.starts_with(&prefix));
+        }
+        self.log(format!(
+            "{} plugin '{plugin_name}'",
+            if enabled { "Enabled" } else { "Disabled" }
+        ));
+    }
+
+    /// Run a clicked plugin action. `PluginActionKind` is a closed enum, so
+    /// this match is the complete list of everything a plugin action can
+    /// ever cause; there is no path from here into arbitrary plugin code.
+    fn run_plugin_action(&mut self, kind: frame_engine::world::PluginActionKind) {
+        match kind {
+            frame_engine::world::PluginActionKind::RunScript { script } => {
+                // Every entity currently assigned this exact script, run
+                // once, right now, through the same ScriptRuntime::run a
+                // normal tick already uses for it. Shared per-tick state
+                // (such as held input) reflects whatever the last real tick
+                // set, not a fresh begin_tick, since this isn't a tick of
+                // its own.
+                let ids: Vec<usize> = self
+                    .world
+                    .scripts
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(id, slot)| slot.as_ref().filter(|s| s.uses == script).map(|_| id))
+                    .collect();
+                if ids.is_empty() {
+                    self.log(format!("No entity currently uses script '{script}'"));
+                    return;
+                }
+                for id in &ids {
+                    self.script_runtime.run(&mut self.world, *id);
+                }
+                self.log(format!(
+                    "Ran '{script}' once for {} entit{}",
+                    ids.len(),
+                    if ids.len() == 1 { "y" } else { "ies" }
+                ));
+            }
+            frame_engine::world::PluginActionKind::ToggleValue { name } => {
+                // Every live entity that already has a value under this
+                // name; toggling can't originate one on an entity that
+                // doesn't, the same rule fields and scripts both follow.
+                let ids: Vec<usize> = self
+                    .world
+                    .positions
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(id, slot)| slot.as_ref().map(|_| id))
+                    .collect();
+                let mut toggled = 0usize;
+                for id in ids {
+                    if let Some(value) = self.world.get_dynamic::<f64>(&name, id).copied() {
+                        let new_value = if value > 0.5 { 0.0 } else { 1.0 };
+                        self.world.insert_dynamic::<f64>(&name, id, new_value);
+                        toggled += 1;
+                    }
+                }
+                self.log(format!(
+                    "Toggled '{name}' on {toggled} entit{}",
+                    if toggled == 1 { "y" } else { "ies" }
+                ));
+            }
+            frame_engine::world::PluginActionKind::ToggleGlobal { name } => {
+                let current = self.world.globals.get(&name).copied().unwrap_or(0.0);
+                let new_value = if current > 0.5 { 0.0 } else { 1.0 };
+                self.world.globals.insert(name.clone(), new_value);
+                self.log(format!("Toggled global '{name}'"));
+            }
+        }
+    }
+
+    fn enter_editor(&mut self, name: String, scene_path: std::path::PathBuf) {
+        self.current_scene_path = Some(scene_path);
+        self.selected = None;
+        // Open paused: arrange the scene first, press P when ready to run.
+        self.paused = true;
+        self.mode = AppMode::Editor;
+        if let Some(window) = &self.window {
+            window.set_title(&format!("Frame Editor — {name}"));
+        }
+        self.log(format!("Opened project '{name}'"));
+        self.project_name = Some(name);
+        self.load_project_assets();
+    }
+    /// The current view-projection matrix: an orbit around the focus normally, or
+    /// a free camera from `cam_eye` while flying.
+    fn view_matrix(&self, width: u32, height: u32) -> Mat4 {
+        if self.fly_mode {
+            let aspect = width as f32 / height.max(1) as f32;
+            let forward = view_forward(self.cam_yaw, self.cam_pitch);
+            let view = Mat4::look_at_rh(self.cam_eye, self.cam_eye + forward, Vec3::Y);
+            let proj = Mat4::perspective_rh(FOV_DEGREES.to_radians(), aspect, 0.1, 10000.0);
+            proj * view
+        } else {
+            camera_matrix(
+                self.cam_focus_x,
+                self.cam_focus_y,
+                self.cam_focus_z,
+                self.cam_distance,
+                self.cam_yaw,
+                self.cam_pitch,
+                width,
+                height,
+            )
+        }
+    }
+    /// Where the camera actually is: the free-camera eye while flying, or the
+    /// orbit eye (focus plus the orbit offset) otherwise.
+    fn camera_eye(&self) -> Vec3 {
+        if self.fly_mode {
+            self.cam_eye
+        } else {
+            let offset = Vec3::new(
+                self.cam_pitch.cos() * self.cam_yaw.sin(),
+                self.cam_pitch.sin(),
+                self.cam_pitch.cos() * self.cam_yaw.cos(),
+            ) * self.cam_distance;
+            Vec3::new(self.cam_focus_x, self.cam_focus_y, self.cam_focus_z) + offset
+        }
+    }
+
+    /// Recompute the gizmo's screen geometry for the current selection and camera.
+    /// Arms are sized as a fraction of the camera-to-entity distance, so the gizmo
+    /// stays about the same size on screen however far away the entity is. Also
+    /// refreshes which arm the cursor is hovering.
+    fn update_gizmo(&mut self, width: u32, height: u32) {
+        self.gizmo = None;
+        // No gizmo while flying: the cursor is locked, so there's nothing to grab.
+        if self.fly_mode {
+            self.gizmo_hover = None;
+            return;
+        }
+        let Some(id) = self.selected else {
+            self.gizmo_hover = None;
+            return;
+        };
+        let Some(p) = self.world.positions.get(id).copied() else {
+            self.gizmo_hover = None;
+            return;
+        };
+        let (w, h) = (width as f32, height as f32);
+        let eye = self.camera_eye();
+        let dist = (Vec3::new(p.x, p.y, p.z) - eye).length();
+        let len = (dist * GIZMO_SCREEN_FRAC).max(1.0);
+        let vp = self.view_matrix(width, height);
+        let origin = project(vp, p.x, p.y, p.z, w, h);
+        let ex = project(vp, p.x + len, p.y, p.z, w, h);
+        let ey = project(vp, p.x, p.y + len, p.z, w, h);
+        let ez = project(vp, p.x, p.y, p.z + len, w, h);
+        if let (Some(origin), Some(ex), Some(ey), Some(ez)) = (origin, ex, ey, ez) {
+            self.gizmo = Some(GizmoScreen {
+                origin,
+                ends: [ex, ey, ez],
+                len,
+            });
+        }
+        // Hover follows the cursor unless a drag is already in progress.
+        self.gizmo_hover = if self.gizmo_drag.is_some() {
+            self.gizmo_drag
+        } else {
+            self.gizmo_hit()
+        };
+    }
+
+    /// Which gizmo arm, if any, the cursor is close enough to grab. Nearest wins,
+    /// so crossing arms behave sensibly.
+    fn gizmo_hit(&self) -> Option<usize> {
+        let g = self.gizmo?;
+        let cursor = (self.last_cursor.0 as f32, self.last_cursor.1 as f32);
+        let mut best: Option<(usize, f32)> = None;
+        for (axis, end) in g.ends.iter().enumerate() {
+            let d = dist_to_segment(cursor, g.origin, *end);
+            let better = match best {
+                None => true,
+                Some((_, bd)) => d < bd,
+            };
+            if d <= GIZMO_PICK_PX && better {
+                best = Some((axis, d));
+            }
+        }
+        best.map(|(axis, _)| axis)
+    }
+
+    fn pick(&mut self) {
+        let (width_u, height_u) = match &self.window {
+            Some(window) => {
+                let size = window.inner_size();
+                (size.width.max(1), size.height.max(1))
+            }
+            None => return,
+        };
+        let width = width_u as f32;
+        let height = height_u as f32;
+        let vp = self.view_matrix(width_u, height_u);
+        // While flying the cursor is locked, so aim from screen centre (a
+        // crosshair): look at an entity and click to pick it. Otherwise use the
+        // cursor.
+        let (cursor_x, cursor_y) = if self.fly_mode {
+            (width * 0.5, height * 0.5)
+        } else {
+            (self.last_cursor.0 as f32, self.last_cursor.1 as f32)
+        };
+        let mut picked: Option<usize> = None;
+        for (id, slot) in self.world.positions.iter().enumerate() {
+            if let Some(p) = slot {
+                // Hit-box grows with the entity's scale so picking matches what's drawn.
+                let scale = self.world.scales.get(id).copied().unwrap_or_default();
+                let half_x = QUAD_SIZE * 0.5 * scale.x;
+                let half_y = QUAD_SIZE * 0.5 * scale.y;
+                let center = project(vp, p.x, p.y, p.z, width, height);
+                let corner = project(vp, p.x + half_x, p.y + half_y, p.z, width, height);
+                if let (Some((cx, cy)), Some((ex, ey))) = (center, corner) {
+                    let half_w = (ex - cx).abs();
+                    let half_h = (ey - cy).abs();
+                    if (cursor_x - cx).abs() <= half_w && (cursor_y - cy).abs() <= half_h {
+                        picked = Some(id);
+                    }
+                }
+            }
+        }
+        if let Some(id) = picked {
+            self.selected = Some(id);
+            // Picking while flying makes that entity the orbit pivot for when we
+            // drop back to orbit.
+            if self.fly_mode {
+                if let Some(p) = self.world.positions.get(id) {
+                    self.cam_focus_x = p.x;
+                    self.cam_focus_y = p.y;
+                    self.cam_focus_z = p.z;
+                    self.fly_picked = true;
+                }
+            }
+            if let (Some(p), Some(v)) =
+                (self.world.positions.get(id), self.world.velocities.get(id))
+            {
+                println!(
+                    "Selected entity {} | pos ({:.1}, {:.1}, {:.1}) | vel ({:.2}, {:.2}, {:.2})",
+                    id, p.x, p.y, p.z, v.dx, v.dy, v.dz,
+                );
+            }
+        }
+    }
+}
+// Decode the embedded logo into a winit window icon (shown in the title bar and
+// the OS taskbar). Returns None if it can't decode, so the window still opens.
+// NOTE: honoured on X11 and Windows; Wayland ignores it and takes the taskbar
+// icon from a matching .desktop file instead.
+fn load_window_icon() -> Option<Icon> {
+    let rgba = image::load_from_memory(LOGO_PNG).ok()?.to_rgba8();
+    let (width, height) = rgba.dimensions();
+    Icon::from_rgba(rgba.into_raw(), width, height).ok()
+}
+impl ApplicationHandler for App {
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        #[allow(unused_mut)]
+        let mut attributes = Window::default_attributes()
+            .with_title("Frame Editor")
+            .with_window_icon(load_window_icon());
+        // Wayland ignores the in-process icon above; it matches this app-id to a
+        // frame-editor.desktop file and reads the taskbar icon from there.
+        #[cfg(target_os = "linux")]
+        {
+            use winit::platform::wayland::WindowAttributesExtWayland;
+            attributes = attributes.with_name("frame-editor", "frame-editor");
+        }
+        let window = Arc::new(event_loop.create_window(attributes).unwrap());
+        let (gpu, shared) = GpuState::new(window.clone(), self.gpu_shared.as_ref());
+        self.gpu = Some(gpu);
+        self.gpu_shared = Some(shared);
+        // egui input state. Lives here because it needs the window; the egui
+        // Context it shares already exists on App.
+        let egui_state = egui_winit::State::new(
+            self.egui_ctx.clone(),
+            egui::ViewportId::ROOT,
+            window.as_ref(),
+            None,
+            None,
+            None,
+        );
+        self.egui_state = Some(egui_state);
+        window.request_redraw();
+        self.window = Some(window);
+    }
+    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+        // Tear down a closing game window here, after all events for this cycle
+        // are dispatched. Dropping the wgpu surface from inside the window's own
+        // CloseRequested handler segfaults on Wayland; doing it here — outside
+        // event dispatch, with the display still alive — is safe.
+        if self.game_closing {
+            self.close_game();
+            self.game_closing = false;
+        }
+        // Same reasoning, same deferred-teardown pattern, for any popped-out
+        // tab window that asked to close this cycle (its own X button, or its
+        // "Dock back" button).
+        for tab in std::mem::take(&mut self.popped_out_closing) {
+            self.dock_back_tab(tab);
+        }
+    }
+    fn device_event(
+        &mut self,
+        _event_loop: &ActiveEventLoop,
+        _device_id: DeviceId,
+        event: DeviceEvent,
+    ) {
+        // Raw mouse motion drives mouselook while flying. Raw motion (rather than
+        // cursor position) keeps looking smooth with the cursor grabbed in place.
+        if let DeviceEvent::MouseMotion { delta: (dx, dy) } = event {
+            if self.fly_mode {
+                self.cam_yaw += dx as f32 * LOOK_SENS;
+                // Un-inverted: moving the mouse down looks down (pitch increases).
+                self.cam_pitch += dy as f32 * LOOK_SENS;
+                self.cam_pitch = self.cam_pitch.clamp(-1.4, 1.4);
+                if let Some(window) = &self.window {
+                    window.request_redraw();
+                }
+            }
+        }
+    }
+    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        // Release GPU and window resources here, while winit's platform
+        // connection (the Wayland display) is still alive. If we let these drop
+        // later, after the event loop has torn down, the wgpu surface's
+        // destructor touches Wayland objects that are already gone, which is the
+        // segfault on exit. Order matters: GPU state first (its surface holds a
+        // handle to the window), then egui, then the window last.
+        self.gpu = None;
+        self.egui_state = None;
+        self.window = None;
+        self.game_gpu = None;
+        self.game_world = None;
+        self.game_window = None;
+        self.popped_out.clear();
+    }
+    fn window_event(&mut self, event_loop: &ActiveEventLoop, id: WindowId, event: WindowEvent) {
+        // Events addressed to the separate game window go to its own handler.
+        if self.game_window.as_ref().is_some_and(|w| w.id() == id) {
+            self.game_window_event(event);
+            return;
+        }
+        // Same for a popped-out tab window.
+        if let Some(tab) = self
+            .popped_out
+            .iter()
+            .find(|(_, p)| p.window.id() == id)
+            .map(|(tab, _)| *tab)
+        {
+            self.popped_out_window_event(tab, event);
+            return;
+        }
+        // Feed every event to egui so its own widgets (dragging the panel,
+        // future buttons/sliders) keep working. We deliberately ignore the
+        // returned `consumed` flag: in 0.35 it's driven by egui's *interaction*
+        // state, which is the wrong question for a viewport editor and gates
+        // press/release differently once a button goes down — that's what stuck
+        // our drag/orbit state and killed viewport input.
+        if let (Some(state), Some(window)) = (self.egui_state.as_mut(), self.window.as_ref()) {
+            let _ = state.on_window_event(window, &event);
+        }
+        // The viewport is now an egui_dock tab, so is_pointer_over_egui() reads
+        // true over it and would kill 3D input. Instead we route 3D input by the
+        // viewport tab's own body rect: allow picking/orbit/zoom only when the
+        // cursor is inside it. viewport_rect is in egui points; the winit cursor
+        // is in physical pixels, so divide by pixels_per_point to compare. None
+        // (viewport tab hidden behind another tab) means no 3D input.
+        let over_viewport = self.viewport_rect.is_some_and(|r| {
+            let ppp = self.egui_ctx.pixels_per_point();
+            let p = egui::pos2(
+                self.last_cursor.0 as f32 / ppp,
+                self.last_cursor.1 as f32 / ppp,
+            );
+            r.contains(p)
+        });
+        let ui_wants_keys = self.egui_ctx.egui_wants_keyboard_input();
+        match event {
+            WindowEvent::CloseRequested => {
+                println!("Close requested; Shutting Down");
+                event_loop.exit();
+            }
+            // One event per file when several are dropped at once. winit
+            // 0.30 sends this on Windows, macOS and X11, but not on Wayland.
+            WindowEvent::DroppedFile(path) => self.import_dropped(path),
+            WindowEvent::Resized(size) => {
+                if let Some(gpu) = &mut self.gpu {
+                    gpu.resize(size.width, size.height);
+                }
+            }
+            WindowEvent::ModifiersChanged(mods) => {
+                self.ctrl_held = mods.state().control_key();
+                self.shift_held = mods.state().shift_key();
+            }
+            WindowEvent::Focused(false) => {
+                // Losing focus (e.g. Alt+Tab) drops the fly key without a release
+                // event, so leave fly mode here too and free the cursor.
+                self.set_fly(false);
+            }
+            WindowEvent::MouseInput { state, button, .. } if over_viewport || self.fly_mode => {
+                let pressed = state == ElementState::Pressed;
+                match button {
+                    MouseButton::Left => {
+                        if pressed {
+                            // A press on a gizmo arm starts a drag on that axis —
+                            // it takes priority over both camera pan and picking,
+                            // so grabbing a handle never reselects or moves the
+                            // view. One undo step covers the whole drag.
+                            if let Some(axis) = self.gizmo_hit() {
+                                self.push_undo();
+                                self.gizmo_drag = Some(axis);
+                                self.gizmo_hover = Some(axis);
+                            } else {
+                                // No longer drives camera pan (Shift+Middle does
+                                // that now); kept as plain drag-state tracking in
+                                // case a future box-select wants it.
+                                self.dragging = true;
+                                self.pick();
+                            }
+                        } else {
+                            self.dragging = false;
+                            self.gizmo_drag = None;
+                        }
+                    }
+                    // Middle button held = orbit; Shift+Middle held = pan instead.
+                    MouseButton::Middle => {
+                        if pressed {
+                            if self.shift_held {
+                                self.panning = true;
+                            } else {
+                                self.orbiting = true;
+                            }
+                        } else {
+                            self.orbiting = false;
+                            self.panning = false;
+                        }
+                    }
+                    // Right button held = flythrough camera (mouselook plus WASD),
+                    // seeded from the current orbit view. Held rather than a
+                    // modifier key so it can't collide with a window manager's own
+                    // Alt-drag bindings.
+                    MouseButton::Right => {
+                        self.set_fly(pressed);
+                    }
+                    _ => {}
+                }
+            }
+            WindowEvent::CursorMoved { position, .. } => {
+                let dx = (position.x - self.last_cursor.0) as f32;
+                let dy = (position.y - self.last_cursor.1) as f32;
+                if let (Some(axis), Some(g), Some(id)) =
+                    (self.gizmo_drag, self.gizmo, self.selected)
+                {
+                    // Map the screen drag onto the world axis: measure how far the
+                    // cursor moved *along* the arm's on-screen direction, as a
+                    // fraction of that arm's screen length, then apply the same
+                    // fraction of its world length. Screen and world stay in step,
+                    // so the entity tracks the cursor at any camera angle.
+                    let (ax, ay) = (g.ends[axis].0 - g.origin.0, g.ends[axis].1 - g.origin.1);
+                    let len2 = ax * ax + ay * ay;
+                    // An arm pointing nearly at the camera collapses to a dot on
+                    // screen; dragging it would be meaningless, so ignore it.
+                    if len2 > 1.0 {
+                        let t = (dx * ax + dy * ay) / len2;
+                        let step = t * g.len;
+                        if let Some(p) = self.world.positions.get_mut(id) {
+                            match axis {
+                                0 => p.x += step,
+                                1 => p.y += step,
+                                _ => p.z += step,
+                            }
+                        }
+                    }
+                } else if self.orbiting {
+                    // Sweep the orbit. Drag right -> swing around; drag up ->
+                    // rise over the top. Pitch is clamped just short of the
+                    // poles so the up vector never degenerates.
+                    self.cam_yaw += dx * ORBIT_SENS;
+                    self.cam_pitch -= dy * ORBIT_SENS;
+                    self.cam_pitch = self.cam_pitch.clamp(-1.4, 1.4);
+                } else if self.panning {
+                    if let Some(window) = &self.window {
+                        let height_px = window.inner_size().height.max(1) as f32;
+                        let visible_world_height =
+                            2.0 * self.cam_distance * (FOV_DEGREES.to_radians() * 0.5).tan();
+                        let world_per_px = visible_world_height / height_px;
+                        self.cam_focus_x -= dx * world_per_px;
+                        self.cam_focus_y += dy * world_per_px;
+                    }
+                }
+                self.last_cursor = (position.x, position.y);
+            }
+            WindowEvent::MouseWheel { delta, .. } if over_viewport || self.fly_mode => {
+                let scroll = match delta {
+                    MouseScrollDelta::LineDelta(_, y) => y,
+                    MouseScrollDelta::PixelDelta(pos) => pos.y as f32,
+                };
+                // While flying, scroll adjusts the flythrough speed instead of
+                // zooming the orbit camera (there's no orbit distance to zoom
+                // while flying). The chosen speed sticks for the rest of the
+                // hold and carries over into the next flight too.
+                if self.fly_mode {
+                    if scroll > 0.0 {
+                        self.fly_speed *= 1.1;
+                    } else if scroll < 0.0 {
+                        self.fly_speed /= 1.1;
+                    }
+                    self.fly_speed = self.fly_speed.clamp(0.1, 200.0);
+                } else {
+                    if scroll > 0.0 {
+                        self.cam_distance /= 1.1;
+                    } else if scroll < 0.0 {
+                        self.cam_distance *= 1.1;
+                    }
+                    self.cam_distance = self.cam_distance.clamp(10.0, 2000.0);
+                }
+            }
+            WindowEvent::KeyboardInput { event, .. } if matches!(self.mode, AppMode::Editor) => {
+                // Level-triggered movement input (WASD). Updated on both press
+                // and release so the input system always sees what is held right
+                // now. Tracked even when egui holds keyboard focus — otherwise
+                // ticking the Controlled checkbox (which keeps focus) would
+                // silently swallow WASD and the entity could never be driven.
+                // The edge-triggered editor actions below still defer to egui
+                // via `ui_wants_keys`.
+                if let PhysicalKey::Code(code) = event.physical_key {
+                    let pressed = event.state == ElementState::Pressed;
+                    match code {
+                        KeyCode::KeyW => self.input.set(Button::Up, pressed),
+                        KeyCode::KeyA => self.input.set(Button::Left, pressed),
+                        KeyCode::KeyS => self.input.set(Button::Down, pressed),
+                        KeyCode::KeyD => self.input.set(Button::Right, pressed),
+                        KeyCode::Space => self.input.set(Button::Jump, pressed),
+                        _ => {}
+                    }
+                }
+                if !ui_wants_keys && event.state == ElementState::Pressed {
+                    if let PhysicalKey::Code(code) = event.physical_key {
+                        // Undo / redo (Ctrl+Z, Ctrl+Y or Ctrl+Shift+Z). Fires only
+                        // when no egui widget holds focus, so it doesn't fight a
+                        // text field's own editing.
+                        if self.ctrl_held && !event.repeat {
+                            match code {
+                                KeyCode::KeyZ if self.shift_held => self.redo(),
+                                KeyCode::KeyZ => self.undo(),
+                                KeyCode::KeyY => self.redo(),
+                                _ => {}
+                            }
+                        }
+                        // Position nudge — moves the selected entity along a world
+                        // axis. Runs on auto-repeat too, so holding a key glides.
+                        let nudge = match code {
+                            KeyCode::ArrowLeft => Some((-EDIT_STEP, 0.0, 0.0)),
+                            KeyCode::ArrowRight => Some((EDIT_STEP, 0.0, 0.0)),
+                            KeyCode::ArrowUp => Some((0.0, EDIT_STEP, 0.0)),
+                            KeyCode::ArrowDown => Some((0.0, -EDIT_STEP, 0.0)),
+                            KeyCode::PageUp => Some((0.0, 0.0, EDIT_STEP)),
+                            KeyCode::PageDown => Some((0.0, 0.0, -EDIT_STEP)),
+                            _ => None,
+                        };
+                        if let Some((dx, dy, dz)) = nudge {
+                            if let Some(id) = self.selected {
+                                // One undo step per press-and-hold: snapshot on the
+                                // first press, not on each auto-repeat.
+                                if !event.repeat {
+                                    self.push_undo();
+                                }
+                                if let Some(p) = self.world.positions.get_mut(id) {
+                                    p.x += dx;
+                                    p.y += dy;
+                                    p.z += dz;
+                                }
+                            }
+                        } else if !event.repeat {
+                            // One-shot actions — fire once per fresh press (no
+                            // auto-repeat). Each calls the same method the menus do.
+                            match code {
+                                // P, not Space: Space is Jump.
+                                KeyCode::KeyP => self.toggle_pause(),
+                                // Period steps the sim one tick while paused.
+                                // Kept off S so it doesn't collide with WASD.
+                                KeyCode::Period => self.step_once(),
+                                KeyCode::Escape => self.clear_selection(),
+                                // H: toggle the controls overlay.
+                                KeyCode::KeyH => self.toggle_help(),
+                                // N: spawn a new entity at the camera focus, and select it.
+                                KeyCode::KeyN => self.spawn_at_focus(),
+                                // Delete: despawn the selected entity.
+                                KeyCode::Delete => self.despawn_selected(),
+                                // F5: save the current world to disk.
+                                KeyCode::F5 => self.save_scene(),
+                                // F9: reload the world from disk, discarding the current one.
+                                KeyCode::F9 => self.reload_scene(),
+                                _ => {}
+                            }
+                        }
+                    }
+                }
+            }
+            WindowEvent::RedrawRequested => {
+                // On the launcher screen there's no simulation and no 3D — draw
+                // just the launcher UI and stop.
+                if matches!(self.mode, AppMode::Launcher) {
+                    self.draw_launcher(event_loop);
+                    return;
+                }
+                // Flythrough: while flying (right mouse held over the viewport),
+                // WASD moves the camera through the scene along the direction it's
+                // looking. Uses the actual view vectors, so it's correct at any
+                // angle. While playing, WASD instead drives Controlled entities.
+                if self.fly_mode {
+                    let forward = view_forward(self.cam_yaw, self.cam_pitch);
+                    let right = forward.cross(Vec3::Y).normalize_or_zero();
+                    let mut mv = Vec3::ZERO;
+                    if self.input.is_held(Button::Up) {
+                        mv += forward;
+                    }
+                    if self.input.is_held(Button::Down) {
+                        mv -= forward;
+                    }
+                    if self.input.is_held(Button::Right) {
+                        mv += right;
+                    }
+                    if self.input.is_held(Button::Left) {
+                        mv -= right;
+                    }
+                    self.cam_eye += mv.normalize_or_zero() * self.fly_speed;
+                }
+                let owed = self.clock.advance(!self.paused);
+                // Same folder the Assets tab and imported models resolve
+                // against, computed here too since the tick loop runs before
+                // that local is set up further down.
+                let tick_assets_root = self
+                    .current_scene_path
+                    .as_ref()
+                    .and_then(|p| p.parent())
+                    .map(|p| p.join("assets"));
+                let mut sound_messages = Vec::new();
+                for _ in 0..owed {
+                    // Detection runs first each tick, so a script can read whether
+                    // its entity is colliding *this* tick (via the `hit` variable)
+                    // and react before movement is applied.
+                    systems::collision(&mut self.world);
+                    systems::run_scripts(&mut self.world, &mut self.script_runtime, &self.input);
+                    // While flying, WASD moves the camera, not Controlled entities.
+                    if !self.fly_mode {
+                        systems::input_movement(&mut self.world, &self.input);
+                    }
+                    systems::gravity(&mut self.world);
+                    systems::movement(&mut self.world);
+                    self.physics.step(&mut self.world, 1.0 / TICK_RATE as f32);
+                    systems::resolve_collisions(&mut self.world);
+                    sound_messages.extend(update_sounds(
+                        &mut self.world,
+                        self.audio_manager.as_mut(),
+                        &mut self.sound_cache,
+                        tick_assets_root.as_deref(),
+                    ));
+                }
+                // Logged after the loop ends, once self.world's borrow above
+                // is done. self.log needs &mut self, which would conflict
+                // with a still-live world borrow from inside the loop.
+                for msg in sound_messages {
+                    self.log(msg);
+                }
+                // Refresh collisions once more for the editor's red tint. Inside
+                // the loop, detection ran at each tick's start (before that tick's
+                // movement); this recomputes it at the final, on-screen positions,
+                // and also keeps the tint live while paused (when the loop above
+                // doesn't run at all) or while dragging entities around.
+                systems::collision(&mut self.world);
+                let colliding: std::collections::HashSet<usize> = self
+                    .world
+                    .collisions
+                    .iter()
+                    .flat_map(|&(a, b, _)| [a, b])
+                    .collect();
+                let selected = self.selected;
+                // Per-primitive instance buckets from the world (see build_instances).
+                let custom_names: Vec<String> = self.custom_meshes.keys().cloned().collect();
+                let (instances, group_counts) =
+                    build_instances(&self.world, selected, &colliding, &custom_names);
+                let lights = build_lights(&self.world);
+                let (width, height) = match &self.window {
+                    Some(window) => {
+                        let size = window.inner_size();
+                        (size.width, size.height)
+                    }
+                    None => (1, 1),
+                };
+                // The selected entity's ID/POS/VEL now live in the Inspector
+                // panel, so the old top-left readout is retired. The controls
+                // legend below is the only remaining hand-rolled overlay.
+                let mut text_instances: Vec<TextInstance> = Vec::new();
+                // Controls overlay (toggle with H), anchored bottom-left. Drawn
+                // at a smaller pixel size than the inspector so it reads as
+                // secondary furniture.
+                if self.show_help {
+                    let help = "CONTROLS   H TO HIDE\n\n\
+                                                    P  PLAY PAUSE\n\n\
+                                                    .  STEP WHEN PAUSED\n\n\
+                                                    WASD  DRIVE OR FLY\n\n\
+                                                    SPACE  JUMP\n\n\
+                                                    N  SPAWN ENTITY\n\n\
+                                                    DEL  DESPAWN SELECTED\n\n\
+                                                    ARROWS  MOVE X Y\n\n\
+                                                    PGUP PGDN  MOVE Z\n\n\
+                                                    F5 SAVE   F9 LOAD\n\n\
+                                                    ESC  DESELECT\n\n\
+                                                    LMB  SELECT\n\n\
+                                                    DRAG ARROWS  MOVE ENTITY\n\n\
+                                                    MMB  DRAG ORBIT\n\n\
+                                                    SHIFT MMB  DRAG PAN\n\n\
+                                                    HOLD RMB  FLY CAM\n\n\
+                                                    WHEEL  ZOOM   WHEEL WHILE FLYING  FLY SPEED";
+                    let pixel = 2.0;
+                    let lines = help.lines().count() as f32;
+                    let line_h = (font::GLYPH_HEIGHT as f32 + 1.0) * pixel;
+                    let start_y = height as f32 - lines * line_h - 16.0;
+                    text_instances.extend(build_text(
+                        help,
+                        16.0,
+                        start_y,
+                        pixel,
+                        width as f32,
+                        height as f32,
+                    ));
+                }
+                let view_proj = self.view_matrix(width, height).to_cols_array_2d();
+                // Refresh the translate gizmo for the current selection and camera,
+                // then convert it to egui points for the Viewport tab to paint.
+                self.update_gizmo(width, height);
+                // Refresh the Source Control snapshot every couple of seconds —
+                // statuses() walks the working tree, so not every frame.
+                if self.git_refresh_at.elapsed().as_secs_f32() > 2.0 {
+                    self.git_refresh_at = std::time::Instant::now();
+                    self.git_summary = self
+                        .current_scene_path
+                        .as_ref()
+                        .and_then(|p| p.parent())
+                        .and_then(git_summary);
+                }
+                let ppp = self.egui_ctx.pixels_per_point();
+                let gizmo_draw = self.gizmo.map(|g| {
+                    let to_pos = |p: (f32, f32)| egui::pos2(p.0 / ppp, p.1 / ppp);
+                    GizmoDraw {
+                        origin: to_pos(g.origin),
+                        ends: [to_pos(g.ends[0]), to_pos(g.ends[1]), to_pos(g.ends[2])],
+                        active: self.gizmo_hover,
+                    }
+                });
+                // --- Run egui for this frame ---
+                // run_ui hands our closure a full-screen root Ui and runs the
+                // begin/end pass internally. Panels shown into that root dock to
+                // the window edges. In egui 0.35 the old SidePanel/TopBottomPanel
+                // types were merged into one `Panel` (Panel::top/right/bottom/...).
+                // Panels are solid but resizable (drag their inner edge); the
+                // tabs/content are still a mockup wired to nothing but text and
+                // the live log. We move state in/out via locals so the closure
+                // never has to borrow `self`.
+                let mut console_tab = self.console_tab;
+                let log_lines = std::mem::take(&mut self.log_lines);
+                // Assets tab state, lifted so the closure stays off self.
+                let assets_root = self
+                    .current_scene_path
+                    .as_ref()
+                    .and_then(|p| p.parent())
+                    .map(|p| p.join("assets"));
+                let mut assets_subdir = std::mem::take(&mut self.assets_subdir);
+                let mut new_asset_folder = std::mem::take(&mut self.new_asset_folder);
+                let thumbnails = self.thumbnails.clone();
+                let mut move_pending = std::mem::take(&mut self.move_pending);
+                let script_library = std::mem::take(&mut self.world.script_library);
+                let new_script_name = std::mem::take(&mut self.new_script_name);
+                let script_filter = std::mem::take(&mut self.script_filter);
+                let open_script = std::mem::take(&mut self.open_script);
+                let renaming = std::mem::take(&mut self.renaming);
+                // Compile-check the open script once per frame, before the egui
+                // pass (the runtime lives on `self`, which the egui closure can't
+                // borrow). This reflects the source as of frame start; an edit
+                // made this frame shows its result next frame — the same one-frame
+                // path the inspector edits use. None = no script open.
+                let script_status: Option<Result<(), script::ScriptError>> = open_script
+                    .as_ref()
+                    .and_then(|name| script_library.get(name))
+                    .map(|src| self.script_runtime.check(src));
+                // Semantic pass: names the script uses that the API doesn't define
+                // (a typo). Only meaningful when the source parses, which `warnings`
+                // enforces by returning nothing for unparseable source.
+                let script_warnings: Vec<script::ScriptError> = open_script
+                    .as_ref()
+                    .and_then(|name| script_library.get(name))
+                    .map(|src| self.script_runtime.warnings(src))
+                    .unwrap_or_default();
+                // Live entity ids for the Scene list, plus the selected entity's
+                // position/velocity lifted into a local so the egui closure never
+                // touches `self`. Any edits get written back into the world after
+                // the pass; selection changes flow through `new_selection`.
+                let entity_ids: Vec<usize> = self
+                    .world
+                    .positions
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, slot)| slot.as_ref().map(|_| i))
+                    .collect();
+                let new_selection = self.selected;
+                let edited = self.selected.and_then(|id| {
+                    Some(EditedEntity {
+                        id,
+                        pos: *self.world.positions.get(id)?,
+                        vel: *self.world.velocities.get(id)?,
+                        color: self.world.colors.get(id).copied().unwrap_or_default(),
+                        controlled: self.world.controlled.get(id).is_some(),
+                        scale: self.world.scales.get(id).copied().unwrap_or_default(),
+                        material: self.world.materials.get(id).copied().unwrap_or_default(),
+                        rotation: self.world.rotations.get(id).copied().unwrap_or_default(),
+                        script_source: self.world.scripts.get(id).map(|s| s.uses.clone()),
+                        mesh: self.world.meshes.get(id).cloned().unwrap_or_default(),
+                        is_static: self.world.statics.get(id).is_some(),
+                        has_gravity: self.world.gravities.get(id).is_some(),
+                        is_rigid_body: self.world.rigid_bodies.get(id).is_some(),
+                        light: self.world.lights.get(id).copied(),
+                        sound: self.world.sounds.get(id).cloned(),
+                    })
+                });
+                // For each enabled plugin's declared fields, keep the ones
+                // the selected entity actually has a value under. A field
+                // can't originate a value it doesn't already have, the same
+                // rule the custom_<name> script variables follow.
+                let custom_fields: Vec<EditableCustomField> = match self.selected {
+                    Some(id) => self
+                        .world
+                        .installed_plugins
+                        .values()
+                        .filter(|plugin| plugin.enabled)
+                        .flat_map(|plugin| plugin.manifest.fields.iter())
+                        .filter_map(|field| {
+                            self.world.get_dynamic::<f64>(&field.name, id).map(|value| {
+                                EditableCustomField {
+                                    entity: id,
+                                    name: field.name.clone(),
+                                    label: field.label.clone(),
+                                    value: *value,
+                                    min: field.min,
+                                    max: field.max,
+                                }
+                            })
+                        })
+                        .collect(),
+                    None => Vec::new(),
+                };
+                // Upload the logo to the GPU on the first frame, then reuse the handle.
+                if self.logo_texture.is_none() {
+                    let rgba = image::load_from_memory(LOGO_PNG)
+                        .expect("embedded logo PNG should decode")
+                        .to_rgba8();
+                    let (w, h) = rgba.dimensions();
+                    let color_image = egui::ColorImage::from_rgba_unmultiplied(
+                        [w as usize, h as usize],
+                        rgba.as_raw(),
+                    );
+                    self.logo_texture = Some(self.egui_ctx.load_texture(
+                        "frame-editor-logo",
+                        color_image,
+                        egui::TextureOptions::LINEAR,
+                    ));
+                }
+                let logo = self.logo_texture.clone();
+                let paused = self.paused;
+                let mut plugins_panel_open = self.plugins_panel_open;
+                let mut editor_settings_open = self.editor_settings_open;
+                // A snapshot, not a live borrow: the closure below can't hold
+                // a reference into self.world. A checkbox toggle is detected
+                // here and applied after the pass via plugin_toggle, the same
+                // lift-then-write-back pattern menu_action and delete use.
+                let installed_plugins: Vec<(String, frame_engine::world::InstalledPlugin)> = self
+                    .world
+                    .installed_plugins
+                    .iter()
+                    .map(|(name, plugin)| (name.clone(), plugin.clone()))
+                    .collect();
+                let mut plugin_toggle: Option<(String, bool)> = None;
+                let mut plugin_action: Option<frame_engine::world::PluginActionKind> = None;
+                // A snapshot, edited in place by panel field sliders and
+                // written back wholesale after the pass. Global values
+                // aren't tied to any entity, so there's none of the
+                // entity-capture care the per-entity custom fields needed,
+                // there's nothing here that could end up applied to the
+                // wrong target.
+                let mut globals_edit = self.world.globals.clone();
+                let mut menu_action: Option<MenuAction> = None;
+                // Move the dock's per-frame state into the viewer, and lift the
+                // dock layout off `self` (swapping in a throwaway) so the egui
+                // closure can borrow neither. Both are drained back afterwards.
+                // Snapshot of the selected entity's editable state before the UI
+                // pass, so we can tell if the Inspector changed it this frame.
+                let edited_before = edited.clone();
+                let custom_fields_before = custom_fields.clone();
+                let mut dock_state =
+                    std::mem::replace(&mut self.dock_state, egui_dock::DockState::new(Vec::new()));
+                let mut viewer = EditorTabViewer {
+                    entity_ids,
+                    selection: new_selection,
+                    edited,
+                    custom_fields,
+                    script_library,
+                    new_script_name,
+                    script_filter,
+                    open_script,
+                    renaming,
+                    renamed: None,
+                    script_status,
+                    script_warnings,
+                    custom_mesh_names: self.custom_meshes.keys().cloned().collect(),
+                    assets_root: assets_root.clone(),
+                    git_summary: std::mem::take(&mut self.git_summary),
+                    // Reset each frame; the Viewport tab sets it if it's visible.
+                    viewport_rect: None,
+                    gizmo: gizmo_draw,
+                    pop_out_request: None,
+                };
+                let (egui_paint_jobs, egui_textures_delta, egui_ppp) = if let (
+                    Some(state),
+                    Some(window),
+                ) =
+                    (self.egui_state.as_mut(), self.window.as_ref())
+                {
+                    let raw_input = state.take_egui_input(window);
+                    let full_output = self.egui_ctx.run_ui(raw_input, |ui| {
+                            // Top toolbar strip — fixed height, placeholder menu.
+                            egui::Panel::top("toolbar").resizable(false).show(ui, |ui| {
+                                ui.horizontal(|ui| {
+                                    if let Some(logo) = &logo {
+                                        ui.add(
+                                            egui::Image::new(logo)
+                                                .fit_to_exact_size(egui::vec2(20.0, 20.0)),
+                                        );
+                                        ui.separator();
+                                    }
+                                    ui.menu_button("File", |ui| {
+                                        if ui.button("Open scene…").clicked() {
+                                            menu_action = Some(MenuAction::OpenScene);
+                                        }
+                                        if ui.button("Import model…").clicked() {
+                                            menu_action = Some(MenuAction::ImportModel);
+                                        }
+                                        if ui.button("Import audio…").clicked() {
+                                            menu_action = Some(MenuAction::ImportAudio);
+                                        }
+                                        ui.separator();
+                                        if ui.button("Save scene").clicked() {
+                                            menu_action = Some(MenuAction::SaveScene);
+                                        }
+                                        if ui.button("Save scene as…").clicked() {
+                                            menu_action = Some(MenuAction::SaveSceneAs);
+                                        }
+                                        if ui.button("Reload scene").clicked() {
+                                            menu_action = Some(MenuAction::ReloadScene);
+                                        }
+                                        ui.separator();
+                                        if ui.button("Close project").clicked() {
+                                            menu_action = Some(MenuAction::CloseProject);
+                                        }
+                                        if ui.button("Quit").clicked() {
+                                            menu_action = Some(MenuAction::Quit);
+                                        }
+                                    });
+                                    ui.menu_button("Edit", |ui| {
+                                        if ui.button("Undo").clicked() {
+                                            menu_action = Some(MenuAction::Undo);
+                                        }
+                                        if ui.button("Redo").clicked() {
+                                            menu_action = Some(MenuAction::Redo);
+                                        }
+                                        ui.separator();
+                                        if ui.button("Spawn entity").clicked() {
+                                            menu_action = Some(MenuAction::SpawnEntity);
+                                        }
+                                        if ui.button("Despawn selected").clicked() {
+                                            menu_action = Some(MenuAction::DespawnSelected);
+                                        }
+                                        ui.separator();
+                                        if ui.button("Clear selection").clicked() {
+                                            menu_action = Some(MenuAction::ClearSelection);
+                                        }
+                                        ui.separator();
+                                        if ui.button("Editor settings…").clicked() {
+                                            menu_action = Some(MenuAction::OpenEditorSettings);
+                                        }
+                                    });
+                                    ui.menu_button("View", |ui| {
+                                        let play_pause = if paused { "Play" } else { "Pause" };
+                                        if ui.button(play_pause).clicked() {
+                                            menu_action = Some(MenuAction::TogglePause);
+                                        }
+                                        if ui.button("Step one tick").clicked() {
+                                            menu_action = Some(MenuAction::StepOnce);
+                                        }
+                                        ui.separator();
+                                        if ui.button("Controls overlay").clicked() {
+                                            menu_action = Some(MenuAction::ToggleHelp);
+                                        }
+                                    });
+                                    ui.menu_button("Help", |ui| {
+                                        if ui.button("About").clicked() {
+                                            menu_action = Some(MenuAction::About);
+                                        }
+                                    });
+                                    // A toggle, not a dropdown, since clicking it
+                                    // opens or closes the plugins panel directly
+                                    // rather than showing a list of items.
+                                    if ui
+                                        .selectable_label(plugins_panel_open, "Plugins")
+                                        .clicked()
+                                    {
+                                        plugins_panel_open = !plugins_panel_open;
+                                    }
+                                });
+                            });
+                            // The Plugins slide-down: only shown when toggled on
+                            // from the toolbar tab above. A Panel::top stacks
+                            // directly below the toolbar and shrinks whatever's
+                            // left for the dock area (the Viewport included)
+                            // beneath it, the same way the toolbar and console
+                            // panels already claim their own space.
+                            if plugins_panel_open {
+                                egui::Panel::top("plugins_panel")
+                                    .resizable(false)
+                                    .default_size(110.0)
+                                    .show(ui, |ui| {
+                                        let enabled: Vec<&(String, frame_engine::world::InstalledPlugin)> =
+                                            installed_plugins.iter().filter(|(_, p)| p.enabled).collect();
+                                        if enabled.is_empty() {
+                                            ui.weak(
+                                                "No plugins enabled. Turn some on from Edit > Editor settings…",
+                                            );
+                                        } else {
+                                            egui::ScrollArea::horizontal().show(ui, |ui| {
+                                                ui.horizontal(|ui| {
+                                                    for (_, plugin) in &enabled {
+                                                        ui.group(|ui| {
+                                                            ui.set_min_width(160.0);
+                                                            ui.vertical(|ui| {
+                                                                ui.strong(&plugin.manifest.name);
+                                                                ui.weak(format!(
+                                                                    "v{} by {}",
+                                                                    plugin.manifest.version,
+                                                                    plugin.manifest.author
+                                                                ));
+                                                                if !plugin.manifest.description.is_empty() {
+                                                                    ui.label(&plugin.manifest.description);
+                                                                }
+                                                                // A button per declared action. Clicking
+                                                                // one only ever records which kind was
+                                                                // chosen; the editor decides what that
+                                                                // means and does it after this pass, the
+                                                                // plugin itself never runs anything here.
+                                                                for action in &plugin.manifest.actions {
+                                                                    if ui.button(&action.label).clicked() {
+                                                                        plugin_action = Some(action.kind.clone());
+                                                                    }
+                                                                }
+                                                                // Panels: titled, global sections, not
+                                                                // tied to this or any entity. A field only
+                                                                // shows if globals_edit already has a
+                                                                // value under its name; it can't
+                                                                // originate one, same rule as everywhere
+                                                                // else in this system.
+                                                                for panel in &plugin.manifest.panels {
+                                                                    ui.separator();
+                                                                    ui.strong(&panel.title);
+                                                                    for field in &panel.fields {
+                                                                        if let Some(value) =
+                                                                            globals_edit.get_mut(&field.name)
+                                                                        {
+                                                                            ui.horizontal(|ui| {
+                                                                                ui.label(field.label.as_str());
+                                                                                match (field.min, field.max) {
+                                                                                    (Some(lo), Some(hi)) => {
+                                                                                        ui.add(egui::Slider::new(
+                                                                                            value,
+                                                                                            lo..=hi,
+                                                                                        ));
+                                                                                    }
+                                                                                    _ => {
+                                                                                        let mut drag =
+                                                                                            egui::DragValue::new(value)
+                                                                                                .speed(0.1);
+                                                                                        if let Some(lo) = field.min {
+                                                                                            drag = drag
+                                                                                                .range(lo..=f64::MAX);
+                                                                                        }
+                                                                                        if let Some(hi) = field.max {
+                                                                                            drag = drag
+                                                                                                .range(f64::MIN..=hi);
+                                                                                        }
+                                                                                        ui.add(drag);
+                                                                                    }
+                                                                                }
+                                                                            });
+                                                                        }
+                                                                    }
+                                                                    for action in &panel.actions {
+                                                                        if ui.button(&action.label).clicked() {
+                                                                            plugin_action =
+                                                                                Some(action.kind.clone());
+                                                                        }
+                                                                    }
+                                                                }
+                                                            });
+                                                        });
+                                                    }
+                                                });
+                                            });
+                                        }
+                                    });
+                            }
+                            // Editor Settings: a floating window, opened from
+                            // Edit > Editor settings…. Just plugin toggles for
+                            // now; a home for more editor-wide configuration
+                            // later, the same way Project Settings grew on the
+                            // launcher.
+                            if editor_settings_open {
+                                egui::Window::new("Editor Settings")
+                                    .collapsible(false)
+                                    .open(&mut editor_settings_open)
+                                    .show(ui.ctx(), |ui| {
+                                        ui.heading("Plugins");
+                                        ui.add_space(4.0);
+                                        if installed_plugins.is_empty() {
+                                            ui.weak("No plugins found in this project's plugins/ folder.");
+                                        }
+                                        for (name, plugin) in &installed_plugins {
+                                            ui.horizontal(|ui| {
+                                                let mut on = plugin.enabled;
+                                                if ui.checkbox(&mut on, &plugin.manifest.name).changed() {
+                                                    plugin_toggle = Some((name.clone(), on));
+                                                }
+                                                ui.weak(format!(
+                                                    "v{} by {}",
+                                                    plugin.manifest.version, plugin.manifest.author
+                                                ));
+                                            });
+                                            if !plugin.manifest.description.is_empty() {
+                                                ui.weak(&plugin.manifest.description);
+                                            }
+                                            ui.add_space(4.0);
+                                        }
+                                        ui.separator();
+                                        ui.weak("More editor configuration will live here over time.");
+                                    });
+                            }
+                            // Bottom console dock — Output (the live log) and a
+                            // Terminal placeholder. Full width; drag its top edge
+                            // to resize.
+                            egui::Panel::bottom("console")
+                                .resizable(true)
+                                .default_size(160.0)
+                                .show(ui, |ui| {
+                                    ui.horizontal(|ui| {
+                                        ui.selectable_value(
+                                            &mut console_tab,
+                                            ConsoleTab::Output,
+                                            "Output",
+                                        );
+                                        ui.selectable_value(
+                                            &mut console_tab,
+                                            ConsoleTab::Terminal,
+                                            "Terminal",
+                                        );
+                                        ui.selectable_value(
+                                            &mut console_tab,
+                                            ConsoleTab::Assets,
+                                            "Assets",
+                                        );
+                                    });
+                                    ui.separator();
+                                    match console_tab {
+                                        ConsoleTab::Output => {
+                                            egui::ScrollArea::vertical()
+                                                .stick_to_bottom(true)
+                                                .auto_shrink([false, false])
+                                                .show(ui, |ui| {
+                                                    if log_lines.is_empty() {
+                                                        ui.weak("(no output yet)");
+                                                    }
+                                                    for line in &log_lines {
+                                                        ui.monospace(line);
+                                                    }
+                                                });
+                                        }
+                                        ConsoleTab::Terminal => {
+                                            ui.weak("(terminal goes here)");
+                                        }
+                                        ConsoleTab::Assets => {
+                                            assets_tab_ui(
+                                                ui,
+                                                assets_root.as_deref(),
+                                                &mut assets_subdir,
+                                                &mut new_asset_folder,
+                                                &thumbnails,
+                                                &mut move_pending,
+                                            );
+                                        }
+                                    }
+                                });
+                            // Right inspector dock — Scene / Inspector tabs.
+                            // Drag its left edge to resize.
+                            // The dock fills the whole central area (below the
+                            // toolbar, above the console). Frame::NONE keeps it
+                            // from painting a background, so the Viewport tab —
+                            // whose body we leave unpainted — shows the 3D scene
+                            // rendered behind egui. This lets the Script Editor
+                            // tab take over the centre, full-width.
+                            egui::CentralPanel::default()
+                                .frame(egui::Frame::NONE)
+                                .show(ui, |ui| {
+                                    egui_dock::DockArea::new(&mut dock_state)
+                                        .show_inside(ui, &mut viewer);
+                                });
+                        });
+                    state.handle_platform_output(window, full_output.platform_output);
+                    let ppp = full_output.pixels_per_point;
+                    let jobs = self.egui_ctx.tessellate(full_output.shapes, ppp);
+                    (jobs, full_output.textures_delta, ppp)
+                } else {
+                    (Vec::new(), egui::TexturesDelta::default(), 1.0)
+                };
+                // Draw and present every popped-out tab's own window this same
+                // frame too, reusing this same `viewer` (and therefore this
+                // same snapshot of world state) the main dock just drew from —
+                // so an edit made in a popped-out Inspector window and one
+                // made in a still-docked tab in the same frame both land in
+                // the one drain-back below, instead of racing each other.
+                let popped_out_tabs: Vec<Tab> = self.popped_out.keys().copied().collect();
+                for tab in popped_out_tabs {
+                    self.render_popped_out(tab, &mut viewer);
+                }
+                self.console_tab = console_tab;
+                self.plugins_panel_open = plugins_panel_open;
+                self.editor_settings_open = editor_settings_open;
+                if let Some((name, enabled)) = plugin_toggle {
+                    self.set_plugin_enabled(&name, enabled);
+                }
+                if let Some(kind) = plugin_action {
+                    self.run_plugin_action(kind);
+                }
+                // Written back unconditionally, the same way plugin
+                // enable/disable isn't part of undo either: global panel
+                // values live outside the Inspector's per-entity editing
+                // gesture, so there's nothing here for undo to coalesce.
+                self.world.globals = globals_edit;
+                self.assets_subdir = assets_subdir;
+                self.new_asset_folder = new_asset_folder;
+                self.move_pending = move_pending;
+                self.log_lines = log_lines;
+                // Drain the dock layout and the tabs' state back onto self.
+                self.dock_state = dock_state;
+                // Pop out a tab now that self.dock_state is the real, current
+                // layout again — pop_out_tab removes the tab from it, so this
+                // has to run after the line just above, not before.
+                if let Some(tab) = viewer.pop_out_request.take() {
+                    self.pop_out_tab(event_loop, tab);
+                }
+                self.viewport_rect = viewer.viewport_rect;
+                self.world.script_library = viewer.script_library;
+                self.git_summary = viewer.git_summary;
+                self.new_script_name = viewer.new_script_name;
+                self.script_filter = viewer.script_filter;
+                self.open_script = viewer.open_script;
+                self.renaming = viewer.renaming;
+                if let Some((old_name, new_name)) = viewer.renamed {
+                    // Rewrite every entity's Script.uses that pointed at the old
+                    // name, so a rename doesn't orphan references the way a
+                    // delete deliberately can. The library key itself was
+                    // already swapped in scripts_tab_ui; this is the part that
+                    // needed world access, which that function doesn't have.
+                    for slot in self.world.scripts.iter_mut() {
+                        if let Some(script) = slot {
+                            if script.uses == old_name {
+                                script.uses = new_name.clone();
+                            }
+                        }
+                    }
+                    self.log(format!("Renamed script '{old_name}' to '{new_name}'"));
+                }
+                self.selected = viewer.selection;
+                let edited = viewer.edited;
+                let custom_fields = viewer.custom_fields;
+                // Coalesce Inspector edits into one undo step per gesture: snapshot
+                // on the first frame the values change, and reset when they stop.
+                // (This runs before the write-back below, so the world is still in
+                // its pre-edit state when we snapshot it.) Plugin fields count as
+                // part of the same gesture as everything else in the Inspector.
+                let inspector_changed =
+                    edited != edited_before || custom_fields != custom_fields_before;
+                if inspector_changed && !self.inspector_editing {
+                    self.push_undo();
+                    self.inspector_editing = true;
+                } else if !inspector_changed {
+                    self.inspector_editing = false;
+                }
+                // Push any inspector edits back into the world. The render this
+                // frame already used the old values; the change shows next frame
+                // (same one-frame path as the keyboard nudge).
+                if let Some(EditedEntity {
+                    id,
+                    pos,
+                    vel,
+                    color,
+                    controlled,
+                    scale,
+                    material,
+                    rotation,
+                    script_source,
+                    mesh,
+                    is_static,
+                    has_gravity,
+                    is_rigid_body,
+                    light,
+                    sound,
+                }) = edited
+                {
+                    if let Some(p) = self.world.positions.get_mut(id) {
+                        *p = pos;
+                    }
+                    if let Some(v) = self.world.velocities.get_mut(id) {
+                        *v = vel;
+                    }
+                    self.world.colors.insert(id, color);
+                    self.world.scales.insert(id, scale);
+                    self.world.materials.insert(id, material);
+                    self.world.rotations.insert(id, rotation);
+                    self.world.meshes.insert(id, mesh);
+                    if controlled {
+                        self.world.controlled.insert(id, Controlled);
+                    } else {
+                        self.world.controlled.remove(id);
+                    }
+                    if is_static {
+                        self.world.statics.insert(id, Static);
+                    } else {
+                        self.world.statics.remove(id);
+                    }
+                    if has_gravity {
+                        self.world.gravities.insert(id, Gravity);
+                    } else {
+                        self.world.gravities.remove(id);
+                    }
+                    if is_rigid_body {
+                        self.world.rigid_bodies.insert(id, RigidBody);
+                    } else {
+                        self.world.rigid_bodies.remove(id);
+                    }
+                    match light {
+                        Some(l) => {
+                            self.world.lights.insert(id, l);
+                        }
+                        None => {
+                            self.world.lights.remove(id);
+                        }
+                    }
+                    match sound {
+                        Some(s) => {
+                            self.world.sounds.insert(id, s);
+                        }
+                        None => {
+                            self.world.sounds.remove(id);
+                        }
+                    }
+                    match script_source {
+                        Some(uses) => {
+                            self.world.scripts.insert(id, Script { uses });
+                        }
+                        None => {
+                            self.world.scripts.remove(id);
+                        }
+                    }
+                }
+                // Plugin field edits write back the same unconditional way
+                // every other single value in the Inspector does, each to
+                // the entity captured alongside it, not whatever's currently
+                // selected (which may have already changed this same frame).
+                for field in &custom_fields {
+                    self.world
+                        .insert_dynamic::<f64>(&field.name, field.entity, field.value);
+                }
+                // A menu item clicked this frame runs the same action method the
+                // keyboard uses — one command, two triggers. This sits at
+                // statement level (NOT inside the `edited` block above), so it
+                // fires whether or not an entity is selected.
+                match menu_action {
+                    Some(MenuAction::OpenScene) => self.open_scene(),
+                    Some(MenuAction::ImportModel) => self.import_model(),
+                    Some(MenuAction::ImportAudio) => self.import_audio(),
+                    Some(MenuAction::SaveScene) => self.save_scene(),
+                    Some(MenuAction::SaveSceneAs) => self.save_scene_as(),
+                    Some(MenuAction::ReloadScene) => self.reload_scene(),
+                    Some(MenuAction::CloseProject) => self.close_project(),
+                    Some(MenuAction::Undo) => self.undo(),
+                    Some(MenuAction::Redo) => self.redo(),
+                    Some(MenuAction::SpawnEntity) => self.spawn_at_focus(),
+                    Some(MenuAction::DespawnSelected) => self.despawn_selected(),
+                    Some(MenuAction::ClearSelection) => self.clear_selection(),
+                    Some(MenuAction::TogglePause) => self.toggle_pause(),
+                    Some(MenuAction::StepOnce) => self.step_once(),
+                    Some(MenuAction::ToggleHelp) => self.toggle_help(),
+                    Some(MenuAction::OpenEditorSettings) => self.editor_settings_open = true,
+                    Some(MenuAction::About) => {
+                        self.log("Frame Editor — a hand-rolled Rust simulation engine and editor.");
+                    }
+                    Some(MenuAction::Quit) => event_loop.exit(),
+                    None => {}
+                }
+                if let Some(gpu) = &mut self.gpu {
+                    gpu.render(
+                        &instances,
+                        &group_counts,
+                        &text_instances,
+                        view_proj,
+                        &lights,
+                        &egui_paint_jobs,
+                        &egui_textures_delta,
+                        egui_ppp,
+                    );
+                }
+                if let Some(window) = &self.window {
+                    window.request_redraw();
+                }
+            }
+            _ => {}
+        }
+    }
+}
+// The fallback scene used when there's no scene.ron on disk yet.
+/// Path to the file that remembers recently opened projects (one folder path
+/// per line), under the platform config directory.
+fn recent_projects_file() -> Option<std::path::PathBuf> {
+    dirs::config_dir().map(|d| d.join("frame-editor").join("recent-projects.txt"))
+}
+
+/// Small editor preferences that persist across runs, stored as RON beside the
+/// recent-projects list. Currently just whether the controls overlay shows;
+/// hide it once (H) and it stays hidden on the next start.
+#[derive(serde::Serialize, serde::Deserialize)]
+struct EditorPrefs {
+    show_help: bool,
+}
+
+impl Default for EditorPrefs {
+    fn default() -> Self {
+        Self { show_help: true }
+    }
+}
+
+fn prefs_file() -> Option<std::path::PathBuf> {
+    dirs::config_dir().map(|d| d.join("frame-editor").join("editor.ron"))
+}
+
+fn load_prefs() -> EditorPrefs {
+    prefs_file()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .and_then(|t| ron::from_str(&t).ok())
+        .unwrap_or_default()
+}
+
+fn save_prefs(prefs: &EditorPrefs) {
+    let Some(path) = prefs_file() else { return };
+    if let Some(dir) = path.parent() {
+        let _ = std::fs::create_dir_all(dir);
+    }
+    if let Ok(text) = ron::to_string(prefs) {
+        let _ = std::fs::write(path, text);
+    }
+}
+
+/// The remembered project folders as written, unfiltered and in file order.
+fn read_recent_projects() -> Vec<std::path::PathBuf> {
+    let Some(file) = recent_projects_file() else {
+        return Vec::new();
+    };
+    let Ok(text) = std::fs::read_to_string(&file) else {
+        return Vec::new();
+    };
+    text.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .map(std::path::PathBuf::from)
+        .collect()
+}
+
+/// Persist the remembered project folders.
+fn write_recent_projects(roots: &[std::path::PathBuf]) {
+    let Some(file) = recent_projects_file() else {
+        return;
+    };
+    if let Some(parent) = file.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let text = roots
+        .iter()
+        .filter_map(|p| p.to_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+    let _ = std::fs::write(&file, text);
+}
+
+/// Remembered projects that still exist, most-recently-edited first (by each
+/// project scene file's modification time).
+/// Per-project metadata stored beside the scene in `project.ron`. The project's
+/// name is the scene file's stem, so it isn't duplicated here.
+#[derive(serde::Serialize, serde::Deserialize, Default, Clone)]
+struct ProjectManifest {
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    version: String,
+}
+
+/// Load every .obj in a project's assets folder into a name -> mesh map.
+/// Parse failures get logged by the caller through the returned errors list.
+/// Load every plugin in a project's `plugins/` folder: each subfolder with a
+/// `plugin.ron` manifest and a `scripts/` folder of `.rhai` files. Returns
+/// the manifests found (for `World::installed_plugins`), each plugin's
+/// scripts as name-to-source pairs ready to merge into `script_library`
+/// (name-spaced `<plugin-name>/<script-stem>`, so two different plugins'
+/// scripts can never collide, and it's visible at a glance in the script
+/// picker which scripts came from a plugin versus which were written by
+/// hand), and any errors encountered, the same three-part shape
+/// `load_project_models` already uses.
+///
+/// A folder with no `plugin.ron` is skipped quietly rather than treated as
+/// an error, it just isn't a plugin folder. Reload merges and updates,
+/// deliberately: it doesn't currently remove a script whose plugin, or whose
+/// specific script file, has since been deleted from disk, a real limitation
+/// worth knowing rather than a silent gap.
+fn load_project_plugins(
+    root: &std::path::Path,
+) -> (
+    std::collections::BTreeMap<String, frame_engine::world::PluginManifest>,
+    std::collections::BTreeMap<String, String>,
+    Vec<String>,
+) {
+    let mut manifests = std::collections::BTreeMap::new();
+    let mut scripts = std::collections::BTreeMap::new();
+    let mut errors = Vec::new();
+    let plugins_dir = root.join("plugins");
+    // Creates the folder if it's missing (a brand new project, or an older
+    // one that predates plugins existing at all), so it's sitting there
+    // ready to drag a plugin into without anyone having to make it by hand.
+    // A no-op if it already exists.
+    let _ = std::fs::create_dir_all(&plugins_dir);
+    let Ok(entries) = std::fs::read_dir(&plugins_dir) else {
+        return (manifests, scripts, errors);
+    };
+    for entry in entries.flatten() {
+        let plugin_dir = entry.path();
+        if !plugin_dir.is_dir() {
+            continue;
+        }
+        let manifest_text = match std::fs::read_to_string(plugin_dir.join("plugin.ron")) {
+            Ok(text) => text,
+            Err(_) => continue, // no manifest here, not a plugin folder
+        };
+        let manifest: frame_engine::world::PluginManifest = match ron::from_str(&manifest_text) {
+            Ok(manifest) => manifest,
+            Err(e) => {
+                errors.push(format!("{}: invalid plugin.ron: {e}", plugin_dir.display()));
+                continue;
+            }
+        };
+        if let Ok(script_entries) = std::fs::read_dir(plugin_dir.join("scripts")) {
+            for script_entry in script_entries.flatten() {
+                let script_path = script_entry.path();
+                if script_path.extension().and_then(|e| e.to_str()) != Some("rhai") {
+                    continue;
+                }
+                let Some(stem) = script_path.file_stem().and_then(|s| s.to_str()) else {
+                    continue;
+                };
+                match std::fs::read_to_string(&script_path) {
+                    Ok(source) => {
+                        scripts.insert(format!("{}/{stem}", manifest.name), source);
+                    }
+                    Err(e) => errors.push(format!("{}: {e}", script_path.display())),
+                }
+            }
+        }
+        manifests.insert(manifest.name.clone(), manifest);
+    }
+    (manifests, scripts, errors)
+}
+
+/// Merge freshly-scanned plugin manifests and scripts into `world`,
+/// preserving whatever enabled/disabled state it already has for a plugin
+/// it's seen before, and defaulting a newly discovered one to disabled, the
+/// same "off until you turn it on" default a mod manager uses. Only an
+/// enabled plugin's scripts actually enter script_library. Shared by
+/// load_project_assets (editing a project) and start_play (a fresh load for
+/// the Play window), since both face the same problem: reconcile what's
+/// really on disk right now with a world that's already been loaded.
+fn merge_plugins_into_world(
+    world: &mut World,
+    manifests: std::collections::BTreeMap<String, frame_engine::world::PluginManifest>,
+    scripts: std::collections::BTreeMap<String, String>,
+) {
+    let mut installed = std::collections::BTreeMap::new();
+    for (name, manifest) in manifests {
+        let enabled = world
+            .installed_plugins
+            .get(&name)
+            .map(|p| p.enabled)
+            .unwrap_or(false);
+        installed.insert(
+            name,
+            frame_engine::world::InstalledPlugin { manifest, enabled },
+        );
+    }
+    world.installed_plugins = installed;
+    for (name, source) in scripts {
+        let owner = name.split('/').next().unwrap_or("");
+        let enabled = world
+            .installed_plugins
+            .get(owner)
+            .map(|p| p.enabled)
+            .unwrap_or(false);
+        if enabled {
+            world.script_library.insert(name, source);
+        }
+    }
+}
+
+fn load_project_models(
+    root: &std::path::Path,
+) -> (
+    std::collections::BTreeMap<String, frame_engine::assets::MeshData>,
+    Vec<String>,
+) {
+    let mut models = std::collections::BTreeMap::new();
+    let mut errors = Vec::new();
+    scan_models_dir(&root.join("assets"), &mut models, &mut errors);
+    (models, errors)
+}
+
+/// Walk a folder and its subfolders for .obj files, parsing each into the map.
+/// Models are named by file stem wherever they sit, so two files with the same
+/// stem in different folders collide and the later one wins.
+fn scan_models_dir(
+    dir: &std::path::Path,
+    models: &mut std::collections::BTreeMap<String, frame_engine::assets::MeshData>,
+    errors: &mut Vec<String>,
+) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return; // no folder yet, nothing to load
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            scan_models_dir(&path, models, errors);
+            continue;
+        }
+        if path.extension().and_then(|e| e.to_str()) != Some("obj") {
+            continue;
+        }
+        let Some(name) = path.file_stem().and_then(|s| s.to_str()).map(String::from) else {
+            continue;
+        };
+        match std::fs::read_to_string(&path) {
+            Ok(text) => match frame_engine::assets::parse_obj(&text) {
+                Ok(data) => {
+                    models.insert(name, data);
+                }
+                Err(e) => errors.push(format!("{name}.obj: {e}")),
+            },
+            Err(e) => errors.push(format!("{name}.obj: {e}")),
+        }
+    }
+}
+
+/// Read a project's manifest, or a default one if it has none yet.
+/// One changed file in the working tree, for the Source Control tab: its path
+/// and a short label ("modified", "new", "deleted", ...), plus whether the change
+/// is staged.
+struct GitFileStatus {
+    path: String,
+    label: &'static str,
+    staged: bool,
+}
+
+/// A read-only snapshot of the open project's git state: enough for "what state
+/// is my repo in?" at a glance. Produced by `git_summary`, refreshed on a timer.
+struct GitSummary {
+    branch: String,
+    // Commits ahead of / behind the upstream branch, if one is configured.
+    ahead_behind: Option<(usize, usize)>,
+    upstream: Option<String>,
+    files: Vec<GitFileStatus>,
+}
+
+/// Read the git state of the repository containing `root`, or None if it isn't
+/// inside one. Read-only: opens, reads, drops. No credentials are ever needed
+/// because nothing here talks to the network — ahead/behind counts compare
+/// against the remote-tracking ref as of the last fetch/pull done OUTSIDE the
+/// editor.
+fn git_summary(root: &std::path::Path) -> Option<GitSummary> {
+    // discover() walks up parent directories, so a project folder nested inside
+    // a repo (the common layout) is found too.
+    let repo = git2::Repository::discover(root).ok()?;
+
+    // Branch name (or a short description of a detached/unborn HEAD).
+    let head = repo.head().ok();
+    let branch = head
+        .as_ref()
+        .and_then(|h| h.shorthand().ok())
+        .unwrap_or("(no branch)")
+        .to_string();
+
+    // Ahead/behind vs. the upstream, if the branch has one configured.
+    let mut ahead_behind = None;
+    let mut upstream_name = None;
+    if let Some(h) = &head {
+        if h.is_branch() {
+            if let Ok(name) = h.shorthand() {
+                if let Ok(local) = repo.find_branch(name, git2::BranchType::Local) {
+                    if let Ok(up) = local.upstream() {
+                        if let Ok(Some(up_name)) = up.name() {
+                            upstream_name = Some(up_name.to_string());
+                        }
+                        if let (Some(local_oid), Some(up_oid)) = (h.target(), up.get().target()) {
+                            ahead_behind = repo.graph_ahead_behind(local_oid, up_oid).ok();
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    // Working-tree and index status, including untracked files.
+    let mut opts = git2::StatusOptions::new();
+    opts.include_untracked(true);
+    let mut files = Vec::new();
+    if let Ok(statuses) = repo.statuses(Some(&mut opts)) {
+        for entry in statuses.iter() {
+            let Ok(path) = entry.path() else { continue };
+            let s = entry.status();
+            // Index (staged) changes and worktree (unstaged) changes are separate
+            // flags on the same entry; a file can carry both.
+            let checks: [(git2::Status, &'static str, bool); 8] = [
+                (git2::Status::INDEX_NEW, "new", true),
+                (git2::Status::INDEX_MODIFIED, "modified", true),
+                (git2::Status::INDEX_DELETED, "deleted", true),
+                (git2::Status::WT_NEW, "new", false),
+                (git2::Status::WT_MODIFIED, "modified", false),
+                (git2::Status::WT_DELETED, "deleted", false),
+                (git2::Status::WT_RENAMED, "renamed", false),
+                (git2::Status::CONFLICTED, "conflicted", false),
+            ];
+            for (flag, label, staged) in checks {
+                if s.contains(flag) {
+                    files.push(GitFileStatus {
+                        path: path.to_string(),
+                        label,
+                        staged,
+                    });
+                }
+            }
+        }
+    }
+
+    Some(GitSummary {
+        branch,
+        ahead_behind,
+        upstream: upstream_name,
+        files,
+    })
+}
+
+fn read_manifest(root: &std::path::Path) -> ProjectManifest {
+    std::fs::read_to_string(root.join("project.ron"))
+        .ok()
+        .and_then(|t| ron::from_str(&t).ok())
+        .unwrap_or_default()
+}
+
+/// Write a project's manifest.
+fn write_manifest(root: &std::path::Path, manifest: &ProjectManifest) {
+    if let Ok(text) = ron::ser::to_string_pretty(manifest, ron::ser::PrettyConfig::default()) {
+        let _ = std::fs::write(root.join("project.ron"), text);
+    }
+}
+
+/// A remembered project, resolved for display on the launcher: its folder, the
+/// scene file inside it, the name (the scene file's stem), and when it was last
+/// edited (the scene file's modification time).
+#[derive(Clone)]
+struct RecentProject {
+    root: std::path::PathBuf,
+    name: String,
+    description: String,
+    version: String,
+    modified: Option<std::time::SystemTime>,
+}
+
+/// Find a project folder's scene file: the first `.ron` in it that isn't the
+/// `project.ron` manifest. A project's name is this file's stem.
+fn find_scene(folder: &std::path::Path) -> Option<std::path::PathBuf> {
+    let mut scenes: Vec<std::path::PathBuf> = std::fs::read_dir(folder)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            p.extension().and_then(|x| x.to_str()) == Some("ron")
+                && p.file_name().and_then(|n| n.to_str()) != Some("project.ron")
+        })
+        .collect();
+    scenes.sort();
+    scenes.into_iter().next()
+}
+
+/// Remembered projects that still hold a scene, most-recently-edited first.
+fn sorted_recent_projects() -> Vec<RecentProject> {
+    let mut projects: Vec<RecentProject> = read_recent_projects()
+        .into_iter()
+        .filter_map(|root| {
+            let scene = find_scene(&root)?;
+            let name = scene
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("Project")
+                .to_string();
+            let modified = std::fs::metadata(&scene).and_then(|m| m.modified()).ok();
+            let manifest = read_manifest(&root);
+            Some(RecentProject {
+                root: root.clone(),
+                name,
+                description: manifest.description,
+                version: manifest.version,
+                modified,
+            })
+        })
+        .collect();
+    projects.sort_by_key(|p| p.modified);
+    projects.reverse();
+    projects
+}
+
+/// Format a scene's last-edited time as a local date and time for the launcher.
+fn format_edited(modified: Option<std::time::SystemTime>) -> String {
+    match modified {
+        Some(t) => chrono::DateTime::<chrono::Local>::from(t)
+            .format("%b %e, %Y at %H:%M")
+            .to_string(),
+        None => "unknown".to_string(),
+    }
+}
+
+/// Build per-primitive instance buckets from a world, in the engine's Mesh order
+/// (Cube, Sphere, Plane). Colliding entities are tinted toward red (a debug
+/// flag); the selected entity, if any, is highlighted. Shared by the editor
+/// viewport and the play window.
+fn build_instances(
+    world: &World,
+    selected: Option<usize>,
+    colliding: &std::collections::HashSet<usize>,
+    custom_names: &[String],
+) -> (Vec<InstanceRaw>, Vec<u32>) {
+    // One bucket per mesh: the three primitives, then the imported models in
+    // the same sorted name order the mesh buffer uses.
+    let mut buckets: Vec<Vec<InstanceRaw>> = vec![Vec::new(); 3 + custom_names.len()];
+    for (id, slot) in world.positions.iter().enumerate() {
+        let Some(p) = slot.as_ref() else { continue };
+        let color = world.colors.get(id).copied().unwrap_or_default();
+        let scale = world.scales.get(id).copied().unwrap_or_default();
+        let mesh = world.meshes.get(id).cloned().unwrap_or_default();
+        let material = world.materials.get(id).copied().unwrap_or_default();
+        let rotation = world.rotations.get(id).copied().unwrap_or_default();
+        let rgb = if colliding.contains(&id) {
+            const T: f32 = 0.6; // how far toward red
+            [
+                color.r * (1.0 - T) + 1.0 * T,
+                color.g * (1.0 - T) + 0.15 * T,
+                color.b * (1.0 - T) + 0.15 * T,
+            ]
+        } else {
+            [color.r, color.g, color.b]
+        };
+        let raw = InstanceRaw {
+            position: [p.x, p.y, p.z],
+            color: rgb,
+            selected: if Some(id) == selected { 1.0 } else { 0.0 },
+            scale: [scale.x, scale.y, scale.z],
+            emissive: material.emissive,
+            yaw: rotation.yaw,
+        };
+        let bucket = match &mesh {
+            Mesh::Cube => 0,
+            Mesh::Sphere => 1,
+            Mesh::Plane => 2,
+            // An imported model draws with its own vertices. A name with no
+            // loaded model falls back to the cube.
+            Mesh::Custom(name) => match custom_names.iter().position(|n| n == name) {
+                Some(i) => 3 + i,
+                None => 0,
+            },
+        };
+        buckets[bucket].push(raw);
+    }
+    let group_counts: Vec<u32> = buckets.iter().map(|b| b.len() as u32).collect();
+    let instances: Vec<InstanceRaw> = buckets.into_iter().flatten().collect();
+    (instances, group_counts)
+}
+
+/// Gather up to MAX_LIGHTS active Light entities from the world into the
+/// fixed-size array the shader's uniform buffer expects, in entity id order.
+/// A Light entity beyond the cap is silently not drawn, a real, named
+/// limitation rather than an unbounded per-frame cost. Unused slots are
+/// left zeroed (intensity 0.0), which the shader's loop reads as "nothing
+/// here".
+fn build_lights(world: &World) -> [LightRaw; MAX_LIGHTS] {
+    let mut out = [LightRaw::zeroed(); MAX_LIGHTS];
+    let mut count = 0usize;
+    for (id, slot) in world.lights.iter().enumerate() {
+        if count >= MAX_LIGHTS {
+            break;
+        }
+        let Some(light) = slot.as_ref() else {
+            continue;
+        };
+        let (position_or_direction, kind_flag, range) = match light.kind {
+            LightKind::Directional { direction } => {
+                ([direction[0], direction[1], direction[2], 0.0], 0.0, 0.0)
+            }
+            LightKind::Point { range } => {
+                // Position has no Default (every entity is meant to be
+                // spawned with an explicit one), so a Point light on a
+                // slot with no position at all falls back to the world
+                // origin rather than relying on one.
+                let p = world.positions.get(id).copied().unwrap_or(Position {
+                    x: 0.0,
+                    y: 0.0,
+                    z: 0.0,
+                });
+                ([p.x, p.y, p.z, 0.0], 1.0, range)
+            }
+        };
+        out[count] = LightRaw {
+            position_or_direction,
+            params: [kind_flag, range, light.intensity, 0.0],
+        };
+        count += 1;
+    }
+    out
+}
+
+/// Turn each entity's pending `Sound.play` request into an actual sound,
+/// clearing the flag once handled either way (a missing file or no audio
+/// device still consumes the request, rather than retrying it every tick
+/// forever). Returns log lines for the caller to print, since logging here
+/// directly would need `&mut self` while `world` is already borrowed from
+/// either `self.world` or `self.game_world`, the same reason this is a
+/// free function taking `world` explicitly rather than an `App` method: a
+/// method could only ever reach `self.world`, never the Play window's
+/// separately-held `self.game_world`.
+///
+/// `assets_root` is the open project's `assets/` folder; a `Sound.name`
+/// resolves under it, the same convention `Mesh::Custom` already uses for
+/// imported models. No audio device (`audio_manager` is `None`) or no
+/// project open (`assets_root` is `None`) both mean requests are quietly
+/// dropped rather than erroring, since a Sound component is still valid
+/// data either way, it just can't play right now.
+/// Audio formats the editor can import and play, matching the features
+/// `kira` is built with by default.
+const AUDIO_EXTENSIONS: &[&str] = &["wav", "ogg", "mp3", "flac"];
+
+/// Find a sound's file under `assets`. A Sound stores just a file name
+/// ("footstep.wav"), so the file can be moved between asset folders without
+/// breaking anything, the same way a model is found by name. An exact path
+/// under assets/ is tried first, so an older scene that stored a relative
+/// path ("audio/footstep.wav") still works. Otherwise every folder is
+/// searched, in sorted order so the result is the same every time, for a
+/// file with that name.
+fn find_audio(assets: &std::path::Path, name: &str) -> Option<std::path::PathBuf> {
+    if name.is_empty() {
+        return None;
+    }
+    let direct = assets.join(name);
+    if direct.is_file() {
+        return Some(direct);
+    }
+    let file_name = name.rsplit(['/', '\\']).next()?;
+    let mut matches = Vec::new();
+    walk_files(assets, &mut |path| {
+        if path.file_name().and_then(|f| f.to_str()) == Some(file_name) {
+            matches.push(path.to_path_buf());
+        }
+    });
+    matches.sort();
+    matches.into_iter().next()
+}
+
+/// Every audio file name under `assets`, sorted and without duplicates, for
+/// the Inspector's Sound picker.
+fn list_audio(assets: &std::path::Path) -> Vec<String> {
+    let mut names = Vec::new();
+    walk_files(assets, &mut |path| {
+        let is_audio = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| AUDIO_EXTENSIONS.contains(&e.to_ascii_lowercase().as_str()))
+            .unwrap_or(false);
+        if is_audio {
+            if let Some(name) = path.file_name().and_then(|f| f.to_str()) {
+                names.push(name.to_string());
+            }
+        }
+    });
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// Call `visit` for every file under `dir`, in every subfolder. Unreadable
+/// folders are skipped rather than failing the whole walk.
+fn walk_files(dir: &std::path::Path, visit: &mut dyn FnMut(&std::path::Path)) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        match entry.file_type() {
+            Ok(t) if t.is_dir() => walk_files(&path, visit),
+            Ok(t) if t.is_file() => visit(&path),
+            _ => {}
+        }
+    }
+}
+
+fn update_sounds(
+    world: &mut World,
+    mut audio_manager: Option<&mut kira::AudioManager<kira::DefaultBackend>>,
+    sound_cache: &mut std::collections::HashMap<String, kira::sound::static_sound::StaticSoundData>,
+    assets_root: Option<&std::path::Path>,
+) -> Vec<String> {
+    let mut messages = Vec::new();
+    let ids: Vec<usize> = world
+        .sounds
+        .iter()
+        .enumerate()
+        .filter_map(|(id, slot)| slot.as_ref().filter(|s| s.play).map(|_| id))
+        .collect();
+    for id in ids {
+        // Read the name, then immediately clear the request flag: whatever
+        // happens below (missing manager, missing file, decode error), this
+        // one-shot request is spent, not retried next tick.
+        let name = world
+            .sounds
+            .get(id)
+            .map(|s| s.name.clone())
+            .unwrap_or_default();
+        if let Some(s) = world.sounds.get_mut(id) {
+            s.play = false;
+        }
+        let Some(manager) = audio_manager.as_deref_mut() else {
+            continue;
+        };
+        let Some(root) = assets_root else {
+            messages.push(format!(
+                "Sound '{name}' requested on entity {id}, but no project is open."
+            ));
+            continue;
+        };
+        if !sound_cache.contains_key(&name) {
+            let Some(path) = find_audio(root, &name) else {
+                messages.push(format!(
+                    "Couldn't find sound '{name}' anywhere under assets/"
+                ));
+                continue;
+            };
+            match kira::sound::static_sound::StaticSoundData::from_file(&path) {
+                Ok(data) => {
+                    sound_cache.insert(name.clone(), data);
+                }
+                Err(e) => {
+                    messages.push(format!("Couldn't load sound '{name}': {e:?}"));
+                    continue;
+                }
+            }
+        }
+        // Cheap clone: StaticSoundData shares its decoded audio data through
+        // an Arc, so this doesn't re-read or re-decode the file, it just
+        // hands the manager another handle to the same samples.
+        if let Some(data) = sound_cache.get(&name) {
+            if let Err(e) = manager.play(data.clone()) {
+                messages.push(format!("Couldn't play sound '{name}': {e:?}"));
+            }
+        }
+    }
+    messages
+}
+
+fn default_world() -> World {
+    let mut world = World::new();
+    world.spawn(
+        Position {
+            x: 0.0,
+            y: 0.0,
+            z: 40.0,
+        },
+        Velocity {
+            dx: 0.0,
+            dy: 0.0,
+            dz: 0.0,
+        },
+    );
+    world.spawn(
+        Position {
+            x: 40.0,
+            y: 20.0,
+            z: 0.0,
+        },
+        Velocity {
+            dx: -0.3,
+            dy: 0.3,
+            dz: 0.0,
+        },
+    );
+    world.spawn(
+        Position {
+            x: 0.0,
+            y: 0.0,
+            z: -50.0,
+        },
+        Velocity {
+            dx: 0.0,
+            dy: 0.0,
+            dz: 0.6,
+        },
+    );
+    world
+}
+fn main() {
+    let event_loop = EventLoop::new().unwrap();
+    // The editor opens on the launcher screen with no project loaded, so it
+    // starts from an empty world; creating or opening a project replaces it.
+    let world = World::default();
+    let mut app = App {
+        window: None,
+        gpu: None,
+        gpu_shared: None,
+        world,
+        // Same shared gravity as the Play window and the engine's own
+        // standalone demo; see `physics::GRAVITY_Y`.
+        physics: Physics::new(GRAVITY_Y),
+        undo_stack: Vec::new(),
+        redo_stack: Vec::new(),
+        inspector_editing: false,
+        ctrl_held: false,
+        shift_held: false,
+        mode: AppMode::Launcher,
+        project_name: None,
+        recent_projects: sorted_recent_projects(),
+        new_project_name: String::new(),
+        settings_open: false,
+        pending_delete: None,
+        settings_root: None,
+        settings_orig_name: String::new(),
+        settings_name: String::new(),
+        settings_description: String::new(),
+        settings_version: String::new(),
+        // No scene target until a project is opened.
+        current_scene_path: None,
+        custom_meshes: std::collections::BTreeMap::new(),
+        game_custom_names: Vec::new(),
+        assets_subdir: std::path::PathBuf::new(),
+        new_asset_folder: String::new(),
+        thumbnails: std::collections::HashMap::new(),
+        move_pending: None,
+        git_summary: None,
+        git_refresh_at: std::time::Instant::now(),
+        paused: false,
+        clock: Clock::new(TICK_RATE, MAX_CATCHUP_TICKS),
+        cam_focus_x: 0.0,
+        cam_focus_y: 0.0,
+        cam_distance: 150.0,
+        // Gentle default tilt so the cubes read as 3D on launch. Zero both for
+        // the old straight-down-Z view.
+        cam_yaw: 0.5,
+        cam_pitch: 0.3,
+        dragging: false,
+        orbiting: false,
+        panning: false,
+        fly_speed: CAM_PAN_SPEED,
+        gizmo: None,
+        gizmo_drag: None,
+        gizmo_hover: None,
+        last_cursor: (0.0, 0.0),
+        selected: None,
+        show_help: load_prefs().show_help,
+        egui_ctx: egui::Context::default(),
+        egui_state: None,
+        // Default layout mirrors the old editor: the Viewport and Script Editor
+        // are tabs filling the centre (click Script Editor to edit full-width
+        // over the viewport), with Scene and Inspector docked on the right. All
+        // of it is draggable, tabbable, and splittable at runtime.
+        dock_state: {
+            let mut state = egui_dock::DockState::new(vec![Tab::Viewport, Tab::Scripts]);
+            state.main_surface_mut().split_right(
+                egui_dock::NodeIndex::root(),
+                0.78,
+                vec![Tab::Scene, Tab::Inspector, Tab::Source],
+            );
+            state
+        },
+        viewport_rect: None,
+        fly_mode: false,
+        cam_focus_z: 0.0,
+        cam_eye: Vec3::ZERO,
+        fly_picked: false,
+        console_tab: ConsoleTab::Output,
+        log_lines: vec!["Frame Editor started.".to_string()],
+        input: InputState::new(),
+        game_window: None,
+        game_gpu: None,
+        game_world: None,
+        game_physics: None,
+        game_input: InputState::new(),
+        game_clock: Clock::new(TICK_RATE, MAX_CATCHUP_TICKS),
+        game_closing: false,
+        popped_out: std::collections::HashMap::new(),
+        popped_out_closing: Vec::new(),
+        new_script_name: String::new(),
+        script_filter: String::new(),
+        open_script: None,
+        renaming: None,
+        plugins_panel_open: false,
+        editor_settings_open: false,
+        script_runtime: script::RhaiRuntime::new(),
+        logo_texture: None,
+        // A missing/unusable audio device (headless, no default output) is a
+        // real, expected case, not a crash: the editor still runs, sounds
+        // just silently don't play, the same graceful-degradation the game
+        // window already gives a closed window.
+        audio_manager: kira::AudioManager::<kira::DefaultBackend>::new(
+            kira::AudioManagerSettings::default(),
+        )
+        .map_err(|e| eprintln!("Audio device unavailable, sounds won't play: {e:?}"))
+        .ok(),
+        sound_cache: std::collections::HashMap::new(),
+    };
+    println!("Frame Editor started at the launcher.");
+    event_loop.run_app(&mut app).unwrap();
+}
