@@ -80,6 +80,29 @@ const MAX_LIGHTS: usize = 4;
 struct LightsUniform {
     lights: [LightRaw; MAX_LIGHTS],
 }
+// One mesh's material data handed to the shader (group 1, binding 2). Must
+// match MaterialParams in shader.wgsl field-for-field. x/y/z used, w padding,
+// the same "everything a clean 16-byte multiple" reasoning LightRaw already
+// uses.
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct MaterialUniform {
+    // x: roughness, y: metalness, z: 1.0 if a real texture is bound (0.0 for
+    // the shared default white texture), w unused.
+    params: [f32; 4],
+}
+/// Decoded, GPU-ready form of one mesh's `world::MeshMaterial`. Decoding a
+/// PNG (the `image` crate call) happens once per file, cached by name at the
+/// App level (see `App::texture_cache`); this is what actually reaches
+/// `GpuState::set_custom_meshes`, so rebuilding a material bind group (say,
+/// after a roughness slider drag) never re-reads or re-decodes a texture
+/// file that hasn't changed, only re-uploads bytes already in memory.
+struct MaterialGpuData {
+    /// (width, height, RGBA8 pixels), or `None` for an untextured mesh.
+    texture_rgba: Option<(u32, u32, Vec<u8>)>,
+    roughness: f32,
+    metalness: f32,
+}
 // Per-vertex mesh geometry: a position in the primitive's local (roughly unit)
 // space and its surface normal. One shared vertex buffer holds every primitive's
 // vertices back to back; each entity instance picks which slice to draw.
@@ -88,9 +111,13 @@ struct LightsUniform {
 struct MeshVertex {
     position: [f32; 3],
     normal: [f32; 3],
+    // Texture coordinates. Zeroed for the three built-in primitives (Cube,
+    // Sphere, Plane), which stay untextured in this first pass; a real value
+    // only ever comes from an imported model's own parsed UVs.
+    uv: [f32; 2],
 }
 impl MeshVertex {
-    const ATTRIBS: [wgpu::VertexAttribute; 2] = [
+    const ATTRIBS: [wgpu::VertexAttribute; 3] = [
         wgpu::VertexAttribute {
             format: wgpu::VertexFormat::Float32x3,
             offset: 0,
@@ -100,6 +127,11 @@ impl MeshVertex {
             format: wgpu::VertexFormat::Float32x3,
             offset: std::mem::size_of::<[f32; 3]>() as wgpu::BufferAddress, // 12
             shader_location: 1,
+        },
+        wgpu::VertexAttribute {
+            format: wgpu::VertexFormat::Float32x2,
+            offset: std::mem::size_of::<[f32; 6]>() as wgpu::BufferAddress, // 24
+            shader_location: 2,
         },
     ];
     fn layout() -> wgpu::VertexBufferLayout<'static> {
@@ -147,6 +179,7 @@ fn cube_vertices() -> Vec<MeshVertex> {
             verts.push(MeshVertex {
                 position: C[i],
                 normal,
+                uv: [0.0, 0.0],
             });
         }
     }
@@ -172,6 +205,7 @@ fn sphere_vertices() -> Vec<MeshVertex> {
     let vert = |unit: [f32; 3]| MeshVertex {
         position: [unit[0] * RADIUS, unit[1] * RADIUS, unit[2] * RADIUS],
         normal: unit,
+        uv: [0.0, 0.0],
     };
     let mut verts = Vec::new();
     for lat in 0..LAT {
@@ -204,6 +238,7 @@ fn plane_vertices() -> Vec<MeshVertex> {
     let v = |x: f32, z: f32| MeshVertex {
         position: [x, 0.0, z],
         normal,
+        uv: [0.0, 0.0],
     };
     vec![
         v(-0.5, -0.5),
@@ -227,38 +262,39 @@ struct InstanceRaw {
     yaw: f32,
 }
 impl InstanceRaw {
-    // Locations 0-1 belong to the mesh vertex buffer (MeshVertex); the instance
-    // attributes continue from 2.
+    // Locations 0-2 belong to the mesh vertex buffer (MeshVertex, which grew
+    // a uv attribute at location 2 alongside textures); the instance
+    // attributes continue from 3.
     const ATTRIBS: [wgpu::VertexAttribute; 6] = [
         wgpu::VertexAttribute {
             format: wgpu::VertexFormat::Float32x3,
             offset: 0,
-            shader_location: 2,
+            shader_location: 3,
         },
         wgpu::VertexAttribute {
             format: wgpu::VertexFormat::Float32x3,
             offset: std::mem::size_of::<[f32; 3]>() as wgpu::BufferAddress, // 12
-            shader_location: 3,
+            shader_location: 4,
         },
         wgpu::VertexAttribute {
             format: wgpu::VertexFormat::Float32,
             offset: std::mem::size_of::<[f32; 6]>() as wgpu::BufferAddress, // 24
-            shader_location: 4,
+            shader_location: 5,
         },
         wgpu::VertexAttribute {
             format: wgpu::VertexFormat::Float32x3,
             offset: std::mem::size_of::<[f32; 7]>() as wgpu::BufferAddress, // 28
-            shader_location: 5,
-        },
-        wgpu::VertexAttribute {
-            format: wgpu::VertexFormat::Float32,
-            offset: std::mem::size_of::<[f32; 10]>() as wgpu::BufferAddress, // 40
             shader_location: 6,
         },
         wgpu::VertexAttribute {
             format: wgpu::VertexFormat::Float32,
-            offset: std::mem::size_of::<[f32; 11]>() as wgpu::BufferAddress, // 44
+            offset: std::mem::size_of::<[f32; 10]>() as wgpu::BufferAddress, // 40
             shader_location: 7,
+        },
+        wgpu::VertexAttribute {
+            format: wgpu::VertexFormat::Float32,
+            offset: std::mem::size_of::<[f32; 11]>() as wgpu::BufferAddress, // 44
+            shader_location: 8,
         },
     ];
     fn layout() -> wgpu::VertexBufferLayout<'static> {
@@ -315,6 +351,112 @@ fn create_depth_view(device: &wgpu::Device, width: u32, height: u32) -> wgpu::Te
         view_formats: &[],
     });
     texture.create_view(&wgpu::TextureViewDescriptor::default())
+}
+// Build the 1x1 opaque-white texture every mesh's material bind group falls
+// back to when it has no real texture of its own: sampling it always
+// returns (1,1,1,1), so multiplying it into an entity's own color in the
+// shader is a harmless no-op. This is what lets the three built-in
+// primitives (which never get a real texture) and an untextured custom mesh
+// share the exact same shader path as a textured one.
+fn create_default_white_texture(device: &wgpu::Device, queue: &wgpu::Queue) -> wgpu::TextureView {
+    let texture = device.create_texture_with_data(
+        queue,
+        &wgpu::TextureDescriptor {
+            label: Some("default white material texture"),
+            size: wgpu::Extent3d {
+                width: 1,
+                height: 1,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        },
+        wgpu::util::TextureDataOrder::LayerMajor,
+        &[255, 255, 255, 255],
+    );
+    texture.create_view(&wgpu::TextureViewDescriptor::default())
+}
+// Upload an already-decoded RGBA8 image (see MaterialGpuData) into a real
+// wgpu texture and return its view. Decoding the PNG itself happens once, at
+// the App level, cached by file name, so rebuilding a mesh's material bind
+// group (a roughness slider drag, say) re-uploads bytes already in memory
+// rather than re-reading and re-decoding the file each time.
+fn create_material_texture(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    width: u32,
+    height: u32,
+    rgba: &[u8],
+) -> wgpu::TextureView {
+    let texture = device.create_texture_with_data(
+        queue,
+        &wgpu::TextureDescriptor {
+            label: Some("material texture"),
+            size: wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        },
+        wgpu::util::TextureDataOrder::LayerMajor,
+        rgba,
+    );
+    texture.create_view(&wgpu::TextureViewDescriptor::default())
+}
+// Build one mesh's material bind group (group 1: texture, sampler, params
+// uniform). `texture_view` is either this mesh's own loaded texture or the
+// shared default white one; `has_texture` tells the shader which, so it
+// knows whether to actually sample or just treat the mesh as untextured.
+fn create_material_bind_group(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    sampler: &wgpu::Sampler,
+    texture_view: &wgpu::TextureView,
+    roughness: f32,
+    metalness: f32,
+    has_texture: bool,
+) -> wgpu::BindGroup {
+    let uniform = MaterialUniform {
+        params: [
+            roughness,
+            metalness,
+            if has_texture { 1.0 } else { 0.0 },
+            0.0,
+        ],
+    };
+    let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("material params buffer"),
+        contents: bytemuck::cast_slice(&[uniform]),
+        usage: wgpu::BufferUsages::UNIFORM,
+    });
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("material bind group"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: wgpu::BindingResource::TextureView(texture_view),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::Sampler(sampler),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: buffer.as_entire_binding(),
+            },
+        ],
+    })
 }
 // Turn a string into a pile of screen-space quads, one per lit font pixel.
 //
@@ -534,6 +676,7 @@ fn build_mesh_buffer(
             .map(|v| MeshVertex {
                 position: v.position,
                 normal: v.normal,
+                uv: v.uv,
             })
             .collect();
         push(verts, &mut mesh_verts, &mut ranges);
@@ -593,6 +736,16 @@ struct GpuState {
     preview_camera_buffer: wgpu::Buffer,
     preview_bind_group: wgpu::BindGroup,
     preview_texture_id: egui::TextureId,
+    // Material bind groups (group 1: texture, sampler, MaterialUniform), one
+    // per mesh bucket, same order as mesh_ranges (Cube, Sphere, Plane, then
+    // customs by name). The three primitives always point at the shared
+    // default (see `default_material_bind_group`); each custom mesh gets its
+    // own, rebuilt whenever its material changes or its texture is
+    // (re)loaded. Rebuilt as a whole alongside mesh_ranges in
+    // set_custom_meshes, so the two never drift out of index-correspondence.
+    material_bind_group_layout: wgpu::BindGroupLayout,
+    material_sampler: wgpu::Sampler,
+    material_bind_groups: Vec<wgpu::BindGroup>,
 }
 impl GpuState {
     /// Builds a GpuState for one window. `shared` is `None` exactly once per
@@ -715,6 +868,70 @@ impl GpuState {
                 },
             ],
         });
+        // --- Material bind group layout (group 1: texture, sampler, params) ---
+        // One of these is bound before each mesh's draw call in render()/
+        // render_preview(), separate from the scene bind group above (group
+        // 0, camera+lights), since different meshes in the same frame need
+        // different materials while sharing the same camera and lights.
+        let material_bind_group_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("material bind group layout"),
+                entries: &[
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 0,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 1,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                ],
+            });
+        let material_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("material sampler"),
+            address_mode_u: wgpu::AddressMode::Repeat,
+            address_mode_v: wgpu::AddressMode::Repeat,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            ..Default::default()
+        });
+        // Every mesh gets a material bind group; the three primitives (and
+        // any custom mesh with no texture of its own) point at this shared
+        // 1x1 opaque-white texture, so sampling it and multiplying into the
+        // entity's own color is a harmless no-op. Rebuilt fully, alongside
+        // mesh_ranges, in set_custom_meshes.
+        let default_material_view = create_default_white_texture(&device, &queue);
+        let material_bind_groups: Vec<wgpu::BindGroup> = (0..3)
+            .map(|_| {
+                create_material_bind_group(
+                    &device,
+                    &material_bind_group_layout,
+                    &material_sampler,
+                    &default_material_view,
+                    0.5,
+                    0.0,
+                    false,
+                )
+            })
+            .collect();
         // --- Camera preview (see GpuState's own field doc comment) ---
         let preview_texture = device.create_texture(&wgpu::TextureDescriptor {
             label: Some("camera preview texture"),
@@ -770,7 +987,13 @@ impl GpuState {
         let entity_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("entity pipeline layout"),
-                bind_group_layouts: &[Some(&scene_bind_group_layout)],
+                // Group 0: camera + lights (scene-wide). Group 1: this mesh's
+                // own material (texture, sampler, roughness/metalness),
+                // rebound before each mesh's draw call.
+                bind_group_layouts: &[
+                    Some(&scene_bind_group_layout),
+                    Some(&material_bind_group_layout),
+                ],
                 immediate_size: 0,
             });
         let render_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -867,16 +1090,64 @@ impl GpuState {
                 preview_camera_buffer,
                 preview_bind_group,
                 preview_texture_id,
+                material_bind_group_layout,
+                material_sampler,
+                material_bind_groups,
             },
             shared_out,
         )
     }
-    // Rebuild the mesh vertex buffer with the current set of imported models.
-    // Called when a project loads or a model gets imported. Cheap and rare.
-    fn set_custom_meshes(&mut self, customs: &[&frame_engine::assets::MeshData]) {
-        let (buffer, ranges) = build_mesh_buffer(&self.device, customs);
+    // Rebuild the mesh vertex buffer with the current set of imported models,
+    // and alongside it every mesh's material bind group (primitives first,
+    // then customs in the same order), so mesh_ranges and material_bind_groups
+    // never drift out of index-correspondence with each other. Called when a
+    // project loads, a model is (re)imported, or a mesh's material changes.
+    // `customs` pairs each model with its material, in `custom_names` order.
+    fn set_custom_meshes(
+        &mut self,
+        customs: &[(&frame_engine::assets::MeshData, &MaterialGpuData)],
+    ) {
+        let mesh_data: Vec<&frame_engine::assets::MeshData> =
+            customs.iter().map(|(data, _)| *data).collect();
+        let (buffer, ranges) = build_mesh_buffer(&self.device, &mesh_data);
         self.mesh_vertex_buffer = buffer;
         self.mesh_ranges = ranges;
+        let default_view = create_default_white_texture(&self.device, &self.queue);
+        let mut bind_groups: Vec<wgpu::BindGroup> = (0..3)
+            .map(|_| {
+                create_material_bind_group(
+                    &self.device,
+                    &self.material_bind_group_layout,
+                    &self.material_sampler,
+                    &default_view,
+                    0.5,
+                    0.0,
+                    false,
+                )
+            })
+            .collect();
+        for (_, material) in customs {
+            let (view, has_texture) = match &material.texture_rgba {
+                Some((width, height, rgba)) => (
+                    create_material_texture(&self.device, &self.queue, *width, *height, rgba),
+                    true,
+                ),
+                None => (
+                    create_default_white_texture(&self.device, &self.queue),
+                    false,
+                ),
+            };
+            bind_groups.push(create_material_bind_group(
+                &self.device,
+                &self.material_bind_group_layout,
+                &self.material_sampler,
+                &view,
+                material.roughness,
+                material.metalness,
+                has_texture,
+            ));
+        }
+        self.material_bind_groups = bind_groups;
     }
     fn resize(&mut self, width: u32, height: u32) {
         if width > 0 && height > 0 {
@@ -1020,6 +1291,17 @@ impl GpuState {
                         // instance (which some backends validate against).
                         let begin = instance_start as wgpu::BufferAddress * stride;
                         render_pass.set_vertex_buffer(1, buffer.slice(begin..));
+                        // This mesh's own material (texture/roughness/
+                        // metalness), rebound per mesh since different
+                        // buckets in the same frame can differ. Falls back to
+                        // bind group 0 (always a valid default) if the two
+                        // lists briefly disagree in length, the same
+                        // tolerance the mesh_ranges lookup just below has.
+                        let material = self
+                            .material_bind_groups
+                            .get(primitive)
+                            .unwrap_or(&self.material_bind_groups[0]);
+                        render_pass.set_bind_group(1, material, &[]);
                         // Skip a group with no matching range. Happens if the
                         // instance list and mesh buffer briefly disagree.
                         if let Some(range) = self.mesh_ranges.get(primitive) {
@@ -1155,6 +1437,11 @@ impl GpuState {
                     if *count > 0 {
                         let begin = instance_start as wgpu::BufferAddress * stride;
                         render_pass.set_vertex_buffer(1, buffer.slice(begin..));
+                        let material = self
+                            .material_bind_groups
+                            .get(primitive)
+                            .unwrap_or(&self.material_bind_groups[0]);
+                        render_pass.set_bind_group(1, material, &[]);
                         if let Some(range) = self.mesh_ranges.get(primitive) {
                             render_pass.draw(range.clone(), 0..*count);
                         }
@@ -1217,6 +1504,7 @@ enum MenuAction {
     OpenScene,
     ImportModel,
     ImportAudio,
+    ImportTexture,
     SaveScene,
     SaveSceneAs,
     ReloadScene,
@@ -1450,8 +1738,14 @@ fn prefabs_tab_ui(
 
 /// Assets tab: a small browser for the project's assets folder. Folders can be
 /// opened and created; files are listed with a tag for models. Import
-/// happens through File > Import model and File > Import audio (audio lands
-/// in whichever folder is open here), or by dropping files on the window.
+/// happens through File > Import model, File > Import audio (audio lands
+/// in whichever folder is open here) or File > Import texture, or by
+/// dropping files on the window. A model tile also gets a Material button,
+/// opening a small panel below the grid to assign its texture and set its
+/// roughness/metalness (see world::MeshMaterial's doc comment for why these
+/// live on the model rather than per entity). Returns the edited material
+/// for the caller to write into World::mesh_meta and re-upload to the GPU,
+/// the same lift-then-write-back shape every other tab here already uses.
 fn assets_tab_ui(
     ui: &mut egui::Ui,
     assets_root: Option<&std::path::Path>,
@@ -1459,10 +1753,14 @@ fn assets_tab_ui(
     new_folder: &mut String,
     thumbnails: &std::collections::HashMap<String, egui::TextureHandle>,
     move_pending: &mut Option<std::path::PathBuf>,
-) {
+    mesh_meta: &std::collections::BTreeMap<String, frame_engine::world::MeshMeta>,
+    image_names: &[String],
+    material_editing: &mut Option<String>,
+) -> Option<(String, frame_engine::world::MeshMaterial)> {
+    let mut material_result = None;
     let Some(root) = assets_root else {
         ui.weak("Open a project to browse its assets.");
-        return;
+        return None;
     };
     let current = root.join(&*subdir);
     // Header: where we are, plus Up when inside a subfolder.
@@ -1531,7 +1829,7 @@ fn assets_tab_ui(
         }
     } else {
         ui.weak("No assets folder yet. Importing a model or audio creates it.");
-        return;
+        return None;
     }
     dirs.sort();
     files.sort();
@@ -1590,27 +1888,158 @@ fn assets_tab_ui(
                                 }
                             }
                             ui.add(egui::Label::new(egui::RichText::new(file).small()).truncate());
-                            if ui.small_button("Move").clicked() {
-                                *move_pending = Some(current.join(file));
-                            }
+                            ui.horizontal(|ui| {
+                                if ui.small_button("Move").clicked() {
+                                    *move_pending = Some(current.join(file));
+                                }
+                                // A model tile (one with a thumbnail) also
+                                // gets a Material button, toggling the panel
+                                // below the grid for this mesh specifically.
+                                if mesh_meta.contains_key(stem) {
+                                    if ui.small_button("Material").clicked() {
+                                        *material_editing =
+                                            if material_editing.as_deref() == Some(stem) {
+                                                None
+                                            } else {
+                                                Some(stem.to_string())
+                                            };
+                                    }
+                                }
+                            });
                         });
                     });
                 }
             });
         });
+    // Material panel: only while a model's Material button is toggled on,
+    // and only while that model still exists (it can vanish out from under
+    // this if the assets folder changes on disk between frames).
+    if let Some(name) = material_editing.clone() {
+        if let Some(meta) = mesh_meta.get(&name) {
+            let mut mat = meta.material.clone();
+            let mut changed = false;
+            ui.separator();
+            ui.horizontal(|ui| {
+                ui.label(format!("Material: {name}"));
+                if ui.small_button("Close").clicked() {
+                    *material_editing = None;
+                }
+            });
+            ui.horizontal(|ui| {
+                ui.label("Texture");
+                egui::ComboBox::from_id_salt("material_texture_picker")
+                    .selected_text(mat.texture.clone().unwrap_or_else(|| "(none)".to_string()))
+                    .show_ui(ui, |ui| {
+                        if ui.selectable_label(mat.texture.is_none(), "(none)").clicked()
+                            && mat.texture.is_some()
+                        {
+                            mat.texture = None;
+                            changed = true;
+                        }
+                        for img in image_names {
+                            let selected = mat.texture.as_deref() == Some(img.as_str());
+                            if ui.selectable_label(selected, img.as_str()).clicked() && !selected {
+                                mat.texture = Some(img.clone());
+                                changed = true;
+                            }
+                        }
+                    });
+                if image_names.is_empty() {
+                    ui.weak("(no images yet — File > Import texture…)");
+                }
+            });
+            changed |= ui
+                .add(egui::Slider::new(&mut mat.roughness, 0.0..=1.0).text("Roughness"))
+                .changed();
+            changed |= ui
+                .add(egui::Slider::new(&mut mat.metalness, 0.0..=1.0).text("Metalness"))
+                .changed();
+            if changed {
+                material_result = Some((name, mat));
+            }
+        } else {
+            *material_editing = None;
+        }
+    }
+    material_result
 }
 
-/// Scene tab: the entity list.
-fn scene_tab_ui(ui: &mut egui::Ui, entity_ids: &[usize], selection: &mut Option<usize>) {
+/// Scene tab: entities shown as a parent/child tree rather than a flat list,
+/// using each entity's `Parent.entity` link (see `World::apply_parenting`
+/// and the Parent section of the Inspector). An entity's parent has to be
+/// present in this same `entity_ids` snapshot to nest under it; a dangling
+/// or missing parent (despawned, or pointing at itself) falls back to being
+/// shown at the root level, the same tolerance `apply_parenting` itself
+/// gives a stale link rather than erroring.
+fn scene_tab_ui(
+    ui: &mut egui::Ui,
+    entity_ids: &[usize],
+    entity_parents: &std::collections::HashMap<usize, usize>,
+    selection: &mut Option<usize>,
+) {
     ui.label(format!("{} entities", entity_ids.len()));
     ui.separator();
+
+    let valid: std::collections::HashSet<usize> = entity_ids.iter().copied().collect();
+    let mut children: std::collections::BTreeMap<usize, Vec<usize>> =
+        std::collections::BTreeMap::new();
+    let mut roots: Vec<usize> = Vec::new();
+    for &id in entity_ids {
+        match entity_parents.get(&id) {
+            Some(&parent) if parent != id && valid.contains(&parent) => {
+                children.entry(parent).or_default().push(id);
+            }
+            _ => roots.push(id),
+        }
+    }
+
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
         .show(ui, |ui| {
-            for &id in entity_ids {
-                ui.selectable_value(selection, Some(id), format!("Entity {id}"));
+            // Guards against a cycle in the Parent links (A parents B parents
+            // A) — apply_parenting only ever walks one entity's single parent
+            // at a time each tick, so it never has to notice a cycle, but a
+            // tree view actually descends the graph and would recurse forever
+            // without this.
+            let mut visiting = std::collections::HashSet::new();
+            for &id in &roots {
+                scene_tree_node(ui, id, 0, &children, &mut visiting, selection);
             }
         });
+}
+
+/// One row (and its children, recursively) of the Scene tree. See
+/// `scene_tab_ui` for the cycle guard `visiting` provides.
+fn scene_tree_node(
+    ui: &mut egui::Ui,
+    id: usize,
+    depth: usize,
+    children: &std::collections::BTreeMap<usize, Vec<usize>>,
+    visiting: &mut std::collections::HashSet<usize>,
+    selection: &mut Option<usize>,
+) {
+    if !visiting.insert(id) {
+        ui.colored_label(
+            egui::Color32::from_rgb(0xe0, 0x5c, 0x5c),
+            format!("Entity {id} (parent cycle, stopped here)"),
+        );
+        return;
+    }
+    ui.horizontal(|ui| {
+        ui.add_space(depth as f32 * 16.0);
+        let label = if depth == 0 {
+            format!("Entity {id}")
+        } else {
+            format!("↳ Entity {id}")
+        };
+        ui.selectable_value(selection, Some(id), label);
+    });
+    if let Some(kids) = children.get(&id) {
+        for &child in kids {
+            scene_tree_node(ui, child, depth + 1, children, visiting, selection);
+        }
+    }
+    visiting.remove(&id);
 }
 
 /// One custom Inspector field for the currently selected entity, lifted out
@@ -2257,6 +2686,9 @@ fn scripts_tab_ui(
 /// frame and drained back into the world afterwards.
 struct EditorTabViewer {
     entity_ids: Vec<usize>,
+    // Each entity's Parent.entity, for the Scene tab's tree view. Built
+    // alongside entity_ids from the same world snapshot; see scene_tab_ui.
+    entity_parents: std::collections::HashMap<usize, usize>,
     selection: Option<usize>,
     edited: Option<EditedEntity>,
     // Plugin-declared custom fields for the selected entity. See
@@ -2351,7 +2783,12 @@ impl egui_dock::TabViewer for EditorTabViewer {
                     }
                 }
             }
-            Tab::Scene => scene_tab_ui(ui, &self.entity_ids, &mut self.selection),
+            Tab::Scene => scene_tab_ui(
+                ui,
+                &self.entity_ids,
+                &self.entity_parents,
+                &mut self.selection,
+            ),
             Tab::Inspector => inspector_tab_ui(
                 ui,
                 &mut self.edited,
@@ -2483,6 +2920,15 @@ struct App {
     // they can be uploaded to any GPU device (editor window and game window).
     // BTreeMap so the name order is stable and sorted.
     custom_meshes: std::collections::BTreeMap<String, frame_engine::assets::MeshData>,
+    // Decoded material textures, keyed by file name, shared with build_material_gpu_data
+    // the same way sound_cache caches decoded audio: so editing a mesh's
+    // roughness/metalness in the Assets tab (which rebuilds every material
+    // bind group) never re-reads or re-decodes a texture file that hasn't
+    // itself changed.
+    texture_cache: std::collections::HashMap<String, (u32, u32, Vec<u8>)>,
+    // Which mesh's material panel is open in the Assets tab, if any. None
+    // when nothing's expanded, or when the named mesh no longer exists.
+    material_editing: Option<String>,
     // Saved prefabs for the open project, scanned from its prefabs/ folder
     // the same way custom_meshes is scanned from assets/. Unlinked stamps
     // (see Prefab's own doc comment): this map is only ever read to spawn a
@@ -3376,7 +3822,19 @@ impl App {
         }
         self.game_custom_names = models.keys().cloned().collect();
         let refs: Vec<&frame_engine::assets::MeshData> = models.values().collect();
-        gpu.set_custom_meshes(&refs);
+        // A fresh, local decode cache: Play starts far less often than a
+        // material gets tweaked in the editor, so there's no need to share
+        // App::texture_cache here.
+        let mut game_texture_cache = std::collections::HashMap::new();
+        let materials = build_material_gpu_data(
+            &self.game_custom_names,
+            &world.mesh_meta,
+            &root.join("assets"),
+            &mut game_texture_cache,
+        );
+        let pairs: Vec<(&frame_engine::assets::MeshData, &MaterialGpuData)> =
+            refs.iter().copied().zip(materials.iter()).collect();
+        gpu.set_custom_meshes(&pairs);
         window.request_redraw();
         self.game_gpu = Some(gpu);
         self.game_world = Some(world);
@@ -3808,8 +4266,93 @@ impl App {
         }
     }
 
+    /// File > Import texture: pick one or more image files and import each,
+    /// the same "one at a time, shared per-file work factored out" shape as
+    /// Import audio.
+    fn import_texture(&mut self) {
+        if self.current_scene_path.is_none() {
+            self.log("Open a project before importing a texture".to_string());
+            return;
+        }
+        let Some(picked) = rfd::FileDialog::new()
+            .add_filter("Image", IMAGE_EXTENSIONS)
+            .pick_files()
+        else {
+            return; // dialog cancelled
+        };
+        for path in picked {
+            self.import_texture_from(path);
+        }
+    }
+
+    /// Import one image file into the folder currently open in the Assets
+    /// tab, the same "decode once to catch a broken file early, land wherever
+    /// the user is working, replace an existing same-name file in place"
+    /// shape `import_audio_from` already uses for audio. A texture is found
+    /// by name anywhere under assets/ (see `find_image`), matching how a
+    /// Sound or a Mesh::Custom resolves its own file.
+    fn import_texture_from(&mut self, picked: std::path::PathBuf) {
+        let Some(assets) = self
+            .current_scene_path
+            .as_ref()
+            .and_then(|p| p.parent())
+            .map(|p| p.join("assets"))
+        else {
+            self.log("Open a project before importing a texture".to_string());
+            return;
+        };
+        let Some(name) = picked
+            .file_name()
+            .and_then(|f| f.to_str())
+            .map(String::from)
+        else {
+            return;
+        };
+        if let Err(e) = image::open(&picked) {
+            self.log(format!("Could not read image '{name}': {e:?}"));
+            return;
+        }
+        let existing = find_image(&assets, &name);
+        let dest = match &existing {
+            Some(path) => path.clone(),
+            None => {
+                let folder = assets.join(&self.assets_subdir);
+                let folder = if folder.is_dir() { folder } else { assets.clone() };
+                if let Err(e) = std::fs::create_dir_all(&folder) {
+                    self.log(format!("Could not create assets folder: {e}"));
+                    return;
+                }
+                folder.join(&name)
+            }
+        };
+        if picked != dest {
+            if let Err(e) = std::fs::copy(&picked, &dest) {
+                self.log(format!("Could not copy image into assets: {e}"));
+                return;
+            }
+        }
+        // Drop any cached decode of the old file, same reasoning
+        // import_audio_from's sound_cache invalidation already documents.
+        self.texture_cache
+            .retain(|key, _| key.rsplit(['/', '\\']).next() != Some(name.as_str()));
+        // Any mesh whose material already points at this exact file name
+        // needs its bind group rebuilt with the new pixels, not just its
+        // cache entry dropped.
+        self.refresh_custom_mesh_gpu();
+        let shown = dest
+            .strip_prefix(&assets)
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| name.clone());
+        if existing.is_some() {
+            self.log(format!("Replaced image 'assets/{shown}'"));
+        } else {
+            self.log(format!("Imported image 'assets/{shown}'"));
+        }
+    }
+
     /// Import dropped files: .obj as a model, a supported audio format as
-    /// audio, anything else skipped with a message.
+    /// audio, a supported image format as a texture, anything else skipped
+    /// with a message.
     fn import_dropped(&mut self, path: std::path::PathBuf) {
         let ext = path
             .extension()
@@ -3820,12 +4363,16 @@ impl App {
             self.import_model_from(path);
         } else if AUDIO_EXTENSIONS.contains(&ext.as_str()) {
             self.import_audio_from(path);
+        } else if IMAGE_EXTENSIONS.contains(&ext.as_str()) {
+            self.import_texture_from(path);
         } else {
             let name = path
                 .file_name()
                 .map(|f| f.to_string_lossy().to_string())
                 .unwrap_or_default();
-            self.log(format!("Can't import '{name}': not a model or a supported audio file"));
+            self.log(format!(
+                "Can't import '{name}': not a model, a supported audio file, or a supported image"
+            ));
         }
     }
 
@@ -3845,6 +4392,33 @@ impl App {
 
     /// Import one .obj into the project's assets folder. Shared by the File
     /// menu and drag and drop.
+    /// Rebuild every custom mesh's GPU material bind group from whatever's
+    /// currently in `self.world.mesh_meta`, decoding any newly-referenced
+    /// texture through `self.texture_cache` (so an already-decoded one is
+    /// never re-read). Called after anything that can change what a mesh
+    /// should look like: importing/reimporting a model, reloading a project,
+    /// or editing a material in the Assets tab.
+    fn refresh_custom_mesh_gpu(&mut self) {
+        let custom_names: Vec<String> = self.custom_meshes.keys().cloned().collect();
+        let refs: Vec<&frame_engine::assets::MeshData> = self.custom_meshes.values().collect();
+        let assets_root = self
+            .current_scene_path
+            .as_ref()
+            .and_then(|p| p.parent())
+            .map(|p| p.join("assets"))
+            .unwrap_or_default();
+        let materials = build_material_gpu_data(
+            &custom_names,
+            &self.world.mesh_meta,
+            &assets_root,
+            &mut self.texture_cache,
+        );
+        let pairs: Vec<(&frame_engine::assets::MeshData, &MaterialGpuData)> =
+            refs.iter().copied().zip(materials.iter()).collect();
+        if let Some(gpu) = &mut self.gpu {
+            gpu.set_custom_meshes(&pairs);
+        }
+    }
     fn import_model_from(&mut self, picked: std::path::PathBuf) {
         let Some(root) = self
             .current_scene_path
@@ -3894,17 +4468,25 @@ impl App {
             }
         }
         let replaced = self.custom_meshes.contains_key(&name);
+        // Re-importing a model (replacing it) must not silently reset a
+        // material already assigned to it, so the existing entry's material
+        // is carried over rather than defaulted; only half_extents actually
+        // needs recomputing from the freshly parsed geometry.
+        let material = self
+            .world
+            .mesh_meta
+            .get(&name)
+            .map(|m| m.material.clone())
+            .unwrap_or_default();
         self.world.mesh_meta.insert(
             name.clone(),
             frame_engine::world::MeshMeta {
                 half_extents: data.half_extents,
+                material,
             },
         );
         self.custom_meshes.insert(name.clone(), data);
-        let refs: Vec<&frame_engine::assets::MeshData> = self.custom_meshes.values().collect();
-        if let Some(gpu) = &mut self.gpu {
-            gpu.set_custom_meshes(&refs);
-        }
+        self.refresh_custom_mesh_gpu();
         self.rebuild_thumbnails();
         if replaced {
             self.log(format!("Replaced model '{name}'"));
@@ -3948,20 +4530,29 @@ impl App {
             self.prefabs = prefabs;
         }
         for (name, data) in &self.custom_meshes {
+            // A project reload must not reset a mesh's already-assigned
+            // material back to default (same reasoning as import_model_from
+            // above): carry over whatever's already in mesh_meta for this
+            // name, recomputing only half_extents from the freshly parsed
+            // geometry.
+            let material = self
+                .world
+                .mesh_meta
+                .get(name)
+                .map(|m| m.material.clone())
+                .unwrap_or_default();
             self.world.mesh_meta.insert(
                 name.clone(),
                 frame_engine::world::MeshMeta {
                     half_extents: data.half_extents,
+                    material,
                 },
             );
         }
         if !self.custom_meshes.is_empty() {
             self.log(format!("Loaded {} model(s)", self.custom_meshes.len()));
         }
-        let refs: Vec<&frame_engine::assets::MeshData> = self.custom_meshes.values().collect();
-        if let Some(gpu) = &mut self.gpu {
-            gpu.set_custom_meshes(&refs);
-        }
+        self.refresh_custom_mesh_gpu();
         self.rebuild_thumbnails();
     }
 
@@ -4777,6 +5368,15 @@ impl ApplicationHandler for App {
                 let mut new_asset_folder = std::mem::take(&mut self.new_asset_folder);
                 let thumbnails = self.thumbnails.clone();
                 let mut move_pending = std::mem::take(&mut self.move_pending);
+                // Snapshot for the Assets tab's material panel; a real edit
+                // is staged here and applied after the pass (writing it needs
+                // self.world.mesh_meta and a GPU re-upload, neither of which
+                // the egui closure can borrow), same lift-then-write-back
+                // shape as prefab_spawn_request just below.
+                let mesh_meta_snapshot = self.world.mesh_meta.clone();
+                let image_names = assets_root.as_deref().map(list_images).unwrap_or_default();
+                let mut material_editing = std::mem::take(&mut self.material_editing);
+                let mut material_edit: Option<(String, frame_engine::world::MeshMaterial)> = None;
                 // Snapshot for the Prefabs tab to read; spawning is staged
                 // here and applied after the pass (spawn_prefab_at_focus
                 // needs self.world and the camera focus point, neither of
@@ -4817,6 +5417,14 @@ impl ApplicationHandler for App {
                     .iter()
                     .enumerate()
                     .filter_map(|(i, slot)| slot.as_ref().map(|_| i))
+                    .collect();
+                // For the Scene tab's tree view: each listed entity's own
+                // Parent.entity, if it has one. Missing/dangling parents are
+                // resolved against the live entity_ids list inside
+                // scene_tab_ui itself, not here.
+                let entity_parents: std::collections::HashMap<usize, usize> = entity_ids
+                    .iter()
+                    .filter_map(|&id| self.world.parents.get(id).map(|p| (id, p.entity)))
                     .collect();
                 let new_selection = self.selected;
                 let edited = self.selected.and_then(|id| {
@@ -4917,6 +5525,7 @@ impl ApplicationHandler for App {
                     std::mem::replace(&mut self.dock_state, egui_dock::DockState::new(Vec::new()));
                 let mut viewer = EditorTabViewer {
                     entity_ids,
+                    entity_parents,
                     selection: new_selection,
                     edited,
                     custom_fields,
@@ -4966,6 +5575,9 @@ impl ApplicationHandler for App {
                                         }
                                         if ui.button("Import audio…").clicked() {
                                             menu_action = Some(MenuAction::ImportAudio);
+                                        }
+                                        if ui.button("Import texture…").clicked() {
+                                            menu_action = Some(MenuAction::ImportTexture);
                                         }
                                         ui.separator();
                                         if ui.button("Save scene").clicked() {
@@ -5218,14 +5830,19 @@ impl ApplicationHandler for App {
                                             ui.weak("(terminal goes here)");
                                         }
                                         ConsoleTab::Assets => {
-                                            assets_tab_ui(
+                                            if let Some(edit) = assets_tab_ui(
                                                 ui,
                                                 assets_root.as_deref(),
                                                 &mut assets_subdir,
                                                 &mut new_asset_folder,
                                                 &thumbnails,
                                                 &mut move_pending,
-                                            );
+                                                &mesh_meta_snapshot,
+                                                &image_names,
+                                                &mut material_editing,
+                                            ) {
+                                                material_edit = Some(edit);
+                                            }
                                         }
                                         ConsoleTab::Prefabs => {
                                             if let Some(name) = prefabs_tab_ui(ui, &prefabs) {
@@ -5293,6 +5910,13 @@ impl ApplicationHandler for App {
                 self.assets_subdir = assets_subdir;
                 self.new_asset_folder = new_asset_folder;
                 self.move_pending = move_pending;
+                self.material_editing = material_editing;
+                if let Some((name, material)) = material_edit {
+                    if let Some(meta) = self.world.mesh_meta.get_mut(&name) {
+                        meta.material = material;
+                    }
+                    self.refresh_custom_mesh_gpu();
+                }
                 self.log_lines = log_lines;
                 // Drain the dock layout and the tabs' state back onto self.
                 self.dock_state = dock_state;
@@ -5455,6 +6079,7 @@ impl ApplicationHandler for App {
                     Some(MenuAction::OpenScene) => self.open_scene(),
                     Some(MenuAction::ImportModel) => self.import_model(),
                     Some(MenuAction::ImportAudio) => self.import_audio(),
+                    Some(MenuAction::ImportTexture) => self.import_texture(),
                     Some(MenuAction::SaveScene) => self.save_scene(),
                     Some(MenuAction::SaveSceneAs) => self.save_scene_as(),
                     Some(MenuAction::ReloadScene) => self.reload_scene(),
@@ -6174,6 +6799,93 @@ fn list_audio(assets: &std::path::Path) -> Vec<String> {
     names
 }
 
+/// Image formats the editor can import and use as a material texture.
+/// PNG-only for now, matching the `image` crate's enabled feature set (see
+/// Cargo.toml) — no new dependency feature added just for this first pass.
+const IMAGE_EXTENSIONS: &[&str] = &["png"];
+
+/// Find a texture's file under `assets`, the same "by name, anywhere under
+/// assets/" resolution `find_audio` gives Sound, so a texture can be moved
+/// between asset folders without breaking a mesh's material.
+fn find_image(assets: &std::path::Path, name: &str) -> Option<std::path::PathBuf> {
+    if name.is_empty() {
+        return None;
+    }
+    let direct = assets.join(name);
+    if direct.is_file() {
+        return Some(direct);
+    }
+    let file_name = name.rsplit(['/', '\\']).next()?;
+    let mut matches = Vec::new();
+    walk_files(assets, &mut |path| {
+        if path.file_name().and_then(|f| f.to_str()) == Some(file_name) {
+            matches.push(path.to_path_buf());
+        }
+    });
+    matches.sort();
+    matches.into_iter().next()
+}
+
+/// Every image file name under `assets`, sorted and without duplicates, for
+/// the Assets tab's material texture picker.
+fn list_images(assets: &std::path::Path) -> Vec<String> {
+    let mut names = Vec::new();
+    walk_files(assets, &mut |path| {
+        let is_image = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(|e| IMAGE_EXTENSIONS.contains(&e.to_ascii_lowercase().as_str()))
+            .unwrap_or(false);
+        if is_image {
+            if let Some(name) = path.file_name().and_then(|f| f.to_str()) {
+                names.push(name.to_string());
+            }
+        }
+    });
+    names.sort();
+    names.dedup();
+    names
+}
+
+/// Build GPU-ready material data for a set of custom meshes, in the same
+/// name order `custom_names`/`mesh_meta` already share (see
+/// `MaterialGpuData`'s own doc comment for why decoding is cached). A mesh
+/// with no entry in `mesh_meta` yet (freshly imported, before its first
+/// material edit) gets `MeshMaterial::default()` — untextured, matching how
+/// it always looked before materials existed.
+fn build_material_gpu_data(
+    names: &[String],
+    mesh_meta: &std::collections::BTreeMap<String, frame_engine::world::MeshMeta>,
+    assets: &std::path::Path,
+    cache: &mut std::collections::HashMap<String, (u32, u32, Vec<u8>)>,
+) -> Vec<MaterialGpuData> {
+    names
+        .iter()
+        .map(|name| {
+            let material = mesh_meta
+                .get(name)
+                .map(|m| m.material.clone())
+                .unwrap_or_default();
+            let texture_rgba = material.texture.as_ref().and_then(|tex_name| {
+                if let Some(cached) = cache.get(tex_name) {
+                    return Some(cached.clone());
+                }
+                let path = find_image(assets, tex_name)?;
+                let img = image::open(&path).ok()?.to_rgba8();
+                let (width, height) = img.dimensions();
+                let data = (width, height, img.into_raw());
+                cache.insert(tex_name.clone(), data.clone());
+                Some(data)
+            });
+            MaterialGpuData {
+                texture_rgba,
+                roughness: material.roughness,
+                metalness: material.metalness,
+            }
+        })
+        .collect()
+}
+
 /// Call `visit` for every file under `dir`, in every subfolder. Unreadable
 /// folders are skipped rather than failing the whole walk.
 fn walk_files(dir: &std::path::Path, visit: &mut dyn FnMut(&std::path::Path)) {
@@ -6325,6 +7037,8 @@ fn main() {
         // No scene target until a project is opened.
         current_scene_path: None,
         custom_meshes: std::collections::BTreeMap::new(),
+        texture_cache: std::collections::HashMap::new(),
+        material_editing: None,
         prefabs: std::collections::BTreeMap::new(),
         new_prefab_name: String::new(),
         game_custom_names: Vec::new(),

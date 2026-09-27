@@ -32,23 +32,40 @@ struct Lights {
 };
 @group(0) @binding(1) var<uniform> lights: Lights;
 
+// This mesh's own material: a base-color texture (bound below) plus
+// roughness/metalness, one per imported model rather than per entity (see
+// world::MeshMaterial's doc comment in main.rs/world/mod.rs for why). Bound
+// fresh before each mesh's draw call, since different meshes in the same
+// frame can have different materials.
+struct MaterialParams {
+    // x: roughness (0 smooth .. 1 rough). y: metalness (0 .. 1 metal).
+    // z: 1.0 if material_texture holds a real texture, 0.0 for the shared
+    // default (a textureless mesh samples pure white, a harmless no-op).
+    // w unused.
+    params: vec4<f32>,
+};
+@group(1) @binding(0) var material_texture: texture_2d<f32>;
+@group(1) @binding(1) var material_sampler: sampler;
+@group(1) @binding(2) var<uniform> material: MaterialParams;
+
 // Per-vertex mesh data (matches MeshVertex in main.rs). Position is in the
 // primitive's local space, roughly unit-sized, centred on the origin, and is
 // blown up to world size below. Bound at vertex-buffer slot 0.
 struct VertexInput {
     @location(0) position: vec3<f32>,
     @location(1) normal: vec3<f32>,
+    @location(2) uv: vec2<f32>,
 };
 
 // Per-entity instance data (matches InstanceRaw in main.rs). Bound at slot 1.
 // Locations continue after the mesh attributes above.
 struct InstanceInput {
-    @location(2) position: vec3<f32>,
-    @location(3) color: vec3<f32>,
-    @location(4) selected: f32,
-    @location(5) scale: vec3<f32>,
-    @location(6) emissive: f32,
-    @location(7) yaw: f32,
+    @location(3) position: vec3<f32>,
+    @location(4) color: vec3<f32>,
+    @location(5) selected: f32,
+    @location(6) scale: vec3<f32>,
+    @location(7) emissive: f32,
+    @location(8) yaw: f32,
 };
 
 struct VertexOutput {
@@ -58,6 +75,7 @@ struct VertexOutput {
     @location(2) emissive: f32,
     @location(3) world_position: vec3<f32>,
     @location(4) world_normal: vec3<f32>,
+    @location(5) uv: vec2<f32>,
 };
 
 // World size of a primitive at scale 1. Primitives are generated at ~unit size
@@ -100,11 +118,24 @@ fn vs_main(vertex: VertexInput, instance: InstanceInput) -> VertexOutput {
     out.emissive = instance.emissive;
     out.world_position = world_pos;
     out.world_normal = rotated_normal;
+    out.uv = vertex.uv;
     return out;
 }
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+    // Base color: the entity's own vertex color, tinted by this mesh's
+    // texture when it has one (textureSample reads (1,1,1,1) from the
+    // shared default texture, a harmless no-op, when it doesn't).
+    let has_texture = material.params.z;
+    var base_color = in.color;
+    if (has_texture > 0.5) {
+        let sampled = textureSample(material_texture, material_sampler, in.uv);
+        base_color = base_color * sampled.rgb;
+    }
+    let roughness = material.params.x;
+    let metalness = material.params.y;
+
     // Ambient floor, the same value the old single hard-coded term always
     // used, plus every active light's diffuse contribution, summed. A scene
     // with no Light entities at all falls back to just this floor, flatter
@@ -132,18 +163,32 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
             light_dir = to_light / max(dist, 0.0001);
             attenuation = clamp(1.0 - dist / range, 0.0, 1.0);
         }
-        let diffuse = max(dot(normal, light_dir), 0.0);
-        accumulated = accumulated + diffuse * attenuation * intensity;
+        var diffuse = max(dot(normal, light_dir), 0.0);
+        // Roughness/metalness tweak, NOT a real specular highlight (that
+        // needs the camera's world position, not available here yet — see
+        // MeshMaterial's doc comment). A rough surface's lit side reads a
+        // little flatter/brighter (less falloff contrast); a metal surface's
+        // lit side reads punchier (more contrast, tinted toward its own
+        // color rather than the light's), approximating "matte" versus
+        // "shiny metal" without a real BRDF.
+        diffuse = pow(diffuse, mix(1.4, 0.7, roughness));
+        accumulated = accumulated + diffuse * attenuation * intensity * mix(1.0, 1.3, metalness);
     }
     let shade = min(accumulated, 1.0);
 
-    // Each entity draws in its own colour. Emissive blends between normal
-    // shading and full unlit brightness, so a high emissive value makes an
-    // entity glow, ignoring every light. The selected entity is then
-    // brightened toward white so it stands out.
-    let shaded = in.color * shade;
+    // Metals have essentially no diffuse ambient bounce, so their unlit side
+    // reads darker than a non-metal's; scale just the ambient floor down by
+    // metalness rather than the whole shaded result, so a lit metal doesn't
+    // simply look dimmer overall.
+    let shade_metal_adjusted = min(shade - 0.4 * metalness, 1.0);
 
-    let lit = mix(shaded, in.color, in.emissive);
+    // Each entity draws in its own (possibly textured) colour. Emissive
+    // blends between normal shading and full unlit brightness, so a high
+    // emissive value makes an entity glow, ignoring every light. The
+    // selected entity is then brightened toward white so it stands out.
+    let shaded = base_color * shade_metal_adjusted;
+
+    let lit = mix(shaded, base_color, in.emissive);
     let highlighted = mix(lit, vec3<f32>(1.0, 1.0, 1.0), 0.3 * in.selected);
     return vec4<f32>(highlighted, 1.0);
 }

@@ -9,17 +9,23 @@
 //                   v//vn or v/vt/vn. Indices are 1 based, negative counts
 //                   from the end.
 //
-// Texture coords (vt), materials, groups and anything else are skipped since
-// the renderer only draws single colour models right now. Faces with more than
-// 3 corners get fan triangulated. A face with no normals gets a computed flat
-// one so unshaded exports still light.
+// Materials, groups and anything else are still skipped: a model's texture,
+// roughness and metalness are assigned in the editor after import (see
+// world::MeshMaterial), not read from a .mtl file. Texture coordinates (vt)
+// ARE read now, so an imported model can be textured. Faces with more than 3
+// corners get fan triangulated. A face with no normals gets a computed flat
+// one so unshaded exports still light. A face with no texture coordinates
+// gets (0.0, 0.0) at every corner, same "missing data gets a harmless
+// default, not an error" tolerance the normal fallback already has.
 
-/// One vertex of a parsed mesh. Position and normal, same layout the editor
-/// feeds the GPU. Plain data, no graphics types in the engine.
+/// One vertex of a parsed mesh. Position, normal and UV, same layout the
+/// editor feeds the GPU. Plain data, no graphics types in the engine.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct MeshVertexData {
     pub position: [f32; 3],
     pub normal: [f32; 3],
+    /// Texture coordinates, (0.0, 0.0) when the OBJ had none for this corner.
+    pub uv: [f32; 2],
 }
 
 /// A parsed mesh ready to render. Flat triangle list, every 3 vertices is one
@@ -42,6 +48,7 @@ pub struct MeshData {
 pub fn parse_obj(text: &str) -> Result<MeshData, String> {
     let mut positions: Vec<[f32; 3]> = Vec::new();
     let mut normals: Vec<[f32; 3]> = Vec::new();
+    let mut uvs: Vec<[f32; 2]> = Vec::new();
     let mut vertices: Vec<MeshVertexData> = Vec::new();
 
     for (line_no, raw_line) in text.lines().enumerate() {
@@ -60,21 +67,30 @@ pub fn parse_obj(text: &str) -> Result<MeshData, String> {
         match keyword {
             "v" => positions.push(parse_vec3(&mut parts, line_no, "v")?),
             "vn" => normals.push(parse_vec3(&mut parts, line_no, "vn")?),
+            "vt" => uvs.push(parse_uv(&mut parts, line_no)?),
             "f" => {
                 // Resolve every corner first, then fan triangulate:
                 // corners (0, k, k+1) for k in 1..n-1.
-                let mut corners: Vec<([f32; 3], Option<[f32; 3]>)> = Vec::new();
+                let mut corners: Vec<([f32; 3], [f32; 2], Option<[f32; 3]>)> = Vec::new();
                 for token in parts {
-                    let (pi, ni) = parse_face_corner(token, line_no)?;
+                    let (pi, ti, ni) = parse_face_corner(token, line_no)?;
                     let position = *resolve(&positions, pi)
                         .ok_or_else(|| format!("line {line_no}: face vertex index {pi} is out of range"))?;
+                    let uv = match ti {
+                        Some(ti) => *resolve(&uvs, ti).ok_or_else(|| {
+                            format!("line {line_no}: face texture coord index {ti} is out of range")
+                        })?,
+                        // No vt on this corner at all: a harmless default,
+                        // same tolerance a missing normal already gets.
+                        None => [0.0, 0.0],
+                    };
                     let normal = match ni {
                         Some(ni) => Some(*resolve(&normals, ni).ok_or_else(|| {
                             format!("line {line_no}: face normal index {ni} is out of range")
                         })?),
                         None => None,
                     };
-                    corners.push((position, normal));
+                    corners.push((position, uv, normal));
                 }
                 if corners.len() < 3 {
                     return Err(format!("line {line_no}: face has fewer than 3 corners"));
@@ -84,15 +100,16 @@ pub fn parse_obj(text: &str) -> Result<MeshData, String> {
                     // A corner with no exported normal gets the flat face
                     // normal from the triangle winding.
                     let flat = face_normal(tri[0].0, tri[1].0, tri[2].0);
-                    for (position, normal) in tri {
+                    for (position, uv, normal) in tri {
                         vertices.push(MeshVertexData {
                             position,
                             normal: normal.unwrap_or(flat),
+                            uv,
                         });
                     }
                 }
             }
-            // vt, o, g, s, usemtl, mtllib, l, p and so on. Not used, not an error.
+            // o, g, s, usemtl, mtllib, l, p and so on. Not used, not an error.
             _ => {}
         }
     }
@@ -121,16 +138,42 @@ fn parse_vec3<'a>(
     Ok(out)
 }
 
+/// Parse three floats for a vt line. OBJ allows a third (w) component for
+/// 3D textures; this parser only ever uses 2D texture coordinates, so a
+/// third number, if present, is read and discarded rather than rejected.
+fn parse_uv<'a>(
+    parts: &mut impl Iterator<Item = &'a str>,
+    line_no: usize,
+) -> Result<[f32; 2], String> {
+    let mut out = [0.0f32; 2];
+    for slot in &mut out {
+        let token = parts
+            .next()
+            .ok_or_else(|| format!("line {line_no}: 'vt' needs at least two numbers"))?;
+        *slot = token
+            .parse::<f32>()
+            .map_err(|_| format!("line {line_no}: '{token}' is not a number"))?;
+    }
+    Ok(out)
+}
+
 /// Parse one face corner token (v, v/vt, v//vn or v/vt/vn) into a
-/// (position index, optional normal index) pair. Still 1 based or negative.
-fn parse_face_corner(token: &str, line_no: usize) -> Result<(i64, Option<i64>), String> {
+/// (position index, optional texture coord index, optional normal index)
+/// triple. Still 1 based or negative.
+fn parse_face_corner(token: &str, line_no: usize) -> Result<(i64, Option<i64>, Option<i64>), String> {
     let mut fields = token.split('/');
     let pi = fields
         .next()
         .filter(|s| !s.is_empty())
         .and_then(|s| s.parse::<i64>().ok())
         .ok_or_else(|| format!("line {line_no}: bad face corner '{token}'"))?;
-    let _vt = fields.next(); // texture coord index, unused
+    let ti = match fields.next() {
+        Some(s) if !s.is_empty() => Some(
+            s.parse::<i64>()
+                .map_err(|_| format!("line {line_no}: bad texture coord index in '{token}'"))?,
+        ),
+        _ => None,
+    };
     let ni = match fields.next() {
         Some(s) if !s.is_empty() => Some(
             s.parse::<i64>()
@@ -138,7 +181,7 @@ fn parse_face_corner(token: &str, line_no: usize) -> Result<(i64, Option<i64>), 
         ),
         _ => None,
     };
-    Ok((pi, ni))
+    Ok((pi, ti, ni))
 }
 
 /// Resolve an OBJ index into the list it refers to. 1 based, negative counts

@@ -184,13 +184,59 @@ pub enum Mesh {
     Custom(String),
 }
 
+/// A material for an imported model, keyed the same way as the `MeshMeta` it
+/// lives on: one per model, shared by every entity that uses that model,
+/// not per-entity the way `Material`'s emissive strength is. Chosen this way
+/// deliberately, not by accident: the renderer already draws every entity of
+/// a given mesh in one batched draw call (see `build_instances`), so tying a
+/// texture to the mesh itself needs no new per-instance texture lookup, while
+/// a per-entity texture would. `roughness` and `metalness` ride along on the
+/// same footing for consistency, even though either could in principle be
+/// per-entity like `emissive` is; splitting them from the texture would mean
+/// two different places to look for "what does this model look like".
+///
+/// Feeds a simple, non-physically-based shading tweak (see shader.wgsl):
+/// roughness and metalness are NOT literal specular-highlight controls yet.
+/// True view-dependent specular needs the camera's world position threaded
+/// into every render call site (the main viewport, Play window, popped-out
+/// tabs, and the Inspector's camera preview each build their own view
+/// separately), a larger, separate change, deliberately not done as part of
+/// this first pass.
+#[derive(Serialize, Deserialize, Clone, PartialEq)]
+pub struct MeshMaterial {
+    /// A texture file name, resolved the same "anywhere under assets/" way
+    /// `Sound` resolves its file. `None` means untextured: the entity's own
+    /// `Color` is used exactly as it was before this existed.
+    pub texture: Option<String>,
+    /// 0.0 (smooth) to 1.0 (rough). Defaults to 0.5, a neutral middle value.
+    pub roughness: f32,
+    /// 0.0 (non-metal) to 1.0 (metal). Defaults to 0.0, matching every
+    /// model's appearance before this existed.
+    pub metalness: f32,
+}
+
+impl Default for MeshMaterial {
+    fn default() -> Self {
+        MeshMaterial {
+            texture: None,
+            roughness: 0.5,
+            metalness: 0.0,
+        }
+    }
+}
+
 /// Metadata for one imported model, keyed by name in World::mesh_meta. Holds
 /// the unit space half extents (each 0.5 or less, same unit sizing as the
-/// primitives) that collision fits its box to. Lives in the scene rather than
-/// the model file so a scene knows its collision shapes before assets load.
-#[derive(Serialize, Deserialize, Clone, Copy, PartialEq)]
+/// primitives) that collision fits its box to, plus its material. Lives in
+/// the scene rather than the model file so a scene knows its collision shape
+/// and appearance before assets load. No longer `Copy`: `MeshMaterial` carries
+/// an `Option<String>`, so this now needs an explicit `.clone()` at its call
+/// sites, same as `Prefab` and other non-`Copy` scene data.
+#[derive(Serialize, Deserialize, Clone, PartialEq)]
 pub struct MeshMeta {
     pub half_extents: [f32; 3],
+    #[serde(default)]
+    pub material: MeshMaterial,
 }
 
 /// A plugin's manifest (its `plugin.ron`), one per folder under a project's
