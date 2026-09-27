@@ -5,8 +5,8 @@ use frame_engine::input::{Button, InputState};
 use frame_engine::physics::{GRAVITY_Y, Physics};
 use frame_engine::systems;
 use frame_engine::world::{
-    Controlled, Gravity, Light, LightKind, Mesh, Position, RigidBody, Script, ScriptRuntime,
-    Sound, Static, Velocity, World,
+    Camera, Controlled, Gravity, Light, LightKind, Mesh, Position, RigidBody, Script,
+    ScriptRuntime, Sound, Static, Velocity, World,
 };
 use glam::{Mat4, Vec3, Vec4};
 use std::sync::Arc;
@@ -34,6 +34,13 @@ const ORBIT_SENS: f32 = 0.005;
 const LOOK_SENS: f32 = 0.005;
 // Format of the depth buffer. 32-bit float depth, no stencil.
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
+// Size of the Camera preview shown in the Inspector when a Camera entity is
+// selected. Fixed rather than following the panel width: the Inspector's own
+// width can change (docking, popping out), and re-creating the preview
+// texture and its egui registration on every resize is more churn than a
+// small preview image needs.
+const PREVIEW_WIDTH: u32 = 320;
+const PREVIEW_HEIGHT: u32 = 180;
 // How far a single nudge moves the selected entity, in world units.
 const EDIT_STEP: f32 = 5.0;
 // How far the WASD free camera pans the focus point per frame (while paused).
@@ -292,15 +299,12 @@ impl TextInstance {
 }
 // Create (or recreate) the depth texture's view, sized to match the surface.
 // Called once at startup and again on every resize.
-fn create_depth_view(
-    device: &wgpu::Device,
-    config: &wgpu::SurfaceConfiguration,
-) -> wgpu::TextureView {
+fn create_depth_view(device: &wgpu::Device, width: u32, height: u32) -> wgpu::TextureView {
     let texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("depth texture"),
         size: wgpu::Extent3d {
-            width: config.width.max(1),
-            height: config.height.max(1),
+            width: width.max(1),
+            height: height.max(1),
             depth_or_array_layers: 1,
         },
         mip_level_count: 1,
@@ -406,6 +410,47 @@ fn camera_view_proj(
         focus_x, focus_y, focus_z, distance, yaw, pitch, width, height,
     )
     .to_cols_array_2d()
+}
+// The view-projection matrix for one specific Camera-marked entity, looking
+// straight along its own yaw (no pitch, since Rotation is yaw-only across
+// this whole engine). Shared by Play mode's camera selection below and the
+// Inspector's Camera preview, which needs the *selected* camera's view
+// specifically, not necessarily whichever one Play would pick (see
+// find_camera_entity below for the "which one would Play pick" question).
+//
+// Deliberately does not reuse camera_matrix/view_forward above: those use
+// their own yaw convention (yaw turns the opposite way from an entity's
+// Rotation.yaw), built for the orbit camera's own cam_yaw/cam_pitch fields.
+// Mixing the two conventions in one function is exactly the kind of mistake
+// that already had to be fixed once in physics.rs, so this works out the
+// entity's forward vector directly from the documented convention instead:
+// yaw 0 faces -Z, and yaw turns clockwise seen from above (towards +X).
+fn camera_entity_view_proj(
+    world: &frame_engine::world::World,
+    id: usize,
+    width: u32,
+    height: u32,
+) -> Option<[[f32; 4]; 4]> {
+    let pos = world.positions.get(id)?;
+    let yaw = world.rotations.get(id).map(|r| r.yaw).unwrap_or(0.0);
+    let eye = Vec3::new(pos.x, pos.y, pos.z);
+    let forward = Vec3::new(yaw.sin(), 0.0, -yaw.cos());
+    let aspect = width as f32 / height.max(1) as f32;
+    let view = Mat4::look_at_rh(eye, eye + forward, Vec3::Y);
+    let proj = Mat4::perspective_rh(FOV_DEGREES.to_radians(), aspect, 0.1, 10000.0);
+    Some((proj * view).to_cols_array_2d())
+}
+// The scene's active Camera entity, if any: the lowest id. What Play mode
+// renders from when one exists, and also the entity to leave out of the
+// render itself (see build_instances' own `exclude` doc comment) -- both
+// uses need the same answer to the same question, "which entity is the
+// camera right now", so this is the one place that answers it.
+fn find_camera_entity(world: &frame_engine::world::World) -> Option<usize> {
+    world
+        .cameras
+        .iter()
+        .enumerate()
+        .find_map(|(id, slot)| slot.as_ref().map(|_| id))
 }
 // The camera's look direction (eye -> target) for a given yaw/pitch. Matches the
 // orbit convention, so entering fly mode preserves the current heading.
@@ -537,6 +582,17 @@ struct GpuState {
     scene_bind_group: wgpu::BindGroup,
     depth_view: wgpu::TextureView,
     egui_renderer: egui_wgpu::Renderer,
+    // Camera preview (see `render_preview`): a small, fixed-size offscreen
+    // target with its own camera uniform and bind group (so writing its
+    // view_proj never disturbs `camera_buffer`, the main viewport's own),
+    // registered once with egui_renderer so re-rendering into the same
+    // texture view each frame is all that's needed to keep the Inspector's
+    // preview image current, no re-registration.
+    preview_view: wgpu::TextureView,
+    preview_depth_view: wgpu::TextureView,
+    preview_camera_buffer: wgpu::Buffer,
+    preview_bind_group: wgpu::BindGroup,
+    preview_texture_id: egui::TextureId,
 }
 impl GpuState {
     /// Builds a GpuState for one window. `shared` is `None` exactly once per
@@ -591,10 +647,10 @@ impl GpuState {
             .get_default_config(&adapter, size.width.max(1), size.height.max(1))
             .unwrap();
         surface.configure(&device, &config);
-        let depth_view = create_depth_view(&device, &config);
+        let depth_view = create_depth_view(&device, config.width, config.height);
         // egui's renderer. It draws in its own pass with no depth attachment,
         // so RendererOptions::default() (depth_stencil_format: None) is correct.
-        let egui_renderer = egui_wgpu::Renderer::new(
+        let mut egui_renderer = egui_wgpu::Renderer::new(
             &device,
             config.format,
             egui_wgpu::RendererOptions::default(),
@@ -659,6 +715,51 @@ impl GpuState {
                 },
             ],
         });
+        // --- Camera preview (see GpuState's own field doc comment) ---
+        let preview_texture = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("camera preview texture"),
+            size: wgpu::Extent3d {
+                width: PREVIEW_WIDTH,
+                height: PREVIEW_HEIGHT,
+                depth_or_array_layers: 1,
+            },
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: config.format,
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+            view_formats: &[],
+        });
+        let preview_view = preview_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let preview_depth_view = create_depth_view(&device, PREVIEW_WIDTH, PREVIEW_HEIGHT);
+        let preview_camera_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("preview camera buffer"),
+            contents: bytemuck::cast_slice(&[CameraUniform {
+                view_proj: Mat4::IDENTITY.to_cols_array_2d(),
+            }]),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        // Its own bind group, not a shared one: writing this camera's
+        // view_proj each frame must never touch `camera_buffer`, the
+        // viewport's own, since both get drawn in the same frame.
+        let preview_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("preview scene bind group"),
+            layout: &scene_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: preview_camera_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    // Same lights as the main viewport: it's the same scene,
+                    // just seen from a different camera.
+                    resource: lights_buffer.as_entire_binding(),
+                },
+            ],
+        });
+        let preview_texture_id =
+            egui_renderer.register_native_texture(&device, &preview_view, wgpu::FilterMode::Linear);
         // --- Primitive geometry: one shared vertex buffer, built once ---
         // Concatenate every primitive's vertices and remember each one's range,
         // in the engine's Mesh order (Cube, Sphere, Plane). At draw time we bind
@@ -761,6 +862,11 @@ impl GpuState {
                 scene_bind_group,
                 depth_view,
                 egui_renderer,
+                preview_view,
+                preview_depth_view,
+                preview_camera_buffer,
+                preview_bind_group,
+                preview_texture_id,
             },
             shared_out,
         )
@@ -778,7 +884,8 @@ impl GpuState {
             self.config.height = height;
             self.surface.configure(&self.device, &self.config);
             // Depth buffer must track the window size, or the test reads garbage.
-            self.depth_view = create_depth_view(&self.device, &self.config);
+            self.depth_view =
+                create_depth_view(&self.device, self.config.width, self.config.height);
         }
     }
     // Draw one frame: entities (world-space cubes) then text (screen overlay).
@@ -965,6 +1072,99 @@ impl GpuState {
         );
         frame.present();
     }
+    /// Render the scene from a Camera entity's own point of view into the
+    /// small, fixed-size preview texture registered with egui as
+    /// `preview_texture_id`. Separate from `render()` deliberately: this
+    /// draws to an offscreen texture, not the window's swapchain, has no
+    /// egui pass of its own, and uses its own camera bind group so writing
+    /// its view_proj can never clobber the main viewport's `camera_buffer`
+    /// mid-frame. The caller (the Inspector's Camera preview) is expected to
+    /// call this before drawing the egui frame that displays the texture,
+    /// same window and same encoder timing `render()` already relies on for
+    /// its own camera/lights writes.
+    fn render_preview(
+        &mut self,
+        instances: &[InstanceRaw],
+        group_counts: &[u32],
+        view_proj: [[f32; 4]; 4],
+        lights: &[LightRaw; MAX_LIGHTS],
+    ) {
+        self.queue.write_buffer(
+            &self.preview_camera_buffer,
+            0,
+            bytemuck::cast_slice(&[CameraUniform { view_proj }]),
+        );
+        self.queue.write_buffer(
+            &self.lights_buffer,
+            0,
+            bytemuck::cast_slice(&[LightsUniform { lights: *lights }]),
+        );
+        let instance_buffer = if instances.is_empty() {
+            None
+        } else {
+            Some(
+                self.device
+                    .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                        label: Some("preview instance buffer"),
+                        contents: bytemuck::cast_slice(instances),
+                        usage: wgpu::BufferUsages::VERTEX,
+                    }),
+            )
+        };
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("preview encoder"),
+            });
+        {
+            let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                label: Some("preview pass"),
+                color_attachments: &[Some(wgpu::RenderPassColorAttachment {
+                    view: &self.preview_view,
+                    resolve_target: None,
+                    depth_slice: None,
+                    ops: wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(wgpu::Color {
+                            r: 0.12,
+                            g: 0.12,
+                            b: 0.16,
+                            a: 1.0,
+                        }),
+                        store: wgpu::StoreOp::Store,
+                    },
+                })],
+                depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                    view: &self.preview_depth_view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: wgpu::LoadOp::Clear(1.0),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: None,
+                }),
+                timestamp_writes: None,
+                occlusion_query_set: None,
+                multiview_mask: None,
+            });
+            render_pass.set_pipeline(&self.render_pipeline);
+            render_pass.set_bind_group(0, &self.preview_bind_group, &[]);
+            if let Some(buffer) = &instance_buffer {
+                render_pass.set_vertex_buffer(0, self.mesh_vertex_buffer.slice(..));
+                let stride = std::mem::size_of::<InstanceRaw>() as wgpu::BufferAddress;
+                let mut instance_start = 0u32;
+                for (primitive, count) in group_counts.iter().enumerate() {
+                    if *count > 0 {
+                        let begin = instance_start as wgpu::BufferAddress * stride;
+                        render_pass.set_vertex_buffer(1, buffer.slice(begin..));
+                        if let Some(range) = self.mesh_ranges.get(primitive) {
+                            render_pass.draw(range.clone(), 0..*count);
+                        }
+                    }
+                    instance_start += count;
+                }
+            }
+        }
+        self.queue.submit(std::iter::once(encoder.finish()));
+    }
 }
 /// Which tab is showing in the right-hand inspector dock.
 /// A dockable tool panel, shown as a tab in the right-hand egui_dock area. These
@@ -1061,6 +1261,8 @@ struct EditedEntity {
     is_rigid_body: bool,
     light: Option<Light>,
     sound: Option<Sound>,
+    is_camera: bool,
+    parent: Option<frame_engine::world::Parent>,
 }
 
 /// Source Control tab: a read-only view of the open project's git state —
@@ -1415,6 +1617,11 @@ fn inspector_tab_ui(
     // The open project's assets folder, for the Sound picker. None when no
     // project is open.
     assets_root: Option<&std::path::Path>,
+    // The main window's Camera preview texture, registered with egui once
+    // and re-rendered into every frame a Camera entity is selected (see
+    // GpuState::render_preview). None on the launcher screen, before the
+    // window/GPU exist.
+    preview_texture_id: Option<egui::TextureId>,
 ) {
     match edited {
         Some(EditedEntity {
@@ -1433,6 +1640,8 @@ fn inspector_tab_ui(
             is_rigid_body,
             light,
             sound,
+            is_camera,
+            parent,
         }) => {
             ui.label(format!("Entity {id}"));
             ui.add_space(4.0);
@@ -1525,6 +1734,35 @@ fn inspector_tab_ui(
                      With Controlled it's a character: input moves it and it \
                      stops at walls. Add Gravity to make it fall.",
                 );
+            ui.checkbox(is_camera, "Camera").on_hover_text(
+                "Play mode renders from the first Camera entity in the \
+                     scene (lowest id) instead of the editor's own orbit \
+                     camera. Only its Position and yaw matter — no pitch, \
+                     since Rotation is yaw-only everywhere in this engine. \
+                     Attach it to a Parent below to have it ride along on \
+                     another entity.",
+            );
+            if *is_camera {
+                match preview_texture_id {
+                    Some(texture_id) => {
+                        ui.add(
+                            egui::Image::new((
+                                texture_id,
+                                egui::vec2(PREVIEW_WIDTH as f32, PREVIEW_HEIGHT as f32) * 0.75,
+                            ))
+                            .corner_radius(4.0),
+                        )
+                        .on_hover_text(
+                            "What this camera sees, updated live while it's \
+                             selected. Position/Rotation edits above, and any \
+                             Parent it rides on, show up here immediately.",
+                        );
+                    }
+                    None => {
+                        ui.weak("(camera preview unavailable)");
+                    }
+                }
+            }
             ui.add_space(8.0);
             ui.label("Light");
             let mut has_light = light.is_some();
@@ -1639,6 +1877,62 @@ fn inspector_tab_ui(
                 if ui.button("Play now").clicked() {
                     s.play = true;
                 }
+            }
+            ui.add_space(8.0);
+            ui.label("Parent");
+            let mut has_parent = parent.is_some();
+            if ui
+                .checkbox(&mut has_parent, "Attached to another entity")
+                .changed()
+            {
+                *parent = if has_parent {
+                    Some(frame_engine::world::Parent::default())
+                } else {
+                    None
+                };
+            }
+            if let Some(p) = parent {
+                ui.horizontal(|ui| {
+                    ui.label("Parent entity id");
+                    ui.add(egui::DragValue::new(&mut p.entity).speed(1.0));
+                });
+                ui.label("Offset (in the parent's own space)")
+                    .on_hover_text(
+                        "x is to the parent's right, z is behind it — these \
+                         turn with the parent's yaw, so the offset stays in \
+                         the same relative spot as it turns.",
+                    );
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::DragValue::new(&mut p.offset_x)
+                            .speed(0.1)
+                            .prefix("x "),
+                    );
+                    ui.add(
+                        egui::DragValue::new(&mut p.offset_y)
+                            .speed(0.1)
+                            .prefix("y "),
+                    );
+                    ui.add(
+                        egui::DragValue::new(&mut p.offset_z)
+                            .speed(0.1)
+                            .prefix("z "),
+                    );
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Offset yaw");
+                    let mut offset_yaw_degrees = p.offset_yaw.to_degrees();
+                    if ui
+                        .add(
+                            egui::DragValue::new(&mut offset_yaw_degrees)
+                                .speed(1.0)
+                                .suffix("°"),
+                        )
+                        .changed()
+                    {
+                        p.offset_yaw = offset_yaw_degrees.to_radians();
+                    }
+                });
             }
             ui.add_space(8.0);
             ui.label("Script");
@@ -1931,6 +2225,10 @@ struct EditorTabViewer {
     // the caller pops it out (see App::pop_out_tab) after the egui pass, the
     // same lift-then-write-back pattern menu_action uses.
     pop_out_request: Option<Tab>,
+    // The main window's GpuState.preview_texture_id, for the Inspector's
+    // Camera preview to draw. `None` before the window/GPU exist yet (the
+    // launcher screen), in which case the Inspector just doesn't show one.
+    preview_texture_id: Option<egui::TextureId>,
 }
 
 impl egui_dock::TabViewer for EditorTabViewer {
@@ -1990,6 +2288,7 @@ impl egui_dock::TabViewer for EditorTabViewer {
                 &self.custom_mesh_names,
                 &mut self.custom_fields,
                 self.assets_root.as_deref(),
+                self.preview_texture_id,
             ),
             Tab::Scripts => scripts_tab_ui(
                 ui,
@@ -2256,6 +2555,7 @@ impl App {
             systems::movement(&mut self.world);
             self.physics.step(&mut self.world, 1.0 / TICK_RATE as f32);
             systems::resolve_collisions(&mut self.world);
+            systems::apply_parenting(&mut self.world);
             self.log("Stepped one tick");
         }
     }
@@ -2985,6 +3285,10 @@ impl App {
                     physics.step(world, 1.0 / TICK_RATE as f32);
                 }
                 systems::resolve_collisions(world);
+                // Last, so a mounted camera (or anything else riding on a
+                // Parent) sees this tick's real final position, not the
+                // parent's position from before movement/physics ran.
+                systems::apply_parenting(world);
                 sound_messages.extend(update_sounds(
                     world,
                     self.audio_manager.as_mut(),
@@ -3006,25 +3310,47 @@ impl App {
             }
             None => return,
         };
+        // The active Camera entity, if any (lowest id) -- found once and
+        // reused both to exclude it from its own render below (a first-
+        // person camera doesn't draw its own mesh around its own eye) and to
+        // build the view itself.
+        let active_camera_id = self
+            .game_world
+            .as_ref()
+            .and_then(|world| find_camera_entity(world));
         let (instances, group_counts, lights) = match &self.game_world {
             Some(world) => {
                 let empty = std::collections::HashSet::new();
-                let (instances, group_counts) =
-                    build_instances(world, None, &empty, &self.game_custom_names);
+                let (instances, group_counts) = build_instances(
+                    world,
+                    None,
+                    &empty,
+                    &self.game_custom_names,
+                    active_camera_id,
+                );
                 (instances, group_counts, build_lights(world))
             }
             None => return,
         };
-        let view_proj = camera_view_proj(
-            self.cam_focus_x,
-            self.cam_focus_y,
-            self.cam_focus_z,
-            self.cam_distance,
-            self.cam_yaw,
-            self.cam_pitch,
-            width,
-            height,
-        );
+        // If the scene has a Camera entity, Play renders from it: what the
+        // player actually sees. Otherwise, fall back to the editor's own
+        // orbit camera, frozen at whatever it was showing when Play started
+        // (the pre-existing behaviour, unchanged for a scene with no camera).
+        let view_proj = active_camera_id
+            .zip(self.game_world.as_ref())
+            .and_then(|(id, world)| camera_entity_view_proj(world, id, width, height))
+            .unwrap_or_else(|| {
+                camera_view_proj(
+                    self.cam_focus_x,
+                    self.cam_focus_y,
+                    self.cam_focus_z,
+                    self.cam_distance,
+                    self.cam_yaw,
+                    self.cam_pitch,
+                    width,
+                    height,
+                )
+            });
         if let Some(gpu) = self.game_gpu.as_mut() {
             gpu.render(
                 &instances,
@@ -4177,6 +4503,9 @@ impl ApplicationHandler for App {
                     systems::movement(&mut self.world);
                     self.physics.step(&mut self.world, 1.0 / TICK_RATE as f32);
                     systems::resolve_collisions(&mut self.world);
+                    // Last, so a mounted camera (or anything else riding on
+                    // a Parent) sees this tick's real final position.
+                    systems::apply_parenting(&mut self.world);
                     sound_messages.extend(update_sounds(
                         &mut self.world,
                         self.audio_manager.as_mut(),
@@ -4206,7 +4535,7 @@ impl ApplicationHandler for App {
                 // Per-primitive instance buckets from the world (see build_instances).
                 let custom_names: Vec<String> = self.custom_meshes.keys().cloned().collect();
                 let (instances, group_counts) =
-                    build_instances(&self.world, selected, &colliding, &custom_names);
+                    build_instances(&self.world, selected, &colliding, &custom_names, None);
                 let lights = build_lights(&self.world);
                 let (width, height) = match &self.window {
                     Some(window) => {
@@ -4348,6 +4677,8 @@ impl ApplicationHandler for App {
                         is_rigid_body: self.world.rigid_bodies.get(id).is_some(),
                         light: self.world.lights.get(id).copied(),
                         sound: self.world.sounds.get(id).cloned(),
+                        is_camera: self.world.cameras.get(id).is_some(),
+                        parent: self.world.parents.get(id).copied(),
                     })
                 });
                 // For each enabled plugin's declared fields, keep the ones
@@ -4445,6 +4776,7 @@ impl ApplicationHandler for App {
                     viewport_rect: None,
                     gizmo: gizmo_draw,
                     pop_out_request: None,
+                    preview_texture_id: self.gpu.as_ref().map(|g| g.preview_texture_id),
                 };
                 let (egui_paint_jobs, egui_textures_delta, egui_ppp) = if let (
                     Some(state),
@@ -4761,6 +5093,16 @@ impl ApplicationHandler for App {
                 // the one drain-back below, instead of racing each other.
                 let popped_out_tabs: Vec<Tab> = self.popped_out.keys().copied().collect();
                 for tab in popped_out_tabs {
+                    // A popped-out window has its own GpuState and therefore
+                    // its own egui_renderer, which never had the main
+                    // window's preview_texture_id registered — drawing it
+                    // there would reference a texture id that doesn't exist
+                    // in that renderer. Simplest safe fix: no live preview
+                    // image while the Inspector is popped out; the Camera
+                    // checkbox and Parent section still work as normal.
+                    if tab == Tab::Inspector {
+                        viewer.preview_texture_id = None;
+                    }
                     self.render_popped_out(tab, &mut viewer);
                 }
                 self.console_tab = console_tab;
@@ -4846,6 +5188,8 @@ impl ApplicationHandler for App {
                     is_rigid_body,
                     light,
                     sound,
+                    is_camera,
+                    parent,
                 }) = edited
                 {
                     if let Some(p) = self.world.positions.get_mut(id) {
@@ -4885,6 +5229,19 @@ impl ApplicationHandler for App {
                         }
                         None => {
                             self.world.lights.remove(id);
+                        }
+                    }
+                    if is_camera {
+                        self.world.cameras.insert(id, Camera);
+                    } else {
+                        self.world.cameras.remove(id);
+                    }
+                    match parent {
+                        Some(p) => {
+                            self.world.parents.insert(id, p);
+                        }
+                        None => {
+                            self.world.parents.remove(id);
                         }
                     }
                     match sound {
@@ -4938,6 +5295,42 @@ impl ApplicationHandler for App {
                     }
                     Some(MenuAction::Quit) => event_loop.exit(),
                     None => {}
+                }
+                // Camera preview: only while a Camera entity is selected, and
+                // rendered before the main pass below so the Inspector's egui
+                // draw call this same frame already sees this frame's view,
+                // not last frame's.
+                if let Some(id) = self.selected {
+                    if self.world.cameras.get(id).is_some() {
+                        if let Some(preview_view_proj) =
+                            camera_entity_view_proj(&self.world, id, PREVIEW_WIDTH, PREVIEW_HEIGHT)
+                        {
+                            // Excludes the camera's own entity: otherwise its
+                            // eye sits somewhere inside its own mesh (the
+                            // main viewport draws it as an ordinary cube, so
+                            // it can be selected and moved like anything
+                            // else) and the preview is just the inside of
+                            // that shape, whatever its scale. Built fresh
+                            // rather than reusing `instances` above, which
+                            // deliberately keeps every entity for the main
+                            // viewport.
+                            let (preview_instances, preview_group_counts) = build_instances(
+                                &self.world,
+                                selected,
+                                &colliding,
+                                &custom_names,
+                                Some(id),
+                            );
+                            if let Some(gpu) = &mut self.gpu {
+                                gpu.render_preview(
+                                    &preview_instances,
+                                    &preview_group_counts,
+                                    preview_view_proj,
+                                    &lights,
+                                );
+                            }
+                        }
+                    }
                 }
                 if let Some(gpu) = &mut self.gpu {
                     gpu.render(
@@ -5390,11 +5783,24 @@ fn build_instances(
     selected: Option<usize>,
     colliding: &std::collections::HashSet<usize>,
     custom_names: &[String],
+    // An entity to leave out entirely, not drawn at all. Used when rendering
+    // from a Camera entity's own point of view (the Inspector preview, or
+    // Play mode with a Camera in the scene): without this, a first-person
+    // camera renders its own mesh with its eye sitting somewhere inside that
+    // mesh's own geometry, so the view is just the inside of a solid shape,
+    // however small the mesh's scale — the same reason a first-person game
+    // hides the player's own body from their own camera. `None` for every
+    // other caller (the main orbit viewport, Play with no Camera), which
+    // draws every entity as normal.
+    exclude: Option<usize>,
 ) -> (Vec<InstanceRaw>, Vec<u32>) {
     // One bucket per mesh: the three primitives, then the imported models in
     // the same sorted name order the mesh buffer uses.
     let mut buckets: Vec<Vec<InstanceRaw>> = vec![Vec::new(); 3 + custom_names.len()];
     for (id, slot) in world.positions.iter().enumerate() {
+        if Some(id) == exclude {
+            continue;
+        }
         let Some(p) = slot.as_ref() else { continue };
         let color = world.colors.get(id).copied().unwrap_or_default();
         let scale = world.scales.get(id).copied().unwrap_or_default();

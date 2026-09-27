@@ -228,6 +228,68 @@ pub fn resolve_collisions(world: &mut World) {
     }
 }
 
+/// Move and turn every `Parent`-attached entity to match its parent, plus its
+/// own local offset. Meant to run last each tick, after every other system
+/// that might move the parent (hand-rolled movement, scripts, physics), so a
+/// rider sees the parent's *final* position for that tick, not a stale one
+/// from before the parent moved.
+///
+/// The offset rotates with the parent's yaw, using this engine's own
+/// clockwise-from-above convention (yaw 0 faces -Z; see `physics.rs`'s
+/// module doc comment for the fullest explanation of it). Worked out
+/// independently here rather than shared with `physics::rapier_rotation`,
+/// since that one builds a rapier `Rotation` type and this is a plain 2D
+/// rotation of an (x, z) offset: for a parent facing yaw, a purely-forward
+/// local offset (0, -1) should end up pointing the same way the parent's own
+/// forward vector does, and a purely-rightward one (1, 0) should end up
+/// pointing the same way the parent's own right side does as it turns; both
+/// were checked against yaw 0 and yaw pi/2 while this was built.
+///
+/// An entity with no `Parent`, or whose named parent has since despawned, is
+/// left untouched, the same tolerance a stale `Script` reference gets.
+pub fn apply_parenting(world: &mut World) {
+    let ids: Vec<usize> = world
+        .parents
+        .iter()
+        .enumerate()
+        .filter_map(|(id, slot)| slot.as_ref().map(|_| id))
+        .collect();
+    for id in ids {
+        let Some(parent) = world.parents.get(id).copied() else {
+            continue;
+        };
+        let Some(parent_pos) = world.positions.get(parent.entity).copied() else {
+            continue; // dangling or missing parent: leave this entity as it is
+        };
+        let parent_yaw = world
+            .rotations
+            .get(parent.entity)
+            .map(|r| r.yaw)
+            .unwrap_or(0.0);
+        let (sin, cos) = parent_yaw.sin_cos();
+        let world_dx = parent.offset_x * cos - parent.offset_z * sin;
+        let world_dz = parent.offset_x * sin + parent.offset_z * cos;
+        if let Some(p) = world.positions.get_mut(id) {
+            p.x = parent_pos.x + world_dx;
+            p.y = parent_pos.y + parent.offset_y;
+            p.z = parent_pos.z + world_dz;
+        }
+        // Unconditional insert, not `get_mut`: a freshly spawned entity has
+        // no `Rotation` at all until something gives it one (the Inspector
+        // does, on first edit; a script never has to). A `Parent`-attached
+        // entity needs a real, current yaw to be worth attaching at all (a
+        // mounted camera's own facing depends on it), so this creates one
+        // rather than silently doing nothing for an entity that never
+        // happened to get a `Rotation` from anywhere else.
+        world.rotations.insert(
+            id,
+            crate::world::Rotation {
+                yaw: parent_yaw + parent.offset_yaw,
+            },
+        );
+    }
+}
+
 /// Accelerate every falling entity downward (−Y). An entity falls if it carries
 /// the `Gravity` marker and isn't `Static`. This adds to velocity, not position,
 /// so `movement` integrates it and `resolve_collisions` can arrest it against a

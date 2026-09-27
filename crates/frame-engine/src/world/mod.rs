@@ -103,11 +103,49 @@ pub struct Gravity;
 /// `Static` maps to a fixed rapier body, and `Gravity` without `Static` maps
 /// to a dynamic one; ordinary `movement` (a `Velocity` with neither marker)
 /// has no rapier equivalent yet, so a `RigidBody`-marked entity needs one of
-/// the other two. A `RigidBody`-marked entity that is also `Controlled` is
-/// not yet supported, a named, deliberate limitation (see the `physics`
-/// module), not a silent no-op.
+/// the other two. `RigidBody` together with `Controlled` is a kinematic
+/// character, driven by rapier's own character controller instead of forces;
+/// see the `physics` module.
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq)]
 pub struct RigidBody;
+
+/// Marks an entity as a camera. Play mode renders from the first `Camera`-
+/// marked entity found (lowest id), instead of the editor's own free orbit
+/// camera, when one exists in the scene; a scene with none is unaffected.
+/// Marker only, no fields yet: field of view and similar are possible later
+/// additions. Since `Rotation` is yaw-only across this whole engine, a
+/// camera can turn left and right (by turning itself, or by riding along on
+/// a `Parent` that turns) but can never tilt up or down.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq)]
+pub struct Camera;
+
+/// Attaches this entity to another. Each tick, `systems::apply_parenting`
+/// overwrites this entity's `Position` and `Rotation` from the named
+/// parent's, plus this local offset: `offset_x`/`offset_y`/`offset_z` are in
+/// the parent's own local space (offset_x to its right, positive offset_z
+/// behind it, matching the engine's yaw-0-faces-negative-Z convention) and
+/// rotate with the parent's yaw, so the offset stays in the same relative
+/// spot, behind-and-above, say, as the parent turns, the way a camera or a
+/// weapon mounted on a character would. `offset_yaw` adds directly to the
+/// parent's yaw, no rotation of its own.
+///
+/// Deliberately simple for this first pass: not `RigidBody`-aware itself (a
+/// parented entity just gets a `Position`/`Rotation` written onto it, same
+/// as any other entity; nothing stops it also being simulated by physics,
+/// but the two writing to the same fields the same tick isn't a combination
+/// this has been built or tested for), and applied after every other system
+/// each tick so it sees the parent's final position for that tick, not a
+/// stale one from before the parent moved. A dangling `entity` (removed, or
+/// never existed) is simply skipped, the same tolerance a stale `Script`
+/// reference already gets.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Default)]
+pub struct Parent {
+    pub entity: usize,
+    pub offset_x: f32,
+    pub offset_y: f32,
+    pub offset_z: f32,
+    pub offset_yaw: f32,
+}
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq)]
 pub struct Position {
@@ -591,6 +629,12 @@ pub struct World {
     /// bodies, colliders) is deliberately not here, see `physics::Physics`.
     #[serde(default)]
     pub rigid_bodies: ComponentStorage<RigidBody>,
+    /// Which entities are cameras. See `Camera`'s own doc comment.
+    #[serde(default)]
+    pub cameras: ComponentStorage<Camera>,
+    /// Which entities are attached to another. See `Parent`'s own doc comment.
+    #[serde(default)]
+    pub parents: ComponentStorage<Parent>,
     /// Optional per-entity light sources, the same "most entities have
     /// none" shape as `statics`/`gravities` above.
     #[serde(default)]
@@ -770,6 +814,8 @@ impl World {
             self.statics.remove(id);
             self.gravities.remove(id);
             self.rigid_bodies.remove(id);
+            self.cameras.remove(id);
+            self.parents.remove(id);
             self.lights.remove(id);
             self.sounds.remove(id);
             // Every registered dynamic component too, without needing to know
