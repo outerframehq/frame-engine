@@ -282,6 +282,10 @@ impl Physics {
     /// body for rapier's next step. Uses up all of `move_intents`, so a stale
     /// intent never carries over to the next tick.
     fn move_characters(&mut self, world: &mut World, dt: f32) {
+        // Rebuilt fresh every step from `self.characters`, the live set,
+        // rather than left to accumulate stale entries for a despawned or
+        // un-Controlled entity.
+        world.grounded.clear();
         let intents = std::mem::take(&mut world.move_intents);
         // The query pipeline borrows all of `self.rapier`, so a body can't be
         // changed while it's alive. Work out every move first, then apply.
@@ -329,6 +333,7 @@ impl Physics {
             );
 
             character.grounded = movement.grounded;
+            world.grounded.insert(id, character.grounded);
             if movement.grounded && character.fall_speed < 0.0 {
                 // Landed: stop building up speed while standing still.
                 character.fall_speed = 0.0;

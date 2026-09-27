@@ -2972,8 +2972,13 @@ impl App {
         for _ in 0..owed {
             if let Some(world) = self.game_world.as_mut() {
                 systems::collision(world);
-                systems::run_scripts(world, &mut self.script_runtime, &self.game_input);
+                // Input first, then scripts: a script can see (and override,
+                // per entity, by touching move_dx/move_dz/move_jump) whatever
+                // the built-in Controlled input already asked for this tick,
+                // rather than the keyboard unconditionally overwriting
+                // whatever the script just set.
                 systems::input_movement(world, &self.game_input);
+                systems::run_scripts(world, &mut self.script_runtime, &self.game_input);
                 systems::gravity(world);
                 systems::movement(world);
                 if let Some(physics) = self.game_physics.as_mut() {
@@ -4157,11 +4162,17 @@ impl ApplicationHandler for App {
                     // its entity is colliding *this* tick (via the `hit` variable)
                     // and react before movement is applied.
                     systems::collision(&mut self.world);
-                    systems::run_scripts(&mut self.world, &mut self.script_runtime, &self.input);
                     // While flying, WASD moves the camera, not Controlled entities.
                     if !self.fly_mode {
                         systems::input_movement(&mut self.world, &self.input);
                     }
+                    // Scripts run after input, not before: a script can see
+                    // (and override, per entity, by touching
+                    // move_dx/move_dz/move_jump) whatever the built-in
+                    // Controlled input already asked for this tick, rather
+                    // than the keyboard unconditionally overwriting whatever
+                    // the script just set.
+                    systems::run_scripts(&mut self.world, &mut self.script_runtime, &self.input);
                     systems::gravity(&mut self.world);
                     systems::movement(&mut self.world);
                     self.physics.step(&mut self.world, 1.0 / TICK_RATE as f32);

@@ -659,6 +659,18 @@ pub struct World {
     /// saved with the scene.
     #[serde(skip)]
     pub move_intents: std::collections::BTreeMap<usize, MoveIntent>,
+    /// Whether each physics character was touching the ground as of the last
+    /// time `physics::Physics::move_characters` ran, keyed by entity id.
+    /// Rebuilt fresh every physics step (see there), so an id only appears
+    /// here while it's a live `Controlled` + `RigidBody` character. Read by
+    /// scripts as `grounded`; since physics runs after scripts in the tick
+    /// pipeline, a script sees the *previous* tick's value, the same one-tick
+    /// lag `move_intents` itself has no equivalent problem for (scripts write
+    /// it, physics reads it the same tick) but a script *reading* physics
+    /// output unavoidably does. Transient like `collisions`/`move_intents`,
+    /// never saved with the scene.
+    #[serde(skip)]
+    pub grounded: std::collections::BTreeMap<usize, bool>,
     /// Runtime-registered component storage, keyed by name, for a component
     /// type the engine was never compiled knowing about. This is the seam a
     /// host (a private game layer, an editor plugin) uses to attach its own

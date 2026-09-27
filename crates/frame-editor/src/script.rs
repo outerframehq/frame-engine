@@ -4,7 +4,7 @@
 use std::collections::{HashMap, HashSet};
 
 use frame_engine::input::{Button, InputState};
-use frame_engine::world::{Position, ScriptRuntime, Velocity, World};
+use frame_engine::world::{MoveIntent, Position, ScriptRuntime, Velocity, World};
 
 /// A 3D vector exposed to scripts as `Vec3`, with `.x` / `.y` / `.z`. Used for
 /// position, velocity, and scale, so a script can say `pos.x` and do vector maths
@@ -38,16 +38,28 @@ const API_VARS: &[&str] = &[
     "is_controlled",
     "is_static",
     "has_gravity",
+    "has_rigidbody",
+    "grounded",
     "input_up",
     "input_down",
     "input_left",
     "input_right",
+    "input_jump",
     "hit",
     "hit_id",
     "hit_point", // Actions — a script requests these, Rust performs them.
     "spawn_at",
     "spawn",
-    "despawn_id", // Structured values (preferred).
+    "despawn_id",
+    // Physics character control. Also a request, same shape as spawn/despawn
+    // above, but only ever acted on by a Controlled + RigidBody entity's
+    // character controller (see physics::Physics::move_characters); reading
+    // or writing these on anything else is harmless, just inert. Seeded each
+    // tick with whatever the built-in Controlled input already asked for, so
+    // a script that never touches them changes nothing.
+    "move_dx",
+    "move_dz",
+    "move_jump", // Structured values (preferred).
     "pos",
     "vel",
     "scale",
@@ -143,6 +155,7 @@ pub struct RhaiRuntime {
     input_down: bool,
     input_left: bool,
     input_right: bool,
+    input_jump: bool,
 }
 
 impl RhaiRuntime {
@@ -157,6 +170,7 @@ impl RhaiRuntime {
             input_down: false,
             input_left: false,
             input_right: false,
+            input_jump: false,
         }
     }
 
@@ -262,6 +276,7 @@ impl ScriptRuntime for RhaiRuntime {
         self.input_down = input.is_held(Button::Down);
         self.input_left = input.is_held(Button::Left);
         self.input_right = input.is_held(Button::Right);
+        self.input_jump = input.is_held(Button::Jump);
     }
 
     fn run(&mut self, world: &mut World, entity: usize) {
@@ -332,6 +347,15 @@ impl ScriptRuntime for RhaiRuntime {
         let (cr, cg, cb) = (color.r as f64, color.g as f64, color.b as f64);
         let emissive = material.emissive as f64;
         let yaw = rotation.yaw as f64;
+        // Physics character state. `current_intent` is whatever the built-in
+        // Controlled input (or an earlier script, in some future multi-script
+        // setup) already asked for this tick; scripts run after input_movement
+        // now specifically so this is meaningful to seed with rather than
+        // always zero. `grounded` is last tick's value, see World::grounded's
+        // own doc comment for why.
+        let has_rigidbody = world.rigid_bodies.get(entity).is_some();
+        let current_intent = world.move_intents.get(&entity).copied().unwrap_or_default();
+        let grounded = world.grounded.get(&entity).copied().unwrap_or(false);
         // Whether this entity is part of any overlapping pair this tick, from the
         // engine's collision system (which runs before scripts). Read-only.
         // hit_id is the other entity's id when colliding, or -1.0 when not — a
@@ -376,12 +400,17 @@ impl ScriptRuntime for RhaiRuntime {
         scope.push("is_controlled", world.controlled.get(entity).is_some());
         scope.push("is_static", world.statics.get(entity).is_some());
         scope.push("has_gravity", world.gravities.get(entity).is_some());
+        scope.push("has_rigidbody", has_rigidbody);
+        // Read-only: whether this character was on the ground as of the last
+        // physics step. Always false for a non-physics entity.
+        scope.push("grounded", grounded);
         // Read-only: which movement buttons are currently held, snapshotted
         // once per tick in begin_tick. Shared context, not per-entity data.
         scope.push("input_up", self.input_up);
         scope.push("input_down", self.input_down);
         scope.push("input_left", self.input_left);
         scope.push("input_right", self.input_right);
+        scope.push("input_jump", self.input_jump);
         scope.push("hit", hit); // read-only: colliding with anything this tick
         scope.push("hit_id", hit_id); // read-only: the other entity's id, or -1.0
         scope.push("hit_point", hit_point); // read-only: where the collision happened
@@ -409,6 +438,16 @@ impl ScriptRuntime for RhaiRuntime {
         // script can pass its own id to despawn itself, or any other id (say,
         // hit_id) to despawn whatever it just collided with.
         scope.push("despawn_id", -1.0f64);
+
+        // Physics character control. Seeded with whatever's already in
+        // World.move_intents for this entity (the built-in Controlled input
+        // ran earlier this tick, see systems::input_movement's call site), so
+        // a script that leaves these alone doesn't cancel out keyboard input,
+        // and one that sets only move_jump, say, leaves move_dx/move_dz as
+        // input already set them.
+        scope.push("move_dx", current_intent.dx as f64);
+        scope.push("move_dz", current_intent.dz as f64);
+        scope.push("move_jump", current_intent.jump);
 
         // Structured values — the preferred spelling.
         scope.push(
@@ -537,6 +576,30 @@ impl ScriptRuntime for RhaiRuntime {
         rotation.yaw = f_yaw as f32;
         world.rotations.insert(entity, rotation);
 
+        // Physics character control write-back. Unconditional re-insert, same
+        // as scale/color/material/rotation above: a script that never touched
+        // move_dx/move_dz/move_jump writes back exactly what it was seeded
+        // with, so this changes nothing for a script that doesn't care about
+        // movement. Only ever read by physics::Physics::move_characters for a
+        // Controlled + RigidBody entity; a harmless no-op for anything else.
+        let move_dx = scope
+            .get_value::<f64>("move_dx")
+            .unwrap_or(current_intent.dx as f64);
+        let move_dz = scope
+            .get_value::<f64>("move_dz")
+            .unwrap_or(current_intent.dz as f64);
+        let move_jump = scope
+            .get_value::<bool>("move_jump")
+            .unwrap_or(current_intent.jump);
+        world.move_intents.insert(
+            entity,
+            MoveIntent {
+                dx: move_dx as f32,
+                dz: move_dz as f32,
+                jump: move_jump,
+            },
+        );
+
         // Dynamic component write-back: same unconditional re-insert as every
         // other single value above, no change-detection needed.
         for (name, original) in &custom {
@@ -571,3 +634,4 @@ impl ScriptRuntime for RhaiRuntime {
         }
     }
 }
+

@@ -50,10 +50,15 @@ These are set for you every tick. Read them, write them, or both.
 | `is_controlled` | Has the `Controlled` marker | read-only | `true` if this entity is driven by WASD. |
 | `is_static` | Has the `Static` marker | read-only | `true` if collision response won't move this entity. |
 | `has_gravity` | Has the `Gravity` marker | read-only | `true` if this entity falls. |
+| `has_rigidbody` | Has the `RigidBody` marker | read-only | `true` if this entity is simulated by physics instead of the built-in movement. |
+| `grounded` | Touching the ground | read-only | `true` if this entity is a physics character and was on the ground as of the last physics step. Always `false` otherwise. One tick behind, since physics runs after scripts each tick. |
 | `input_up` / `input_down` / `input_left` / `input_right` | Movement keys held | read-only | `true` while that key is held. Same for every entity's script this tick, not specific to one. |
+| `input_jump` | Jump key held | read-only | `true` while Jump is held. Same shared-per-tick caveat as the movement keys above. |
 | `spawn_at` | Where a new entity appears | read/write | `spawn_at.x/.y/.z`. Defaults to this entity's own position. |
 | `spawn`   | Request a new entity        | read/write | Set `true` to spawn one at `spawn_at`, at the end of this tick. Resets to `false` at the start of every script run, so it has to be set again each time you want another one. |
 | `despawn_id` | Request an entity removed | read/write | An entity id, or `-1.0` for no request. Can be this entity's own `id`, or any other, `hit_id` included. |
+| `move_dx` / `move_dz` | Requested movement | read/write | World-space movement this tick, same units `Controlled` input uses. Only acted on for a `Controlled` + `RigidBody` entity (a physics character); harmless on anything else. Seeded with whatever `Controlled` input already asked for this tick, so leaving it alone doesn't cancel keyboard movement. |
+| `move_jump` | Requested jump | read/write | Same physics-character-only rule as `move_dx`/`move_dz`. Needs a fresh `true` (not held) to actually jump, same as the Jump key. |
 | `pos`     | Position                  | read/write | `pos.x`, `pos.y`, `pos.z`. Where the entity is.    |
 | `vel`     | Velocity (per tick)       | read/write | `vel.x`, `vel.y`, `vel.z`. Added to position each tick. |
 | `scale`   | Scale (per axis)          | read/write | `scale.x`, `scale.y`, `scale.z`. `1.0` is normal size. |
@@ -281,6 +286,36 @@ A newly spawned entity gets the same defaults as one you'd create in the editor
 (no script, no colour beyond the default, `Position` and zero `Velocity`). It
 doesn't inherit anything from the entity that spawned it, and there's no way yet
 to read back the new entity's own id.
+
+## Driving a physics character
+
+`move_dx`, `move_dz`, and `move_jump` only matter for an entity that has both
+`Controlled` and `RigidBody`, a physics-simulated character. Setting `pos`
+directly doesn't work for one of these, physics owns its position, not the
+script, the same way it doesn't work to set `pos` on anything else physics
+controls. `move_dx`/`move_dz`/`move_jump` are how you actually ask a physics
+character to move.
+
+They're requests, the same shape as `spawn`/`despawn_id`: you set them, physics
+decides what really happens (a wall stops you, gravity and jumping are still
+physics' job). And they're seeded each tick with whatever the built-in
+`Controlled` input already asked for, so a script that never touches them
+doesn't cancel out keyboard movement, it just leaves it alone.
+
+**Jump automatically when grounded and moving:**
+
+```rust
+if grounded && (input_up || input_down || input_left || input_right) {
+    move_jump = true;
+}
+```
+
+**Override just one axis**, leaving whatever the keyboard already set for the
+other, and for jump:
+
+```rust
+move_dz = -2.0;  // always drift forward, regardless of input
+```
 
 ## When a script has a mistake
 
