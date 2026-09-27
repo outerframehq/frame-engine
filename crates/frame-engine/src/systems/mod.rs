@@ -1,6 +1,6 @@
 use crate::input::{Button, InputState};
-use crate::world::{MoveIntent, ScriptRuntime};
 use crate::world::World;
+use crate::world::{MoveIntent, ScriptRuntime};
 
 /// Expand an axis-aligned box's half-extents to bound the same box after it's
 /// rotated by `yaw` around the world's vertical (Y) axis. This is a

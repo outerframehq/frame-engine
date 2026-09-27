@@ -634,4 +634,3 @@ impl ScriptRuntime for RhaiRuntime {
         }
     }
 }
-
