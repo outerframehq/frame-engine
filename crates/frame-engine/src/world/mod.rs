@@ -697,6 +697,34 @@ pub struct Prefab {
     pub light: Option<Light>,
     #[serde(default)]
     pub sound: Option<Sound>,
+    /// Every entity directly `Parent`-attached to the one this prefab was
+    /// captured from (2026-09-27), captured recursively — a child can have
+    /// its own children too, so this is the whole descendant subtree, not
+    /// just one level. Added after Luke noticed a captured prefab silently
+    /// left its children behind, which the Scene tab's new tree view made
+    /// obvious for the first time; before that a prefab only ever
+    /// represented one entity in isolation. `#[serde(default)]` so a prefab
+    /// file saved before this field existed still loads, as an entity with
+    /// no children, exactly how it already behaved.
+    #[serde(default)]
+    pub children: Vec<PrefabChild>,
+}
+
+/// One child in a `Prefab`'s subtree: the offset it carried on its own live
+/// `Parent` component (the same `offset_x`/`offset_y`/`offset_z`/
+/// `offset_yaw` fields, just without `entity`), plus the child's own full
+/// `Prefab`. Deliberately no entity id anywhere in here — which live entity
+/// this was, and which live entity it'll become, are both meaningless
+/// outside a single capture/spawn call, so the tree's own nesting is what
+/// stands in for the parent/child relationship instead, both in this type
+/// and in the RON file it serializes to.
+#[derive(Serialize, Deserialize, Clone)]
+pub struct PrefabChild {
+    pub offset_x: f32,
+    pub offset_y: f32,
+    pub offset_z: f32,
+    pub offset_yaw: f32,
+    pub prefab: Box<Prefab>,
 }
 
 #[derive(Serialize, Deserialize, Default, Clone)]
@@ -921,17 +949,72 @@ impl World {
         }
     }
 
-    /// Capture entity `id`'s "shape" into a reusable `Prefab`. Returns `None`
-    /// only if `id` isn't a live entity at all (no `Color`, which every
-    /// spawned entity always has); a missing optional component (no `Light`,
-    /// say) just means the prefab's own field for it is `None`/`false`,
-    /// exactly like the entity it came from.
+    /// Capture entity `id`'s "shape" into a reusable `Prefab`, recursively
+    /// capturing every entity `Parent`-attached to it (and to those, and so
+    /// on) as `children` too — the whole subtree, not just `id` on its own.
+    /// Returns `None` only if `id` isn't a live entity at all (no `Color`,
+    /// which every spawned entity always has); a missing optional component
+    /// (no `Light`, say) just means the prefab's own field for it is
+    /// `None`/`false`, exactly like the entity it came from.
     pub fn capture_prefab(&self, id: usize) -> Option<Prefab> {
+        let mut visiting = std::collections::HashSet::new();
+        self.capture_prefab_inner(id, &mut visiting)
+    }
+
+    /// The actual recursive work behind `capture_prefab`. `visiting` guards
+    /// against a `Parent` cycle (A parents B parents A) the same way the
+    /// Scene tab's tree view has to: every entity has at most one direct
+    /// parent, so in a genuine tree no id is ever reached twice, and the
+    /// only way one is is a cycle — at which point this just stops
+    /// descending rather than recursing forever, silently leaving the
+    /// cycle's far side out of the capture.
+    fn capture_prefab_inner(
+        &self,
+        id: usize,
+        visiting: &mut std::collections::HashSet<usize>,
+    ) -> Option<Prefab> {
         let color = *self.colors.get(id)?;
+        if !visiting.insert(id) {
+            return None;
+        }
         let scale = self.scales.get(id).copied().unwrap_or_default();
         let mesh = self.meshes.get(id).cloned().unwrap_or_default();
         let material = self.materials.get(id).copied().unwrap_or_default();
         let rotation = self.rotations.get(id).copied().unwrap_or_default();
+        // Every entity whose own Parent points straight at this one, each
+        // captured the same recursive way, so a grandchild's own children
+        // come along too.
+        let children = self
+            .parents
+            .iter()
+            .enumerate()
+            .filter_map(|(child_id, slot)| {
+                let p = slot.as_ref()?;
+                if p.entity != id {
+                    return None;
+                }
+                let mut child_prefab = self.capture_prefab_inner(child_id, visiting)?;
+                // The child's own live Parent (pointing at this entity's
+                // live id) got captured into child_prefab.parent same as any
+                // other component, but that id won't exist once this is
+                // spawned again — the PrefabChild wrapper above is the only
+                // thing that should describe this relationship. Clearing it
+                // here, rather than leaving a stale, misleading id sitting
+                // in the file, matches how apply_prefab_shape/
+                // spawn_prefab_children already overwrite it regardless
+                // (spawn_prefab_children's own insert always runs after
+                // apply_prefab_shape), so this changes nothing about spawned
+                // behaviour, only what a saved prefab's RON file contains.
+                child_prefab.parent = None;
+                Some(PrefabChild {
+                    offset_x: p.offset_x,
+                    offset_y: p.offset_y,
+                    offset_z: p.offset_z,
+                    offset_yaw: p.offset_yaw,
+                    prefab: Box::new(child_prefab),
+                })
+            })
+            .collect();
         Some(Prefab {
             color,
             scale,
@@ -947,13 +1030,18 @@ impl World {
             parent: self.parents.get(id).cloned(),
             light: self.lights.get(id).cloned(),
             sound: self.sounds.get(id).cloned(),
+            children,
         })
     }
 
     /// Spawn a fresh entity from a prefab at `position`, zero velocity, full
     /// health, no reference back to the prefab it came from (the
-    /// unlinked-stamp design, see `Prefab`'s own doc comment). Returns the
-    /// new entity's id, the same as `spawn` does.
+    /// unlinked-stamp design, see `Prefab`'s own doc comment) — then spawns
+    /// its whole captured subtree too (2026-09-27), each child attached back
+    /// to its own new parent's freshly assigned id. Returns the root's new
+    /// id, the same as `spawn` does; the id's a prefab's children get are
+    /// new to this call and not returned, the same way none of `spawn`'s
+    /// other side effects are.
     pub fn spawn_from_prefab(&mut self, prefab: &Prefab, position: Position) -> usize {
         let id = self.spawn(
             position,
@@ -963,6 +1051,15 @@ impl World {
                 dz: 0.0,
             },
         );
+        self.apply_prefab_shape(id, prefab);
+        self.spawn_prefab_children(id, position, prefab);
+        id
+    }
+
+    /// Everything `spawn_from_prefab` writes onto the root entity, factored
+    /// out so `spawn_prefab_children` can apply the exact same shape to
+    /// every descendant too, one call each.
+    fn apply_prefab_shape(&mut self, id: usize, prefab: &Prefab) {
         self.colors.insert(id, prefab.color);
         self.scales.insert(id, prefab.scale);
         self.meshes.insert(id, prefab.mesh.clone());
@@ -995,7 +1092,42 @@ impl World {
         if let Some(sound) = &prefab.sound {
             self.sounds.insert(id, sound.clone());
         }
-        id
+    }
+
+    /// Spawns every recorded child of `prefab` (recursively, since a child
+    /// can have children of its own), each newly attached to `parent_id`,
+    /// the id `parent_id`'s own entity was *just* given this call — never
+    /// whatever id it happened to have at capture time, which is exactly
+    /// why `PrefabChild` stores no entity id at all (see its own doc
+    /// comment). Spawned at `root_position` (the same position argument
+    /// `spawn_from_prefab` was called with) purely as a harmless placeholder
+    /// spot: a `Parent`-attached entity's own `Position` is cosmetic,
+    /// `apply_parenting` recomputes it from the parent's real position plus
+    /// this offset on the very next tick regardless, so this only avoids a
+    /// one-frame jump from the origin before that first tick runs.
+    fn spawn_prefab_children(&mut self, parent_id: usize, root_position: Position, prefab: &Prefab) {
+        for child in &prefab.children {
+            let child_id = self.spawn(
+                root_position,
+                Velocity {
+                    dx: 0.0,
+                    dy: 0.0,
+                    dz: 0.0,
+                },
+            );
+            self.apply_prefab_shape(child_id, &child.prefab);
+            self.parents.insert(
+                child_id,
+                Parent {
+                    entity: parent_id,
+                    offset_x: child.offset_x,
+                    offset_y: child.offset_y,
+                    offset_z: child.offset_z,
+                    offset_yaw: child.offset_yaw,
+                },
+            );
+            self.spawn_prefab_children(child_id, root_position, &child.prefab);
+        }
     }
 
     /// Attach a value for a runtime-registered component, keyed by name, to an

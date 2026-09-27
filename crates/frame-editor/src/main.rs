@@ -1971,13 +1971,23 @@ fn assets_tab_ui(
 /// or missing parent (despawned, or pointing at itself) falls back to being
 /// shown at the root level, the same tolerance `apply_parenting` itself
 /// gives a stale link rather than erroring.
+///
+/// Dragging one row onto another requests reparenting: drop it, and the
+/// dragged entity becomes a child of whichever row it was released over.
+/// Returns that request (dragged entity, new parent) for the caller to
+/// apply to the world — this function only ever reads `entity_parents`, it
+/// doesn't own the world and can't write to it directly. `None` covers "no
+/// drag happened", "released over empty space", and "rejected" (dropping
+/// onto itself or one of its own descendants, which would create a cycle)
+/// alike; the caller doesn't need to tell those apart.
 fn scene_tab_ui(
     ui: &mut egui::Ui,
     entity_ids: &[usize],
     entity_parents: &std::collections::HashMap<usize, usize>,
     selection: &mut Option<usize>,
-) {
+) -> Option<(usize, usize)> {
     ui.label(format!("{} entities", entity_ids.len()));
+    ui.weak("Drag an entity onto another to make it a child.");
     ui.separator();
 
     let valid: std::collections::HashSet<usize> = entity_ids.iter().copied().collect();
@@ -1993,6 +2003,33 @@ fn scene_tab_ui(
         }
     }
 
+    // Built on egui's own purpose-built drag-and-drop API —
+    // `dnd_drag_source`/`dnd_hover_payload`/`dnd_release_payload`, copied
+    // from egui's own official drag-and-drop demo
+    // (egui_demo_lib::demo::drag_and_drop) — after two hand-rolled attempts
+    // at `Response`/`Sense`/`ui.interact` fell short in different ways (one
+    // broke plain clicking, the other never actually recognised a drag at
+    // all: `response.dragged()` from a bare `ui.allocate_exact_size(...,
+    // Sense::click_and_drag())` never became true here, twice confirmed,
+    // even though the identical `Sense` works fine through
+    // `dnd_drag_source`). The payload is just the dragged entity's own id
+    // (a bare `usize`, satisfies the `Any + Send + Sync` bound trivially).
+    //
+    // A real drag reliably works through `dnd_drag_source`, but its own
+    // click-vs-drag split is a small movement distance, not time, and an
+    // ordinary click's natural hand-wobble easily crosses it — so a plain
+    // click routinely got misread as a (very short) drag, and once egui's
+    // own bookkeeping decides that, `Response::clicked()` never fires for
+    // it. Rather than fight `dnd_drag_source`'s own internal sensing (which
+    // is what actually makes real dragging work, twice now confirmed
+    // fragile to touch), the hold-time requirement is layered entirely on
+    // top of it, resolved once here after the whole tree has rendered for
+    // the frame — never inside a single row's own closure, where the *other*
+    // row involved (the actual drag origin, if this row is just a hovered
+    // target) might read or clear the shared timer before or after this one
+    // in an order this code doesn't control.
+    let mut dragging_row: Option<usize> = None;
+    let mut raw_reparent: Option<(usize, usize)> = None;
     egui::ScrollArea::vertical()
         .auto_shrink([false, false])
         .show(ui, |ui| {
@@ -2003,13 +2040,103 @@ fn scene_tab_ui(
             // without this.
             let mut visiting = std::collections::HashSet::new();
             for &id in &roots {
-                scene_tree_node(ui, id, 0, &children, &mut visiting, selection);
+                scene_tree_node(
+                    ui,
+                    id,
+                    0,
+                    &children,
+                    &mut visiting,
+                    selection,
+                    &mut dragging_row,
+                    &mut raw_reparent,
+                );
             }
         });
+
+    // The one place that reads or clears the shared drag-hold timer, run
+    // strictly after every row's own turn this frame, so there's no
+    // question of which row's closure ran first.
+    let now = ui.input(|i| i.time);
+    if dragging_row.is_none() {
+        // No row is reporting an active drag this frame. Either nothing's
+        // being pressed at all (nothing stored, nothing to do), or a drag
+        // that was active as of last frame just ended — released, however
+        // briefly held.
+        let key = scene_tree_drag_hold_key();
+        if let Some((origin, start_time)) = ui.ctx().data(|d| d.get_temp::<(usize, f64)>(key)) {
+            ui.ctx().data_mut(|d| d.remove::<(usize, f64)>(key));
+            let held_long_enough = now - start_time >= SCENE_TREE_DRAG_HOLD_SECONDS;
+            match raw_reparent {
+                // Landed on another row, and was actually held long enough
+                // to count as a deliberate drag rather than a click's
+                // wobble: apply it, once the usual cycle/self-drop check
+                // clears it.
+                Some((child, target)) if child == origin && held_long_enough => {
+                    if !entity_is_or_descends(&children, child, target) {
+                        return Some((child, target));
+                    }
+                }
+                // Released without ever reaching another valid row, and
+                // never held long enough to be a real drag either: this was
+                // just a click that happened to wobble a pixel or two.
+                // egui's own `Response::clicked()` won't fire for it (as
+                // far as `dnd_drag_source`'s own bookkeeping is concerned
+                // this was a drag, however short), so this is the only
+                // place that ever will.
+                None if !held_long_enough => {
+                    *selection = Some(origin);
+                }
+                // Held long enough but never landed on anything (dropped in
+                // empty space), or landed on something but never held long
+                // enough — neither counts as a click nor a reparent.
+                _ => {}
+            }
+        }
+    }
+    None
+}
+
+/// True if `needle` is `root` itself or nested anywhere under it in the
+/// tree. Used to reject a drag-drop that would make an entity its own
+/// descendant's child — a cycle `apply_parenting` would then walk forever.
+fn entity_is_or_descends(
+    children: &std::collections::BTreeMap<usize, Vec<usize>>,
+    root: usize,
+    needle: usize,
+) -> bool {
+    if root == needle {
+        return true;
+    }
+    children
+        .get(&root)
+        .is_some_and(|kids| kids.iter().any(|&k| entity_is_or_descends(children, k, needle)))
+}
+
+/// How long a row has to be held (in seconds) before it actually counts as
+/// a deliberate drag rather than a click. See the long comments in
+/// `scene_tab_ui` and `scene_tree_node` for why this is layered on top of
+/// `dnd_drag_source` rather than built into the widget itself.
+const SCENE_TREE_DRAG_HOLD_SECONDS: f64 = 1.5;
+
+/// Single fixed key for the one drag-hold timer `scene_tab_ui` tracks
+/// (origin entity id, start time). Only one drag can be in flight across
+/// the whole tree at a time, so this doesn't need to be per-row.
+fn scene_tree_drag_hold_key() -> egui::Id {
+    egui::Id::new("scene_tree_drag_hold")
 }
 
 /// One row (and its children, recursively) of the Scene tree. See
-/// `scene_tab_ui` for the cycle guard `visiting` provides.
+/// `scene_tab_ui` for the cycle guard `visiting` provides and how
+/// `dragging_row`/`raw_reparent` get resolved, with the hold-time check,
+/// after the whole tree has rendered for the frame.
+///
+/// Deliberately a simple first slice of drag-and-drop: the row being
+/// dragged doesn't visually detach into its own floating layer the way
+/// egui's own demo does it for a plain flat list (this tree recurses, and
+/// following that exact pattern for a nested structure wasn't worth the
+/// risk this pass) — only the row currently under the cursor gets an
+/// outline, and only once the drag has actually been held long enough to
+/// count.
 fn scene_tree_node(
     ui: &mut egui::Ui,
     id: usize,
@@ -2017,6 +2144,8 @@ fn scene_tree_node(
     children: &std::collections::BTreeMap<usize, Vec<usize>>,
     visiting: &mut std::collections::HashSet<usize>,
     selection: &mut Option<usize>,
+    dragging_row: &mut Option<usize>,
+    raw_reparent: &mut Option<(usize, usize)>,
 ) {
     if !visiting.insert(id) {
         ui.colored_label(
@@ -2032,11 +2161,157 @@ fn scene_tree_node(
         } else {
             format!("↳ Entity {id}")
         };
-        ui.selectable_value(selection, Some(id), label);
+        let is_selected = *selection == Some(id);
+
+        // Fourth construction of this row's widget, and a different root
+        // cause than the last three fixes assumed. Found via egui's own
+        // issue tracker (emilk/egui#2730): a maintainer states plainly that
+        // `dnd_drag_source` "only detects drags, not clicks" — it isn't a
+        // real `Sense::click_and_drag()` widget at all, just a drag sensor
+        // that happens to also expose a `Response`. That's the actual
+        // reason clicking still felt broken even in the version confirmed
+        // to drag correctly: `dnd_drag_source` was never really trying to
+        // sense a click in the first place.
+        //
+        // The two earlier bare-`Sense::click_and_drag()` attempts
+        // (`ui.allocate_exact_size(..., Sense::click_and_drag())`) never
+        // got `response.dragged()` to become true either, but both relied
+        // on that call's own auto-generated widget id. The one thing
+        // `dnd_drag_source`'s (reliably working) drag-sensing has that
+        // those attempts didn't is an *explicit*, stable id — plausible
+        // enough as the actual difference that it's worth testing directly
+        // rather than a fifth guess at the `Sense` itself: `ui
+        // .allocate_space` reserves the row's rect with no interaction of
+        // its own (nothing to compete with), then one single
+        // `ui.interact(rect, item_id, Sense::click_and_drag())` call, using
+        // the same explicit id scheme `dnd_drag_source` used, senses both a
+        // real click and a real drag on the one widget.
+        let item_id = egui::Id::new(("scene_tree_row", id));
+        let row_height = ui.text_style_height(&egui::TextStyle::Body) + 4.0;
+        let desired_size = egui::vec2(ui.available_width().max(80.0), row_height);
+        let (_auto_id, rect) = ui.allocate_space(desired_size);
+        let response = ui.interact(rect, item_id, egui::Sense::click_and_drag());
+
+        if ui.is_rect_visible(rect) {
+            if is_selected {
+                ui.painter().rect_filled(
+                    rect,
+                    2.0,
+                    egui::Color32::from_rgba_unmultiplied(0xff, 0xd5, 0x4c, 50),
+                );
+            }
+            ui.painter().text(
+                rect.left_center() + egui::vec2(4.0, 0.0),
+                egui::Align2::LEFT_CENTER,
+                &label,
+                egui::FontId::default(),
+                ui.visuals().text_color(),
+            );
+        }
+
+        if response.clicked() {
+            *selection = Some(id);
+        }
+
+        // TEMPORARY diagnostic. Three fixes in a row have each looked right
+        // and then not actually worked on Luke's machine — this prints what
+        // egui itself thinks is happening on the row that's actually being
+        // pressed, to the terminal the editor was launched from, so if this
+        // fourth attempt is *also* wrong, the next round is a real
+        // diagnosis instead of a fifth guess. Safe to delete once clicking
+        // is confirmed working again.
+        if response.clicked() || response.dragged() {
+            eprintln!(
+                "[scene_tree] entity {id}: clicked={} dragged={} hovered={}",
+                response.clicked(),
+                response.dragged(),
+                response.hovered(),
+            );
+        }
+
+        // This row is the drag's own origin this frame. Start (or keep
+        // advancing) the one shared timer `scene_tab_ui` resolves after
+        // every row has had its turn — never resolved here, since a
+        // different row (the one this drag might land on) could run before
+        // or after this one within the same frame, and reading or clearing
+        // shared state from either side of that race is exactly the bug
+        // an earlier attempt at this hold-gate had.
+        if response.dragged() {
+            *dragging_row = Some(id);
+            let key = scene_tree_drag_hold_key();
+            let now = ui.input(|i| i.time);
+            let start_time = ui
+                .ctx()
+                .data(|d| d.get_temp::<(usize, f64)>(key))
+                .filter(|(origin, _)| *origin == id)
+                .map_or(now, |(_, start)| start);
+            ui.ctx().data_mut(|d| d.insert_temp(key, (id, start_time)));
+            if now - start_time >= SCENE_TREE_DRAG_HOLD_SECONDS {
+                // Only past the hold does this row actually become a real
+                // drag-and-drop source; a shorter hold never reaches here,
+                // so `DragAndDrop`'s payload is never set for it and every
+                // other row's `dnd_hover_payload` stays quiet.
+                egui::DragAndDrop::set_payload(ui.ctx(), id);
+            }
+        }
+
+        // `dnd_hover_payload` fires on every row currently under the
+        // pointer while *any* row's drag is in progress. Only actually show
+        // the "drop here" outline once that drag's own timer has cleared
+        // the hold threshold — otherwise every plain click would flash it
+        // again, exactly the bug this whole hold-gate exists to fix.
+        if response.dnd_hover_payload::<usize>().is_some() {
+            let held_long_enough = ui.ctx().data(|d| d.get_temp::<(usize, f64)>(scene_tree_drag_hold_key()))
+                .is_some_and(|(_, start_time)| {
+                    ui.input(|i| i.time) - start_time >= SCENE_TREE_DRAG_HOLD_SECONDS
+                });
+            if held_long_enough {
+                // Four line segments rather than `Painter::rect_stroke`:
+                // this codebase already draws the translate gizmo with
+                // `line_segment`, proven to compile against the pinned
+                // egui version, whereas `rect_stroke`'s exact parameter
+                // list has changed across egui versions (a trailing
+                // `StrokeKind` in some).
+                let r = response.rect;
+                let color = egui::Color32::from_rgb(0xff, 0xd5, 0x4c);
+                let painter = ui.painter();
+                painter.line_segment([r.left_top(), r.right_top()], egui::Stroke::new(1.5, color));
+                painter.line_segment(
+                    [r.right_top(), r.right_bottom()],
+                    egui::Stroke::new(1.5, color),
+                );
+                painter.line_segment(
+                    [r.right_bottom(), r.left_bottom()],
+                    egui::Stroke::new(1.5, color),
+                );
+                painter.line_segment(
+                    [r.left_bottom(), r.left_top()],
+                    egui::Stroke::new(1.5, color),
+                );
+            }
+        }
+
+        // Fires exactly once, on the frame a drag is released over this
+        // exact row — the dragged entity's id is the payload it was
+        // carrying. Recorded here unconditionally; `scene_tab_ui` is the
+        // one place that checks it against the hold timer and decides
+        // whether it actually counts.
+        if let Some(dragged_id) = response.dnd_release_payload::<usize>() {
+            *raw_reparent = Some((*dragged_id, id));
+        }
     });
     if let Some(kids) = children.get(&id) {
         for &child in kids {
-            scene_tree_node(ui, child, depth + 1, children, visiting, selection);
+            scene_tree_node(
+                ui,
+                child,
+                depth + 1,
+                children,
+                visiting,
+                selection,
+                dragging_row,
+                raw_reparent,
+            );
         }
     }
     visiting.remove(&id);
@@ -2689,6 +2964,12 @@ struct EditorTabViewer {
     // Each entity's Parent.entity, for the Scene tab's tree view. Built
     // alongside entity_ids from the same world snapshot; see scene_tab_ui.
     entity_parents: std::collections::HashMap<usize, usize>,
+    // Set by the Scene tab when a drag-and-drop reparent is dropped this
+    // frame: (dragged entity, new parent). None on every other frame,
+    // including any frame the Scene tab isn't visible at all — same
+    // reset-each-frame shape as viewport_rect below. Applied by the caller
+    // after the pass, via App::reparent_entity.
+    scene_reparent_request: Option<(usize, usize)>,
     selection: Option<usize>,
     edited: Option<EditedEntity>,
     // Plugin-declared custom fields for the selected entity. See
@@ -2783,12 +3064,14 @@ impl egui_dock::TabViewer for EditorTabViewer {
                     }
                 }
             }
-            Tab::Scene => scene_tab_ui(
-                ui,
-                &self.entity_ids,
-                &self.entity_parents,
-                &mut self.selection,
-            ),
+            Tab::Scene => {
+                self.scene_reparent_request = scene_tab_ui(
+                    ui,
+                    &self.entity_ids,
+                    &self.entity_parents,
+                    &mut self.selection,
+                );
+            }
             Tab::Inspector => inspector_tab_ui(
                 ui,
                 &mut self.edited,
@@ -3262,6 +3545,31 @@ impl App {
         self.prefabs.insert(name.to_string(), prefab);
         self.log(format!("Saved prefab '{name}'"));
     }
+
+    /// Makes `child` a child of `target`, requested by dragging one row onto
+    /// another in the Scene tab's tree (see `scene_tab_ui`); that function
+    /// already rejects a drop onto the entity itself or one of its own
+    /// descendants, so this is only ever called with a drop that's safe to
+    /// apply. Keeps the entity's existing offset if it was already parented
+    /// to something else — only the `entity` field changes — or starts at
+    /// `Parent::default()`'s zero offset for a fresh attachment, the same
+    /// default the Inspector's "Attached to another entity" checkbox uses.
+    fn reparent_entity(&mut self, child: usize, target: usize) {
+        if child == target {
+            return;
+        }
+        self.push_undo();
+        let offset = self.world.parents.get(child).copied().unwrap_or_default();
+        self.world.parents.insert(
+            child,
+            frame_engine::world::Parent {
+                entity: target,
+                ..offset
+            },
+        );
+        self.log(format!("Entity {child} is now a child of entity {target}"));
+    }
+
     /// Despawn the selected entity, if any.
     fn despawn_selected(&mut self) {
         if let Some(id) = self.selected {
@@ -5526,6 +5834,7 @@ impl ApplicationHandler for App {
                 let mut viewer = EditorTabViewer {
                     entity_ids,
                     entity_parents,
+                    scene_reparent_request: None,
                     selection: new_selection,
                     edited,
                     custom_fields,
@@ -6062,6 +6371,26 @@ impl ApplicationHandler for App {
                             self.world.scripts.remove(id);
                         }
                     }
+                }
+                // Drag-and-drop reparenting, applied *after* the Inspector's
+                // own write-back directly above, not before it (where it
+                // used to sit, right after the save-prefab drain). The
+                // Inspector's `edited` snapshot is captured once at the top
+                // of the frame, before the Scene tab (and any drag-and-drop
+                // reparent) has even rendered — so if the row being dragged
+                // was also the Inspector's currently-selected entity (the
+                // common case: selecting it is usually how you'd start
+                // dragging it), the write-back above would still be holding
+                // that entity's *old* Parent state, and applying it after
+                // the reparent used to silently undo the drop in the same
+                // frame it happened: the Scene tree wouldn't show the new
+                // nesting, the Inspector's "Attached to another entity"
+                // checkbox would stay unticked, even though `reparent_entity`
+                // below had already logged the change and briefly written
+                // it. Ordering the drag-and-drop reparent last makes it the
+                // one that actually sticks.
+                if let Some((child, target)) = viewer.scene_reparent_request.take() {
+                    self.reparent_entity(child, target);
                 }
                 // Plugin field edits write back the same unconditional way
                 // every other single value in the Inspector does, each to
