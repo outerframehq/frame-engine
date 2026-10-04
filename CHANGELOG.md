@@ -123,6 +123,7 @@ Engine:
 
 ### Known issues
 
+- On Windows, docking a popped-out panel back into the main window crashes the editor. The cause is not found yet. Avoid popping panels out on Windows for now, and save first (Ctrl+S) if you do, since the crash loses unsaved changes. Saved scenes are not affected.
 - The tab pop-out feature and the shared-GPU-instance change behind it have only been run on Pop!_OS Linux with an NVIDIA GPU. Other OSes (Windows, macOS), other Linux desktops (X11 vs Wayland), and other GPU vendors (AMD, Intel) haven't been tested and could behave differently — if a popped-out window misbehaves or crashes on a setup other than that, it's a strong first suspect.
 
 ## [Prototype] - 2026-06-27 to 2026-07-14

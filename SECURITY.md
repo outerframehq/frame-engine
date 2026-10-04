@@ -34,7 +34,7 @@ way to stay current is to move to the latest release.
 Anything worth flagging in a supported release is listed here. If a version
 isn't listed, there's nothing currently logged against it.
 
-- (none currently)
+- **Windows: docking a popped-out panel back crashes the editor.** Popping a panel (Scene, Inspector, Script Editor or Source Control) out into its own window and then docking it back into the main window crashes the editor on Windows. The cause is not found yet. Until it is fixed, avoid popping panels out on Windows, and save first (Ctrl+S) if you do try it, because the crash loses any unsaved changes. The same feature works on Linux (tested on Pop!_OS with an NVIDIA GPU). Nothing here affects saved scenes.
 
 ## Reporting a vulnerability
 
