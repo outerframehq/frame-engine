@@ -75,6 +75,8 @@ Early development, past the toy stage, with a working engine and a usable editor
   - a top toolbar showing the editor's logo and working File/Edit/View/Help menus, each item mirroring a keyboard shortcut (open/save/reload scene, close project, quit; spawn, despawn, clear selection; play/pause, step, controls overlay),
   - a Scene tab (lists entities, click to select) and an Inspector tab (edit the selected entity's position, velocity, colour, scale, emissive strength, and rotation, pick its mesh primitive, toggle whether it is `Controlled` or `Static`, and assign a library script through a searchable picker, all written straight back into the world),
   - a fixed bottom console dock with an Output tab showing a live log and a Terminal placeholder.
+- A custom editor theme, Grove: neutral dark panels with a green accent and a wood-brown secondary accent. It is set in one `apply_editor_theme` function, applied to the main window and to every popped-out panel window. The Play window is left alone, since it shows the game rather than the editor. The dock's tab bar is styled to match, and the Inspector's section headings and checkboxes are drawn by two small helpers (`section_label` and `grove_checkbox`) so they look the same everywhere.
+- Three embedded fonts: Manrope for body text, Fraunces for headings, and JetBrains Mono for the console and other monospace text. They are compiled into the editor, so nothing is loaded from the network or the system. See Fonts below for their licence.
 - Runs the simulation live on the engine's fixed-timestep clock, so the sim ticks at a true 30 per second independent of the window's repaint rate, with play, pause, and step controls.
 - Undo and redo (Ctrl+Z / Ctrl+Y), built on full-world snapshots. Spawning, despawning, nudging, and Inspector edits are undoable; a drag or a held key is a single step.
 - A flythrough camera: hold Alt to look around with the mouse and fly with WASD (cursor grabbed), seeded from the current view. Left-click picks the entity at screen-centre and makes it the orbit pivot; release Alt to return to orbit.
@@ -109,6 +111,9 @@ crates/
 │       ├── lib.rs      library root, exposes the engine to other crates
 │       └── main.rs     binary runner, drives the tick loop
 └── frame-editor/       editor; depends on frame-engine
+    ├── assets/
+    │   ├── frame-editor.png   the editor's logo
+    │   └── fonts/             Manrope, Fraunces and JetBrains Mono, embedded
     └── src/
         ├── main.rs     windowed 3D editor: app state, camera, picking,
         │               entity editing, the egui panel layout, and the
@@ -153,7 +158,13 @@ Editor controls:
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE). The embedded fonts below are the exception, each under its own licence.
+
+## Fonts
+
+The editor embeds three fonts from `crates/frame-editor/assets/fonts/`: [Manrope](https://fonts.google.com/specimen/Manrope), [Fraunces](https://fonts.google.com/specimen/Fraunces), and [JetBrains Mono](https://www.jetbrains.com/lp/mono/). All three are released under the SIL Open Font License 1.1, which allows use, modification, and redistribution, including inside software, as long as the licence travels with the fonts. They are not covered by this repository's MIT licence.
+
+`Manrope-Regular.ttf` is the regular weight cut from the Manrope variable font. egui reads a variable font at its lightest weight, which looked far too thin, so a fixed weight is used instead.
 
 ## Design notes
 

@@ -1,158 +1,212 @@
-# Frame Engine
+# Frame Engine Design Notes
 
-A simulation engine written in Rust, with a companion 3D editor.
+A living document for Frame Engine itself. It covers engine and editor concerns only. For what has shipped and when, see CHANGELOG.md. For script authors, see SCRIPTING.md. For extending the editor, see PLUGINS.md.
 
-Frame Engine advances a world state forward in fixed, deterministic time steps. It is a simulation engine, not a renderer. The simulation runs headless with no window required, and rendering is a separate, swappable layer on top. That separation lets the engine run on servers and be reused across different games and tools.
+## What Frame Engine is
 
-## Forking and contributing
+Frame Engine is a simulation engine written in Rust. Its job is to advance a world state forward in fixed, deterministic time steps. It is not tied to any one project that uses it.
 
-Frame Engine is built in the open and meant to be learned from. If it looks useful, fork it, clone it, and bend it to whatever you are making. The MIT licence means you can do that freely, for any purpose, with no permission asked.
+## Core principles
 
-A few things worth knowing before you dig in:
+Simulation is separate from rendering. The simulation is pure logic over state. It knows nothing about windows, graphics, or how the world is drawn. A renderer is a separate layer that reads simulation state and draws it. That separation is what lets the simulation run headless on a server, and it lets the renderer change without touching the engine.
 
-- **It is hand-rolled on purpose.** The engine's world, systems, and clock are written by hand rather than pulled from an ECS crate, so the code is meant to be read and understood top to bottom rather than treated as a black box. Reading [DESIGN.md](DESIGN.md) first is the fastest way in: it explains not just what each piece does but why it is shaped that way.
-- **The engine stays graphics-free.** `crates/frame-engine` depends on nothing but `serde` and `ron`. All windowing, GPU, and UI code lives in `crates/frame-editor`. If you extend the engine, keeping that line clean is the one constraint worth respecting, because it is what lets the simulation run headless on a server.
-- **Dependencies point one way.** The editor depends on the engine, never the reverse. The engine knows nothing about the editor or any application built on it.
-- **`main` is the working branch.** It is where features land and can be unstable. Fork from `main` if you want to hack on the latest; depend on a tagged release if you want something steady (see below).
+Headless by default. The simulation runs with no window. That is its primary home: authoritative servers. Rendering is an optional layer on top.
 
-If you build something the engine is missing, a system, a component, a piece of the editor, and you think it fits, get in touch. Open an issue to talk it through, or a pull request if you have already built it. Nothing is guaranteed to land, but good work that fits the project's direction is genuinely welcome, and if it suits the engine it may well make it into the main public build.
+Deterministic, fixed-timestep simulation. One tick always represents the same slice of simulated time, regardless of how fast the hardware runs. The same inputs produce the same outputs on any machine. This is what makes the server's own simulation reproducible and testable. It is not something clients rely on to replay ticks independently; see Persistence and networking, below, for why that assumption changed.
 
-Built something with it, or forked it into your own thing? Tag me on X at [@OuterFrameInter](https://x.com/OuterFrameInter), I would love to see it, and that is also the easiest way to reach me if GitHub is not your preferred route.
+Reusable. The engine is its own crate, kept separate from any tool or application that depends on it. Dependencies point inward. Tools and applications depend on the engine. The engine depends on nothing above it.
 
-Frame Engine is a learning project as much as a tool: I am still growing my own Rust as I build the engine and editor in the open, which is part of why the code is written to be read rather than to show off. Considered feedback, on the engine, the editor, or the overall approach, is always welcome.
+## Workspace layout
 
-## Releases and stability
+The repository is a Cargo workspace holding multiple crates under `crates/`:
 
-`main` is the working branch, where in-progress features land. It is under constant change and can be incomplete or unstable at any moment.
+- `crates/frame-engine/` is the engine. It is both a library (the reusable code, exposed through `lib.rs`) and a binary (a thin `main.rs` that drives the tick loop and can also run as a `server` or a `client`). Other crates import the library. The binary is one specific way of running it.
+- `crates/frame-editor/` is a separate authoring tool. It depends on `frame-engine` through a path dependency and reaches into the engine's types to view, drive, and edit world state. The dependency runs one way. The engine knows nothing about the editor.
 
-**For a stable build, download a tagged release rather than cloning `main`.** Releases are cut at points where the project is known to build and run, so a release is your dependable copy. Tagged releases are on the project's Releases page.
+Keeping both in one repo means the engine and editor move together: one `Cargo.lock`, one history, a shared `target/`. They still build as separate targets (`cargo build -p frame-engine` or `cargo build -p frame-editor`), so a headless server build and an editor build stay cleanly separable.
 
-The latest release is **0.3.0**. The capabilities listed below reflect current `main`, which may be ahead of that release.
+### Engine modules (`crates/frame-engine/src/`)
 
-## Status
+- `core/` holds the fixed-timestep clock that decides when ticks are owed. It lives in `core/clock.rs` and is used by the engine binary, the editor, and the Play window.
+- `world/` holds simulation state: entities, their components, and the storage that holds them. Data, not logic, not drawing. It also defines the `ScriptRuntime` trait, the seam a host implements to run entity scripts, and carries the `Script` component and the shared `script_library` (script name to source text) as data the engine stores but never interprets.
+- `systems/` holds logic that runs each tick and changes world state, such as gravity, movement, input-driven movement, collision, and `run_scripts`, which drives every scripted entity through a `ScriptRuntime` supplied by the host.
+- `physics.rs` wraps `rapier3d` for rigid bodies and colliders. It is a layer over the world, not a replacement for it: the world stays the source of truth and physics reads and writes back through it.
+- `input/` holds a logical input abstraction: which buttons are currently held, expressed as engine-neutral `Button` values with no dependency on any windowing library. The editor translates platform key events into these logical buttons; systems read them. Networked clients upload the same logical input to the server.
+- `render/` holds a headless, read-only ASCII view of the world. It is kept separate from the simulation so it can be ignored or replaced. The editor has its own GPU renderer (see Tooling), so this module is the engine's built-in, dependency-light debug view rather than the only way to see a world.
+- `net/` holds the engine's multiplayer layer: an authoritative `Server` and a `Client`, connected over raw TCP with a `serde`/RON wire format. Clients upload input, the server simulates and broadcasts state. See Persistence and networking for the current scope.
+- `assets/` holds the hand-rolled OBJ parser and related asset data.
 
-Early development, past the toy stage, with a working engine and a usable editor shell.
+The flow each frame is: `world` holds state, `systems` change that state each tick (reading `input` where relevant), `render` draws it, and `core` drives the loop.
 
-**Engine**
+The folder structure is a convention, not a rule. Rust does not enforce it, so it can be reshaped as the real structure emerges.
 
-- A deterministic fixed-timestep clock (in `core/`) with spiral-of-death protection, used by both the engine binary and the editor.
-- A hand-rolled ECS world with several component types (position, velocity, colour, a per-axis scale, an emissive material strength, a yaw rotation, health, a `Mesh` primitive, a `Light`, a `Sound`, and a `Controlled` marker) and runtime spawn and despawn, both reachable from a script as well as the editor. Spawn reuses freed slots, so entity ids stay stable and despawned slots are reclaimed.
-- A `Light` component (`Directional`, a fixed no-falloff direction like a sun, or `Point`, at the entity's own position with a linear falloff to a set range, plus an intensity multiplier) and a `Sound` component (a file name and a one-shot `play` request flag, the same request-and-clear pattern `spawn`/`despawn` already use from scripts). Both are just data the engine carries and serializes; drawing a light and actually playing a sound are the editor's job.
-- Runtime component registration: `World` can hold component types it wasn't compiled knowing about, through a generic, string-keyed `insert_dynamic`/`get_dynamic` API. Doesn't serialize with the scene yet; a registered component resets on reload. Scripts can reach these too, through `custom_<name>` variables.
-- A `Substance` schema (melting point, durability, conductivity, and more) and a name-keyed registry for it on `World`, the shape for a wood, a stone, or a metal, with `Substance::blend` mixing two into a new one, freeform, any ratio, no fixed recipes. No actual substances are defined; that stays game content.
-- A generic `ComponentStorage<T>` type, wired into the world. It implements `Default`, and `World` derives `Default`, so a fresh world is built in one place and adding a component type is cheap and uniform.
-- A movement system that advances entities each tick, and an input system that drives `Controlled` entities from held WASD keys.
-- Per-entity colour and scale, stored as component data and serialized with the scene.
-- A per-entity `Mesh` primitive (cube, sphere, or plane), stored as component data and serialized with the scene; defaults to cube, so older scenes load unchanged.
-- A hand rolled OBJ importer: an assets module parses Wavefront OBJ text (Blender's export works with default settings), normalises models to unit size, and reports their half extents so collision fits their real shape. Imported models are a `Mesh::Custom(name)` on an entity.
-- AABB collision, detection and response: a `collision` system records which entity boxes overlap each run, along with the contact point where they overlap (feeding the `hit`/`hit_id`/`hit_point` script variables and the editor's red tint), and a `resolve_collisions` system pushes overlapping entities apart along their least-overlapping axis after movement. A `Static` marker keeps an entity immovable, so others rest against it. Boxes are axis-aligned scale-boxes derived from a shared `ENTITY_SIZE`, the world-space size the editor also renders and picks against.
-- Per-entity scripting: an entity can carry a `Script` that names a shared library script (source held once on the world, in a name-to-source map), with a `ScriptRuntime` trait and a `run_scripts` system forming the seam. The engine stores script source as data and runs nothing itself; the interpreter lives in the editor, the same way rendering does.
-- A graphics-free input abstraction (which buttons are held), fed by the editor and read by systems, so input can drive the simulation without the engine knowing about windowing.
-- Scene serialization to and from a human-readable RON file (`serde` and RON), with backward compatibility for scenes saved before newer fields like colour and scale existed.
-- A read-only ASCII debug renderer that draws the world as a grid.
-- A library and binary split, so the engine is importable by other crates.
-- A first slice of multiplayer, in `net/`: an authoritative `Server` that accepts clients, applies their uploaded input, and broadcasts every entity's position, and a receiving `Client` that applies whatever arrives and uploads its own held input back. Positions and input only, no interest management, and a disconnected client's entity is despawned but can't yet reconnect to it, all deliberately left for later. This replaces an earlier lockstep plan, a better fit for a small closed session than a persistent, always-joinable world; see [DESIGN.md](DESIGN.md) for why. Runnable now through the engine binary's own `server`/`client` modes.
+## Tech decisions
 
-**frame-editor** (companion editor; links to the engine, runs the sim in a window)
+Language: Rust, for the engine, the editor, and anything built on top of them. One language means no FFI seam, and compile-time safety lands on the riskiest code, which is the long-lived server simulation.
 
-- Opens a native window (`winit`) and renders the world on the GPU through `wgpu`.
-- Draws entities as instanced, shaded primitives (cube, sphere, or plane) in real 3D, each in its own colour, size, optional glow (an emissive material strength), and yaw rotation, with a perspective camera and a depth buffer for correct occlusion. Overlapping entities are tinted red, a live view of the engine's collision detection.
-- Multi-light shading: up to four active `Light` entities are summed per fragment (not per vertex, so falloff reads correctly across a face) on top of a flat ambient base. A Light beyond the cap is simply not drawn, a real, named limit rather than an unbounded cost. Lights are edited from the Inspector: pick Directional or Point, set direction or range, and set intensity.
-- Sound playback through `kira`: a Sound section in the Inspector picks a file from a dropdown of the project's audio (found by name anywhere under `assets/`, so it can be moved between folders) and a "Play now" button fires it for a quick manual test. Each tick, any entity with a pending `Sound.play` request gets it turned into a real play call, the file decoded once into a small cache and reused (cheaply cloned, not re-read) on every later play. No audio device or no project open both just mean the request is quietly dropped.
-- An orbit, pan, and zoom camera (left-drag pan, scroll zoom, middle-drag orbit).
-- Click-to-pick selection: click an entity to select it. The selected entity is brightened rather than recoloured, so its own colour stays visible while you edit it.
-- Live entity editing: nudge the selection with the arrow keys and Page Up/Down, spawn with `N`, despawn with `Delete`, and drive a `Controlled` entity with WASD while the sim is playing.
-- A project launcher: the editor opens on a launcher to create a named project, open one by folder, or reopen a recent one from a list of cards (name, description, last-edited date, version, and Edit / Play / Settings actions). A project is a folder holding a scene file named after it and a `project.ron` manifest (description, version); Settings edits those and renames the scene file.
-- Scene save and load: opening a project loads its scene, `F5` saves it and `F9` reloads it, and the File menu also opens or saves a scene to any path through a native file dialog.
-- A Script Editor: a dockable tab where the shared script library is written, a sidebar of script names beside a single code editor with a line-number gutter and live checks: a status line flags parse errors (line and column) in red, and unknown variables (names that aren't part of the script API or a local `let`) in amber, catching the typos Rhai would otherwise fail on silently at run time. Scripts can be renamed as well as deleted; renaming rewrites every entity's reference to the old name, so it doesn't orphan anything. Scripts see structured values (`pos.x`, `vel`, `color.r`, with vector arithmetic) alongside the older flat names, plus their own id, whether they carry the `Controlled`/`Static`/`Gravity` marker, which movement keys are held, and, on collision, which entity was hit and where. Scripts can also request a new entity be spawned or an existing one despawned, and read or write runtime-registered dynamic component values through `custom_<name>` variables. All of it runs live through a Rhai backend and is assigned to entities from the Inspector. See [SCRIPTING.md](SCRIPTING.md) for how to write them.
-- A translate gizmo: selecting an entity draws three axis arms in the viewport (X red, Y green, Z blue); drag an arm to move the entity along that axis, at any camera angle, as a single undo step.
-- A Source Control tab: a read-only view of the open project's git state, branch, upstream with ahead/behind counts, and changed files (amber unstaged, green staged). No network, no credentials; commits and pushes stay in your terminal or git client.
-- A plugin loader with enable/disable support: a project's `plugins/` folder (created automatically if missing) is scanned the same way its assets are, and each enabled plugin's Rhai scripts merge into the project's own script library under a name-spaced prefix, so they show up in the ordinary Inspector script picker like any hand-written script. Edit > Editor settings… lists every installed plugin with a checkbox, off by default for anything newly found; a Plugins tab next to Help shows what's currently switched on, along with a button for each action a plugin declares. Compiled Rust plugins are deliberately not supported (Rust has no stable ABI, making that genuinely fragile); Rhai keeps every plugin inside the same sandboxed interpreter every other script already runs in. A plugin can also declare custom Inspector fields (a slider or drag box tied to one of its own dynamic values), menu actions (running one of its scripts once, or toggling a value), and panels (a titled, global section in the Plugins panel, not tied to any entity), all purely declarative: a plugin describes what it wants, the editor is the only thing that ever draws or runs anything. See [PLUGINS.md](PLUGINS.md) if you want to build one.
-- Model import and an Assets tab: File > Import model brings a Blender OBJ export into the project, renders it, lists it in the mesh picker, and fits collision to it. The Assets tab in the bottom console shows the project's assets as tiles with rendered previews, with folders and a move flow to organise them. File > Import audio brings in WAV, OGG, MP3 or FLAC files, checking each one decodes first, into whichever assets folder is open. Dropping model or audio files on the editor window imports them too (Windows, macOS and X11; not yet on Wayland).
-- A dockable panel layout built with `egui` and `egui_dock`. The Viewport, Scene, Inspector, and Script Editor are tabs you can drag, tab together, and split apart; the Viewport is a transparent tab so the 3D shows through. Alongside them:
-  - a top toolbar showing the editor's logo and working File/Edit/View/Help menus, each item mirroring a keyboard shortcut (open/save/reload scene, close project, quit; spawn, despawn, clear selection; play/pause, step, controls overlay),
-  - a Scene tab (lists entities, click to select) and an Inspector tab (edit the selected entity's position, velocity, colour, scale, emissive strength, and rotation, pick its mesh primitive, toggle whether it is `Controlled` or `Static`, and assign a library script through a searchable picker, all written straight back into the world),
-  - a fixed bottom console dock with an Output tab showing a live log and a Terminal placeholder.
-- Runs the simulation live on the engine's fixed-timestep clock, so the sim ticks at a true 30 per second independent of the window's repaint rate, with play, pause, and step controls.
-- Undo and redo (Ctrl+Z / Ctrl+Y), built on full-world snapshots. Spawning, despawning, nudging, and Inspector edits are undoable; a drag or a held key is a single step.
-- A flythrough camera: hold Alt to look around with the mouse and fly with WASD (cursor grabbed), seeded from the current view. Left-click picks the entity at screen-centre and makes it the orbit pivot; release Alt to return to orbit.
+Architecture: a hand-rolled, ECS-style data layout. Component data is stored in parallel lists indexed by entity ID rather than as objects that own their data. An entity is just an index. Its data lives in per-component lists, and systems sweep those lists in bulk each tick. It is built by hand rather than with an ECS crate so the data layout stays under our own control and is fully understood. Some components are markers: zero-field tags whose mere presence is the data. An entity is "controlled" if it carries the `Controlled` marker, with no value attached. A system then operates on every entity that has a given combination of components, for example everything that has both a position and the controlled marker. That "query by component signature" is how bulk behaviour attaches to entities here. Per-entity authored behaviour also exists, through a `Script` component and a runtime seam (see Scripting), but the two coexist rather than compete: a system sweeps whole component lists each tick, while a script attaches a small hand-written rule to a single entity.
 
-Play a project in a separate, clean game window: its own window and GPU surface running the world with no editor chrome, the simulation live and WASD driving `Controlled` entities.
+Build versus buy: hand-roll the parts that are the heart of the project and worth understanding deeply, which is the engine and its world, systems, and clock. Use existing libraries for solved problems that are not the heart. Two choices deserve a note because they are where the line is easiest to argue about:
 
-Currently at the frontier: richer authoring (prefabs); a fuller material model (textures, roughness, metalness) on imported models; collision refinements (tighter, true oriented boxes, a broad phase); interest management and reconnect support for multiplayer; and wiring `net::Server`/`net::Client` into the editor's own Play window. Rotation, script rename support, the script API's original "what a script can reach" list (the entity hit and where, its own id, markers, input, spawn/despawn), a first slice of client input upload, a plugin loader with enable/disable support, the full editor-extension surface for plugins (custom Inspector fields, menu actions, and panels), multi-light shading, and basic sound playback, are done for now.
+- Physics uses `rapier3d`. A rigid-body constraint solver (stacking, friction, restitution, joints, characters) is a large, subtle body of work that is not what makes this engine different, so it is bought, not hand-rolled. It is the one dependency the engine crate takes beyond `serde` and `ron`. It is pinned to a minor version because rapier is pre-1.0 and its API still moves between minor releases. The earlier hand-rolled axis-aligned collision code stays for trigger-style overlap detection and the `hit` script variables.
+- Scripting uses `rhai`, and audio uses `kira`. Both live in the editor, not the engine, for the reasons in Engine purity.
 
-## Principles
+In the editor, the other libraries are: `winit` for windowing, `wgpu` for the GPU API, `glam` for linear algebra, `bytemuck` for casting plain structs into the byte slices the GPU expects, `pollster` for blocking on wgpu's async setup, `image` for decoding the embedded logo and textures, `egui` (with `egui_dock`) for the dockable panel UI, `rfd` for native file dialogs, `dirs` for the platform config directory, `chrono` for dates on project cards, `serde` with `ron` for the `project.ron` manifest, and `git2` for reading a project's repository state in the Source Control tab. These are load-bearing, but they are not where the learning or the differentiation lives.
 
-- **Simulation is separate from rendering.** The simulation knows nothing about how it is drawn. The editor reads the world and draws it across a crate boundary, and never owns the state. The engine crate pulls in no graphics libraries, and no script interpreter: it holds script source as data and leaves running it to the host, just as it leaves drawing to the host.
-- **Headless by default.** Runs with no window. Rendering is optional and added on top.
-- **Deterministic, fixed-timestep.** One tick is always the same slice of simulated time, so behaviour is identical across machines. The editor honours this with the engine's own clock rather than ticking once per rendered frame.
-- **Reusable.** The engine is its own library crate, so it can power more than one game or tool. Dependencies point inward: tools depend on the engine, never the reverse.
-- **Hand-roll the heart, buy the rest.** The engine is built by hand to be understood deeply. Solved problems that are not the heart (windowing, the GPU API, linear algebra, UI, file dialogs, config paths, dates, git, audio) use existing libraries: `winit`, `wgpu`, `glam`, `egui` and `egui_dock`, `rfd`, `dirs`, `chrono`, `git2`, `kira`, and, in the editor, for the project manifest, `serde` with `ron`.
-- **No premature abstraction.** Machinery is built when the pain is real, not before. The fixed-timestep clock stayed duplicated inline until a second consumer made the duplication real, then moved into `core/`.
+Editor viewport rendering: the editor renders on the GPU through `wgpu`, in real 3D, with a perspective camera, instanced geometry (cube, sphere, plane, and imported models), and a depth buffer for correct occlusion. This replaced an earlier `softbuffer` CPU-pixel view, which did its job as a dependency-light first window and proved the cross-crate link and the camera, pick, and inspector concepts in 2D. Real 3D needs a GPU pipeline, so the editor moved to wgpu once those concepts held up. The engine was untouched by that migration. All of it lives in the editor crate, on the far side of the simulation and rendering line.
 
-## Workspace structure
+Engine purity: the engine crate pulls in no rendering, windowing, audio, or scripting libraries. Everything graphics-related (`wgpu`, `glam`, `winit`, `egui`, `image`) lives in the editor, as do the script interpreter and audio playback. The engine is plain data and logic, plus the physics solver it deliberately buys. Note that "graphics-free" is the line, not "no appearance data": the engine carries per-entity colour, scale, and texture coordinates as component data because they are part of the simulated world state, but it owns no code that draws. The same line holds for scripting and sound: the engine carries script source and sound references as component data and defines the runtime as a trait, but pulls in no interpreter and no audio device. So the real boundary is "graphics-free, interpreter-free, and audio-free," not "no appearance or behaviour data".
 
-This repository is a Cargo workspace holding multiple crates:
+Scripting: behaviour attaches two ways. Systems act on whole component signatures in bulk (every controlled entity, every entity with a velocity). Per-entity scripts attach a small authored rule to a single entity. The engine owns the seam for the second, not the machinery: a `Script` component that names a script, a `script_library` on the world mapping each name to its Rhai source, and a `ScriptRuntime` trait with `begin_tick` (optional, for per-tick shared state such as a clock or the held input) and `run` (apply one entity's script to the world). The engine stores the source and defines the trait; it interprets nothing.
 
-```
-crates/
-├── frame-engine/       the simulation engine (library and binary)
-│   └── src/
-│       ├── core/       fixed-timestep clock (clock.rs)
-│       ├── world/      simulation state (entities, components, storage)
-│       ├── systems/    logic that runs each tick
-│       ├── input/      graphics-free input abstraction (held buttons)
-│       ├── net/        multiplayer: an authoritative Server and a Client
-│       ├── render/     read-only ASCII debug view
-│       ├── lib.rs      library root, exposes the engine to other crates
-│       └── main.rs     binary runner, drives the tick loop
-└── frame-editor/       editor; depends on frame-engine
-    └── src/
-        ├── main.rs     windowed 3D editor: app state, camera, picking,
-        │               entity editing, the egui panel layout, and the
-        │               wgpu render pipeline
-        ├── script.rs   the Rhai script runtime (the editor's ScriptRuntime)
-        ├── shader.wgsl entity shader (instanced, shaded primitives)
-        ├── text.wgsl   screen-space overlay shader (controls legend)
-        └── font.rs     hand-rolled bitmap font for the overlay
-```
+Scripts are referenced, not inlined. An entity's `Script` holds a name into the library, so a script's source lives exactly once and editing it updates every entity that uses it. An earlier version stored the source inline on each entity; the reference model replaced it so shared behaviour is not duplicated across entities.
 
-The engine and editor live in one repo so they evolve together, but build as separate targets.
+The interpreter lives in the editor. `rhai` was chosen for being small, made for embedding in Rust, and friendly to determinism, which matters because the server's own simulation needs to be reproducible. Because the runtime is a trait, a different backend (a `wasm` runtime is the obvious candidate) is just another `impl ScriptRuntime`, with no change to the engine or to authored scripts. What a script can read and write each tick is documented for authors in SCRIPTING.md.
 
-## Building
+Plugins: extension happens through scripts and the editor's extension surface, not compiled dynamic libraries. A plugin is loaded by the editor, written against Rhai, and can add editor behaviour and project-specific components through the engine's dynamic component registration. This keeps the public engine free of any one project's data and avoids the ABI and safety problems of loading native code. See PLUGINS.md.
 
-Requires [Rust](https://rustup.rs).
+Editor of choice: Zed.
 
-Run the engine (headless tick loop and ASCII debug view):
+## The Grove theme
 
-```
-cargo run -p frame-engine
-```
+The editor has its own look, named Grove. It is a deliberate part of the editor's identity, not decoration applied late, and it lives in one place so it can be tuned without touching panel code.
 
-Run the editor (opens the project launcher; pick or create a project to enter the 3D editor):
+- Palette. Near-neutral dark greys for backgrounds, panels, inputs, and borders, so the interface recedes behind the scene. One restrained green accent marks selection, focus, and active controls. A warm wood tone is used sparingly as a secondary accent. An earlier, greener palette overpowered everything else and was neutralised for that reason.
+- Fonts. Three fonts are embedded in the binary so the look is identical on every machine: Manrope for body text, Fraunces for headings and section labels, and JetBrains Mono for code and numbers. All three are SIL Open Font License 1.1, which is why they sit in the editor's `assets/fonts/` with their licence text. Manrope ships as a static Regular file, because egui loads a variable font at its default axis value and Manrope's default is a thin weight.
+- Chrome. The docking area is explicitly styled from the theme, because `egui_dock` ignores ambient egui visuals unless given its own style. Active tabs take the panel colour with a wood outline. A thin wood-to-green strip runs across the top of the window.
+- Controls. Inspector section headings use the serif at a muted tone for hierarchy. Checkboxes are custom: a rounded box with a diamond tick, replacing the stock tick. Selected rows, slider styling, and Inspector spacing are being brought in line with the same language.
 
-```
-cargo run -p frame-editor
-```
+The theme is an editor concern only. Nothing in the engine knows about it.
 
-Editor controls:
+## Open questions
 
-- **P** play or pause, **.** step one tick while paused
-- **WASD** drive a `Controlled` entity (while playing), **Space** jump (a physics character with Gravity, standing on something)
-- **Left-click** select an entity, **Esc** clear selection
-- **Arrow keys** move selection on X and Y, **Page Up / Page Down** move on Z
-- **N** spawn an entity, **Delete** despawn the selection
-- **Ctrl+Z** undo, **Ctrl+Y** (or **Ctrl+Shift+Z**) redo
-- **F5** save scene, **F9** reload scene
-- **Left-drag** pan, **Scroll** zoom, **Middle-drag** orbit
-- **Drag a gizmo arm** move the selected entity along that axis
-- **Hold Alt** flythrough camera, mouse looks, **WASD** flies, left-click picks the centred entity as the orbit pivot
-- **H** toggle the controls overlay
+Lighting and materials. Shading supports several lights: each fragment is lit by up to four `Light` components, and `Material` carries an emissive strength that blends a fragment toward its own flat colour as it rises toward 1.0. Entities can also carry textures. There are still no shadows, and nothing like roughness or metalness. That is fine for a debug and authoring viewport. A fuller material model and shadows are a later, separate concern.
 
-## License
+Picking is approximate. Selection projects each entity's centre and a corner to the screen and does a rectangle hit-test against the cursor. It is a screen-space bounding box, not a true ray-versus-geometry pick. The box scales with the entity's `Scale`, so a resized entity stays clickable, but it is shape-agnostic: the same scale-box for a cube, a sphere, or a plane. A tighter, shape-aware pick may eventually be worth it.
 
-MIT. See [LICENSE](LICENSE).
+Two renderers exist: the engine's headless ASCII view and the editor's wgpu viewport. The ASCII view is still useful as a zero-dependency headless check. Whether it stays long-term or retires once the editor is the canonical viewer is open.
 
-## Design notes
+How far to take component storage. The current direction is a fixed set of named component fields on `World`, plus a runtime registry for component types the engine was never compiled knowing about. The open part is whether the dynamic registry should grow to cover serialization and scripting access, or stay a narrow escape hatch.
 
-See [DESIGN.md](DESIGN.md) for architecture decisions and reasoning, [SCRIPTING.md](SCRIPTING.md) for the guide to writing entity scripts, and [PLUGINS.md](PLUGINS.md) for the guide to building a plugin.
+Gap-storage tradeoffs at scale. The `Vec<Option<T>>` layout leaves holes for despawned entities. Spawn reuses the first freed hole rather than always growing, which keeps the lists from running away, but iteration still visits holes. Sparse sets or a similar approach may be worth revisiting as entity counts grow.
+
+Scripting surface and lifecycle. Scripts see `pos`, `vel`, and `scale` as a registered `Vec3` type and `color` as an `Rgb`, while the original flat names (`px`, `sx`, `cr`, and so on) remain supported for existing scripts. The runtime writes back whichever spelling a script changed, structured winning if both did. The editor runs a semantic pass over the compiled script (via Rhai's `internals` AST walk), flagging any variable that is neither part of the API nor a local `let`. That check deliberately only under-reports: block scope is ignored and unparseable source yields no warnings, so a warning shown is always real.
+
+A script can read its own entity id, its markers, which movement keys are held, and, on collision, which entity was hit and where. It can request a spawn or despawn by setting a value the engine reads back after the script finishes, rather than calling into a live `World`. That keeps the set-then-read-back architecture intact instead of making the interpreter hold a mutable engine reference mid-script. Nothing throttles a script that spawns unconditionally every tick; that risk is documented in SCRIPTING.md rather than guarded against in code, a deliberate choice. Deleting a library script leaves referencing entities with a dangling name, which the runtime skips safely and the inspector flags. Renaming rewrites every entity's reference, so it does not orphan anything.
+
+Physics scope. Rigid bodies, colliders, characters, jumping, and turning are in through `rapier3d`. Open: joints, collision layers, and how much of rapier's surface to expose to scripts. Rotated and mesh-accurate colliders depend on how far the rest of the engine's rotation model grows, since `Rotation` is still a single yaw angle rather than a full 3D orientation.
+
+Persistence and networking. Scene serialization exists. Multiplayer is an authoritative server over raw TCP. Clients connect, receive a `Welcome` message, upload their logical input each tick, and receive the server's state. When a client disconnects, the server despawns the entity that client was driving. The wire format reuses `serde`/RON from the scene format rather than something bandwidth-efficient. Still open: syncing the full component set rather than the core state, interest management (every client currently gets every entity regardless of relevance or distance), a compact wire format, and region handoff between servers for a larger persistent world.
+
+This reflects a real course correction from earlier notes here, which named lockstep (every client independently replaying identical deterministic ticks from shared inputs, with no state sent over the network) as the long-term aim. That fits a small, closed session where every player starts and ends together. It does not fit a persistent, always-on world where players join and leave at any time: a late joiner would need to replay the entire input history from world genesis to catch up, and the smallest floating-point difference between two machines would desync everyone permanently. The engine's fixed-timestep determinism stays exactly as valuable as it always was, because it makes the server's own simulation reproducible, but the client side of "networked" means receiving real state from an authoritative server.
+
+## Implemented so far (engine)
+
+Fixed-timestep clock (`core/clock.rs`). An accumulator-based clock running at a fixed tick rate of 30 ticks per second. It separates simulation speed from hardware speed: every tick advances the sim by the same slice of time, so behaviour is deterministic across machines. A catch-up cap prevents the spiral of death, where after a hard stall the excess owed time is dropped rather than replayed. The clock is its own type with an `advance(running) -> owed_ticks` method, so each consumer asks how many ticks it owes and runs that many.
+
+Hand-rolled ECS world (`world/`). Entities are indices. Component data lives in per-component lists indexed by entity ID, where `Some` means the entity has that component and `None` means it does not. The set of components grows as the engine needs them, so this document names the groups rather than counting them (the full list is in `world/` and the CHANGELOG):
+
+- Spatial and motion: `Position`, `Velocity`, `Rotation` (a yaw angle only), `Scale` (per axis), and `Parent`, which attaches an entity to another so the child moves with it.
+- Appearance: `Color`, `Material` (emissive strength and texture), `Mesh` (a primitive or an imported model by name), and `UiText` and `UiImage` for on-screen elements.
+- Behaviour and state: `Health`, `Script`, `Camera`, `Light`, and `Sound`.
+- Physics: `RigidBody` and its collider and character settings.
+- Markers: zero-field tags whose presence is the data, such as `Controlled`, `Static`, and `Gravity`.
+
+The z axis is present from the start, so verticality such as floors and height is native rather than bolted on later. The world also holds name-keyed registries: `script_library`, `mesh_meta` (each imported model's half extents), and `substances`. A `Substance` carries physical properties (melting point, durability, conductivity, and so on, every field `Option<f32>` so `None` means a property genuinely does not apply, not a gap to fill in). `Substance::blend` mixes two substances, which is the first piece of logic on top of that schema.
+
+The world supports runtime spawn and despawn, both reachable from a script as well as the editor. Spawn reuses the first freed slot, so ids stay stable. Despawn clears every one of an entity's component slots, including markers and any dynamic components, while the index stays valid for whatever spawns into it next.
+
+Prefabs. A subtree of entities can be captured as a prefab and spawned again, with parenting preserved. A prefab is data, so it serializes like a scene.
+
+Runtime component registration (`world/`). `World` can hold component types it was never compiled knowing about, through `insert_dynamic`, `get_dynamic`, `get_dynamic_mut`, and `remove_dynamic`, all generic over `T: Clone + 'static` and keyed by string name, the same naming pattern `script_library` and `mesh_meta` use. A name's type is fixed by whichever `T` first inserts under it; a later insert with a different `T` is refused rather than corrupting the slot. This is the seam that keeps project-specific component types (a plugin's own data) out of the public engine, rather than every new kind of data needing to become a public `World` field. It deliberately does not serialize with the scene yet: a registered component resets on reload.
+
+Generic component storage (`world/storage.rs`). A reusable `ComponentStorage<T>`, a private `Vec<Option<T>>` with `new`, `insert`, `get`, `get_mut`, `remove`, `len`, `iter`, and `iter_mut`, so every component type uses the same tested storage code. `ComponentStorage<T>` implements `Default`, and `World` derives `Default`, so a fresh world is constructed in exactly one place. Adding a component type is adding one storage field. This is also the seam the editor's inspector reads and writes through.
+
+Systems (`systems/`). Simulation logic lives in named functions rather than inline in the tick loop. Gravity adds a constant downward step to the velocity of every non-static entity with the `Gravity` marker, just before movement. Movement applies each velocity to its position. `input_movement` drives every entity with a position and the `Controlled` marker from the held buttons. Collision detection and physics (below) follow. Each system walks the entities that match a component signature and acts on them, so adding behaviour means adding a system and a call, not editing the loop.
+
+Physics (`physics.rs`). Rigid bodies and colliders run through `rapier3d`, stepped at the engine's fixed tick. The world remains the source of truth: body state is written back into `Position` and `Velocity` after each step. Character controllers, jumping, and turning are supported for entities that are driven directly.
+
+Collision detection (`systems/`). A `collision` system finds which entity boxes overlap and records each pair on the world (`World.collisions`), along with the contact point: the centre of the region the two boxes share. It is a trigger, feeding the `hit`, `hit_id`, and `hit_point` script variables and the editor's red tint. Each box is axis-aligned and centred on the entity's position; a shared `half_extents` helper sizes it per mesh (a `Plane` is flat in Y so things rest on its surface, while cubes and spheres use the full scale-box). It ignores `Rotation`, and the sweep is O(n^2) over live entities. `World.collisions` is transient derived state, recomputed on each run and skipped by serde.
+
+Scripting seam (`world/` and `systems/`). An entity carries a `Script` that names an entry in the world's `script_library`; a `ScriptRuntime` trait defines how a host runs one (`begin_tick` once per tick for shared state, then `run` per scripted entity); the `run_scripts` system walks every scripted entity and drives it through whatever runtime the host provides. The engine stores the source and owns the seam; it interprets nothing. Both the `Script` component and the library serialize with the scene, and an entity whose named script is missing is skipped.
+
+OBJ import (`assets/`). A hand-rolled Wavefront OBJ parser, the engine's first asset loader, written by hand because OBJ is simple enough to be worth understanding end to end. It covers what Blender exports for a plain static model: `v`, `vt`, `vn`, and `f` lines, all four face corner forms, 1-based and negative indices, comments, fan triangulation of faces with more than three corners, and a computed flat normal when a face has none. Texture coordinates are kept so a model can be textured. Parsed models are normalised to unit size, centred with the largest half extent at 0.5 like the primitives, so a model at scale 1 comes out cube-sized and keeps its proportions. The parser takes a string and returns plain vertex data, with no file IO and no graphics types, so it lives in the engine with zero new dependencies. `Mesh` has a `Custom(name)` variant, and `mesh_meta` holds each model's half extents so collision can fit a box to a model without the vertex data.
+
+Multiplayer (`net/`). `Server::bind` opens a non-blocking TCP listener, polled once per tick to accept new clients, read their uploaded input, and broadcast world state. `Client::connect` opens a non-blocking connection; its `poll`, also run once per tick, reads whatever has arrived, applies complete messages to a local `World`, and sends the local logical input upward. A new client receives a `Welcome` identifying the entity it controls, and the server despawns that entity when the client disconnects. Every message is framed with a 4-byte big-endian length prefix ahead of a RON payload, the minimum a byte-stream protocol like TCP needs to know where one message ends and the next begins; a partially received message waits in a buffer until the rest arrives on a later poll. The engine binary runs as a headless `server` or a `client` for end-to-end use. Interest management and a compact wire format are not done (see Open questions).
+
+Logical input (`input/`). A graphics-free `InputState` records which logical `Button`s are currently held. It depends on no windowing library: the editor maps platform key events onto these neutral buttons, networked clients upload them, and the engine reads them. It is what `input_movement` consumes each tick.
+
+Scene serialization (`serde` and RON). The `World` serializes to and from a human-readable RON file on disk. Scenes saved before a field existed still load: the missing field defaults rather than failing, so older files stay readable. This is the persistence primitive scene authoring builds on, wired into the editor as save and load.
+
+Read-only ASCII debug renderer (`render/`). Draws the world as a grid each frame, mapping entity x and y onto cells. It is read-only by design, taking `&World` and never `&mut`, which enforces the simulation and rendering separation. Render rate is independent of tick rate.
+
+Library and binary split (`lib.rs` and `main.rs`). The engine is both a library and a binary that consumes the library the same way any external crate would. This is what makes the engine importable. The editor is the second consumer.
+
+Plain value components (`Position`, `Velocity`, `Color`, `Scale`, `Material`, `Rotation`, `Health`, `Substance`, and similar) derive `Copy`, so the editor can read a component out of the world, edit a copy in a panel, and write it back without holding a borrow on the world across the UI code.
+
+## Tooling
+
+`frame-editor` (`crates/frame-editor/`) is a separate binary crate that depends on the engine library. It is a 3D viewer and editor of a live world. It opens a native window, runs the engine's simulation under its own control, renders the world on the GPU, and lets you navigate, inspect, select, and edit entities through a docked panel layout.
+
+What the editor does today:
+
+Native window via `winit`, using the `ApplicationHandler` event-loop model. The editor owns its application state (an `App` holding the window, the GPU state, the engine `World`, the clock, the camera, the selection, the held input, and the panel state) and runs its own event-driven loop. That loop is distinct from the engine's headless tick loop, because an editor controls when to step the simulation rather than ticking forever.
+
+Clean shutdown. GPU and window resources are released while winit's platform connection is still alive, on the way out, rather than being dropped after the event loop has torn down. On Wayland the wgpu surface's destructor touches platform objects, so dropping it too late was a segfault on close. Releasing in order (GPU state, then egui, then the window) fixes it.
+
+GPU rendering via `wgpu`. Each primitive's geometry (cube, sphere, plane) is generated once on the CPU at unit size and uploaded to one shared vertex buffer, with imported models appended after the primitives. A per-entity instance buffer (position, colour, a selected flag, a per-axis scale, an emissive strength, and a yaw angle) places, sizes, and rotates each entity. Instances are grouped by mesh and drawn one mesh at a time against its slice of the shared buffer, so a scene of mixed shapes takes only a handful of draw calls. Textured models sample their texture in the fragment stage. Fragments are lit by up to four lights. A second, screen-space pipeline draws the controls overlay, and egui's own render pass is layered on top.
+
+Real 3D with perspective and depth. The camera builds a view-projection matrix with `glam`, so the scene has true perspective. A 32-bit depth buffer, recreated on resize, does per-pixel depth testing, so nearer geometry occludes farther geometry regardless of draw order.
+
+Orbit, pan, and zoom camera. The camera orbits a focus point at an adjustable distance, with yaw and pitch. Left-drag pans the focus point, scroll zooms, and middle-drag orbits, with pitch clamped just short of the poles so the up vector never degenerates.
+
+Flythrough camera. Holding Alt switches from orbit to a free camera, seeded from the current orbit eye so the view does not jump. The mouse looks around (the cursor is grabbed and hidden) and WASD flies the eye along the look direction. Left-click while flying picks the entity at screen centre and makes it the pivot; releasing Alt rebuilds the orbit around it, or around a point straight ahead if nothing was picked. Alt is read from the modifier state rather than a key event, because a lone Alt press often only reports that way on Wayland, and losing window focus also leaves fly mode so the cursor cannot stay grabbed. Known limitation: releasing Alt does not restore the exact pre-Alt view.
+
+Click-to-pick selection and live editing. Left-click selects an entity; the selection is highlighted by brightening it toward white so its own colour stays readable. `Escape` clears the selection. Arrow keys nudge the selection on X and Y, Page Up and Page Down on Z, `N` spawns an entity at the camera focus, and `Delete` despawns the selection. While the sim is playing, `Controlled` entities are driven by WASD through the engine's input system.
+
+Undo and redo. The editor keeps stacks of full-world snapshots, which is why the engine's world and storages are `Clone`. A snapshot is pushed before a mutating gesture and coalesced so a whole gesture is one step: discrete actions snapshot once, a held nudge key snapshots only on the first press, and Inspector edits are caught by comparing the selected entity's editable state before and after the frame's UI pass (which is why the plain-data components derive `PartialEq`). Ctrl+Z restores the top snapshot onto a redo stack; Ctrl+Y or Ctrl+Shift+Z reverses it; a fresh edit clears the redo stack. History is capped. Script-editor typing is not its own undo step.
+
+Scene save and load. A project's scene is a RON file. `F5` saves, `F9` reloads, and the File menu opens or saves any path through a native dialog (`rfd`, on its `xdg-portal` backend so it works on Wayland).
+
+Project launcher. The editor opens on a launcher rather than a fixed scene. It is a distinct app mode: an egui-only screen with no simulation and no 3D, that switches into the editor once a project is loaded, and that File > Close project returns to. A project is a folder holding a scene file named after the project, plus an optional `project.ron` manifest carrying the description and version. New scaffolds a project, Open picks a folder, and recent projects are remembered in a small file under the platform config directory, shown as cards with name, description, last-edited date, and version, with Edit, Play, Settings, and a two-step Delete. Settings is a floating window that edits the manifest. The manifest is the one place the editor reads and writes its own RON with `serde`; the engine still owns the scene format. Projects open paused, and editor preferences persist in an `editor.ron` under the config directory.
+
+Play. Play opens the project in a separate, clean game window: its own winit window and wgpu surface running a copy of the world, the 3D scene only with no editor chrome, driven from the world's `Camera` entity. Events are routed by window id, and closing it (or Esc) tears the window down deferred in `about_to_wait` so dropping the wgpu surface does not crash on Wayland.
+
+Dockable panel UI via `egui` and `egui_dock`. The tool panels are dockable tabs, not fixed regions: they can be dragged, tabbed together, and split apart at runtime, and any tab can be popped out into its own window. Popped-out windows share the editor's single GPU instance rather than each creating their own.
+
+- A top toolbar with the editor's logo and File, Edit, View, and Help menus. Each menu item runs the same action as its keyboard shortcut: the menu and the key are two triggers for one command, so they cannot drift apart.
+- A `DockArea` between the toolbar and console holding the tabs: Viewport, Scene, Inspector, Script Editor, and Source Control. The Scene tab lists every live entity as a tree, supports parenting by drag and drop, and selects on click. The Inspector edits the selected entity's components (transform, appearance, markers, physics, light, sound, camera, script) and writes straight back into the world. The Script Editor keeps its script-name sidebar beside one large code editor.
+- A bottom console dock with an Output log, a Terminal placeholder, and the Assets tab. The toolbar and console stay fixed rather than dockable.
+
+The Viewport is itself one of the dock tabs, but a special one: its body is left unpainted, so the 3D scene (rendered on the GPU behind egui) shows through. Because the viewport is an egui area, `is_pointer_over_egui()` cannot tell viewport from panel, so the Viewport tab records its on-screen rect each frame and the camera and picking respond only when the cursor is inside it. When another tab covers the viewport that rect is absent, so a click in the Script Editor never picks an entity behind it. WASD is read regardless of panel focus, so driving a `Controlled` entity keeps working while a panel widget holds keyboard focus. A camera preview shows what a `Camera` entity sees without entering Play.
+
+Rhai scripting backend. The editor provides the engine's `ScriptRuntime` as a `rhai` interpreter, the one place `rhai` is used. Each tick it resolves an entity's script name to library source, compiles it (cached by source text, so a script shared by many entities compiles once), hands the entity's current state to the script as variables, runs it, and writes the changes back. State goes in as structured `Vec3` and `Rgb` values, single numbers (`emissive`, `yaw`), and the original flat numbers, and whichever spelling a script changed wins on write-back. Spawn and despawn are requests applied once after the script finishes. Scripts run before the movement systems each tick, so a script that sets a velocity has it applied the same tick. A script that fails to compile is reported once and then skipped, so one bad script cannot stall the loop. The Script Editor compile-checks the open script as you type and shows a status line: a syntax error's line, column, and message in red, and, when the source parses, a semantic pass flags in amber any name that is neither part of the script API nor declared with `let`.
+
+Script Editor. A two-pane split: a left sidebar listing every library script by name (where you add, select, rename, and delete scripts) and a single large code editor with a line-number gutter. Because scripts are shared by name, this is where a behaviour is written once; assigning it to entities happens in the Inspector.
+
+Translate gizmo. Selecting an entity draws three coloured axis arms at it (X red, Y green, Z blue); dragging an arm moves the entity along that world axis. The gizmo is deliberately not scene geometry. It is painted as an egui overlay on the transparent Viewport tab, projecting the arms to screen with the same `project` helper picking uses, which keeps a pure editor tool out of the render pipeline. The drag maps screen movement back to world movement by the fraction of the arm's projected length the cursor travelled along it, so the entity tracks the cursor at any camera angle. Arm length scales with camera distance to hold a roughly constant on-screen size, and an arm projected nearly end-on is ignored rather than producing wild movement. Pressing an arm takes priority over camera pan and picking, each drag pushes one undo snapshot, and the gizmo hides while flying.
+
+Source Control tab. A read-only dockable panel showing the open project's git state, built on `git2`. It shows the current branch, the upstream with ahead and behind counts when one is configured, and the working tree's changed files, each labelled modified, new, deleted, renamed, or conflicted. Read-only is the load-bearing choice: the panel opens the repository, reads, and drops, so it needs no network access and no credential handling, which is the moment integrating git becomes genuinely hard. Commits and pushes stay in the terminal or a git client. The snapshot refreshes on a roughly two-second timer rather than every frame, and `Repository::discover` walks up parent directories, so a project nested inside a repository is found.
+
+Model import and the Assets tab. File > Import model picks an OBJ, copies it into the project's assets folder, parses it through the engine, records its half extents in `mesh_meta`, and uploads it to the GPU. Opening a project scans the assets folder the same way. The Assets tab shows the folder as tiles, each model with a small preview drawn by a hand-rolled software rasteriser (the meshes are already unit-normalised on the CPU, so a fixed camera, an orthographic projection, a z-buffer, and one light are enough), cached per model. Folders can be opened and created, and a move and paste flow renames files between them. Audio files are imported through the same flow and played back through `kira`, which lives in the editor.
+
+Collision feedback. Collision detection runs first in each tick, so a script can read whether its entity is colliding this tick. The editor runs it once more per frame, including while paused, and tints any overlapping entity red in the viewport. The tint is a visual flag only; the entity's colour in the world is unchanged.
+
+Controls overlay. A bottom-left list of keybindings, drawn with a hand-rolled 5x7 bitmap font through the screen-space overlay pipeline. `H` toggles it. This is the last remaining hand-rolled text overlay.
+
+Live simulation on the engine's clock. The editor advances the world by calling the engine's systems, driven by the engine's `core` clock, so the sim runs at a true 30 ticks per second independent of the window's repaint rate. Pausing stops the simulation but not the rendering. `Space` toggles pause, `.` steps one tick while paused, and the viewport keeps redrawing the frozen state so you can navigate a paused world.
+
+Editor extension surface. The editor loads plugins written for the Rhai backend and exposes a defined surface for them to add behaviour. The boundaries and what plugins may touch are described in PLUGINS.md, and the security expectations are in SECURITY.md.
+
+## What's next
+
+In rough order:
+
+- Finish the Grove theme pass: selected-row highlight in the Scene tab, slider styling, and Inspector layout spacing.
+- Restore the exact pre-Alt view when leaving the flythrough camera without picking an entity, so a look-around does not move the orbit.
+- A fuller material model (roughness, metalness) and shadows, now that there is a multi-light model for them to respond to.
+- Collision and physics refinements: rotated and mesh-accurate colliders, joints, and a broad phase if entity counts grow.
+- Networking: interest management, syncing the full component set, and a compact wire format.
+- Serializing dynamic components with the scene.
+
+Extending the script API is done for now. Whatever comes after the current surface is worth its own real discussion rather than continuing that list by default.
