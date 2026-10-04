@@ -647,6 +647,66 @@ pub struct Sound {
     pub play: bool,
 }
 
+/// Screen-space UI text, drawn as a flat overlay on top of the 3D scene
+/// rather than as geometry in the world. Optional, the same "most entities
+/// have none" shape as `Light`/`Sound`: an entity carrying this is excluded
+/// from the normal 3D render pass entirely (see `build_instances`) and drawn
+/// instead by the host as a screen-space overlay.
+///
+/// `x`/`y` are normalized screen-space coordinates, 0.0 to 1.0 from the
+/// top-left corner, resolution-independent by construction rather than pixel
+/// coordinates that would need separate scaling logic per window size.
+/// Deliberately a flat first slice: no anchoring beyond this single point, no
+/// parent/child nesting between UI elements, and not interactive (no click
+/// handling yet) — those are separate, later steps.
+#[derive(Serialize, Deserialize, Clone, PartialEq)]
+pub struct UiText {
+    pub text: String,
+    pub x: f32,
+    pub y: f32,
+    pub font_size: f32,
+    pub color: Color,
+}
+
+impl Default for UiText {
+    fn default() -> Self {
+        UiText {
+            text: "Text".to_string(),
+            x: 0.5,
+            y: 0.5,
+            font_size: 24.0,
+            color: Color { r: 1.0, g: 1.0, b: 1.0 },
+        }
+    }
+}
+
+/// Screen-space UI image, `UiText`'s sibling: a texture drawn as a flat
+/// overlay instead of world geometry. `name` resolves the same "anywhere
+/// under assets/" way `Sound` and `MeshMaterial`'s texture do. `width`/
+/// `height` are normalized against screen width/height the same way `x`/`y`
+/// are, so a UI image scales with the window instead of staying a fixed
+/// pixel size.
+#[derive(Serialize, Deserialize, Clone, PartialEq)]
+pub struct UiImage {
+    pub name: String,
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+}
+
+impl Default for UiImage {
+    fn default() -> Self {
+        UiImage {
+            name: String::new(),
+            x: 0.5,
+            y: 0.5,
+            width: 0.2,
+            height: 0.2,
+        }
+    }
+}
+
 /// What a physics-controlled entity asked to do this tick: move (dx, dz) in
 /// world units, and whether Jump is held. Whether it can actually move or
 /// jump is decided by the physics step, not here.
@@ -759,6 +819,15 @@ pub struct World {
     /// shape as `lights`/`statics`/`gravities` above.
     #[serde(default)]
     pub sounds: ComponentStorage<Sound>,
+    /// Optional per-entity screen-space UI text, the same "most entities
+    /// have none" shape as `lights`/`sounds`. An entity carrying this is
+    /// excluded from the 3D render pass (see `build_instances`) and drawn
+    /// instead as a screen-space overlay.
+    #[serde(default)]
+    pub ui_texts: ComponentStorage<UiText>,
+    /// Optional per-entity screen-space UI image, `ui_texts`'s sibling.
+    #[serde(default)]
+    pub ui_images: ComponentStorage<UiImage>,
     /// Metadata for imported meshes, keyed by mesh name. Works like
     /// script_library does for scripts.
     #[serde(default)]
@@ -934,6 +1003,8 @@ impl World {
             self.parents.remove(id);
             self.lights.remove(id);
             self.sounds.remove(id);
+            self.ui_texts.remove(id);
+            self.ui_images.remove(id);
             // Every registered dynamic component too, without needing to know
             // any of their types: remove_erased is exactly what that's for.
             for entry in self.dynamic.values_mut() {
