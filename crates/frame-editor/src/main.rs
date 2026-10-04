@@ -2473,17 +2473,17 @@ fn inspector_tab_ui(
                     }
                 });
             ui.add_space(4.0);
-            grove_checkbox(ui, controlled, "Controlled (WASD)");
-            grove_checkbox(ui, is_static, "Static (immovable)");
-            grove_checkbox(ui, has_gravity, "Gravity (falls)");
-            grove_checkbox(ui, is_rigid_body, "Physics (rapier3d)")
+            outerface_checkbox(ui, controlled, "Controlled (WASD)");
+            outerface_checkbox(ui, is_static, "Static (immovable)");
+            outerface_checkbox(ui, has_gravity, "Gravity (falls)");
+            outerface_checkbox(ui, is_rigid_body, "Physics (rapier3d)")
                 .on_hover_text(
                     "Simulated by rapier3d instead of the built-in movement/\
                      gravity/collision. Needs Static, Gravity or Controlled too. \
                      With Controlled it's a character: input moves it and it \
                      stops at walls. Add Gravity to make it fall.",
                 );
-            grove_checkbox(ui, is_camera, "Camera").on_hover_text(
+            outerface_checkbox(ui, is_camera, "Camera").on_hover_text(
                 "Play mode renders from the first Camera entity in the \
                      scene (lowest id) instead of the editor's own orbit \
                      camera. Only its Position and yaw matter — no pitch, \
@@ -2515,7 +2515,7 @@ fn inspector_tab_ui(
             ui.add_space(8.0);
             section_label(ui, "Light");
             let mut has_light = light.is_some();
-            if grove_checkbox(ui, &mut has_light, "Light source").changed() {
+            if outerface_checkbox(ui, &mut has_light, "Light source").changed() {
                 *light = if has_light {
                     Some(Light::default())
                 } else {
@@ -2584,7 +2584,7 @@ fn inspector_tab_ui(
             ui.add_space(8.0);
             section_label(ui, "Sound");
             let mut has_sound = sound.is_some();
-            if grove_checkbox(ui, &mut has_sound, "Sound source").changed() {
+            if outerface_checkbox(ui, &mut has_sound, "Sound source").changed() {
                 *sound = if has_sound {
                     Some(Sound::default())
                 } else {
@@ -2630,7 +2630,7 @@ fn inspector_tab_ui(
             ui.add_space(8.0);
             section_label(ui, "UI Text");
             let mut has_ui_text = ui_text.is_some();
-            if grove_checkbox(ui, &mut has_ui_text, "Screen-space text overlay")
+            if outerface_checkbox(ui, &mut has_ui_text, "Screen-space text overlay")
                 .changed()
             {
                 *ui_text = if has_ui_text {
@@ -2678,7 +2678,7 @@ fn inspector_tab_ui(
             ui.add_space(8.0);
             section_label(ui, "UI Image");
             let mut has_ui_image = ui_image.is_some();
-            if grove_checkbox(ui, &mut has_ui_image, "Screen-space image overlay")
+            if outerface_checkbox(ui, &mut has_ui_image, "Screen-space image overlay")
                 .changed()
             {
                 *ui_image = if has_ui_image {
@@ -2746,7 +2746,7 @@ fn inspector_tab_ui(
             ui.add_space(8.0);
             section_label(ui, "Parent");
             let mut has_parent = parent.is_some();
-            if grove_checkbox(ui, &mut has_parent, "Attached to another entity")
+            if outerface_checkbox(ui, &mut has_parent, "Attached to another entity")
                 .changed()
             {
                 *parent = if has_parent {
@@ -3273,7 +3273,7 @@ mod theme {
     pub const WOOD: Color32 = Color32::from_rgb(0xB9, 0x8A, 0x4E);
 }
 
-/// The editor's visual theme (Grove Panel: green accent, small rounding,
+/// The editor's visual theme (Outerface V1: green accent, small rounding,
 /// carved-adjacent widget states). Applied to every egui::Context the
 /// editor's own chrome uses -- the main window and each popped-out tab
 /// window -- but deliberately not the Play window, which is the player's
@@ -3335,7 +3335,7 @@ fn apply_editor_theme(ctx: &egui::Context) {
 
     ctx.set_visuals(visuals);
 
-    // Grove typography: Manrope for body text, JetBrains Mono for monospace,
+    // Outerface V1 typography: Manrope for body text, JetBrains Mono for monospace,
     // Fraunces (serif) as its own named family used for headings. Each is put
     // first in its family so egui's built-in fonts stay behind as fallbacks
     // for any glyph these don't cover.
@@ -3399,11 +3399,11 @@ fn section_label(ui: &mut egui::Ui, text: &str) {
     );
 }
 
-/// The Grove checkbox: a small square box with an accent border and a diamond
+/// The Outerface V1 checkbox: a small square box with an accent border and a diamond
 /// tick when checked, the mockup's look. Drop-in for `ui.checkbox`: takes the
 /// same `&mut bool` and label, and the returned response reports `changed()`
 /// and takes `on_hover_text` the same way. Clicking the label toggles it too.
-fn grove_checkbox(
+fn outerface_checkbox(
     ui: &mut egui::Ui,
     checked: &mut bool,
     text: impl Into<egui::WidgetText>,
@@ -3457,7 +3457,7 @@ fn grove_checkbox(
     .inner
 }
 
-/// The dock's tab chrome in the Grove theme: the active tab sits on the panel
+/// The dock's tab chrome in the Outerface V1 theme: the active tab sits on the panel
 /// color with a wood-brown outline (the mockup's selected-tab look), inactive
 /// tabs are muted with no outline, and hovering warms them to the green accent.
 fn dock_style(base: &egui::Style) -> egui_dock::Style {
@@ -6409,7 +6409,7 @@ impl ApplicationHandler for App {
                     let raw_input = state.take_egui_input(window);
                     let full_output = self.egui_ctx.run_ui(raw_input, |ui| {
                             // Thin wood-to-green strip across the very top: the
-                            // Grove theme's signature accent from the mockup.
+                            // Outerface V1 theme's signature accent from the mockup.
                             egui::Panel::top("theme_strip")
                                 .exact_size(3.0)
                                 .resizable(false)
@@ -6638,7 +6638,7 @@ impl ApplicationHandler for App {
                                         for (name, plugin) in &installed_plugins {
                                             ui.horizontal(|ui| {
                                                 let mut on = plugin.enabled;
-                                                if grove_checkbox(ui, &mut on, &plugin.manifest.name).changed() {
+                                                if outerface_checkbox(ui, &mut on, &plugin.manifest.name).changed() {
                                                     plugin_toggle = Some((name.clone(), on));
                                                 }
                                                 ui.weak(format!(
