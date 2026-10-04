@@ -1552,6 +1552,8 @@ struct EditedEntity {
     sound: Option<Sound>,
     is_camera: bool,
     parent: Option<frame_engine::world::Parent>,
+    ui_text: Option<frame_engine::world::UiText>,
+    ui_image: Option<frame_engine::world::UiImage>,
 }
 
 /// Source Control tab: a read-only view of the open project's git state —
@@ -2383,6 +2385,8 @@ fn inspector_tab_ui(
             sound,
             is_camera,
             parent,
+            ui_text,
+            ui_image,
         }) => {
             ui.label(format!("Entity {id}"));
             ui.add_space(4.0);
@@ -2618,6 +2622,120 @@ fn inspector_tab_ui(
                 if ui.button("Play now").clicked() {
                     s.play = true;
                 }
+            }
+            ui.add_space(8.0);
+            ui.label("UI Text");
+            let mut has_ui_text = ui_text.is_some();
+            if ui
+                .checkbox(&mut has_ui_text, "Screen-space text overlay")
+                .changed()
+            {
+                *ui_text = if has_ui_text {
+                    Some(frame_engine::world::UiText::default())
+                } else {
+                    None
+                };
+            }
+            if let Some(t) = ui_text {
+                ui.horizontal(|ui| {
+                    ui.label("Text");
+                    ui.text_edit_singleline(&mut t.text);
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Position");
+                    ui.add(
+                        egui::DragValue::new(&mut t.x)
+                            .speed(0.01)
+                            .range(0.0..=1.0)
+                            .prefix("x "),
+                    );
+                    ui.add(
+                        egui::DragValue::new(&mut t.y)
+                            .speed(0.01)
+                            .range(0.0..=1.0)
+                            .prefix("y "),
+                    );
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Font size");
+                    ui.add(egui::DragValue::new(&mut t.font_size).speed(0.5).range(4.0..=200.0));
+                });
+                ui.label("Color");
+                let mut rgb = [t.color.r, t.color.g, t.color.b];
+                if ui.color_edit_button_rgb(&mut rgb).changed() {
+                    t.color.r = rgb[0];
+                    t.color.g = rgb[1];
+                    t.color.b = rgb[2];
+                }
+            }
+            ui.add_space(8.0);
+            ui.label("UI Image");
+            let mut has_ui_image = ui_image.is_some();
+            if ui
+                .checkbox(&mut has_ui_image, "Screen-space image overlay")
+                .changed()
+            {
+                *ui_image = if has_ui_image {
+                    Some(frame_engine::world::UiImage::default())
+                } else {
+                    None
+                };
+            }
+            if let Some(img) = ui_image {
+                ui.horizontal(|ui| {
+                    ui.label("File");
+                    let shown = if img.name.is_empty() {
+                        "(none)".to_string()
+                    } else {
+                        img.name.clone()
+                    };
+                    egui::ComboBox::from_id_salt("ui_image_picker")
+                        .selected_text(shown)
+                        .show_ui(ui, |ui| {
+                            // Listed only while the dropdown is open, same
+                            // reasoning as the Sound file picker above: a
+                            // texture added outside the editor shows up
+                            // without walking the assets folder every frame.
+                            let names = assets_root.map(list_images).unwrap_or_default();
+                            if names.is_empty() {
+                                ui.weak("No images yet. File > Import texture…");
+                            }
+                            for name in names {
+                                let label = name.clone();
+                                ui.selectable_value(&mut img.name, name, label);
+                            }
+                        });
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Position");
+                    ui.add(
+                        egui::DragValue::new(&mut img.x)
+                            .speed(0.01)
+                            .range(0.0..=1.0)
+                            .prefix("x "),
+                    );
+                    ui.add(
+                        egui::DragValue::new(&mut img.y)
+                            .speed(0.01)
+                            .range(0.0..=1.0)
+                            .prefix("y "),
+                    );
+                });
+                ui.horizontal(|ui| {
+                    ui.label("Size");
+                    ui.add(
+                        egui::DragValue::new(&mut img.width)
+                            .speed(0.01)
+                            .range(0.0..=1.0)
+                            .prefix("w "),
+                    );
+                    ui.add(
+                        egui::DragValue::new(&mut img.height)
+                            .speed(0.01)
+                            .range(0.0..=1.0)
+                            .prefix("h "),
+                    );
+                });
             }
             ui.add_space(8.0);
             ui.label("Parent");
@@ -5754,6 +5872,8 @@ impl ApplicationHandler for App {
                         sound: self.world.sounds.get(id).cloned(),
                         is_camera: self.world.cameras.get(id).is_some(),
                         parent: self.world.parents.get(id).copied(),
+                        ui_text: self.world.ui_texts.get(id).cloned(),
+                        ui_image: self.world.ui_images.get(id).cloned(),
                     })
                 });
                 // For each enabled plugin's declared fields, keep the ones
@@ -6301,6 +6421,8 @@ impl ApplicationHandler for App {
                     sound,
                     is_camera,
                     parent,
+                    ui_text,
+                    ui_image,
                 }) = edited
                 {
                     if let Some(p) = self.world.positions.get_mut(id) {
@@ -6369,6 +6491,22 @@ impl ApplicationHandler for App {
                         }
                         None => {
                             self.world.scripts.remove(id);
+                        }
+                    }
+                    match ui_text {
+                        Some(t) => {
+                            self.world.ui_texts.insert(id, t);
+                        }
+                        None => {
+                            self.world.ui_texts.remove(id);
+                        }
+                    }
+                    match ui_image {
+                        Some(img) => {
+                            self.world.ui_images.insert(id, img);
+                        }
+                        None => {
+                            self.world.ui_images.remove(id);
                         }
                     }
                 }
@@ -6975,6 +7113,12 @@ fn build_instances(
     let mut buckets: Vec<Vec<InstanceRaw>> = vec![Vec::new(); 3 + custom_names.len()];
     for (id, slot) in world.positions.iter().enumerate() {
         if Some(id) == exclude {
+            continue;
+        }
+        // A UI entity is drawn as a screen-space overlay, not as 3D
+        // geometry; same reasoning as the camera-self exclusion above, just
+        // for every such entity instead of one.
+        if world.ui_texts.get(id).is_some() || world.ui_images.get(id).is_some() {
             continue;
         }
         let Some(p) = slot.as_ref() else { continue };
