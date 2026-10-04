@@ -69,8 +69,12 @@ These are set for you every tick. Read them, write them, or both.
 | `hit_id`  | Which entity, if hit      | read-only  | The other entity's id, or `-1.0` if not colliding. If this entity overlaps more than one other at once, only one is reported. |
 | `hit_point`| Where the hit happened   | read-only  | `hit_point.x/.y/.z`. The centre of the overlap, in world space. Reads as this entity's own position when not colliding. |
 
-Anything you don't set keeps its current value. `t` and `hit` are read-only;
-writing to them does nothing.
+Anything you don't set keeps its current value. Variables marked read-only can
+be assigned to without an error, but nothing is written back.
+
+**Axes:** Y is up, X is right, and -Z is forward (the way the camera faces at
+`yaw` 0 and the way the Up key moves a controlled entity). The floor is the XZ
+plane, and gravity pulls along -Y.
 
 `pos`, `vel`, `scale`, and `hit_point` are **vectors**, so you can do maths on them whole:
 
@@ -107,17 +111,17 @@ will fight (the script places the entity, then velocity nudges it off again).
 
 ## Examples
 
-**Orbit** the origin in the XY plane:
+**Orbit** the origin around the floor (the XZ plane):
 
 ```rust
 pos.x = cos(t * 0.08) * 50.0;
-pos.y = sin(t * 0.08) * 50.0;
+pos.z = sin(t * 0.08) * 50.0;
 ```
 
-**Bob** up and down on the Z axis:
+**Bob** up and down on the Y axis:
 
 ```rust
-pos.z = sin(t * 0.1) * 20.0;
+pos.y = sin(t * 0.1) * 20.0;
 ```
 
 **Pulse**, breathe in and out by scaling:
@@ -130,7 +134,7 @@ scale = vec3(s, s, s);
 **Climb** steadily using velocity (set once, keeps going):
 
 ```rust
-vel.z = 0.5;
+vel.y = 0.5;
 ```
 
 **Throb** the colour between dim and bright red:
@@ -156,10 +160,10 @@ yaw = yaw + 0.02;
 **React** to position, fall until low, then rise (a rough bounce):
 
 ```rust
-if pos.z > 60.0 {
-    vel.z = -0.5;
-} else if pos.z < 0.0 {
-    vel.z = 0.5;
+if pos.y > 60.0 {
+    vel.y = -0.5;
+} else if pos.y < 0.0 {
+    vel.y = 0.5;
 }
 ```
 
@@ -173,8 +177,11 @@ if hit {
 
 `hit` is `true` on any tick this entity's box overlaps another's (the editor also
 tints overlapping entities red, so you can see it happening). It's a plain
-detection flag. Nothing pushes the entities apart, so what happens next is
-entirely up to your script.
+detection flag. The engine separates overlapping entities on its own (a
+`Static` one is never moved), but reacting to a contact, by stopping, flashing
+or despawning, is up to your script. An entity with `RigidBody` is skipped by
+this collision pass entirely, since physics resolves its contacts, so its `hit`
+stays `false`.
 
 **React only to one entity**, check `hit_id` against a known id:
 
@@ -316,6 +323,27 @@ other, and for jump:
 ```rust
 move_dz = -2.0;  // always drift forward, regardless of input
 ```
+
+## Dynamic values: `custom_<name>`
+
+The world can hold named values the engine was never compiled knowing about
+(see PLUGINS.md for how a plugin uses them). If an entity already has a numeric
+value under a name, your script sees it as `custom_<name>`, and it is read/write:
+
+```rust
+custom_mywander_speed = custom_mywander_speed + 0.1;
+```
+
+Three rules to know:
+
+- Values are always numbers (`f64`).
+- A script can only reach a name the entity **already has a value under**. It
+  can't create a brand-new one, so an entity without that value simply has no
+  such variable.
+- The variable is `custom_` plus the value's own name, so the name has to be a
+  valid identifier (letters, digits and underscores) to be usable from a script.
+
+Numeric values survive a save and reload.
 
 ## When a script has a mistake
 

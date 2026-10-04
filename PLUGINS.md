@@ -142,20 +142,22 @@ to one of its own values. Declare it in `plugin.ron`:
     author: "your name",
     description: "A couple of simple wander behaviours.",
     fields: [
-        (name: "mywander/speed", label: "Wander speed", min: Some(0.0), max: Some(5.0)),
+        (name: "mywander_speed", label: "Wander speed", min: Some(0.0), max: Some(5.0)),
     ],
 )
 ```
 
-`name` must match a dynamic component name your own scripts already use with
-`insert_dynamic`/`get_dynamic` (see SCRIPTING.md's `custom_<name>` variables).
+`name` must match a dynamic component name your own scripts already use (see
+SCRIPTING.md's `custom_<name>` variables). To be reachable from a script, the
+name must be a valid identifier, so letters, digits and underscores only:
+`mywander_speed`, not `mywander/speed`.
 `label` is what shows next to the control in the Inspector. `min`/`max` are
 both optional; giving both draws a slider, leaving either out (or both) falls
 back to a plain, unbounded drag box.
 
 A field only ever appears for an entity that **already has a value** under
 that name. It can't originate one. If nothing on the entity has ever called
-`insert_dynamic("mywander/speed", …)`, the field simply doesn't show up, the
+`insert_dynamic("mywander_speed", …)`, the field simply doesn't show up, the
 same rule the `custom_<name>` script variables already follow, and for the
 same reason: a plugin describes a field, it doesn't get to decide an entity
 suddenly has data it never had.
@@ -181,7 +183,7 @@ next to Help). Declare them in `plugin.ron`:
     description: "A couple of simple wander behaviours.",
     actions: [
         (label: "Run patrol now", kind: RunScript(script: "mywander/patrol")),
-        (label: "Toggle alert mode", kind: ToggleValue(name: "mywander/alert")),
+        (label: "Toggle alert mode", kind: ToggleValue(name: "mywander_alert")),
     ],
 )
 ```
@@ -222,10 +224,10 @@ selected, or whether anything is.
         (
             title: "Wander settings",
             fields: [
-                (name: "mywander/global_speed", label: "Global speed", min: Some(0.0), max: Some(5.0)),
+                (name: "mywander_global_speed", label: "Global speed", min: Some(0.0), max: Some(5.0)),
             ],
             actions: [
-                (label: "Toggle wandering", kind: ToggleGlobal(name: "mywander/enabled")),
+                (label: "Toggle wandering", kind: ToggleGlobal(name: "mywander_enabled")),
             ],
         ),
     ],
