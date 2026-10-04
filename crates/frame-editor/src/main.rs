@@ -2086,7 +2086,7 @@ fn scene_tab_ui(
         let key = scene_tree_drag_hold_key();
         if let Some((origin, start_time)) = ui.ctx().data(|d| d.get_temp::<(usize, f64)>(key)) {
             ui.ctx().data_mut(|d| d.remove::<(usize, f64)>(key));
-            let held_long_enough = now - start_time >= SCENE_TREE_DRAG_HOLD_SECONDS;
+            let held_long_enough = now - start_time >= scene_tree_drag_hold_seconds();
             match raw_reparent {
                 // Landed on another row, and was actually held long enough
                 // to count as a deliberate drag rather than a click's
@@ -2134,11 +2134,28 @@ fn entity_is_or_descends(
     })
 }
 
-/// How long a row has to be held (in seconds) before it actually counts as
-/// a deliberate drag rather than a click. See the long comments in
+/// How long a row has to be held, by default, before it counts as a
+/// deliberate drag rather than a click. An ordinary click is over in roughly a
+/// tenth of a second, so 0.3 s keeps a click's hand-wobble from becoming a
+/// drag while still feeling snappy. It was 1.5 s, which felt far too slow; it
+/// is now a preference (Edit > Editor settings…). See the long comments in
 /// `scene_tab_ui` and `scene_tree_node` for why this is layered on top of
 /// `dnd_drag_source` rather than built into the widget itself.
-const SCENE_TREE_DRAG_HOLD_SECONDS: f64 = 1.5;
+const SCENE_TREE_DRAG_HOLD_DEFAULT: f32 = 0.3;
+
+/// The live hold time, as `f32` bits. A process-wide atomic rather than a
+/// field on `App`, because the Scene tab is drawn by free functions and can
+/// also be popped out into a window with its own egui context.
+static SCENE_TREE_DRAG_HOLD_BITS: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(SCENE_TREE_DRAG_HOLD_DEFAULT.to_bits());
+
+fn scene_tree_drag_hold_seconds() -> f64 {
+    f32::from_bits(SCENE_TREE_DRAG_HOLD_BITS.load(std::sync::atomic::Ordering::Relaxed)) as f64
+}
+
+fn set_scene_tree_drag_hold_seconds(seconds: f32) {
+    SCENE_TREE_DRAG_HOLD_BITS.store(seconds.to_bits(), std::sync::atomic::Ordering::Relaxed);
+}
 
 /// Single fixed key for the one drag-hold timer `scene_tab_ui` tracks
 /// (origin entity id, start time). Only one drag can be in flight across
@@ -2268,7 +2285,7 @@ fn scene_tree_node(
                 .filter(|(origin, _)| *origin == id)
                 .map_or(now, |(_, start)| start);
             ui.ctx().data_mut(|d| d.insert_temp(key, (id, start_time)));
-            if now - start_time >= SCENE_TREE_DRAG_HOLD_SECONDS {
+            if now - start_time >= scene_tree_drag_hold_seconds() {
                 // Only past the hold does this row actually become a real
                 // drag-and-drop source; a shorter hold never reaches here,
                 // so `DragAndDrop`'s payload is never set for it and every
@@ -2287,7 +2304,7 @@ fn scene_tree_node(
                 .ctx()
                 .data(|d| d.get_temp::<(usize, f64)>(scene_tree_drag_hold_key()))
                 .is_some_and(|(_, start_time)| {
-                    ui.input(|i| i.time) - start_time >= SCENE_TREE_DRAG_HOLD_SECONDS
+                    ui.input(|i| i.time) - start_time >= scene_tree_drag_hold_seconds()
                 });
             if held_long_enough {
                 // Four line segments rather than `Painter::rect_stroke`:
@@ -3688,6 +3705,7 @@ struct App {
     orbit_sensitivity: f32,
     invert_look_x: bool,
     invert_look_y: bool,
+    drag_hold_seconds: f32,
     // Translate gizmo state. `gizmo` is recomputed each frame from the selection
     // (None when nothing is selected). `gizmo_drag` is the axis currently being
     // dragged, `gizmo_hover` the one under the cursor — 0 = X, 1 = Y, 2 = Z.
@@ -3853,6 +3871,7 @@ impl App {
             orbit_sensitivity: self.orbit_sensitivity,
             invert_look_x: self.invert_look_x,
             invert_look_y: self.invert_look_y,
+            drag_hold_seconds: self.drag_hold_seconds,
         }
     }
     /// Write editor.ron, but only if something actually changed since the last
@@ -3873,6 +3892,8 @@ impl App {
         self.orbit_sensitivity = prefs.orbit_sensitivity;
         self.invert_look_x = prefs.invert_look_x;
         self.invert_look_y = prefs.invert_look_y;
+        self.drag_hold_seconds = prefs.drag_hold_seconds;
+        set_scene_tree_drag_hold_seconds(self.drag_hold_seconds);
         self.persist_prefs_if_changed();
     }
     /// True if the open scene has changes that haven't been saved.
@@ -6899,6 +6920,14 @@ impl ApplicationHandler for App {
                                                 .text("Orbit sensitivity"),
                                         );
                                         ui.add_space(6.0);
+                                        section_label(ui, "Scene tab");
+                                        ui.add(
+                                            egui::Slider::new(&mut prefs_edit.drag_hold_seconds, 0.05..=1.5)
+                                                .suffix(" s")
+                                                .text("Hold before dragging"),
+                                        );
+                                        ui.weak("How long to hold a row before it starts a drag-to-reparent. Lower is quicker; too low and a click can turn into a drag.");
+                                        ui.add_space(6.0);
                                         if ui.button("Reset to defaults").clicked() {
                                             prefs_edit = EditorPrefs {
                                                 show_help: prefs_edit.show_help,
@@ -7401,6 +7430,8 @@ struct EditorPrefs {
     orbit_sensitivity: f32,
     invert_look_x: bool,
     invert_look_y: bool,
+    // Seconds a Scene-tree row must be held before it counts as a drag.
+    drag_hold_seconds: f32,
 }
 
 impl Default for EditorPrefs {
@@ -7412,6 +7443,7 @@ impl Default for EditorPrefs {
             orbit_sensitivity: 1.0,
             invert_look_x: false,
             invert_look_y: false,
+            drag_hold_seconds: SCENE_TREE_DRAG_HOLD_DEFAULT,
         }
     }
 }
@@ -7429,6 +7461,12 @@ impl EditorPrefs {
         self.fly_speed = fix(self.fly_speed, CAM_PAN_SPEED, 0.1, 200.0);
         self.look_sensitivity = fix(self.look_sensitivity, 1.0, 0.1, 5.0);
         self.orbit_sensitivity = fix(self.orbit_sensitivity, 1.0, 0.1, 5.0);
+        self.drag_hold_seconds = fix(
+            self.drag_hold_seconds,
+            SCENE_TREE_DRAG_HOLD_DEFAULT,
+            0.05,
+            1.5,
+        );
         self
     }
 }
@@ -8275,6 +8313,7 @@ fn main() {
     // starts from an empty world; creating or opening a project replaces it.
     let world = World::default();
     let prefs = load_prefs();
+    set_scene_tree_drag_hold_seconds(prefs.drag_hold_seconds);
     let mut app = App {
         window: None,
         gpu: None,
@@ -8330,6 +8369,7 @@ fn main() {
         orbit_sensitivity: prefs.orbit_sensitivity,
         invert_look_x: prefs.invert_look_x,
         invert_look_y: prefs.invert_look_y,
+        drag_hold_seconds: prefs.drag_hold_seconds,
         gizmo: None,
         gizmo_drag: None,
         gizmo_hover: None,
@@ -8409,6 +8449,7 @@ mod prefs_tests {
         assert!(!p.show_help);
         assert_eq!(p.fly_speed, CAM_PAN_SPEED);
         assert_eq!(p.look_sensitivity, 1.0);
+        assert_eq!(p.drag_hold_seconds, SCENE_TREE_DRAG_HOLD_DEFAULT);
     }
 
     #[test]
