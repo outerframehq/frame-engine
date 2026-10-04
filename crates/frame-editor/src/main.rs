@@ -1520,6 +1520,24 @@ enum MenuAction {
     About,
     Quit,
 }
+/// An action that would throw away unsaved changes, so it asks first when the
+/// scene has any: quitting (menu or the window's close button), closing the
+/// project, reloading the scene from disk, or opening a different scene.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum GuardedAction {
+    Quit,
+    CloseProject,
+    ReloadScene,
+    OpenScene,
+}
+
+/// What the user chose in the unsaved-changes prompt.
+enum UnsavedChoice {
+    Save,
+    Discard,
+    Cancel,
+}
+
 /// The selected entity's editable state, lifted out of the world for the
 /// Inspector to edit and written back after the egui pass.
 /// The selected entity's editable state, lifted out of the world for the
@@ -2476,13 +2494,12 @@ fn inspector_tab_ui(
             outerface_checkbox(ui, controlled, "Controlled (WASD)");
             outerface_checkbox(ui, is_static, "Static (immovable)");
             outerface_checkbox(ui, has_gravity, "Gravity (falls)");
-            outerface_checkbox(ui, is_rigid_body, "Physics (rapier3d)")
-                .on_hover_text(
-                    "Simulated by rapier3d instead of the built-in movement/\
+            outerface_checkbox(ui, is_rigid_body, "Physics (rapier3d)").on_hover_text(
+                "Simulated by rapier3d instead of the built-in movement/\
                      gravity/collision. Needs Static, Gravity or Controlled too. \
                      With Controlled it's a character: input moves it and it \
                      stops at walls. Add Gravity to make it fall.",
-                );
+            );
             outerface_checkbox(ui, is_camera, "Camera").on_hover_text(
                 "Play mode renders from the first Camera entity in the \
                      scene (lowest id) instead of the editor's own orbit \
@@ -2630,9 +2647,7 @@ fn inspector_tab_ui(
             ui.add_space(8.0);
             section_label(ui, "UI Text");
             let mut has_ui_text = ui_text.is_some();
-            if outerface_checkbox(ui, &mut has_ui_text, "Screen-space text overlay")
-                .changed()
-            {
+            if outerface_checkbox(ui, &mut has_ui_text, "Screen-space text overlay").changed() {
                 *ui_text = if has_ui_text {
                     Some(frame_engine::world::UiText::default())
                 } else {
@@ -2678,9 +2693,7 @@ fn inspector_tab_ui(
             ui.add_space(8.0);
             section_label(ui, "UI Image");
             let mut has_ui_image = ui_image.is_some();
-            if outerface_checkbox(ui, &mut has_ui_image, "Screen-space image overlay")
-                .changed()
-            {
+            if outerface_checkbox(ui, &mut has_ui_image, "Screen-space image overlay").changed() {
                 *ui_image = if has_ui_image {
                     Some(frame_engine::world::UiImage::default())
                 } else {
@@ -2746,9 +2759,7 @@ fn inspector_tab_ui(
             ui.add_space(8.0);
             section_label(ui, "Parent");
             let mut has_parent = parent.is_some();
-            if outerface_checkbox(ui, &mut has_parent, "Attached to another entity")
-                .changed()
-            {
+            if outerface_checkbox(ui, &mut has_parent, "Attached to another entity").changed() {
                 *parent = if has_parent {
                     Some(frame_engine::world::Parent::default())
                 } else {
@@ -3367,10 +3378,7 @@ fn apply_editor_theme(ctx: &egui::Context) {
     let serif = egui::FontFamily::Name("fraunces".into());
     fonts.families.insert(
         serif.clone(),
-        vec![
-            "Fraunces".to_owned(),
-            "Manrope".to_owned(),
-        ],
+        vec!["Fraunces".to_owned(), "Manrope".to_owned()],
     );
     ctx.set_fonts(fonts);
 
@@ -3674,6 +3682,12 @@ struct App {
     // adjusted with the scroll wheel while flying (right mouse button held);
     // persists at whatever value it was last set to across flights.
     fly_speed: f32,
+    // Mouse sensitivities, as multipliers on LOOK_SENS / ORBIT_SENS, and the
+    // look-direction inversions. All persisted in editor.ron.
+    look_sensitivity: f32,
+    orbit_sensitivity: f32,
+    invert_look_x: bool,
+    invert_look_y: bool,
     // Translate gizmo state. `gizmo` is recomputed each frame from the selection
     // (None when nothing is selected). `gizmo_drag` is the axis currently being
     // dragged, `gizmo_hover` the one under the cursor — 0 = X, 1 = Y, 2 = Z.
@@ -3683,6 +3697,19 @@ struct App {
     last_cursor: (f64, f64),
     selected: Option<usize>,
     show_help: bool,
+    // Unsaved-changes tracking. `dirty` is set by any authoring edit (every
+    // mutating gesture pushes an undo snapshot) and cleared on save/load; the
+    // script library is compared against `saved_scripts` as well, since typing
+    // in the Script Editor deliberately isn't an undo step. The running
+    // simulation moving things doesn't count as an edit.
+    dirty: bool,
+    saved_scripts: std::collections::BTreeMap<String, String>,
+    // An action waiting on the unsaved-changes prompt.
+    pending_unsaved: Option<GuardedAction>,
+    // The title last given to the window, so it's only set when it changes.
+    window_title: String,
+    // The preferences as last written to editor.ron.
+    saved_prefs: EditorPrefs,
     egui_ctx: egui::Context,
     egui_state: Option<egui_winit::State>,
     // The layout of the dockable panels (Viewport, Scene, Inspector, Scripts).
@@ -3815,9 +3842,65 @@ impl App {
     /// Toggle the on-screen controls overlay. The choice persists across runs.
     fn toggle_help(&mut self) {
         self.show_help = !self.show_help;
-        save_prefs(&EditorPrefs {
+        self.persist_prefs_if_changed();
+    }
+    /// The preferences as the editor holds them right now.
+    fn current_prefs(&self) -> EditorPrefs {
+        EditorPrefs {
             show_help: self.show_help,
-        });
+            fly_speed: self.fly_speed,
+            look_sensitivity: self.look_sensitivity,
+            orbit_sensitivity: self.orbit_sensitivity,
+            invert_look_x: self.invert_look_x,
+            invert_look_y: self.invert_look_y,
+        }
+    }
+    /// Write editor.ron, but only if something actually changed since the last
+    /// write, so calling this freely (on leaving flythrough, say) is cheap.
+    fn persist_prefs_if_changed(&mut self) {
+        let now = self.current_prefs();
+        if now != self.saved_prefs {
+            save_prefs(&now);
+            self.saved_prefs = now;
+        }
+    }
+    /// Adopt preferences edited in the Editor Settings window and save them.
+    fn apply_prefs(&mut self, prefs: EditorPrefs) {
+        let prefs = prefs.sanitized();
+        self.show_help = prefs.show_help;
+        self.fly_speed = prefs.fly_speed;
+        self.look_sensitivity = prefs.look_sensitivity;
+        self.orbit_sensitivity = prefs.orbit_sensitivity;
+        self.invert_look_x = prefs.invert_look_x;
+        self.invert_look_y = prefs.invert_look_y;
+        self.persist_prefs_if_changed();
+    }
+    /// True if the open scene has changes that haven't been saved.
+    fn is_dirty(&self) -> bool {
+        self.dirty || self.world.script_library != self.saved_scripts
+    }
+    /// Record that the world now matches what is on disk (after a save or a
+    /// load), clearing the unsaved-changes flag.
+    fn mark_saved(&mut self) {
+        self.dirty = false;
+        self.saved_scripts = self.world.script_library.clone();
+    }
+    /// Run an action that discards unsaved changes, or, if there are any, park
+    /// it behind the unsaved-changes prompt instead.
+    fn request_guarded(&mut self, action: GuardedAction, event_loop: &ActiveEventLoop) {
+        if matches!(self.mode, AppMode::Editor) && self.is_dirty() {
+            self.pending_unsaved = Some(action);
+        } else {
+            self.run_guarded(action, event_loop);
+        }
+    }
+    fn run_guarded(&mut self, action: GuardedAction, event_loop: &ActiveEventLoop) {
+        match action {
+            GuardedAction::Quit => event_loop.exit(),
+            GuardedAction::CloseProject => self.close_project(),
+            GuardedAction::ReloadScene => self.reload_scene(),
+            GuardedAction::OpenScene => self.open_scene(),
+        }
     }
     /// Snapshot the world onto the undo stack before a mutating action. Clears
     /// the redo stack (a new edit invalidates any redo history) and caps history.
@@ -3828,6 +3911,7 @@ impl App {
             self.undo_stack.remove(0);
         }
         self.redo_stack.clear();
+        self.dirty = true;
     }
     /// Restore the previous world state, moving the current one onto the redo
     /// stack.
@@ -3836,6 +3920,7 @@ impl App {
             self.redo_stack.push(self.world.clone());
             self.world = prev;
             self.selected = None;
+            self.dirty = true;
             self.log("Undo".to_string());
         } else {
             self.log("Nothing to undo".to_string());
@@ -3847,6 +3932,7 @@ impl App {
             self.undo_stack.push(self.world.clone());
             self.world = next;
             self.selected = None;
+            self.dirty = true;
             self.log("Redo".to_string());
         } else {
             self.log("Nothing to redo".to_string());
@@ -3872,6 +3958,8 @@ impl App {
             self.cam_eye = Vec3::new(self.cam_focus_x, self.cam_focus_y, self.cam_focus_z) + offset;
             self.fly_picked = false;
         } else {
+            // Leaving flight: remember the fly speed if scrolling changed it.
+            self.persist_prefs_if_changed();
             // Return to orbit. Pivot around the entity picked while flying, or —
             // if none — a point straight ahead, so the view doesn't jump. Then
             // rebuild yaw/pitch/distance so the orbit eye stays where flight left
@@ -4024,7 +4112,10 @@ impl App {
     fn save_scene(&mut self) {
         match self.current_scene_path.clone() {
             Some(path) => match self.world.save_to_file(&path) {
-                Ok(()) => self.log(format!("Saved scene to {}", path.display())),
+                Ok(()) => {
+                    self.mark_saved();
+                    self.log(format!("Saved scene to {}", path.display()));
+                }
                 Err(e) => self.log(format!("Save failed: {e}")),
             },
             None => self.save_scene_as(),
@@ -4042,6 +4133,7 @@ impl App {
         if let Some(path) = picked {
             match self.world.save_to_file(&path) {
                 Ok(()) => {
+                    self.mark_saved();
                     self.log(format!("Saved scene to {}", path.display()));
                     self.current_scene_path = Some(path);
                 }
@@ -4062,6 +4154,7 @@ impl App {
                 Ok(world) => {
                     self.world = world;
                     self.selected = None;
+                    self.mark_saved();
                     self.log(format!("Opened scene from {}", path.display()));
                     self.current_scene_path = Some(path);
                 }
@@ -4080,6 +4173,7 @@ impl App {
             Ok(world) => {
                 self.world = world;
                 self.selected = None;
+                self.mark_saved();
                 self.log(format!("Reloaded scene from {}", path.display()));
             }
             Err(e) => self.log(format!("Reload failed: {e}")),
@@ -4430,6 +4524,8 @@ impl App {
         if let Some(window) = &self.window {
             window.set_title("Frame Editor");
         }
+        self.window_title.clear();
+        self.mark_saved();
     }
 
     /// Open the project-settings window for a project, loading its current name
@@ -5478,6 +5574,7 @@ impl App {
         if let Some(installed) = self.world.installed_plugins.get_mut(plugin_name) {
             installed.enabled = enabled;
         }
+        self.dirty = true;
         let prefix = format!("{plugin_name}/");
         if enabled {
             if let Some(root) = self
@@ -5584,6 +5681,10 @@ impl App {
         self.log(format!("Opened project '{name}'"));
         self.project_name = Some(name);
         self.load_project_assets();
+        // Whatever loading the project's plugins merged in counts as the
+        // starting point, not as an unsaved edit.
+        self.window_title.clear();
+        self.mark_saved();
     }
     /// The current view-projection matrix: an orbit around the focus normally, or
     /// a free camera from `cam_eye` while flying.
@@ -5813,9 +5914,13 @@ impl ApplicationHandler for App {
             if self.fly_mode {
                 // view_forward points toward -sin(yaw), so a larger yaw looks
                 // left. Subtract so moving the mouse right looks right.
-                self.cam_yaw -= dx as f32 * LOOK_SENS;
+                let look_x =
+                    LOOK_SENS * self.look_sensitivity * if self.invert_look_x { -1.0 } else { 1.0 };
+                let look_y =
+                    LOOK_SENS * self.look_sensitivity * if self.invert_look_y { -1.0 } else { 1.0 };
+                self.cam_yaw -= dx as f32 * look_x;
                 // Un-inverted: moving the mouse down looks down (pitch increases).
-                self.cam_pitch += dy as f32 * LOOK_SENS;
+                self.cam_pitch += dy as f32 * look_y;
                 self.cam_pitch = self.cam_pitch.clamp(-1.4, 1.4);
                 if let Some(window) = &self.window {
                     window.request_redraw();
@@ -5880,8 +5985,8 @@ impl ApplicationHandler for App {
         let ui_wants_keys = self.egui_ctx.egui_wants_keyboard_input();
         match event {
             WindowEvent::CloseRequested => {
-                println!("Close requested; Shutting Down");
-                event_loop.exit();
+                println!("Close requested");
+                self.request_guarded(GuardedAction::Quit, event_loop);
             }
             // One event per file when several are dropped at once. winit
             // 0.30 sends this on Windows, macOS and X11, but not on Wayland.
@@ -5978,8 +6083,8 @@ impl ApplicationHandler for App {
                     // Sweep the orbit. Drag right -> swing around; drag up ->
                     // rise over the top. Pitch is clamped just short of the
                     // poles so the up vector never degenerates.
-                    self.cam_yaw += dx * ORBIT_SENS;
-                    self.cam_pitch -= dy * ORBIT_SENS;
+                    self.cam_yaw += dx * ORBIT_SENS * self.orbit_sensitivity;
+                    self.cam_pitch -= dy * ORBIT_SENS * self.orbit_sensitivity;
                     self.cam_pitch = self.cam_pitch.clamp(-1.4, 1.4);
                 } else if self.panning {
                     if let Some(window) = &self.window {
@@ -6031,11 +6136,24 @@ impl ApplicationHandler for App {
                     match code {
                         KeyCode::KeyW => self.input.set(Button::Up, pressed),
                         KeyCode::KeyA => self.input.set(Button::Left, pressed),
-                        KeyCode::KeyS => self.input.set(Button::Down, pressed),
+                        // Ctrl+S is Save, not "move down".
+                        KeyCode::KeyS if !(pressed && self.ctrl_held) => {
+                            self.input.set(Button::Down, pressed)
+                        }
                         KeyCode::KeyD => self.input.set(Button::Right, pressed),
                         KeyCode::Space => self.input.set(Button::Jump, pressed),
                         _ => {}
                     }
+                }
+                // Ctrl+S saves, even while a text field (the Script Editor,
+                // say) has focus, since that's exactly when you most want it.
+                if self.ctrl_held
+                    && event.state == ElementState::Pressed
+                    && !event.repeat
+                    && matches!(self.mode, AppMode::Editor)
+                    && event.physical_key == PhysicalKey::Code(KeyCode::KeyS)
+                {
+                    self.save_scene();
                 }
                 if !ui_wants_keys && event.state == ElementState::Pressed {
                     if let PhysicalKey::Code(code) = event.physical_key {
@@ -6093,7 +6211,9 @@ impl ApplicationHandler for App {
                                 // F5: save the current world to disk.
                                 KeyCode::F5 => self.save_scene(),
                                 // F9: reload the world from disk, discarding the current one.
-                                KeyCode::F9 => self.reload_scene(),
+                                KeyCode::F9 => {
+                                    self.request_guarded(GuardedAction::ReloadScene, event_loop)
+                                }
                                 _ => {}
                             }
                         }
@@ -6106,6 +6226,20 @@ impl ApplicationHandler for App {
                 if matches!(self.mode, AppMode::Launcher) {
                     self.draw_launcher(event_loop);
                     return;
+                }
+                // Window title: the project name, with " *" while there are
+                // unsaved changes.
+                if let (Some(name), Some(window)) =
+                    (self.project_name.as_ref(), self.window.as_ref())
+                {
+                    let title = format!(
+                        "Frame Editor — {name}{}",
+                        if self.is_dirty() { " *" } else { "" }
+                    );
+                    if title != self.window_title {
+                        window.set_title(&title);
+                        self.window_title = title;
+                    }
                 }
                 // Flythrough: while flying (right mouse held over the viewport),
                 // WASD moves the camera through the scene along the direction it's
@@ -6410,6 +6544,13 @@ impl ApplicationHandler for App {
                 let paused = self.paused;
                 let mut plugins_panel_open = self.plugins_panel_open;
                 let mut editor_settings_open = self.editor_settings_open;
+                let mut prefs_edit = self.current_prefs();
+                let pending_unsaved = self.pending_unsaved;
+                let project_label = self
+                    .project_name
+                    .clone()
+                    .unwrap_or_else(|| "this project".to_string());
+                let mut unsaved_choice: Option<UnsavedChoice> = None;
                 // A snapshot, not a live borrow: the closure below can't hold
                 // a reference into self.world. A checkbox toggle is detected
                 // here and applied after the pass via plugin_toggle, the same
@@ -6685,6 +6826,42 @@ impl ApplicationHandler for App {
                                         }
                                     });
                             }
+                            // Unsaved-changes prompt, shown when quitting, closing
+                            // the project or reloading would throw edits away.
+                            if let Some(action) = pending_unsaved {
+                                egui::Window::new("Unsaved changes")
+                                    .collapsible(false)
+                                    .resizable(false)
+                                    .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+                                    .show(ui.ctx(), |ui| {
+                                        ui.label(match action {
+                                            GuardedAction::Quit => format!(
+                                                "Save your changes to {project_label} before quitting?"
+                                            ),
+                                            GuardedAction::CloseProject => format!(
+                                                "Save your changes to {project_label} before closing it?"
+                                            ),
+                                            GuardedAction::ReloadScene => format!(
+                                                "Reloading discards your unsaved changes to {project_label}. Save first?"
+                                            ),
+                                            GuardedAction::OpenScene => format!(
+                                                "Save your changes to {project_label} before opening another scene?"
+                                            ),
+                                        });
+                                        ui.add_space(8.0);
+                                        ui.horizontal(|ui| {
+                                            if ui.button("Save").clicked() {
+                                                unsaved_choice = Some(UnsavedChoice::Save);
+                                            }
+                                            if ui.button("Don't save").clicked() {
+                                                unsaved_choice = Some(UnsavedChoice::Discard);
+                                            }
+                                            if ui.button("Cancel").clicked() {
+                                                unsaved_choice = Some(UnsavedChoice::Cancel);
+                                            }
+                                        });
+                                    });
+                            }
                             // Editor Settings: a floating window, opened from
                             // Edit > Editor settings…. Just plugin toggles for
                             // now; a home for more editor-wide configuration
@@ -6696,6 +6873,39 @@ impl ApplicationHandler for App {
                                     .open(&mut editor_settings_open)
                                     .default_width(420.0)
                                     .show(ui.ctx(), |ui| {
+                                      egui::ScrollArea::vertical()
+                                        .max_height(560.0)
+                                        .auto_shrink([false, true])
+                                        .show(ui, |ui| {
+                                        ui.heading("Preferences");
+                                        ui.add_space(4.0);
+                                        section_label(ui, "Flythrough camera (hold right mouse)");
+                                        ui.add(
+                                            egui::Slider::new(&mut prefs_edit.fly_speed, 0.1..=200.0)
+                                                .logarithmic(true)
+                                                .text("Fly speed"),
+                                        );
+                                        ui.weak("Scrolling while you fly changes this too, and it is remembered.");
+                                        ui.add(
+                                            egui::Slider::new(&mut prefs_edit.look_sensitivity, 0.1..=3.0)
+                                                .text("Look sensitivity"),
+                                        );
+                                        outerface_checkbox(ui, &mut prefs_edit.invert_look_x, "Invert horizontal look");
+                                        outerface_checkbox(ui, &mut prefs_edit.invert_look_y, "Invert vertical look");
+                                        ui.add_space(6.0);
+                                        section_label(ui, "Orbit camera (middle mouse)");
+                                        ui.add(
+                                            egui::Slider::new(&mut prefs_edit.orbit_sensitivity, 0.1..=3.0)
+                                                .text("Orbit sensitivity"),
+                                        );
+                                        ui.add_space(6.0);
+                                        if ui.button("Reset to defaults").clicked() {
+                                            prefs_edit = EditorPrefs {
+                                                show_help: prefs_edit.show_help,
+                                                ..EditorPrefs::default()
+                                            };
+                                        }
+                                        ui.separator();
                                         ui.heading("Plugins");
                                         ui.add_space(4.0);
                                         if installed_plugins.is_empty() {
@@ -6718,10 +6928,8 @@ impl ApplicationHandler for App {
                                             ui.add_space(4.0);
                                         }
                                         ui.separator();
-                                        egui::ScrollArea::vertical()
-                                            .max_height(320.0)
-                                            .auto_shrink([false, true])
-                                            .show(ui, |ui| credits_ui(ui));
+                                        credits_ui(ui);
+                                        });
                                     });
                             }
                             // Bottom console dock — Output (the live log) and a
@@ -6845,6 +7053,9 @@ impl ApplicationHandler for App {
                 self.console_tab = console_tab;
                 self.plugins_panel_open = plugins_panel_open;
                 self.editor_settings_open = editor_settings_open;
+                if prefs_edit != self.current_prefs() {
+                    self.apply_prefs(prefs_edit);
+                }
                 if let Some((name, enabled)) = plugin_toggle {
                     self.set_plugin_enabled(&name, enabled);
                 }
@@ -6863,6 +7074,7 @@ impl ApplicationHandler for App {
                 if let Some((name, material)) = material_edit {
                     if let Some(meta) = self.world.mesh_meta.get_mut(&name) {
                         meta.material = material;
+                        self.dirty = true;
                     }
                     self.refresh_custom_mesh_gpu();
                 }
@@ -7062,15 +7274,40 @@ impl ApplicationHandler for App {
                 // keyboard uses — one command, two triggers. This sits at
                 // statement level (NOT inside the `edited` block above), so it
                 // fires whether or not an entity is selected.
+                // The unsaved-changes prompt's answer, applied here so Save sees
+                // this frame's Inspector and Script Editor edits already written
+                // back to the world above.
+                if let Some(choice) = unsaved_choice {
+                    if let Some(action) = self.pending_unsaved.take() {
+                        match choice {
+                            UnsavedChoice::Cancel => {}
+                            UnsavedChoice::Discard => self.run_guarded(action, event_loop),
+                            UnsavedChoice::Save => {
+                                self.save_scene();
+                                if self.is_dirty() {
+                                    self.log("Not saved, so the action was cancelled".to_string());
+                                } else {
+                                    self.run_guarded(action, event_loop);
+                                }
+                            }
+                        }
+                    }
+                }
                 match menu_action {
-                    Some(MenuAction::OpenScene) => self.open_scene(),
+                    Some(MenuAction::OpenScene) => {
+                        self.request_guarded(GuardedAction::OpenScene, event_loop)
+                    }
                     Some(MenuAction::ImportModel) => self.import_model(),
                     Some(MenuAction::ImportAudio) => self.import_audio(),
                     Some(MenuAction::ImportTexture) => self.import_texture(),
                     Some(MenuAction::SaveScene) => self.save_scene(),
                     Some(MenuAction::SaveSceneAs) => self.save_scene_as(),
-                    Some(MenuAction::ReloadScene) => self.reload_scene(),
-                    Some(MenuAction::CloseProject) => self.close_project(),
+                    Some(MenuAction::ReloadScene) => {
+                        self.request_guarded(GuardedAction::ReloadScene, event_loop)
+                    }
+                    Some(MenuAction::CloseProject) => {
+                        self.request_guarded(GuardedAction::CloseProject, event_loop)
+                    }
                     Some(MenuAction::Undo) => self.undo(),
                     Some(MenuAction::Redo) => self.redo(),
                     Some(MenuAction::SpawnEntity) => self.spawn_at_focus(),
@@ -7083,7 +7320,7 @@ impl ApplicationHandler for App {
                     Some(MenuAction::About) => {
                         self.log("Frame Editor — a hand-rolled Rust simulation engine and editor.");
                     }
-                    Some(MenuAction::Quit) => event_loop.exit(),
+                    Some(MenuAction::Quit) => self.request_guarded(GuardedAction::Quit, event_loop),
                     None => {}
                 }
                 // Camera preview: only while a Camera entity is selected, and
@@ -7149,17 +7386,50 @@ fn recent_projects_file() -> Option<std::path::PathBuf> {
     dirs::config_dir().map(|d| d.join("frame-editor").join("recent-projects.txt"))
 }
 
-/// Small editor preferences that persist across runs, stored as RON beside the
-/// recent-projects list. Currently just whether the controls overlay shows;
-/// hide it once (H) and it stays hidden on the next start.
-#[derive(serde::Serialize, serde::Deserialize)]
+/// Editor preferences that persist across runs, stored as RON beside the
+/// recent-projects list: whether the controls overlay shows, the flythrough
+/// speed, and the mouse sensitivities. `#[serde(default)]` means an older
+/// `editor.ron` with fewer fields still loads, filling the rest with defaults.
+/// The two sensitivities are multipliers on the built-in base values, so 1.0
+/// is the stock feel.
+#[derive(serde::Serialize, serde::Deserialize, Clone, PartialEq)]
+#[serde(default)]
 struct EditorPrefs {
     show_help: bool,
+    fly_speed: f32,
+    look_sensitivity: f32,
+    orbit_sensitivity: f32,
+    invert_look_x: bool,
+    invert_look_y: bool,
 }
 
 impl Default for EditorPrefs {
     fn default() -> Self {
-        Self { show_help: true }
+        Self {
+            show_help: true,
+            fly_speed: CAM_PAN_SPEED,
+            look_sensitivity: 1.0,
+            orbit_sensitivity: 1.0,
+            invert_look_x: false,
+            invert_look_y: false,
+        }
+    }
+}
+
+impl EditorPrefs {
+    /// Pull any hand-edited or corrupt value back into a usable range.
+    fn sanitized(mut self) -> Self {
+        let fix = |v: f32, default: f32, lo: f32, hi: f32| {
+            if v.is_finite() {
+                v.clamp(lo, hi)
+            } else {
+                default
+            }
+        };
+        self.fly_speed = fix(self.fly_speed, CAM_PAN_SPEED, 0.1, 200.0);
+        self.look_sensitivity = fix(self.look_sensitivity, 1.0, 0.1, 5.0);
+        self.orbit_sensitivity = fix(self.orbit_sensitivity, 1.0, 0.1, 5.0);
+        self
     }
 }
 
@@ -7170,7 +7440,8 @@ fn prefs_file() -> Option<std::path::PathBuf> {
 fn load_prefs() -> EditorPrefs {
     prefs_file()
         .and_then(|p| std::fs::read_to_string(p).ok())
-        .and_then(|t| ron::from_str(&t).ok())
+        .and_then(|t| ron::from_str::<EditorPrefs>(&t).ok())
+        .map(EditorPrefs::sanitized)
         .unwrap_or_default()
 }
 
@@ -8003,6 +8274,7 @@ fn main() {
     // The editor opens on the launcher screen with no project loaded, so it
     // starts from an empty world; creating or opening a project replaces it.
     let world = World::default();
+    let prefs = load_prefs();
     let mut app = App {
         window: None,
         gpu: None,
@@ -8053,13 +8325,22 @@ fn main() {
         dragging: false,
         orbiting: false,
         panning: false,
-        fly_speed: CAM_PAN_SPEED,
+        fly_speed: prefs.fly_speed,
+        look_sensitivity: prefs.look_sensitivity,
+        orbit_sensitivity: prefs.orbit_sensitivity,
+        invert_look_x: prefs.invert_look_x,
+        invert_look_y: prefs.invert_look_y,
         gizmo: None,
         gizmo_drag: None,
         gizmo_hover: None,
         last_cursor: (0.0, 0.0),
         selected: None,
-        show_help: load_prefs().show_help,
+        show_help: prefs.show_help,
+        dirty: false,
+        saved_scripts: std::collections::BTreeMap::new(),
+        pending_unsaved: None,
+        window_title: String::new(),
+        saved_prefs: prefs,
         egui_ctx: egui::Context::default(),
         egui_state: None,
         // Default layout mirrors the old editor: the Viewport and Script Editor
@@ -8116,4 +8397,37 @@ fn main() {
     };
     println!("Frame Editor started at the launcher.");
     event_loop.run_app(&mut app).unwrap();
+}
+
+#[cfg(test)]
+mod prefs_tests {
+    use super::*;
+
+    #[test]
+    fn old_editor_ron_still_loads_with_defaults() {
+        let p: EditorPrefs = ron::from_str("(show_help: false)").unwrap();
+        assert!(!p.show_help);
+        assert_eq!(p.fly_speed, CAM_PAN_SPEED);
+        assert_eq!(p.look_sensitivity, 1.0);
+    }
+
+    #[test]
+    fn prefs_round_trip_and_sanitize() {
+        let p = EditorPrefs {
+            fly_speed: 12.5,
+            invert_look_y: true,
+            ..EditorPrefs::default()
+        };
+        let text = ron::to_string(&p).unwrap();
+        let back: EditorPrefs = ron::from_str(&text).unwrap();
+        assert!(back == p);
+        let bad = EditorPrefs {
+            fly_speed: f32::NAN,
+            look_sensitivity: 99.0,
+            ..EditorPrefs::default()
+        }
+        .sanitized();
+        assert_eq!(bad.fly_speed, CAM_PAN_SPEED);
+        assert_eq!(bad.look_sensitivity, 5.0);
+    }
 }
