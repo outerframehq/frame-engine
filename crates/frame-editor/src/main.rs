@@ -783,10 +783,9 @@ impl GpuState {
                         force_fallback_adapter: false,
                     }))
                     .unwrap();
-                let (device, queue) = pollster::block_on(
-                    adapter.request_device(&wgpu::DeviceDescriptor::default()),
-                )
-                .unwrap();
+                let (device, queue) =
+                    pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
+                        .unwrap();
                 (instance, surface, adapter, device, queue)
             }
         };
@@ -1932,7 +1931,9 @@ fn assets_tab_ui(
                 egui::ComboBox::from_id_salt("material_texture_picker")
                     .selected_text(mat.texture.clone().unwrap_or_else(|| "(none)".to_string()))
                     .show_ui(ui, |ui| {
-                        if ui.selectable_label(mat.texture.is_none(), "(none)").clicked()
+                        if ui
+                            .selectable_label(mat.texture.is_none(), "(none)")
+                            .clicked()
                             && mat.texture.is_some()
                         {
                             mat.texture = None;
@@ -2109,9 +2110,10 @@ fn entity_is_or_descends(
     if root == needle {
         return true;
     }
-    children
-        .get(&root)
-        .is_some_and(|kids| kids.iter().any(|&k| entity_is_or_descends(children, k, needle)))
+    children.get(&root).is_some_and(|kids| {
+        kids.iter()
+            .any(|&k| entity_is_or_descends(children, k, needle))
+    })
 }
 
 /// How long a row has to be held (in seconds) before it actually counts as
@@ -2263,7 +2265,9 @@ fn scene_tree_node(
         // the hold threshold — otherwise every plain click would flash it
         // again, exactly the bug this whole hold-gate exists to fix.
         if response.dnd_hover_payload::<usize>().is_some() {
-            let held_long_enough = ui.ctx().data(|d| d.get_temp::<(usize, f64)>(scene_tree_drag_hold_key()))
+            let held_long_enough = ui
+                .ctx()
+                .data(|d| d.get_temp::<(usize, f64)>(scene_tree_drag_hold_key()))
                 .is_some_and(|(_, start_time)| {
                     ui.input(|i| i.time) - start_time >= SCENE_TREE_DRAG_HOLD_SECONDS
                 });
@@ -2388,23 +2392,23 @@ fn inspector_tab_ui(
             ui_text,
             ui_image,
         }) => {
-            ui.label(format!("Entity {id}"));
+            ui.heading(format!("Entity {id}"));
             ui.add_space(4.0);
-            ui.label("Position");
+            section_label(ui, "Position");
             ui.horizontal(|ui| {
                 ui.add(egui::DragValue::new(&mut pos.x).speed(1.0).prefix("x "));
                 ui.add(egui::DragValue::new(&mut pos.y).speed(1.0).prefix("y "));
                 ui.add(egui::DragValue::new(&mut pos.z).speed(1.0).prefix("z "));
             });
             ui.add_space(4.0);
-            ui.label("Velocity");
+            section_label(ui, "Velocity");
             ui.horizontal(|ui| {
                 ui.add(egui::DragValue::new(&mut vel.dx).speed(0.1).prefix("dx "));
                 ui.add(egui::DragValue::new(&mut vel.dy).speed(0.1).prefix("dy "));
                 ui.add(egui::DragValue::new(&mut vel.dz).speed(0.1).prefix("dz "));
             });
             ui.add_space(4.0);
-            ui.label("Color");
+            section_label(ui, "Color");
             let mut rgb = [color.r, color.g, color.b];
             if ui.color_edit_button_rgb(&mut rgb).changed() {
                 color.r = rgb[0];
@@ -2412,7 +2416,7 @@ fn inspector_tab_ui(
                 color.b = rgb[2];
             }
             ui.add_space(4.0);
-            ui.label("Scale");
+            section_label(ui, "Scale");
             ui.horizontal(|ui| {
                 ui.add(
                     egui::DragValue::new(&mut scale.x)
@@ -2437,7 +2441,7 @@ fn inspector_tab_ui(
                 ui.add(egui::Slider::new(&mut material.emissive, 0.0..=1.0).text("emissive"));
             });
             ui.add_space(4.0);
-            ui.label("Rotation");
+            section_label(ui, "Rotation");
             let mut yaw_degrees = rotation.yaw.to_degrees();
             if ui
                 .add(
@@ -2450,7 +2454,7 @@ fn inspector_tab_ui(
                 rotation.yaw = yaw_degrees.to_radians();
             }
             ui.add_space(4.0);
-            ui.label("Mesh");
+            section_label(ui, "Mesh");
             let mesh_label: String = match mesh {
                 Mesh::Cube => "Cube".to_string(),
                 Mesh::Sphere => "Sphere".to_string(),
@@ -2469,17 +2473,17 @@ fn inspector_tab_ui(
                     }
                 });
             ui.add_space(4.0);
-            ui.checkbox(controlled, "Controlled (WASD)");
-            ui.checkbox(is_static, "Static (immovable)");
-            ui.checkbox(has_gravity, "Gravity (falls)");
-            ui.checkbox(is_rigid_body, "Physics (rapier3d)")
+            grove_checkbox(ui, controlled, "Controlled (WASD)");
+            grove_checkbox(ui, is_static, "Static (immovable)");
+            grove_checkbox(ui, has_gravity, "Gravity (falls)");
+            grove_checkbox(ui, is_rigid_body, "Physics (rapier3d)")
                 .on_hover_text(
                     "Simulated by rapier3d instead of the built-in movement/\
                      gravity/collision. Needs Static, Gravity or Controlled too. \
                      With Controlled it's a character: input moves it and it \
                      stops at walls. Add Gravity to make it fall.",
                 );
-            ui.checkbox(is_camera, "Camera").on_hover_text(
+            grove_checkbox(ui, is_camera, "Camera").on_hover_text(
                 "Play mode renders from the first Camera entity in the \
                      scene (lowest id) instead of the editor's own orbit \
                      camera. Only its Position and yaw matter — no pitch, \
@@ -2509,9 +2513,9 @@ fn inspector_tab_ui(
                 }
             }
             ui.add_space(8.0);
-            ui.label("Light");
+            section_label(ui, "Light");
             let mut has_light = light.is_some();
-            if ui.checkbox(&mut has_light, "Light source").changed() {
+            if grove_checkbox(ui, &mut has_light, "Light source").changed() {
                 *light = if has_light {
                     Some(Light::default())
                 } else {
@@ -2578,9 +2582,9 @@ fn inspector_tab_ui(
                 });
             }
             ui.add_space(8.0);
-            ui.label("Sound");
+            section_label(ui, "Sound");
             let mut has_sound = sound.is_some();
-            if ui.checkbox(&mut has_sound, "Sound source").changed() {
+            if grove_checkbox(ui, &mut has_sound, "Sound source").changed() {
                 *sound = if has_sound {
                     Some(Sound::default())
                 } else {
@@ -2624,10 +2628,9 @@ fn inspector_tab_ui(
                 }
             }
             ui.add_space(8.0);
-            ui.label("UI Text");
+            section_label(ui, "UI Text");
             let mut has_ui_text = ui_text.is_some();
-            if ui
-                .checkbox(&mut has_ui_text, "Screen-space text overlay")
+            if grove_checkbox(ui, &mut has_ui_text, "Screen-space text overlay")
                 .changed()
             {
                 *ui_text = if has_ui_text {
@@ -2642,7 +2645,7 @@ fn inspector_tab_ui(
                     ui.text_edit_singleline(&mut t.text);
                 });
                 ui.horizontal(|ui| {
-                    ui.label("Position");
+                    section_label(ui, "Position");
                     ui.add(
                         egui::DragValue::new(&mut t.x)
                             .speed(0.01)
@@ -2658,9 +2661,13 @@ fn inspector_tab_ui(
                 });
                 ui.horizontal(|ui| {
                     ui.label("Font size");
-                    ui.add(egui::DragValue::new(&mut t.font_size).speed(0.5).range(4.0..=200.0));
+                    ui.add(
+                        egui::DragValue::new(&mut t.font_size)
+                            .speed(0.5)
+                            .range(4.0..=200.0),
+                    );
                 });
-                ui.label("Color");
+                section_label(ui, "Color");
                 let mut rgb = [t.color.r, t.color.g, t.color.b];
                 if ui.color_edit_button_rgb(&mut rgb).changed() {
                     t.color.r = rgb[0];
@@ -2669,10 +2676,9 @@ fn inspector_tab_ui(
                 }
             }
             ui.add_space(8.0);
-            ui.label("UI Image");
+            section_label(ui, "UI Image");
             let mut has_ui_image = ui_image.is_some();
-            if ui
-                .checkbox(&mut has_ui_image, "Screen-space image overlay")
+            if grove_checkbox(ui, &mut has_ui_image, "Screen-space image overlay")
                 .changed()
             {
                 *ui_image = if has_ui_image {
@@ -2707,7 +2713,7 @@ fn inspector_tab_ui(
                         });
                 });
                 ui.horizontal(|ui| {
-                    ui.label("Position");
+                    section_label(ui, "Position");
                     ui.add(
                         egui::DragValue::new(&mut img.x)
                             .speed(0.01)
@@ -2738,10 +2744,9 @@ fn inspector_tab_ui(
                 });
             }
             ui.add_space(8.0);
-            ui.label("Parent");
+            section_label(ui, "Parent");
             let mut has_parent = parent.is_some();
-            if ui
-                .checkbox(&mut has_parent, "Attached to another entity")
+            if grove_checkbox(ui, &mut has_parent, "Attached to another entity")
                 .changed()
             {
                 *parent = if has_parent {
@@ -2794,7 +2799,7 @@ fn inspector_tab_ui(
                 });
             }
             ui.add_space(8.0);
-            ui.label("Script");
+            section_label(ui, "Script");
             if script_library.is_empty() {
                 ui.weak("No scripts yet — add some in the Script Editor tab.");
             } else {
@@ -2849,7 +2854,7 @@ fn inspector_tab_ui(
                 }
             }
             ui.add_space(8.0);
-            ui.label("Prefab");
+            section_label(ui, "Prefab");
             ui.horizontal(|ui| {
                 ui.add(
                     egui::TextEdit::singleline(new_prefab_name)
@@ -3225,12 +3230,7 @@ impl egui_dock::TabViewer for EditorTabViewer {
     /// OS window (draggable to another monitor). Not offered on the Viewport
     /// tab -- it's the live 3D scene rendered behind egui, not a panel, and
     /// popping it out would need its own duplicated render target.
-    fn context_menu(
-        &mut self,
-        ui: &mut egui::Ui,
-        tab: &mut Self::Tab,
-        _path: egui_dock::NodePath,
-    ) {
+    fn context_menu(&mut self, ui: &mut egui::Ui, tab: &mut Self::Tab, _path: egui_dock::NodePath) {
         if matches!(tab, Tab::Viewport) {
             return;
         }
@@ -3253,6 +3253,247 @@ impl egui_dock::TabViewer for EditorTabViewer {
             _ => [true, true],
         }
     }
+}
+
+mod theme {
+    use egui::Color32;
+
+    pub const BG: Color32 = Color32::from_rgb(0x15, 0x16, 0x15);
+    pub const PANEL: Color32 = Color32::from_rgb(0x1B, 0x1C, 0x1B);
+    pub const INPUT: Color32 = Color32::from_rgb(0x25, 0x27, 0x25);
+    pub const BORDER: Color32 = Color32::from_rgb(0x3A, 0x3D, 0x3A);
+    pub const TEXT: Color32 = Color32::from_rgb(0xE4, 0xE6, 0xE3);
+    pub const MUTED: Color32 = Color32::from_rgb(0x8E, 0x93, 0x8D);
+    pub const ACCENT: Color32 = Color32::from_rgb(0x58, 0x84, 0x4C);
+    pub const ACCENT_HOVER: Color32 = Color32::from_rgb(0x6B, 0x9A, 0x5E);
+    pub const ON_ACCENT: Color32 = Color32::from_rgb(0x0E, 0x17, 0x10);
+    // The wood-brown secondary accent from the mockup. Not used by the
+    // theme below yet -- it was the mockup's tick-mark/marker color, which
+    // needs actual icon/marker work to carry over, not just a Visuals field.
+    pub const WOOD: Color32 = Color32::from_rgb(0xB9, 0x8A, 0x4E);
+}
+
+/// The editor's visual theme (Grove Panel: green accent, small rounding,
+/// carved-adjacent widget states). Applied to every egui::Context the
+/// editor's own chrome uses -- the main window and each popped-out tab
+/// window -- but deliberately not the Play window, which is the player's
+/// own UI, not editor chrome.
+fn apply_editor_theme(ctx: &egui::Context) {
+    use egui::Color32;
+
+    let mut visuals = egui::Visuals::dark();
+
+    visuals.override_text_color = Some(theme::TEXT);
+    visuals.panel_fill = theme::PANEL;
+    visuals.window_fill = theme::PANEL;
+    visuals.extreme_bg_color = theme::INPUT;
+    visuals.faint_bg_color = theme::INPUT;
+    visuals.code_bg_color = theme::INPUT;
+    visuals.hyperlink_color = theme::ACCENT;
+    visuals.window_stroke = egui::Stroke::new(1.0, theme::BORDER);
+    visuals.window_corner_radius = egui::CornerRadius::same(4);
+    visuals.menu_corner_radius = egui::CornerRadius::same(4);
+
+    visuals.selection.bg_fill = Color32::from_rgba_unmultiplied(0x58, 0x84, 0x4C, 90);
+    visuals.selection.stroke = egui::Stroke::new(1.0, theme::ACCENT);
+
+    // Sliders don't paint a filled rail at all unless this is on -- without
+    // it, a Slider looks identical to stock egui no matter what accent color
+    // is set, since the fill (not just the handle) is what reads as "green"
+    // in the mockup. It's drawn with `selection.bg_fill` above.
+    visuals.slider_trailing_fill = true;
+
+    visuals.widgets.noninteractive.bg_fill = theme::PANEL;
+    visuals.widgets.noninteractive.bg_stroke = egui::Stroke::new(1.0, theme::BORDER);
+    visuals.widgets.noninteractive.fg_stroke = egui::Stroke::new(1.0, theme::MUTED);
+
+    visuals.widgets.inactive.bg_fill = theme::INPUT;
+    visuals.widgets.inactive.weak_bg_fill = theme::INPUT;
+    visuals.widgets.inactive.bg_stroke = egui::Stroke::new(1.0, theme::BORDER);
+    visuals.widgets.inactive.fg_stroke = egui::Stroke::new(1.0, theme::TEXT);
+    visuals.widgets.inactive.corner_radius = egui::CornerRadius::same(4);
+
+    visuals.widgets.hovered.bg_fill = theme::INPUT;
+    visuals.widgets.hovered.weak_bg_fill = theme::INPUT;
+    visuals.widgets.hovered.bg_stroke = egui::Stroke::new(1.0, theme::ACCENT_HOVER);
+    visuals.widgets.hovered.fg_stroke = egui::Stroke::new(1.0, theme::ACCENT_HOVER);
+    visuals.widgets.hovered.corner_radius = egui::CornerRadius::same(4);
+
+    visuals.widgets.active.bg_fill = theme::ACCENT;
+    visuals.widgets.active.weak_bg_fill = theme::ACCENT;
+    visuals.widgets.active.bg_stroke = egui::Stroke::new(1.0, theme::ACCENT_HOVER);
+    // Must stay light: egui's strong_text_color() (headings) reads this, so a
+    // dark value made headings vanish on dark panels.
+    visuals.widgets.active.fg_stroke = egui::Stroke::new(1.0, Color32::WHITE);
+    visuals.widgets.active.corner_radius = egui::CornerRadius::same(4);
+
+    visuals.widgets.open.bg_fill = theme::INPUT;
+    visuals.widgets.open.weak_bg_fill = theme::INPUT;
+    visuals.widgets.open.bg_stroke = egui::Stroke::new(1.0, theme::ACCENT);
+    visuals.widgets.open.fg_stroke = egui::Stroke::new(1.0, theme::TEXT);
+    visuals.widgets.open.corner_radius = egui::CornerRadius::same(4);
+
+    ctx.set_visuals(visuals);
+
+    // Grove typography: Manrope for body text, JetBrains Mono for monospace,
+    // Fraunces (serif) as its own named family used for headings. Each is put
+    // first in its family so egui's built-in fonts stay behind as fallbacks
+    // for any glyph these don't cover.
+    let mut fonts = egui::FontDefinitions::default();
+    fonts.font_data.insert(
+        "Manrope".to_owned(),
+        std::sync::Arc::new(egui::FontData::from_static(include_bytes!(
+            "../assets/fonts/Manrope-Regular.ttf"
+        ))),
+    );
+    fonts.font_data.insert(
+        "JetBrainsMono".to_owned(),
+        std::sync::Arc::new(egui::FontData::from_static(include_bytes!(
+            "../assets/fonts/JetBrainsMono-Medium.ttf"
+        ))),
+    );
+    fonts.font_data.insert(
+        "Fraunces".to_owned(),
+        std::sync::Arc::new(egui::FontData::from_static(include_bytes!(
+            "../assets/fonts/Fraunces.ttf"
+        ))),
+    );
+    if let Some(family) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
+        family.insert(0, "Manrope".to_owned());
+    }
+    if let Some(family) = fonts.families.get_mut(&egui::FontFamily::Monospace) {
+        family.insert(0, "JetBrainsMono".to_owned());
+    }
+    let serif = egui::FontFamily::Name("fraunces".into());
+    fonts.families.insert(
+        serif.clone(),
+        vec![
+            "Fraunces".to_owned(),
+            "Manrope".to_owned(),
+        ],
+    );
+    ctx.set_fonts(fonts);
+
+    // Context::style()/set_style() don't exist in this egui version -- style
+    // is now split per Theme (dark/light). all_styles_mut sets spacing on
+    // both, which is fine here since the editor always runs in dark mode.
+    ctx.all_styles_mut(|style| {
+        style.text_styles.insert(
+            egui::TextStyle::Heading,
+            egui::FontId::new(18.0, serif.clone()),
+        );
+        style.spacing.item_spacing = egui::vec2(10.0, 8.0);
+        style.spacing.button_padding = egui::vec2(14.0, 7.0);
+    });
+}
+
+/// An Inspector section heading: small serif (Fraunces) in the muted color, so
+/// "Position", "Velocity" and the rest read as headings above their controls
+/// instead of looking like every other line of text.
+fn section_label(ui: &mut egui::Ui, text: &str) {
+    ui.label(
+        egui::RichText::new(text)
+            .family(egui::FontFamily::Name("fraunces".into()))
+            .size(13.0)
+            .color(theme::MUTED),
+    );
+}
+
+/// The Grove checkbox: a small square box with an accent border and a diamond
+/// tick when checked, the mockup's look. Drop-in for `ui.checkbox`: takes the
+/// same `&mut bool` and label, and the returned response reports `changed()`
+/// and takes `on_hover_text` the same way. Clicking the label toggles it too.
+fn grove_checkbox(
+    ui: &mut egui::Ui,
+    checked: &mut bool,
+    text: impl Into<egui::WidgetText>,
+) -> egui::Response {
+    let text = text.into();
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 7.0;
+        let (box_rect, box_response) =
+            ui.allocate_exact_size(egui::vec2(15.0, 15.0), egui::Sense::click());
+        let label_response = ui.add(
+            egui::Label::new(text)
+                .selectable(false)
+                .sense(egui::Sense::click()),
+        );
+        let mut response = box_response.union(label_response);
+        if response.clicked() {
+            *checked = !*checked;
+            response.mark_changed();
+        }
+
+        let border = if *checked {
+            theme::ACCENT
+        } else if response.hovered() {
+            theme::ACCENT_HOVER
+        } else {
+            theme::BORDER
+        };
+        ui.painter().rect(
+            box_rect,
+            egui::CornerRadius::same(3),
+            theme::INPUT,
+            egui::Stroke::new(1.0, border),
+            egui::StrokeKind::Inside,
+        );
+        if *checked {
+            let c = box_rect.center();
+            let r = 4.0;
+            ui.painter().add(egui::Shape::convex_polygon(
+                vec![
+                    c + egui::vec2(0.0, -r),
+                    c + egui::vec2(r, 0.0),
+                    c + egui::vec2(0.0, r),
+                    c + egui::vec2(-r, 0.0),
+                ],
+                theme::ACCENT,
+                egui::Stroke::NONE,
+            ));
+        }
+        response
+    })
+    .inner
+}
+
+/// The dock's tab chrome in the Grove theme: the active tab sits on the panel
+/// color with a wood-brown outline (the mockup's selected-tab look), inactive
+/// tabs are muted with no outline, and hovering warms them to the green accent.
+fn dock_style(base: &egui::Style) -> egui_dock::Style {
+    let mut style = egui_dock::Style::from_egui(base);
+
+    style.main_surface_border_stroke = egui::Stroke::new(1.0, theme::BORDER);
+
+    style.tab_bar.bg_fill = theme::BG;
+    style.tab_bar.hline_color = theme::BORDER;
+
+    for tab in [
+        &mut style.tab.active,
+        &mut style.tab.focused,
+        &mut style.tab.active_with_kb_focus,
+        &mut style.tab.focused_with_kb_focus,
+    ] {
+        tab.bg_fill = theme::PANEL;
+        tab.outline_color = theme::WOOD;
+        tab.text_color = theme::TEXT;
+        tab.corner_radius = egui::CornerRadius::same(4);
+    }
+    for tab in [
+        &mut style.tab.inactive,
+        &mut style.tab.inactive_with_kb_focus,
+    ] {
+        tab.bg_fill = theme::BG;
+        tab.outline_color = egui::Color32::TRANSPARENT;
+        tab.text_color = theme::MUTED;
+        tab.corner_radius = egui::CornerRadius::same(4);
+    }
+    style.tab.hovered.bg_fill = theme::INPUT;
+    style.tab.hovered.outline_color = theme::BORDER;
+    style.tab.hovered.text_color = theme::ACCENT_HOVER;
+    style.tab.hovered.corner_radius = egui::CornerRadius::same(4);
+
+    style
 }
 
 /// A dock tab the user has popped out into its own real, separate OS window
@@ -3645,7 +3886,9 @@ impl App {
     /// any, they were spawned from, so saving over one never touches them.
     fn save_entity_as_prefab(&mut self, id: usize, name: &str) {
         let Some(prefab) = self.world.capture_prefab(id) else {
-            self.log(format!("Couldn't save prefab: entity {id} no longer exists"));
+            self.log(format!(
+                "Couldn't save prefab: entity {id} no longer exists"
+            ));
             return;
         };
         let Some(root) = self
@@ -4474,8 +4717,10 @@ impl App {
                 };
                 let rgba = decoded.to_rgba8();
                 let (w, h) = rgba.dimensions();
-                let color_image =
-                    egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &rgba.into_raw());
+                let color_image = egui::ColorImage::from_rgba_unmultiplied(
+                    [w as usize, h as usize],
+                    &rgba.into_raw(),
+                );
                 let handle = ctx.load_texture(
                     format!("ui-image-{name}"),
                     color_image,
@@ -4517,7 +4762,11 @@ impl App {
                 .order(egui::Order::Foreground)
                 .interactable(false)
                 .show(ui.ctx(), |ui| {
-                    ui.label(egui::RichText::new(&text.text).size(text.font_size).color(color));
+                    ui.label(
+                        egui::RichText::new(&text.text)
+                            .size(text.font_size)
+                            .color(color),
+                    );
                 });
             }
             for image in &images {
@@ -4620,6 +4869,7 @@ impl App {
         // own doc comment for why this window must not create its own.
         let (gpu, _shared) = GpuState::new(window.clone(), self.gpu_shared.as_ref());
         let egui_ctx = egui::Context::default();
+        apply_editor_theme(&egui_ctx);
         let egui_state = egui_winit::State::new(
             egui_ctx.clone(),
             egui::ViewportId::ROOT,
@@ -4822,7 +5072,11 @@ impl App {
             Some(path) => path.clone(),
             None => {
                 let folder = assets.join(&self.assets_subdir);
-                let folder = if folder.is_dir() { folder } else { assets.clone() };
+                let folder = if folder.is_dir() {
+                    folder
+                } else {
+                    assets.clone()
+                };
                 if let Err(e) = std::fs::create_dir_all(&folder) {
                     self.log(format!("Could not create assets folder: {e}"));
                     return;
@@ -4905,7 +5159,11 @@ impl App {
             Some(path) => path.clone(),
             None => {
                 let folder = assets.join(&self.assets_subdir);
-                let folder = if folder.is_dir() { folder } else { assets.clone() };
+                let folder = if folder.is_dir() {
+                    folder
+                } else {
+                    assets.clone()
+                };
                 if let Err(e) = std::fs::create_dir_all(&folder) {
                     self.log(format!("Could not create assets folder: {e}"));
                     return;
@@ -5432,6 +5690,7 @@ fn load_window_icon() -> Option<Icon> {
 }
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        apply_editor_theme(&self.egui_ctx);
         #[allow(unused_mut)]
         let mut attributes = Window::default_attributes()
             .with_title("Frame Editor")
@@ -6147,6 +6406,27 @@ impl ApplicationHandler for App {
                 {
                     let raw_input = state.take_egui_input(window);
                     let full_output = self.egui_ctx.run_ui(raw_input, |ui| {
+                            // Thin wood-to-green strip across the very top: the
+                            // Grove theme's signature accent from the mockup.
+                            egui::Panel::top("theme_strip")
+                                .exact_size(3.0)
+                                .resizable(false)
+                                .show_separator_line(false)
+                                .frame(egui::Frame::NONE)
+                                .show(ui, |ui| {
+                                    let rect = ui.max_rect();
+                                    let mut mesh = egui::Mesh::default();
+                                    // colored_vertex pushes a vertex and returns
+                                    // nothing; indices are push order: 0 tl, 1 bl,
+                                    // 2 tr, 3 br.
+                                    mesh.colored_vertex(rect.left_top(), theme::WOOD);
+                                    mesh.colored_vertex(rect.left_bottom(), theme::WOOD);
+                                    mesh.colored_vertex(rect.right_top(), theme::ACCENT);
+                                    mesh.colored_vertex(rect.right_bottom(), theme::ACCENT);
+                                    mesh.add_triangle(0, 1, 2);
+                                    mesh.add_triangle(1, 3, 2);
+                                    ui.painter().add(egui::Shape::mesh(mesh));
+                                });
                             // Top toolbar strip — fixed height, placeholder menu.
                             egui::Panel::top("toolbar").resizable(false).show(ui, |ui| {
                                 ui.horizontal(|ui| {
@@ -6356,7 +6636,7 @@ impl ApplicationHandler for App {
                                         for (name, plugin) in &installed_plugins {
                                             ui.horizontal(|ui| {
                                                 let mut on = plugin.enabled;
-                                                if ui.checkbox(&mut on, &plugin.manifest.name).changed() {
+                                                if grove_checkbox(ui, &mut on, &plugin.manifest.name).changed() {
                                                     plugin_toggle = Some((name.clone(), on));
                                                 }
                                                 ui.weak(format!(
@@ -6453,7 +6733,14 @@ impl ApplicationHandler for App {
                             egui::CentralPanel::default()
                                 .frame(egui::Frame::NONE)
                                 .show(ui, |ui| {
+                                    // egui_dock has its own hardcoded default
+                                    // look and ignores the ambient egui style
+                                    // unless told otherwise -- without this,
+                                    // every tab's chrome (bars, borders,
+                                    // the active-tab highlight) stays stock
+                                    // default no matter what Visuals we set.
                                     egui_dock::DockArea::new(&mut dock_state)
+                                        .style(dock_style(ui.style()))
                                         .show_inside(ui, &mut viewer);
                                 });
                         });
