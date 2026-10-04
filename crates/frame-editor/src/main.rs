@@ -3415,6 +3415,19 @@ struct App {
     // `open_game`/`close_game`) rather than reused, so a previous play
     // session's simulated bodies never leak into the next one.
     game_physics: Option<Physics>,
+    // The Play window's own egui context and input state, used only to draw
+    // UiText/UiImage entities as a flat screen-space overlay (see
+    // render_game_ui). Unlike PoppedOutWindow, there's no dock tab to show
+    // here -- the whole egui pass is just the overlay widgets -- so there's
+    // no viewer to borrow and no need for a dedicated struct. `None` exactly
+    // when `game_window` is.
+    game_egui_ctx: Option<egui::Context>,
+    game_egui_state: Option<egui_winit::State>,
+    // UI-image textures uploaded for the current Play session, keyed by file
+    // name under assets/ the same way `thumbnails` is keyed by model name.
+    // Cleared on close_game so a new Play session never shows a stale image
+    // left over from a previous one (or from a different project).
+    game_ui_textures: std::collections::HashMap<String, egui::TextureHandle>,
     game_input: InputState,
     game_clock: Clock,
     // Set when the game window asks to close; the actual teardown happens in
@@ -4261,6 +4274,20 @@ impl App {
         let pairs: Vec<(&frame_engine::assets::MeshData, &MaterialGpuData)> =
             refs.iter().copied().zip(materials.iter()).collect();
         gpu.set_custom_meshes(&pairs);
+        // The game window's own egui context, used only for the UiText/
+        // UiImage overlay (see render_game_ui) -- same creation shape as
+        // pop_out_tab's PoppedOutWindow, just kept as loose fields instead
+        // of a struct since there's no window-to-tab map needed for just
+        // one window.
+        let game_egui_ctx = egui::Context::default();
+        let game_egui_state = egui_winit::State::new(
+            game_egui_ctx.clone(),
+            egui::ViewportId::ROOT,
+            window.as_ref(),
+            None,
+            None,
+            None,
+        );
         window.request_redraw();
         self.game_gpu = Some(gpu);
         self.game_world = Some(world);
@@ -4269,6 +4296,11 @@ impl App {
         self.game_physics = Some(Physics::new(GRAVITY_Y));
         self.game_input = InputState::new();
         self.game_clock = Clock::new(TICK_RATE, MAX_CATCHUP_TICKS);
+        self.game_egui_ctx = Some(game_egui_ctx);
+        self.game_egui_state = Some(game_egui_state);
+        // Cleared rather than just left from a previous session: an image
+        // name can mean a different file in a different project.
+        self.game_ui_textures.clear();
         self.game_window = Some(window);
         self.log(format!("Playing '{name}'"));
     }
@@ -4279,6 +4311,9 @@ impl App {
         self.game_gpu = None;
         self.game_world = None;
         self.game_physics = None;
+        self.game_egui_ctx = None;
+        self.game_egui_state = None;
+        self.game_ui_textures.clear();
         self.game_window = None;
         self.game_input = InputState::new();
     }
@@ -4377,6 +4412,7 @@ impl App {
                     height,
                 )
             });
+        let (egui_paint_jobs, egui_textures_delta, egui_ppp) = self.render_game_ui();
         if let Some(gpu) = self.game_gpu.as_mut() {
             gpu.render(
                 &instances,
@@ -4384,9 +4420,9 @@ impl App {
                 &[],
                 view_proj,
                 &lights,
-                &[],
-                &egui::TexturesDelta::default(),
-                1.0,
+                &egui_paint_jobs,
+                &egui_textures_delta,
+                egui_ppp,
             );
         }
         if let Some(window) = &self.game_window {
@@ -4394,8 +4430,134 @@ impl App {
         }
     }
 
+    /// Build this frame's egui overlay for the Play window: every UiText and
+    /// UiImage entity in `game_world`, drawn as a screen-space panel
+    /// positioned by its normalized x/y, instead of as 3D geometry (see
+    /// build_instances, which skips these same entities for exactly that
+    /// reason). Not interactive yet -- v1 is display only -- so every Area
+    /// below is `.interactable(false)`, just enough for render_game to pass
+    /// real paint jobs into GpuState::render instead of the empty stand-ins
+    /// it used before this existed. Returns the empty defaults if there's no
+    /// game window/egui state yet (Play isn't running).
+    fn render_game_ui(&mut self) -> (Vec<egui::ClippedPrimitive>, egui::TexturesDelta, f32) {
+        let (Some(window), Some(ctx)) = (self.game_window.clone(), self.game_egui_ctx.clone())
+        else {
+            return (Vec::new(), egui::TexturesDelta::default(), 1.0);
+        };
+        let Some(state) = self.game_egui_state.as_mut() else {
+            return (Vec::new(), egui::TexturesDelta::default(), 1.0);
+        };
+        let raw_input = state.take_egui_input(&window);
+        // Resolve any not-yet-seen UiImage's texture before entering the
+        // egui closure below, the same lazily-cached-on-first-use shape as
+        // `thumbnails`/`texture_cache` -- the closure only reads
+        // `game_ui_textures`, it never decodes a file itself.
+        let assets_root = self
+            .current_scene_path
+            .as_ref()
+            .and_then(|p| p.parent())
+            .map(|p| p.join("assets"));
+        if let (Some(world), Some(assets)) = (self.game_world.as_ref(), assets_root.as_deref()) {
+            let names: Vec<String> = world
+                .ui_images
+                .iter()
+                .flatten()
+                .map(|image| image.name.clone())
+                .filter(|name| !name.is_empty() && !self.game_ui_textures.contains_key(name))
+                .collect();
+            for name in names {
+                let Some(path) = find_image(assets, &name) else {
+                    continue;
+                };
+                let Ok(decoded) = image::open(&path) else {
+                    continue;
+                };
+                let rgba = decoded.to_rgba8();
+                let (w, h) = rgba.dimensions();
+                let color_image =
+                    egui::ColorImage::from_rgba_unmultiplied([w as usize, h as usize], &rgba.into_raw());
+                let handle = ctx.load_texture(
+                    format!("ui-image-{name}"),
+                    color_image,
+                    egui::TextureOptions::LINEAR,
+                );
+                self.game_ui_textures.insert(name, handle);
+            }
+        }
+        let Some(world) = self.game_world.as_ref() else {
+            return (Vec::new(), egui::TexturesDelta::default(), 1.0);
+        };
+        let texts: Vec<frame_engine::world::UiText> =
+            world.ui_texts.iter().flatten().cloned().collect();
+        let images: Vec<frame_engine::world::UiImage> =
+            world.ui_images.iter().flatten().cloned().collect();
+        let textures = &self.game_ui_textures;
+        let full_output = ctx.run_ui(raw_input, |ui| {
+            let screen = ui.max_rect();
+            for text in &texts {
+                if text.text.is_empty() {
+                    continue;
+                }
+                let pos = egui::pos2(
+                    screen.min.x + text.x * screen.width(),
+                    screen.min.y + text.y * screen.height(),
+                );
+                let color = egui::Color32::from_rgb(
+                    (text.color.r.clamp(0.0, 1.0) * 255.0) as u8,
+                    (text.color.g.clamp(0.0, 1.0) * 255.0) as u8,
+                    (text.color.b.clamp(0.0, 1.0) * 255.0) as u8,
+                );
+                egui::Area::new(egui::Id::new((
+                    "ui-text",
+                    text.x.to_bits(),
+                    text.y.to_bits(),
+                    &text.text,
+                )))
+                .fixed_pos(pos)
+                .order(egui::Order::Foreground)
+                .interactable(false)
+                .show(ui.ctx(), |ui| {
+                    ui.label(egui::RichText::new(&text.text).size(text.font_size).color(color));
+                });
+            }
+            for image in &images {
+                let Some(handle) = textures.get(&image.name) else {
+                    continue;
+                };
+                let size = egui::vec2(image.width * screen.width(), image.height * screen.height());
+                let pos = egui::pos2(
+                    screen.min.x + image.x * screen.width(),
+                    screen.min.y + image.y * screen.height(),
+                );
+                egui::Area::new(egui::Id::new((
+                    "ui-image",
+                    image.x.to_bits(),
+                    image.y.to_bits(),
+                    &image.name,
+                )))
+                .fixed_pos(pos)
+                .order(egui::Order::Foreground)
+                .interactable(false)
+                .show(ui.ctx(), |ui| {
+                    ui.add(egui::Image::new(handle).fit_to_exact_size(size));
+                });
+            }
+        });
+        state.handle_platform_output(&window, full_output.platform_output);
+        let ppp = full_output.pixels_per_point;
+        let jobs = ctx.tessellate(full_output.shapes, ppp);
+        (jobs, full_output.textures_delta, ppp)
+    }
+
     /// Handle an event addressed to the game window.
     fn game_window_event(&mut self, event: WindowEvent) {
+        // Forwarded first, same as popped_out_window_event: the egui overlay
+        // needs to see resizes and (eventually, once it's interactive) input
+        // regardless of which arm below also reacts to this event.
+        let window = self.game_window.clone();
+        if let (Some(state), Some(window)) = (self.game_egui_state.as_mut(), window.as_ref()) {
+            let _ = state.on_window_event(window, &event);
+        }
         match event {
             WindowEvent::CloseRequested => self.game_closing = true,
             WindowEvent::Resized(size) => {
@@ -7567,6 +7729,9 @@ fn main() {
         game_gpu: None,
         game_world: None,
         game_physics: None,
+        game_egui_ctx: None,
+        game_egui_state: None,
+        game_ui_textures: std::collections::HashMap::new(),
         game_input: InputState::new(),
         game_clock: Clock::new(TICK_RATE, MAX_CATCHUP_TICKS),
         game_closing: false,
