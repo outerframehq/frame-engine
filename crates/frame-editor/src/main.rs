@@ -3387,6 +3387,71 @@ fn apply_editor_theme(ctx: &egui::Context) {
     });
 }
 
+/// The Credits section of the Editor Settings window: who made Frame Engine,
+/// the embedded fonts and their licence, the community links, and the
+/// open-source libraries the editor is built on. Plain data and labels, so
+/// adding a credit later is one more line here.
+fn credits_ui(ui: &mut egui::Ui) {
+    ui.heading("Credits");
+    ui.add_space(4.0);
+
+    ui.label("Frame Engine and Frame Editor");
+    ui.weak(format!(
+        "Version {} (pre-release), MIT licence",
+        env!("CARGO_PKG_VERSION")
+    ));
+    ui.add_space(6.0);
+
+    section_label(ui, "Made by");
+    ui.label("Outer Frame Interactive");
+    ui.weak("Designed and built by Luke Fawcett, in the open, as a learning project.");
+    ui.add_space(6.0);
+
+    section_label(ui, "Theme");
+    ui.label("Outerface V1");
+    ui.weak("The editor's own look: neutral dark panels, a green accent and a wood tone.");
+    ui.add_space(6.0);
+
+    section_label(ui, "Fonts (SIL Open Font License 1.1)");
+    ui.label("Manrope, by Mikhail Sharanda");
+    ui.label("Fraunces, by Undercase Type");
+    ui.label("JetBrains Mono, by JetBrains");
+    ui.add_space(6.0);
+
+    section_label(ui, "Community");
+    ui.hyperlink_to(
+        "github.com/outerframehq/frame-engine",
+        "https://github.com/outerframehq/frame-engine",
+    );
+    ui.hyperlink_to("@OuterFrameInter on X", "https://x.com/OuterFrameInter");
+    ui.hyperlink_to("Discord server", "https://discord.gg/ufXDNJnzgf");
+    ui.add_space(6.0);
+
+    egui::CollapsingHeader::new("Open-source libraries").show(ui, |ui| {
+        ui.weak("Hand-rolled at the heart, bought for the rest:");
+        for (name, what) in [
+            ("winit", "windowing"),
+            ("wgpu", "GPU rendering"),
+            ("glam", "linear algebra"),
+            ("egui, egui_dock", "the editor's panel UI"),
+            ("rapier3d", "rigid-body physics"),
+            ("rhai", "entity scripting"),
+            ("kira", "audio playback"),
+            ("serde, ron", "scene and project files"),
+            ("git2", "the Source Control tab"),
+            ("rfd", "native file dialogs"),
+            ("image", "texture and logo decoding"),
+            ("dirs, chrono", "config paths and dates"),
+            ("bytemuck, pollster", "GPU plumbing"),
+        ] {
+            ui.horizontal(|ui| {
+                ui.monospace(name);
+                ui.weak(what);
+            });
+        }
+    });
+}
+
 /// An Inspector section heading: small serif (Fraunces) in the muted color, so
 /// "Position", "Velocity" and the rest read as headings above their controls
 /// instead of looking like every other line of text.
@@ -6629,6 +6694,7 @@ impl ApplicationHandler for App {
                                 egui::Window::new("Editor Settings")
                                     .collapsible(false)
                                     .open(&mut editor_settings_open)
+                                    .default_width(420.0)
                                     .show(ui.ctx(), |ui| {
                                         ui.heading("Plugins");
                                         ui.add_space(4.0);
@@ -6652,7 +6718,10 @@ impl ApplicationHandler for App {
                                             ui.add_space(4.0);
                                         }
                                         ui.separator();
-                                        ui.weak("More editor configuration will live here over time.");
+                                        egui::ScrollArea::vertical()
+                                            .max_height(320.0)
+                                            .auto_shrink([false, true])
+                                            .show(ui, |ui| credits_ui(ui));
                                     });
                             }
                             // Bottom console dock — Output (the live log) and a
