@@ -5746,7 +5746,9 @@ impl ApplicationHandler for App {
         // cursor position) keeps looking smooth with the cursor grabbed in place.
         if let DeviceEvent::MouseMotion { delta: (dx, dy) } = event {
             if self.fly_mode {
-                self.cam_yaw += dx as f32 * LOOK_SENS;
+                // view_forward points toward -sin(yaw), so a larger yaw looks
+                // left. Subtract so moving the mouse right looks right.
+                self.cam_yaw -= dx as f32 * LOOK_SENS;
                 // Un-inverted: moving the mouse down looks down (pitch increases).
                 self.cam_pitch += dy as f32 * LOOK_SENS;
                 self.cam_pitch = self.cam_pitch.clamp(-1.4, 1.4);
