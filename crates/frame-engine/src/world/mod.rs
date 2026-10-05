@@ -937,6 +937,15 @@ pub struct World {
     /// Optional per-entity screen-space UI image, `ui_texts`'s sibling.
     #[serde(default)]
     pub ui_images: ComponentStorage<UiImage>,
+    /// Components that belong to crates outside the engine, keyed by name.
+    /// A crate that adds its own component (a game-specific feature, say) never
+    /// needs a field here: it stores each entity's value under its own name
+    /// with `ext_set` and reads it back with `ext_get`. Values are kept as
+    /// RON values so they always save and load with the scene, and a scene
+    /// that mentions a component nobody has loaded keeps it untouched
+    /// instead of failing. Missing from an older scene file means none.
+    #[serde(default)]
+    pub extensions: std::collections::BTreeMap<String, ComponentStorage<ron::Value>>,
     /// Metadata for imported meshes, keyed by mesh name. Works like
     /// script_library does for scripts.
     #[serde(default)]
@@ -1067,6 +1076,57 @@ impl Default for Color {
 }
 
 impl World {
+    /// Store `value` as entity `id`'s component named `name`, replacing any
+    /// earlier one. The component can be any serde type; see `extensions`.
+    /// Errors only if the value can't be written as RON.
+    pub fn ext_set<T: Serialize>(
+        &mut self,
+        name: &str,
+        id: usize,
+        value: &T,
+    ) -> Result<(), String> {
+        let text = ron::to_string(value).map_err(|e| e.to_string())?;
+        let value: ron::Value = ron::from_str(&text).map_err(|e| e.to_string())?;
+        self.extensions
+            .entry(name.to_string())
+            .or_default()
+            .insert(id, value);
+        Ok(())
+    }
+
+    /// Entity `id`'s component named `name`, or None when it has none or the
+    /// stored value doesn't fit `T`.
+    pub fn ext_get<T: serde::de::DeserializeOwned>(&self, name: &str, id: usize) -> Option<T> {
+        self.extensions
+            .get(name)?
+            .get(id)?
+            .clone()
+            .into_rust::<T>()
+            .ok()
+    }
+
+    /// Whether entity `id` has a component named `name`.
+    pub fn ext_has(&self, name: &str, id: usize) -> bool {
+        self.extensions
+            .get(name)
+            .is_some_and(|storage| storage.get(id).is_some())
+    }
+
+    /// Remove entity `id`'s component named `name`, if it has one.
+    pub fn ext_remove(&mut self, name: &str, id: usize) {
+        if let Some(storage) = self.extensions.get_mut(name) {
+            storage.remove(id);
+        }
+    }
+
+    /// Ids of every entity that has a component named `name`, in order.
+    pub fn ext_ids(&self, name: &str) -> Vec<usize> {
+        self.extensions
+            .get(name)
+            .map(|storage| storage.entities().collect())
+            .unwrap_or_default()
+    }
+
     /// A fresh, empty world. Because `World` derives `Default`, adding a new
     /// component field updates construction in exactly one place: the derive.
     pub fn new() -> Self {
@@ -1114,6 +1174,9 @@ impl World {
             self.sounds.remove(id);
             self.ui_texts.remove(id);
             self.ui_images.remove(id);
+            for storage in self.extensions.values_mut() {
+                storage.remove(id);
+            }
             // Every registered dynamic component too, without needing to know
             // any of their types: remove_erased is exactly what that's for.
             for entry in self.dynamic.values_mut() {
@@ -1600,5 +1663,129 @@ mod rotation_tests {
                 roll: -0.5
             }
         );
+    }
+}
+
+#[cfg(test)]
+mod extension_tests {
+    use super::*;
+
+    #[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+    struct Probe {
+        seed: u32,
+        scale: f32,
+        wide: u64,
+        name: String,
+        tag: Option<u8>,
+        pair: (i32, f32),
+        items: Vec<f32>,
+    }
+
+    fn probe() -> Probe {
+        Probe {
+            seed: 9,
+            scale: 0.25,
+            wide: 1 << 40,
+            name: "hills".into(),
+            tag: Some(3),
+            pair: (-4, 1.5),
+            items: vec![1.0, 2.5],
+        }
+    }
+
+    fn entity(world: &mut World) -> usize {
+        world.spawn(
+            Position {
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+            },
+            Velocity {
+                dx: 0.0,
+                dy: 0.0,
+                dz: 0.0,
+            },
+        )
+    }
+
+    #[test]
+    fn a_value_reads_back_as_it_was_stored() {
+        let mut world = World::default();
+        let id = entity(&mut world);
+        world.ext_set("probe", id, &probe()).unwrap();
+        assert_eq!(world.ext_get::<Probe>("probe", id), Some(probe()));
+        assert!(world.ext_has("probe", id));
+        assert!(!world.ext_has("other", id));
+        assert_eq!(world.ext_get::<Probe>("other", id), None);
+    }
+
+    #[test]
+    fn values_survive_a_save_and_load() {
+        let mut world = World::default();
+        let id = entity(&mut world);
+        world.ext_set("probe", id, &probe()).unwrap();
+        let text = ron::ser::to_string_pretty(&world, ron::ser::PrettyConfig::default()).unwrap();
+        let back: World = ron::from_str(&text).unwrap();
+        assert_eq!(back.ext_get::<Probe>("probe", id), Some(probe()));
+    }
+
+    #[test]
+    fn an_older_scene_without_extensions_loads_empty() {
+        let mut world = World::default();
+        entity(&mut world);
+        let text = ron::ser::to_string_pretty(&world, ron::ser::PrettyConfig::default()).unwrap();
+        let older: String = text
+            .lines()
+            .filter(|l| !l.trim_start().starts_with("extensions"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let back: World = ron::from_str(&older).unwrap();
+        assert!(back.extensions.is_empty());
+    }
+
+    #[test]
+    fn data_nobody_reads_is_kept_when_the_scene_is_saved_again() {
+        // A build without the crate that owns "probe" still carries the data.
+        let mut world = World::default();
+        let id = entity(&mut world);
+        world.ext_set("probe", id, &probe()).unwrap();
+        let text = ron::ser::to_string_pretty(&world, ron::ser::PrettyConfig::default()).unwrap();
+        let loaded: World = ron::from_str(&text).unwrap();
+        let again = ron::ser::to_string_pretty(&loaded, ron::ser::PrettyConfig::default()).unwrap();
+        let reloaded: World = ron::from_str(&again).unwrap();
+        assert_eq!(reloaded.ext_get::<Probe>("probe", id), Some(probe()));
+    }
+
+    #[test]
+    fn despawning_clears_extension_values() {
+        let mut world = World::default();
+        let id = entity(&mut world);
+        world.ext_set("probe", id, &probe()).unwrap();
+        world.despawn(id);
+        assert!(!world.ext_has("probe", id));
+        let again = entity(&mut world);
+        assert_eq!(again, id);
+        assert!(!world.ext_has("probe", again));
+    }
+
+    #[test]
+    fn remove_and_ids_work() {
+        let mut world = World::default();
+        let a = entity(&mut world);
+        let b = entity(&mut world);
+        world.ext_set("probe", a, &probe()).unwrap();
+        world.ext_set("probe", b, &probe()).unwrap();
+        assert_eq!(world.ext_ids("probe"), vec![a, b]);
+        world.ext_remove("probe", a);
+        assert_eq!(world.ext_ids("probe"), vec![b]);
+        assert!(world.ext_ids("missing").is_empty());
+    }
+
+    #[test]
+    fn a_value_of_the_wrong_shape_reads_as_none() {
+        let mut world = World::default();
+        let id = entity(&mut world);
+        world.ext_set("probe", id, &5u32).unwrap();
+        assert_eq!(world.ext_get::<Probe>("probe", id), None);
     }
 }

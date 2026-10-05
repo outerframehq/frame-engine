@@ -1,0 +1,375 @@
+//! How a crate outside the editor adds a feature to it.
+//!
+//! The editor knows nothing about any particular feature. A crate that wants
+//! to add one (a game-specific feature, say) implements [`EditorModule`] and hands
+//! it to [`crate::run`]. The editor then asks each module, at the right
+//! moments, to:
+//!
+//! - show an Inspector section for the selected entity ([`EditorModule::inspect`]),
+//! - build whatever it will draw from the world ([`EditorModule::build_scene`]),
+//! - make a per-window GPU copy of it ([`EditorModule::new_gpu`], [`ModuleGpu`]),
+//! - and leave anchor entities out of the ordinary shape pass
+//!   ([`EditorModule::anchor_components`]).
+//!
+//! A module's own data lives in the world as named extension components
+//! (`World::ext_set` / `ext_get`), so it saves and loads with the scene.
+
+use super::*;
+use std::collections::{BTreeMap, BTreeSet};
+
+pub use frame_engine::assets::MeshVertexData;
+
+/// Whatever a module builds from the world, shared between every window that
+/// draws it. The module downcasts it back to its own type in `ModuleGpu::sync`.
+pub type ModuleScene = Arc<dyn std::any::Any + Send + Sync>;
+
+/// A feature added to the editor by another crate.
+pub trait EditorModule {
+    /// Short name, for logs.
+    fn name(&self) -> &str;
+
+    /// Names of extension components whose entities are only anchors. An
+    /// entity with any of these is not drawn as a cube; the module draws its
+    /// own geometry instead.
+    fn anchor_components(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    /// Add this module's section to the Inspector for the selected entity.
+    /// Read and write the entity's components through `entity`.
+    fn inspect(&mut self, _ui: &mut egui::Ui, _entity: &mut ExtEdit) {}
+
+    /// Build what should be drawn for `world`, or None for nothing. Called
+    /// every frame for each world being drawn, so reuse the last result when
+    /// nothing changed. `hold` is true while a mouse button is down (dragging
+    /// an Inspector slider, say): keep showing the previous result instead of
+    /// rebuilding on every frame.
+    fn build_scene(&mut self, _world: &World, _hold: bool) -> Option<ModuleScene> {
+        None
+    }
+
+    /// Make this module's GPU state for one window.
+    fn new_gpu(&self, device: &wgpu::Device) -> Box<dyn ModuleGpu>;
+}
+
+/// One window's GPU side of a module.
+pub trait ModuleGpu {
+    /// Make the GPU copy match `scene`: upload when it changed, drop it when
+    /// there is none. Called every frame, so do nothing when already current.
+    fn sync(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, scene: Option<&ModuleScene>);
+
+    /// World-space box (min, max) of what this draws, so shadows can cover it.
+    fn shadow_bounds(&self) -> Option<([f32; 3], [f32; 3])> {
+        None
+    }
+
+    /// Whether there is anything to draw.
+    fn has_geometry(&self) -> bool;
+
+    /// Draw it. The editor has already set the pipeline and bind groups, for
+    /// both the shadow pass and the colour pass.
+    fn draw(&self, pass: &mut wgpu::RenderPass<'_>);
+}
+
+/// An editable copy of one entity's extension components, handed to
+/// [`EditorModule::inspect`]. Changes are written back to the world by the
+/// editor, and only for names that were actually changed.
+#[derive(Clone, PartialEq, Default)]
+pub struct ExtEdit {
+    values: BTreeMap<String, ron::Value>,
+    touched: BTreeSet<String>,
+}
+
+impl ExtEdit {
+    pub(crate) fn from_world(world: &World, id: usize) -> Self {
+        let mut values = BTreeMap::new();
+        for (name, storage) in &world.extensions {
+            if let Some(value) = storage.get(id) {
+                values.insert(name.clone(), value.clone());
+            }
+        }
+        ExtEdit {
+            values,
+            touched: BTreeSet::new(),
+        }
+    }
+
+    pub(crate) fn apply(&self, world: &mut World, id: usize) {
+        for name in &self.touched {
+            match self.values.get(name) {
+                Some(value) => {
+                    world
+                        .extensions
+                        .entry(name.clone())
+                        .or_default()
+                        .insert(id, value.clone());
+                }
+                None => world.ext_remove(name, id),
+            }
+        }
+    }
+
+    /// Whether the entity has a component named `name`.
+    pub fn has(&self, name: &str) -> bool {
+        self.values.contains_key(name)
+    }
+
+    /// The component named `name`, if the entity has it and it reads as `T`.
+    pub fn get<T: serde::de::DeserializeOwned>(&self, name: &str) -> Option<T> {
+        self.values.get(name)?.clone().into_rust::<T>().ok()
+    }
+
+    /// Set the component named `name`. Setting the value it already has is
+    /// not a change.
+    pub fn set<T: serde::Serialize>(&mut self, name: &str, value: &T) {
+        let Ok(text) = ron::to_string(value) else {
+            return;
+        };
+        let Ok(new) = ron::from_str::<ron::Value>(&text) else {
+            return;
+        };
+        if self.values.get(name) != Some(&new) {
+            self.values.insert(name.to_string(), new);
+            self.touched.insert(name.to_string());
+        }
+    }
+
+    /// Remove the component named `name`.
+    pub fn remove(&mut self, name: &str) {
+        if self.values.remove(name).is_some() {
+            self.touched.insert(name.to_string());
+        }
+    }
+}
+
+/// A triangle mesh on the GPU, in world units, for a module to draw.
+pub struct WorldMesh {
+    buffer: wgpu::Buffer,
+    count: u32,
+}
+
+impl WorldMesh {
+    /// Upload `vertices` (a flat triangle list). None when there are none.
+    pub fn new(device: &wgpu::Device, vertices: &[MeshVertexData]) -> Option<Self> {
+        if vertices.is_empty() {
+            return None;
+        }
+        let verts: Vec<MeshVertex> = vertices
+            .iter()
+            .map(|v| MeshVertex {
+                position: v.position,
+                normal: v.normal,
+                uv: v.uv,
+            })
+            .collect();
+        let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("module mesh buffer"),
+            contents: bytemuck::cast_slice(&verts),
+            usage: wgpu::BufferUsages::VERTEX,
+        });
+        Some(WorldMesh {
+            buffer,
+            count: verts.len() as u32,
+        })
+    }
+
+    /// Draw it. Call `WorldInstance::bind` first.
+    pub fn draw(&self, pass: &mut wgpu::RenderPass<'_>) {
+        pass.set_vertex_buffer(0, self.buffer.slice(..));
+        pass.draw(0..self.count, 0..1);
+    }
+}
+
+/// The single placement a module's meshes are drawn with: a world position
+/// and a colour. Vertices are used as plain world units.
+pub struct WorldInstance {
+    buffer: wgpu::Buffer,
+}
+
+impl WorldInstance {
+    pub fn new(device: &wgpu::Device) -> Self {
+        WorldInstance {
+            buffer: device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("module instance buffer"),
+                size: std::mem::size_of::<InstanceRaw>() as wgpu::BufferAddress,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            }),
+        }
+    }
+
+    pub fn set(&self, queue: &wgpu::Queue, position: [f32; 3], color: [f32; 3]) {
+        // The shader multiplies every mesh by the entity size, so scale by
+        // its inverse to leave the vertices as world units.
+        let instance = InstanceRaw {
+            position,
+            color,
+            selected: 0.0,
+            scale: [1.0 / QUAD_SIZE; 3],
+            emissive: 0.0,
+            rotation: [0.0; 3],
+        };
+        queue.write_buffer(&self.buffer, 0, bytemuck::cast_slice(&[instance]));
+    }
+
+    pub fn bind(&self, pass: &mut wgpu::RenderPass<'_>) {
+        pass.set_vertex_buffer(1, self.buffer.slice(..));
+    }
+}
+
+/// The editor's own widgets, so a module's Inspector section looks the same.
+pub mod widgets {
+    pub use crate::{outerface_checkbox, section_label};
+}
+
+pub(crate) fn module_scenes(
+    modules: &std::cell::RefCell<Vec<Box<dyn EditorModule>>>,
+    world: &World,
+    hold: bool,
+) -> Vec<Option<ModuleScene>> {
+    modules
+        .borrow_mut()
+        .iter_mut()
+        .map(|m| m.build_scene(world, hold))
+        .collect()
+}
+
+pub(crate) fn anchor_names(
+    modules: &std::cell::RefCell<Vec<Box<dyn EditorModule>>>,
+) -> Vec<&'static str> {
+    modules
+        .borrow()
+        .iter()
+        .flat_map(|m| m.anchor_components().iter().copied())
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn world_with_entity() -> (World, usize) {
+        let mut world = World::default();
+        let id = world.spawn(
+            Position {
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+            },
+            Velocity {
+                dx: 0.0,
+                dy: 0.0,
+                dz: 0.0,
+            },
+        );
+        (world, id)
+    }
+
+    #[test]
+    fn an_edit_copies_the_entitys_components_and_writes_changes_back() {
+        let (mut world, id) = world_with_entity();
+        world.ext_set("a", id, &1u32).unwrap();
+        world.ext_set("b", id, &2u32).unwrap();
+        let mut edit = ExtEdit::from_world(&world, id);
+        assert_eq!(edit.get::<u32>("a"), Some(1));
+        edit.set("a", &10u32);
+        edit.remove("b");
+        edit.set("c", &3u32);
+        // Nothing reaches the world until the editor applies the edit.
+        assert_eq!(world.ext_get::<u32>("a", id), Some(1));
+        edit.apply(&mut world, id);
+        assert_eq!(world.ext_get::<u32>("a", id), Some(10));
+        assert!(!world.ext_has("b", id));
+        assert_eq!(world.ext_get::<u32>("c", id), Some(3));
+    }
+
+    #[test]
+    fn setting_the_same_value_is_not_a_change() {
+        let (mut world, id) = world_with_entity();
+        world.ext_set("a", id, &1u32).unwrap();
+        let before = ExtEdit::from_world(&world, id);
+        let mut edit = before.clone();
+        edit.set("a", &1u32);
+        edit.remove("missing");
+        assert!(edit == before, "the Inspector would mark the scene dirty");
+    }
+
+    #[test]
+    fn an_edit_only_touches_the_names_it_changed() {
+        let (mut world, id) = world_with_entity();
+        world.ext_set("a", id, &1u32).unwrap();
+        world.ext_set("b", id, &2u32).unwrap();
+        let mut edit = ExtEdit::from_world(&world, id);
+        edit.set("a", &5u32);
+        // Another system changes "b" after the snapshot was taken.
+        world.ext_set("b", id, &99u32).unwrap();
+        edit.apply(&mut world, id);
+        assert_eq!(world.ext_get::<u32>("a", id), Some(5));
+        assert_eq!(world.ext_get::<u32>("b", id), Some(99));
+    }
+
+    struct Anchor;
+    impl EditorModule for Anchor {
+        fn name(&self) -> &str {
+            "anchor"
+        }
+        fn anchor_components(&self) -> &'static [&'static str] {
+            &["anchor_thing"]
+        }
+        fn new_gpu(&self, _device: &wgpu::Device) -> Box<dyn ModuleGpu> {
+            unreachable!("no GPU in tests")
+        }
+    }
+
+    #[test]
+    fn anchor_entities_are_left_out_of_the_shape_pass() {
+        let (mut world, anchor) = world_with_entity();
+        world.ext_set("anchor_thing", anchor, &1u32).unwrap();
+        world.spawn(
+            Position {
+                x: 1.0,
+                y: 0.0,
+                z: 0.0,
+            },
+            Velocity {
+                dx: 0.0,
+                dy: 0.0,
+                dz: 0.0,
+            },
+        );
+        let modules = RefCell::new(vec![Box::new(Anchor) as Box<dyn EditorModule>]);
+        let anchors = anchor_names(&modules);
+        assert_eq!(anchors, vec!["anchor_thing"]);
+        let none = std::collections::HashSet::new();
+        let (with, _) = build_instances(&world, None, &none, &[], &anchors, None);
+        assert_eq!(with.len(), 1, "only the ordinary entity is drawn");
+        let (without, _) = build_instances(&world, None, &none, &[], &[], None);
+        assert_eq!(without.len(), 2, "no module: both drawn");
+    }
+
+    #[test]
+    fn extra_geometry_alone_still_casts_a_shadow_map() {
+        let mut lights = [LightRaw::zeroed(); MAX_LIGHTS];
+        lights[0] = LightRaw {
+            position_or_direction: [-1.0, 1.0, 0.1, 0.0],
+            params: [0.0, 0.0, 1.0, 1.0],
+        };
+        let view = Mat4::look_at_rh(Vec3::new(0.0, 30.0, 60.0), Vec3::ZERO, Vec3::Y);
+        let proj = Mat4::perspective_rh(FOV_DEGREES.to_radians(), 16.0 / 9.0, 0.1, 10000.0);
+        let camera = (proj * view).to_cols_array_2d();
+        let bounds = Some((
+            Vec3::new(-200.0, -30.0, -200.0),
+            Vec3::new(200.0, 30.0, 200.0),
+        ));
+        assert_eq!(compute_shadow(&[], &lights, camera, bounds).params[0], 1.0);
+        assert_eq!(compute_shadow(&[], &lights, camera, None).params[0], 0.0);
+    }
+
+    #[test]
+    fn a_world_instance_scale_cancels_the_shaders_mesh_size() {
+        // Module meshes are in world units; the shader multiplies by the
+        // entity size, so the instance scale must be its inverse.
+        assert_eq!(QUAD_SIZE * (1.0 / QUAD_SIZE), 1.0);
+        assert_eq!(QUAD_SIZE, 8.0, "shader.wgsl's MESH_SIZE must match");
+    }
+}
