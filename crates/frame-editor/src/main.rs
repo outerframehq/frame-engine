@@ -99,6 +99,17 @@ struct ShadowUniform {
 /// than an App field because the Play window has its own GpuState and both
 /// read it.
 static SHADOWS_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+/// How far from the camera shadows are drawn, in world units, as f32 bits.
+/// Smaller is sharper; larger reaches further. An editor preference.
+const SHADOW_DISTANCE_DEFAULT: f32 = 250.0;
+static SHADOW_DISTANCE_BITS: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(SHADOW_DISTANCE_DEFAULT.to_bits());
+fn shadow_distance() -> f32 {
+    f32::from_bits(SHADOW_DISTANCE_BITS.load(std::sync::atomic::Ordering::Relaxed))
+}
+fn set_shadow_distance(distance: f32) {
+    SHADOW_DISTANCE_BITS.store(distance.to_bits(), std::sync::atomic::Ordering::Relaxed);
+}
 fn shadows_enabled() -> bool {
     SHADOWS_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
 }
@@ -110,7 +121,11 @@ fn set_shadows_enabled(on: bool) {
 /// contain every instance. Returns an "off" uniform (the shader then treats
 /// everything as lit) when shadows are disabled, there is nothing to draw,
 /// or no light is marked as the shadow caster.
-fn compute_shadow(instances: &[InstanceRaw], lights: &[LightRaw; MAX_LIGHTS]) -> ShadowUniform {
+fn compute_shadow(
+    instances: &[InstanceRaw],
+    lights: &[LightRaw; MAX_LIGHTS],
+    view_proj: [[f32; 4]; 4],
+) -> ShadowUniform {
     let off = ShadowUniform {
         light_view_proj: Mat4::IDENTITY.to_cols_array_2d(),
         params: [0.0; 4],
@@ -146,26 +161,85 @@ fn compute_shadow(instances: &[InstanceRaw], lights: &[LightRaw; MAX_LIGHTS]) ->
     if !(min.is_finite() && max.is_finite()) {
         return off;
     }
-    let center = (min + max) * 0.5;
-    // Capped so one enormous ground plane can't stretch the map until
-    // nothing has a usable shadow; anything outside the box is simply lit.
-    let radius = ((max - min).length() * 0.5).clamp(8.0, 600.0);
+    let scene_center = (min + max) * 0.5;
+    let scene_radius = ((max - min).length() * 0.5).max(8.0);
     // Pick an "up" that isn't parallel to the light direction.
     let up = if to_light.y.abs() > 0.99 {
         Vec3::Z
     } else {
         Vec3::Y
     };
-    let eye = center + to_light * radius * 2.0;
+    // Fit the map to the part of the world the camera can actually see, up
+    // to the shadow distance, rather than the whole scene: a huge ground
+    // plane would otherwise spread the map thin and blur every shadow. When
+    // the whole scene is already smaller than that slice, the whole scene is
+    // used, which is the sharpest and most stable fit.
+    let mut center = scene_center;
+    let mut radius = scene_radius;
+    let inverse = Mat4::from_cols_array_2d(&view_proj).inverse();
+    let unproject = |x: f32, y: f32, z: f32| {
+        let p = inverse * Vec4::new(x, y, z, 1.0);
+        p.truncate() / p.w
+    };
+    let mut slice_points = Vec::with_capacity(8);
+    for (x, y) in [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)] {
+        let near = unproject(x, y, 0.0);
+        let far = unproject(x, y, 1.0);
+        let ray = far - near;
+        if !(near.is_finite() && far.is_finite()) || ray.length() < 1e-4 {
+            slice_points.clear();
+            break;
+        }
+        let end = near + ray.normalize() * ray.length().min(shadow_distance());
+        slice_points.push(near);
+        slice_points.push(end);
+    }
+    if slice_points.len() == 8 {
+        let mut lo = Vec3::splat(f32::MAX);
+        let mut hi = Vec3::splat(f32::MIN);
+        for p in &slice_points {
+            lo = lo.min(*p);
+            hi = hi.max(*p);
+        }
+        let slice_center = (lo + hi) * 0.5;
+        let slice_radius = slice_points
+            .iter()
+            .map(|p| p.distance(slice_center))
+            .fold(0.0f32, f32::max)
+            .ceil()
+            .max(8.0);
+        if slice_radius < scene_radius {
+            center = slice_center;
+            radius = slice_radius;
+            // Snap the centre to whole shadow-map texels in the light's own
+            // frame, so shadows don't shimmer as the camera moves.
+            let texel = (2.0 * radius) / SHADOW_MAP_SIZE as f32;
+            let basis = Mat4::look_at_rh(Vec3::ZERO, -to_light, up);
+            let c = basis.transform_point3(center);
+            let snapped = Vec3::new(
+                (c.x / texel).round() * texel,
+                (c.y / texel).round() * texel,
+                c.z,
+            );
+            center = basis.inverse().transform_point3(snapped);
+        }
+    }
+    // The light's eye sits beyond everything that can cast, so casters
+    // outside the visible slice (a tall wall behind the camera, say) still
+    // land in the map.
+    let back = scene_radius + (center - scene_center).length() + radius;
+    let eye = center + to_light * back;
     let view = Mat4::look_at_rh(eye, center, up);
-    let proj = Mat4::orthographic_rh(-radius, radius, -radius, radius, 0.1, radius * 4.0);
+    let proj = Mat4::orthographic_rh(-radius, radius, -radius, radius, 0.1, back + radius);
     let texel_world = (2.0 * radius) / SHADOW_MAP_SIZE as f32;
+    // Depth bias is in the 0..1 depth range, which now spans back + radius
+    // units, so scale it to stay about the same size in the world (~0.05).
+    let depth_bias = 0.05 / (back + radius);
     ShadowUniform {
         light_view_proj: (proj * view).to_cols_array_2d(),
-        // Depth is spread over radius*4 units, so this is ~0.04 units.
         params: [
             1.0,
-            0.0002 + 0.0001 * (radius / 100.0).min(1.0),
+            depth_bias,
             texel_world * 1.5,
             1.0 / SHADOW_MAP_SIZE as f32,
         ],
@@ -1415,8 +1489,9 @@ impl GpuState {
         instances: &[InstanceRaw],
         group_counts: &[u32],
         lights: &[LightRaw; MAX_LIGHTS],
+        view_proj: [[f32; 4]; 4],
     ) {
-        let uniform = compute_shadow(instances, lights);
+        let uniform = compute_shadow(instances, lights, view_proj);
         self.queue
             .write_buffer(&self.shadow_buffer, 0, bytemuck::cast_slice(&[uniform]));
         let Some(buffer) = instance_buffer else {
@@ -1546,6 +1621,7 @@ impl GpuState {
             instances,
             group_counts,
             lights,
+            view_proj,
         );
         {
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -1708,6 +1784,7 @@ impl GpuState {
             instances,
             group_counts,
             lights,
+            view_proj,
         );
         {
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -4185,6 +4262,7 @@ impl App {
             invert_look_y: self.invert_look_y,
             drag_hold_seconds: self.drag_hold_seconds,
             shadows: shadows_enabled(),
+            shadow_distance: shadow_distance(),
         }
     }
     /// Write editor.ron, but only if something actually changed since the last
@@ -4208,6 +4286,7 @@ impl App {
         self.drag_hold_seconds = prefs.drag_hold_seconds;
         set_scene_tree_drag_hold_seconds(self.drag_hold_seconds);
         set_shadows_enabled(prefs.shadows);
+        set_shadow_distance(prefs.shadow_distance);
         self.persist_prefs_if_changed();
     }
     /// True if the open scene has changes that haven't been saved.
@@ -7244,7 +7323,12 @@ impl ApplicationHandler for App {
                                         ui.add_space(6.0);
                                         section_label(ui, "Rendering");
                                         outerface_checkbox(ui, &mut prefs_edit.shadows, "Shadows");
-                                        ui.weak("The first directional Light casts shadows onto everything in the scene. Turn off if the viewport feels slow.");
+                                        ui.add(
+                                            egui::Slider::new(&mut prefs_edit.shadow_distance, 20.0..=2000.0)
+                                                .logarithmic(true)
+                                                .text("Shadow distance"),
+                                        );
+                                        ui.weak("The first directional Light casts shadows. A shorter distance gives sharper shadows near the camera; a longer one reaches further. Turn shadows off if the viewport feels slow.");
                                         ui.add_space(6.0);
                                         if ui.button("Reset to defaults").clicked() {
                                             prefs_edit = EditorPrefs {
@@ -7752,6 +7836,8 @@ struct EditorPrefs {
     drag_hold_seconds: f32,
     // Whether the directional light casts shadows.
     shadows: bool,
+    // How far from the camera shadows reach, in world units.
+    shadow_distance: f32,
 }
 
 impl Default for EditorPrefs {
@@ -7765,6 +7851,7 @@ impl Default for EditorPrefs {
             invert_look_y: false,
             drag_hold_seconds: SCENE_TREE_DRAG_HOLD_DEFAULT,
             shadows: true,
+            shadow_distance: SHADOW_DISTANCE_DEFAULT,
         }
     }
 }
@@ -7782,6 +7869,7 @@ impl EditorPrefs {
         self.fly_speed = fix(self.fly_speed, CAM_PAN_SPEED, 0.1, 200.0);
         self.look_sensitivity = fix(self.look_sensitivity, 1.0, 0.1, 5.0);
         self.orbit_sensitivity = fix(self.orbit_sensitivity, 1.0, 0.1, 5.0);
+        self.shadow_distance = fix(self.shadow_distance, SHADOW_DISTANCE_DEFAULT, 20.0, 2000.0);
         self.drag_hold_seconds = fix(
             self.drag_hold_seconds,
             SCENE_TREE_DRAG_HOLD_DEFAULT,
@@ -8647,6 +8735,7 @@ fn main() {
     let prefs = load_prefs();
     set_scene_tree_drag_hold_seconds(prefs.drag_hold_seconds);
     set_shadows_enabled(prefs.shadows);
+    set_shadow_distance(prefs.shadow_distance);
     let mut app = App {
         window: None,
         gpu: None,
@@ -8784,6 +8873,7 @@ mod prefs_tests {
         assert_eq!(p.look_sensitivity, 1.0);
         assert_eq!(p.drag_hold_seconds, SCENE_TREE_DRAG_HOLD_DEFAULT);
         assert!(p.shadows);
+        assert_eq!(p.shadow_distance, SHADOW_DISTANCE_DEFAULT);
     }
 
     #[test]
@@ -8829,5 +8919,76 @@ mod shader_tests {
     #[test]
     fn shadow_shader_is_valid() {
         validate(include_str!("shadow.wgsl"));
+    }
+}
+
+#[cfg(test)]
+mod shadow_fit_tests {
+    use super::*;
+
+    fn instance(position: [f32; 3], scale: f32) -> InstanceRaw {
+        InstanceRaw {
+            position,
+            color: [1.0; 3],
+            selected: 0.0,
+            scale: [scale; 3],
+            emissive: 0.0,
+            yaw: 0.0,
+        }
+    }
+
+    fn sun() -> [LightRaw; MAX_LIGHTS] {
+        let mut lights = [LightRaw::zeroed(); MAX_LIGHTS];
+        lights[0] = LightRaw {
+            position_or_direction: [-1.0, 1.0, 0.1, 0.0],
+            params: [0.0, 0.0, 1.0, 1.0],
+        };
+        lights
+    }
+
+    fn camera() -> [[f32; 4]; 4] {
+        let view = Mat4::look_at_rh(
+            Vec3::new(0.0, 20.0, 40.0),
+            Vec3::new(0.0, 0.0, -20.0),
+            Vec3::Y,
+        );
+        let proj = Mat4::perspective_rh(FOV_DEGREES.to_radians(), 16.0 / 9.0, 0.1, 10000.0);
+        (proj * view).to_cols_array_2d()
+    }
+
+    #[test]
+    fn map_fits_the_view_not_the_huge_ground() {
+        // A ground plane 1600 units wide and a cube near the camera.
+        let instances = [
+            instance([0.0, 0.0, 0.0], 200.0),
+            instance([0.0, 5.0, -20.0], 1.0),
+        ];
+        let u = compute_shadow(&instances, &sun(), camera());
+        assert_eq!(u.params[0], 1.0);
+        // Whole-scene fit would have texels of ~0.6 units; the view fit is sharper.
+        let scene_fit_texel = 2.0 * 600.0 / SHADOW_MAP_SIZE as f32;
+        assert!(u.params[2] / 1.5 < scene_fit_texel);
+        // The cube is inside the map, with a valid depth.
+        let clip = Mat4::from_cols_array_2d(&u.light_view_proj) * Vec4::new(0.0, 5.0, -20.0, 1.0);
+        assert!(clip.x.abs() <= 1.0 && clip.y.abs() <= 1.0, "{clip:?}");
+        assert!(clip.z >= 0.0 && clip.z <= 1.0, "{clip:?}");
+    }
+
+    #[test]
+    fn small_scene_uses_the_whole_scene() {
+        let instances = [
+            instance([0.0, 0.0, 0.0], 1.0),
+            instance([10.0, 0.0, 0.0], 1.0),
+        ];
+        let u = compute_shadow(&instances, &sun(), camera());
+        assert_eq!(u.params[0], 1.0);
+    }
+
+    #[test]
+    fn no_shadow_caster_light_means_shadows_off() {
+        let instances = [instance([0.0, 0.0, 0.0], 1.0)];
+        let mut lights = sun();
+        lights[0].params[3] = 0.0;
+        assert_eq!(compute_shadow(&instances, &lights, camera()).params[0], 0.0);
     }
 }
