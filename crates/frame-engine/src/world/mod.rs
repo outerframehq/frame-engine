@@ -1,6 +1,6 @@
 mod storage;
 use serde::{Deserialize, Serialize};
-pub use storage::ComponentStorage;
+pub use storage::{ComponentStorage, HasEntity, QueryFilter};
 
 /// Type-erased storage for one runtime-registered component type, so `World`
 /// can hold arbitrary component types it was never compiled knowing about.

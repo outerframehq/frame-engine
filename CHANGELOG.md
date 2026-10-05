@@ -13,6 +13,7 @@ lands and the patch version bumps for fixes and small additions.
 
 Engine:
 
+- Query helpers on `ComponentStorage`: `query`/`query_mut`, `join`/`join_mut`, `join3`/`join3_mut`, `entities` and `contains`, plus `with`/`without` filters (`QueryFilter`), so a system can ask for every entity with certain components, and without others, instead of hand-writing an index loop. Plain iterators over the existing storage: no unsafe code, no new dependency, no change to scene files. `gravity`, `movement`, `collision`, `resolve_collisions`, `apply_parenting`, `run_scripts` and `input_movement` now use them, with unit tests for the helpers and for each of those systems (the engine had none before).
 - A `Material` component (an emissive strength, 0.0 to 1.0), per-entity appearance data serialized with the scene; defaults to 0.0, so older scenes load unchanged.
 - A `Rotation` component: a single yaw angle, in radians, around the world's vertical axis. Not full 3D orientation yet, pitch and roll aren't tracked. Serialized with the scene; defaults to 0.0, so older scenes load unchanged.
 - A contact point on collision detection. `World.collisions` now carries the centre of the overlap alongside each colliding pair, computed per axis as the midpoint between the two boxes' shared region, not just which two entities are involved.

@@ -1,6 +1,6 @@
 use crate::input::{Button, InputState};
 use crate::world::World;
-use crate::world::{MoveIntent, ScriptRuntime};
+use crate::world::{MoveIntent, QueryFilter, ScriptRuntime};
 
 /// Expand an axis-aligned box's half-extents to bound the same box after it's
 /// rotated by `yaw` around the world's vertical (Y) axis. This is a
@@ -73,14 +73,10 @@ pub fn collision(world: &mut World) {
     // immutably); the pairwise test below then only touches the local snapshot
     // and `world.collisions`, so there's no borrow clash.
     let mut boxes: Vec<(usize, [f32; 3], [f32; 3])> = Vec::new();
-    for (id, slot) in world.positions.iter().enumerate() {
-        let Some(p) = slot.as_ref() else { continue };
-        // A `RigidBody`-marked entity is detected and resolved by rapier
-        // instead (see `physics::Physics::step`); including it here too
-        // would report the same overlap twice, once from each system.
-        if world.rigid_bodies.get(id).is_some() {
-            continue;
-        }
+    // A `RigidBody`-marked entity is detected and resolved by rapier
+    // instead (see `physics::Physics::step`); including it here too
+    // would report the same overlap twice, once from each system.
+    for (id, p) in world.positions.query().without(&world.rigid_bodies) {
         let s = world.scales.get(id).copied().unwrap_or_default();
         let mesh = world.meshes.get(id).cloned().unwrap_or_default();
         let yaw = world.rotations.get(id).map(|r| r.yaw).unwrap_or(0.0);
@@ -134,13 +130,9 @@ pub fn collision(world: &mut World) {
 pub fn resolve_collisions(world: &mut World) {
     // Snapshot each live entity's centre, half-extents, and static flag.
     let mut boxes: Vec<(usize, [f32; 3], [f32; 3], bool)> = Vec::new();
-    for (id, slot) in world.positions.iter().enumerate() {
-        let Some(p) = slot.as_ref() else { continue };
-        // Same reasoning as `collision` above: rapier resolves a
-        // `RigidBody`-marked entity's overlaps itself.
-        if world.rigid_bodies.get(id).is_some() {
-            continue;
-        }
+    // Same reasoning as `collision` above: rapier resolves a
+    // `RigidBody`-marked entity's overlaps itself.
+    for (id, p) in world.positions.query().without(&world.rigid_bodies) {
         let s = world.scales.get(id).copied().unwrap_or_default();
         let mesh = world.meshes.get(id).cloned().unwrap_or_default();
         let is_static = world.statics.get(id).is_some();
@@ -248,12 +240,9 @@ pub fn resolve_collisions(world: &mut World) {
 /// An entity with no `Parent`, or whose named parent has since despawned, is
 /// left untouched, the same tolerance a stale `Script` reference gets.
 pub fn apply_parenting(world: &mut World) {
-    let ids: Vec<usize> = world
-        .parents
-        .iter()
-        .enumerate()
-        .filter_map(|(id, slot)| slot.as_ref().map(|_| id))
-        .collect();
+    // Ids first, because the loop body writes `Position` and `Rotation`
+    // through the whole world, which a live query would still be borrowing.
+    let ids: Vec<usize> = world.parents.entities().collect();
     for id in ids {
         let Some(parent) = world.parents.get(id).copied() else {
             continue;
@@ -296,20 +285,16 @@ pub fn apply_parenting(world: &mut World) {
 /// floor. Strength is the `GRAVITY` constant.
 pub fn gravity(world: &mut World) {
     use crate::world::GRAVITY;
-    let falling: Vec<usize> = (0..world.velocities.len())
-        .filter(|&id| {
-            world.velocities.get(id).is_some()
-                && world.gravities.get(id).is_some()
-                && world.statics.get(id).is_none()
-                // A `RigidBody`-marked entity gets rapier's own gravity
-                // instead (`physics::Physics::new`'s gravity setting).
-                && world.rigid_bodies.get(id).is_none()
-        })
-        .collect();
-    for id in falling {
-        if let Some(v) = world.velocities.get_mut(id) {
-            v.dy -= GRAVITY;
-        }
+    // A `RigidBody`-marked entity gets rapier's own gravity instead
+    // (`physics::Physics::new`'s gravity setting).
+    for (_, v) in world
+        .velocities
+        .query_mut()
+        .with(&world.gravities)
+        .without(&world.statics)
+        .without(&world.rigid_bodies)
+    {
+        v.dy -= GRAVITY;
     }
 }
 
@@ -319,40 +304,24 @@ pub fn run_scripts(
     input: &crate::input::InputState,
 ) {
     runtime.begin_tick(input);
-    let ids: Vec<usize> = world
-        .scripts
-        .iter()
-        .enumerate()
-        .filter_map(|(id, slot)| slot.as_ref().map(|_| id))
-        .collect();
+    // Ids first: a script gets the whole `&mut World`, so no storage can stay
+    // borrowed while it runs.
+    let ids: Vec<usize> = world.scripts.entities().collect();
     for id in ids {
         runtime.run(world, id);
     }
 }
 
 pub fn movement(world: &mut World) {
-    // Snapshot which entities rapier owns before the mutable loop below, the
-    // same snapshot-then-apply shape `collision`/`resolve_collisions` already
-    // use, rather than trying to borrow `world.rigid_bodies` while
-    // `world.positions` is mid-iteration.
-    let owned_by_physics: Vec<bool> = (0..world.positions.len())
-        .map(|id| world.rigid_bodies.get(id).is_some())
-        .collect();
-    for (id, (position_slot, velocity_slot)) in world
+    // Entities rapier owns are moved by `physics::Physics::step` instead.
+    for (_, position, velocity) in world
         .positions
-        .iter_mut()
-        .zip(world.velocities.iter())
-        .enumerate()
+        .join_mut(&world.velocities)
+        .without(&world.rigid_bodies)
     {
-        if owned_by_physics.get(id).copied().unwrap_or(false) {
-            // Moved by `physics::Physics::step` instead.
-            continue;
-        }
-        if let (Some(position), Some(velocity)) = (position_slot, velocity_slot) {
-            position.x += velocity.dx;
-            position.y += velocity.dy;
-            position.z += velocity.dz;
-        }
+        position.x += velocity.dx;
+        position.y += velocity.dy;
+        position.z += velocity.dz;
     }
 }
 
@@ -407,14 +376,11 @@ pub fn input_movement(world: &mut World, input: &InputState) {
     }
     let ids: Vec<usize> = world
         .controlled
-        .iter()
-        .enumerate()
-        .filter_map(|(id, slot)| slot.as_ref().map(|_| id))
+        .join(&world.positions)
+        .map(|(id, _, _)| id)
         .collect();
     for id in ids {
-        if world.positions.get(id).is_some() {
-            apply_move(world, id, intent);
-        }
+        apply_move(world, id, intent);
     }
 }
 
@@ -430,4 +396,174 @@ pub fn input_movement_for(world: &mut World, entity: usize, input: &InputState) 
         return;
     }
     apply_move(world, entity, intent);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::world::{
+        Controlled, GRAVITY, Gravity, Parent, Position, RigidBody, Static, Velocity, World,
+    };
+
+    fn at(world: &mut World, x: f32, y: f32, z: f32) -> usize {
+        world.spawn(
+            Position { x, y, z },
+            Velocity {
+                dx: 0.0,
+                dy: 0.0,
+                dz: 0.0,
+            },
+        )
+    }
+
+    #[test]
+    fn gravity_only_pulls_free_falling_entities() {
+        let mut world = World::new();
+        let falling = at(&mut world, 0.0, 0.0, 0.0);
+        let floating = at(&mut world, 0.0, 0.0, 0.0); // no Gravity marker
+        let floor = at(&mut world, 0.0, 0.0, 0.0);
+        let physics_owned = at(&mut world, 0.0, 0.0, 0.0);
+        for id in [falling, floor, physics_owned] {
+            world.gravities.insert(id, Gravity);
+        }
+        world.statics.insert(floor, Static);
+        world.rigid_bodies.insert(physics_owned, RigidBody);
+        gravity(&mut world);
+        assert_eq!(world.velocities.get(falling).unwrap().dy, -GRAVITY);
+        assert_eq!(world.velocities.get(floating).unwrap().dy, 0.0);
+        assert_eq!(world.velocities.get(floor).unwrap().dy, 0.0);
+        assert_eq!(world.velocities.get(physics_owned).unwrap().dy, 0.0);
+    }
+
+    #[test]
+    fn movement_applies_velocity_but_skips_physics_owned() {
+        let mut world = World::new();
+        let a = at(&mut world, 1.0, 2.0, 3.0);
+        let b = at(&mut world, 1.0, 2.0, 3.0);
+        for id in [a, b] {
+            *world.velocities.get_mut(id).unwrap() = Velocity {
+                dx: 1.0,
+                dy: 1.0,
+                dz: 1.0,
+            };
+        }
+        world.rigid_bodies.insert(b, RigidBody);
+        movement(&mut world);
+        let pa = world.positions.get(a).unwrap();
+        assert_eq!((pa.x, pa.y, pa.z), (2.0, 3.0, 4.0));
+        let pb = world.positions.get(b).unwrap();
+        assert_eq!((pb.x, pb.y, pb.z), (1.0, 2.0, 3.0));
+    }
+
+    #[test]
+    fn input_moves_controlled_entities_and_records_intent_for_rigid_bodies() {
+        let mut world = World::new();
+        let walker = at(&mut world, 0.0, 0.0, 0.0);
+        let bystander = at(&mut world, 0.0, 0.0, 0.0);
+        let rigid = at(&mut world, 0.0, 0.0, 0.0);
+        world.controlled.insert(walker, Controlled);
+        world.controlled.insert(rigid, Controlled);
+        world.rigid_bodies.insert(rigid, RigidBody);
+        let mut input = InputState::new();
+        input.set(Button::Right, true);
+        input_movement(&mut world, &input);
+        assert_eq!(world.positions.get(walker).unwrap().x, 1.0);
+        assert_eq!(world.positions.get(bystander).unwrap().x, 0.0);
+        assert_eq!(world.positions.get(rigid).unwrap().x, 0.0);
+        assert_eq!(world.move_intents.get(&rigid).unwrap().dx, 1.0);
+    }
+
+    #[test]
+    fn parenting_follows_the_parent_and_ignores_dangling_ones() {
+        let mut world = World::new();
+        let parent = at(&mut world, 10.0, 0.0, 0.0);
+        let child = at(&mut world, 0.0, 0.0, 0.0);
+        let orphan = at(&mut world, 5.0, 5.0, 5.0);
+        world.parents.insert(
+            child,
+            Parent {
+                entity: parent,
+                offset_x: 0.0,
+                offset_y: 2.0,
+                offset_z: 0.0,
+                offset_yaw: 0.0,
+            },
+        );
+        world.parents.insert(
+            orphan,
+            Parent {
+                entity: 99,
+                offset_x: 0.0,
+                offset_y: 0.0,
+                offset_z: 0.0,
+                offset_yaw: 0.0,
+            },
+        );
+        apply_parenting(&mut world);
+        let c = world.positions.get(child).unwrap();
+        assert_eq!((c.x, c.y, c.z), (10.0, 2.0, 0.0));
+        let o = world.positions.get(orphan).unwrap();
+        assert_eq!((o.x, o.y, o.z), (5.0, 5.0, 5.0));
+    }
+
+    #[test]
+    fn collision_reports_overlaps_and_skips_physics_owned() {
+        let mut world = World::new();
+        let a = at(&mut world, 0.0, 0.0, 0.0);
+        let b = at(&mut world, 4.0, 0.0, 0.0); // overlaps a (boxes are 8 wide)
+        let far = at(&mut world, 100.0, 0.0, 0.0);
+        let rigid = at(&mut world, 2.0, 0.0, 0.0); // overlaps both, but rapier's
+        world.rigid_bodies.insert(rigid, RigidBody);
+        collision(&mut world);
+        assert_eq!(world.collisions.len(), 1);
+        let (x, y, _) = world.collisions[0];
+        assert_eq!((x, y), (a, b));
+        assert!(
+            world
+                .collisions
+                .iter()
+                .all(|(p, q, _)| *p != far && *q != far)
+        );
+    }
+
+    #[test]
+    fn resolve_pushes_dynamic_out_of_static_only() {
+        let mut world = World::new();
+        let floor = at(&mut world, 0.0, 0.0, 0.0);
+        let ball = at(&mut world, 0.0, 6.0, 0.0); // 2 units into the floor
+        let other_static = at(&mut world, 0.0, 6.0, 0.0);
+        world.statics.insert(floor, Static);
+        world.statics.insert(other_static, Static);
+        resolve_collisions(&mut world);
+        assert_eq!(world.positions.get(floor).unwrap().y, 0.0);
+        assert_eq!(world.positions.get(other_static).unwrap().y, 6.0);
+        assert_eq!(world.positions.get(ball).unwrap().y, 8.0);
+    }
+
+    #[test]
+    fn scripts_run_for_every_scripted_entity_in_id_order() {
+        use crate::world::Script;
+        struct Recorder(Vec<usize>);
+        impl ScriptRuntime for Recorder {
+            fn begin_tick(&mut self, _input: &InputState) {}
+            fn run(&mut self, _world: &mut World, id: usize) {
+                self.0.push(id);
+            }
+        }
+        let mut world = World::new();
+        let a = at(&mut world, 0.0, 0.0, 0.0);
+        let _plain = at(&mut world, 0.0, 0.0, 0.0);
+        let c = at(&mut world, 0.0, 0.0, 0.0);
+        for id in [a, c] {
+            world.scripts.insert(
+                id,
+                Script {
+                    uses: String::new(),
+                },
+            );
+        }
+        let mut runtime = Recorder(Vec::new());
+        run_scripts(&mut world, &mut runtime, &InputState::new());
+        assert_eq!(runtime.0, vec![a, c]);
+    }
 }
