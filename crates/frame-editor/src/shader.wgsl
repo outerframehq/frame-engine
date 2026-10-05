@@ -21,11 +21,53 @@ struct Light {
     //    distance, not physically-accurate inverse-square, a deliberately
     //    simple first pass).
     // z: intensity, a brightness multiplier; 0.0 means "unused slot".
-    // w unused.
+    // w: 1.0 if this light casts the scene's shadow, else 0.0.
     params: vec4<f32>,
 };
 
 const MAX_LIGHTS: u32 = 4u;
+
+// Shadows: one shadow map for the first directional light (the slot whose
+// params.w is 1.0). MUST match ShadowUniform in main.rs field-for-field.
+struct Shadow {
+    light_view_proj: mat4x4<f32>,
+    // x: 1.0 if shadows are active this frame, else 0.0.
+    // y: depth bias (in the light's 0..1 depth range).
+    // z: normal-offset bias, in world units.
+    // w: size of one shadow-map texel in UV space (1 / map size).
+    params: vec4<f32>,
+};
+@group(0) @binding(2) var<uniform> shadow: Shadow;
+@group(0) @binding(3) var shadow_map: texture_depth_2d;
+@group(0) @binding(4) var shadow_sampler: sampler_comparison;
+
+// 1.0 = fully lit, 0.0 = fully in shadow. Anything outside the shadow map's
+// area counts as lit. A 3x3 grid of comparison samples (each of which is
+// itself bilinear-filtered by the sampler) softens the edge. Uses the
+// "Level" sample variant, which has no uniform-control-flow requirement, so
+// it is safe to call from inside the light loop.
+fn shadow_factor(world_position: vec3<f32>, normal: vec3<f32>) -> f32 {
+    if (shadow.params.x < 0.5) {
+        return 1.0;
+    }
+    let offset_position = world_position + normal * shadow.params.z;
+    let clip = shadow.light_view_proj * vec4<f32>(offset_position, 1.0);
+    let ndc = clip.xyz / clip.w;
+    let uv = vec2<f32>(ndc.x * 0.5 + 0.5, 0.5 - ndc.y * 0.5);
+    if (uv.x < 0.0 || uv.x > 1.0 || uv.y < 0.0 || uv.y > 1.0 || ndc.z > 1.0 || ndc.z < 0.0) {
+        return 1.0;
+    }
+    let reference = ndc.z - shadow.params.y;
+    let texel = shadow.params.w;
+    var sum: f32 = 0.0;
+    for (var dy: i32 = -1; dy <= 1; dy = dy + 1) {
+        for (var dx: i32 = -1; dx <= 1; dx = dx + 1) {
+            let offset = vec2<f32>(f32(dx), f32(dy)) * texel;
+            sum = sum + textureSampleCompareLevel(shadow_map, shadow_sampler, uv + offset, reference);
+        }
+    }
+    return sum / 9.0;
+}
 
 struct Lights {
     lights: array<Light, 4>,
@@ -172,6 +214,12 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
         // color rather than the light's), approximating "matte" versus
         // "shiny metal" without a real BRDF.
         diffuse = pow(diffuse, mix(1.4, 0.7, roughness));
+        // The shadow-casting light only reaches fragments the shadow map says
+        // it can see. The ambient floor is untouched, so shadows are never
+        // pitch black.
+        if (light.params.w > 0.5) {
+            diffuse = diffuse * shadow_factor(in.world_position, normal);
+        }
         accumulated = accumulated + diffuse * attenuation * intensity * mix(1.0, 1.3, metalness);
     }
     let shade = min(accumulated, 1.0);

@@ -68,7 +68,8 @@ struct LightRaw {
     // (point). w unused.
     position_or_direction: [f32; 4],
     // x: kind, 0.0 directional, 1.0 point. y: range (point only). z:
-    // intensity, 0.0 marks an unused slot. w unused.
+    // intensity, 0.0 marks an unused slot. w: 1.0 if this light casts the
+    // scene's shadow (the first directional light), else 0.0.
     params: [f32; 4],
 }
 // A fixed number of simultaneously active lights sent to the shader every
@@ -79,6 +80,96 @@ const MAX_LIGHTS: usize = 4;
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 struct LightsUniform {
     lights: [LightRaw; MAX_LIGHTS],
+}
+// Shadow map resolution (square). 2048 gives soft, readable shadows for a
+// typical scene at 16 MB of GPU memory.
+const SHADOW_MAP_SIZE: u32 = 2048;
+// Shadow data handed to the shader (group 0, binding 2). Must match `Shadow`
+// in shader.wgsl field-for-field. The first 64 bytes double as the shadow
+// pass's own camera (shadow.wgsl reads only the matrix).
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct ShadowUniform {
+    light_view_proj: [[f32; 4]; 4],
+    // x: 1.0 when shadows are active this frame. y: depth bias. z: normal
+    // offset in world units. w: one texel in UV space.
+    params: [f32; 4],
+}
+/// Process-wide switch for shadows (an editor preference). A static rather
+/// than an App field because the Play window has its own GpuState and both
+/// read it.
+static SHADOWS_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+fn shadows_enabled() -> bool {
+    SHADOWS_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+}
+fn set_shadows_enabled(on: bool) {
+    SHADOWS_ENABLED.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+/// Work out the shadow map's view for this frame: an orthographic box,
+/// looking along the first shadow-casting directional light, sized to just
+/// contain every instance. Returns an "off" uniform (the shader then treats
+/// everything as lit) when shadows are disabled, there is nothing to draw,
+/// or no light is marked as the shadow caster.
+fn compute_shadow(instances: &[InstanceRaw], lights: &[LightRaw; MAX_LIGHTS]) -> ShadowUniform {
+    let off = ShadowUniform {
+        light_view_proj: Mat4::IDENTITY.to_cols_array_2d(),
+        params: [0.0; 4],
+    };
+    if !shadows_enabled() || instances.is_empty() {
+        return off;
+    }
+    let Some(light) = lights
+        .iter()
+        .find(|l| l.params[2] > 0.0 && l.params[0] < 0.5 && l.params[3] > 0.5)
+    else {
+        return off;
+    };
+    let to_light = Vec3::new(
+        light.position_or_direction[0],
+        light.position_or_direction[1],
+        light.position_or_direction[2],
+    )
+    .normalize_or_zero();
+    if to_light == Vec3::ZERO {
+        return off;
+    }
+    // World-space bounds of everything that casts. A shape's farthest point
+    // from its centre is at most ~0.9 of the mesh size per unit of scale.
+    let mut min = Vec3::splat(f32::MAX);
+    let mut max = Vec3::splat(f32::MIN);
+    for i in instances {
+        let reach = QUAD_SIZE * 0.9 * i.scale[0].max(i.scale[1]).max(i.scale[2]);
+        let p = Vec3::from(i.position);
+        min = min.min(p - Vec3::splat(reach));
+        max = max.max(p + Vec3::splat(reach));
+    }
+    if !(min.is_finite() && max.is_finite()) {
+        return off;
+    }
+    let center = (min + max) * 0.5;
+    // Capped so one enormous ground plane can't stretch the map until
+    // nothing has a usable shadow; anything outside the box is simply lit.
+    let radius = ((max - min).length() * 0.5).clamp(8.0, 600.0);
+    // Pick an "up" that isn't parallel to the light direction.
+    let up = if to_light.y.abs() > 0.99 {
+        Vec3::Z
+    } else {
+        Vec3::Y
+    };
+    let eye = center + to_light * radius * 2.0;
+    let view = Mat4::look_at_rh(eye, center, up);
+    let proj = Mat4::orthographic_rh(-radius, radius, -radius, radius, 0.1, radius * 4.0);
+    let texel_world = (2.0 * radius) / SHADOW_MAP_SIZE as f32;
+    ShadowUniform {
+        light_view_proj: (proj * view).to_cols_array_2d(),
+        // Depth is spread over radius*4 units, so this is ~0.04 units.
+        params: [
+            1.0,
+            0.0002 + 0.0001 * (radius / 100.0).min(1.0),
+            texel_world * 1.5,
+            1.0 / SHADOW_MAP_SIZE as f32,
+        ],
+    }
 }
 // One mesh's material data handed to the shader (group 1, binding 2). Must
 // match MaterialParams in shader.wgsl field-for-field. x/y/z used, w padding,
@@ -746,6 +837,16 @@ struct GpuState {
     material_bind_group_layout: wgpu::BindGroupLayout,
     material_sampler: wgpu::Sampler,
     material_bind_groups: Vec<wgpu::BindGroup>,
+    // Shadows: a depth-only pass renders every entity from the shadow-casting
+    // light into `shadow_map_view`; the entity shader then samples it (scene
+    // bind group bindings 2-4). `shadow_buffer` holds the light matrix and
+    // bias values; `shadow_pass_bind_group` exposes the same buffer to the
+    // shadow pass alone (the scene bind group can't be bound there, since it
+    // contains the very texture the pass writes to).
+    shadow_pipeline: wgpu::RenderPipeline,
+    shadow_buffer: wgpu::Buffer,
+    shadow_pass_bind_group: wgpu::BindGroup,
+    shadow_map_view: wgpu::TextureView,
 }
 impl GpuState {
     /// Builds a GpuState for one window. `shared` is `None` exactly once per
@@ -851,8 +952,66 @@ impl GpuState {
                         },
                         count: None,
                     },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 2,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 3,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Texture {
+                            sample_type: wgpu::TextureSampleType::Depth,
+                            view_dimension: wgpu::TextureViewDimension::D2,
+                            multisampled: false,
+                        },
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 4,
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison),
+                        count: None,
+                    },
                 ],
             });
+        // --- Shadow map resources (see GpuState::shadow_pipeline) ---
+        let shadow_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("shadow buffer"),
+            contents: bytemuck::cast_slice(&[ShadowUniform::zeroed()]),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        let shadow_map_view = device
+            .create_texture(&wgpu::TextureDescriptor {
+                label: Some("shadow map"),
+                size: wgpu::Extent3d {
+                    width: SHADOW_MAP_SIZE,
+                    height: SHADOW_MAP_SIZE,
+                    depth_or_array_layers: 1,
+                },
+                mip_level_count: 1,
+                sample_count: 1,
+                dimension: wgpu::TextureDimension::D2,
+                format: DEPTH_FORMAT,
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+                    | wgpu::TextureUsages::TEXTURE_BINDING,
+                view_formats: &[],
+            })
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let shadow_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            label: Some("shadow sampler"),
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Linear,
+            compare: Some(wgpu::CompareFunction::LessEqual),
+            ..Default::default()
+        });
         let scene_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("scene bind group"),
             layout: &scene_bind_group_layout,
@@ -864,6 +1023,18 @@ impl GpuState {
                 wgpu::BindGroupEntry {
                     binding: 1,
                     resource: lights_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: shadow_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(&shadow_map_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::Sampler(&shadow_sampler),
                 },
             ],
         });
@@ -972,6 +1143,18 @@ impl GpuState {
                     // just seen from a different camera.
                     resource: lights_buffer.as_entire_binding(),
                 },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: shadow_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: wgpu::BindingResource::TextureView(&shadow_map_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: wgpu::BindingResource::Sampler(&shadow_sampler),
+                },
             ],
         });
         let preview_texture_id =
@@ -1024,6 +1207,66 @@ impl GpuState {
                 depth_compare: Some(wgpu::CompareFunction::Less),
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
+        // --- Shadow pipeline (depth only, from the light's point of view) ---
+        let shadow_pass_layout =
+            device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("shadow pass bind group layout"),
+                entries: &[wgpu::BindGroupLayoutEntry {
+                    binding: 0,
+                    visibility: wgpu::ShaderStages::VERTEX,
+                    ty: wgpu::BindingType::Buffer {
+                        ty: wgpu::BufferBindingType::Uniform,
+                        has_dynamic_offset: false,
+                        min_binding_size: None,
+                    },
+                    count: None,
+                }],
+            });
+        let shadow_pass_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("shadow pass bind group"),
+            layout: &shadow_pass_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: shadow_buffer.as_entire_binding(),
+            }],
+        });
+        let shadow_shader = device.create_shader_module(wgpu::include_wgsl!("shadow.wgsl"));
+        let shadow_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("shadow pipeline layout"),
+                bind_group_layouts: &[Some(&shadow_pass_layout)],
+                immediate_size: 0,
+            });
+        let shadow_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("shadow pipeline"),
+            layout: Some(&shadow_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shadow_shader,
+                entry_point: Some("vs_main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                buffers: &[MeshVertex::layout(), InstanceRaw::layout()],
+            },
+            // Depth only: no fragment stage, no colour target.
+            fragment: None,
+            // No face culling: a Plane is a single quad and must still cast.
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::Less),
+                stencil: wgpu::StencilState::default(),
+                // Slope-scaled bias: surfaces nearly edge-on to the light get
+                // more, which is what stops "shadow acne" stripes.
+                bias: wgpu::DepthBiasState {
+                    constant: 2,
+                    slope_scale: 2.0,
+                    clamp: 0.0,
+                },
             }),
             multisample: wgpu::MultisampleState::default(),
             multiview_mask: None,
@@ -1092,6 +1335,10 @@ impl GpuState {
                 material_bind_group_layout,
                 material_sampler,
                 material_bind_groups,
+                shadow_pipeline,
+                shadow_buffer,
+                shadow_pass_bind_group,
+                shadow_map_view,
             },
             shared_out,
         )
@@ -1156,6 +1403,57 @@ impl GpuState {
             // Depth buffer must track the window size, or the test reads garbage.
             self.depth_view =
                 create_depth_view(&self.device, self.config.width, self.config.height);
+        }
+    }
+    /// Render the shadow map for these instances and lights (or just mark
+    /// shadows off for the shader). Must be called before the pass that
+    /// samples the map, on the same encoder.
+    fn shadow_pass(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        instance_buffer: Option<&wgpu::Buffer>,
+        instances: &[InstanceRaw],
+        group_counts: &[u32],
+        lights: &[LightRaw; MAX_LIGHTS],
+    ) {
+        let uniform = compute_shadow(instances, lights);
+        self.queue
+            .write_buffer(&self.shadow_buffer, 0, bytemuck::cast_slice(&[uniform]));
+        let Some(buffer) = instance_buffer else {
+            return;
+        };
+        if uniform.params[0] < 0.5 {
+            return;
+        }
+        let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+            label: Some("shadow pass"),
+            color_attachments: &[],
+            depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
+                view: &self.shadow_map_view,
+                depth_ops: Some(wgpu::Operations {
+                    load: wgpu::LoadOp::Clear(1.0),
+                    store: wgpu::StoreOp::Store,
+                }),
+                stencil_ops: None,
+            }),
+            timestamp_writes: None,
+            occlusion_query_set: None,
+            multiview_mask: None,
+        });
+        pass.set_pipeline(&self.shadow_pipeline);
+        pass.set_bind_group(0, &self.shadow_pass_bind_group, &[]);
+        pass.set_vertex_buffer(0, self.mesh_vertex_buffer.slice(..));
+        let stride = std::mem::size_of::<InstanceRaw>() as wgpu::BufferAddress;
+        let mut instance_start = 0u32;
+        for (primitive, count) in group_counts.iter().enumerate() {
+            if *count > 0 {
+                let begin = instance_start as wgpu::BufferAddress * stride;
+                pass.set_vertex_buffer(1, buffer.slice(begin..));
+                if let Some(range) = self.mesh_ranges.get(primitive) {
+                    pass.draw(range.clone(), 0..*count);
+                }
+            }
+            instance_start += count;
         }
     }
     // Draw one frame: entities (world-space cubes) then text (screen overlay).
@@ -1241,6 +1539,13 @@ impl GpuState {
             &mut encoder,
             egui_paint_jobs,
             &egui_screen,
+        );
+        self.shadow_pass(
+            &mut encoder,
+            instance_buffer.as_ref(),
+            instances,
+            group_counts,
+            lights,
         );
         {
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -1397,6 +1702,13 @@ impl GpuState {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("preview encoder"),
             });
+        self.shadow_pass(
+            &mut encoder,
+            instance_buffer.as_ref(),
+            instances,
+            group_counts,
+            lights,
+        );
         {
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("preview pass"),
@@ -3872,6 +4184,7 @@ impl App {
             invert_look_x: self.invert_look_x,
             invert_look_y: self.invert_look_y,
             drag_hold_seconds: self.drag_hold_seconds,
+            shadows: shadows_enabled(),
         }
     }
     /// Write editor.ron, but only if something actually changed since the last
@@ -3894,6 +4207,7 @@ impl App {
         self.invert_look_y = prefs.invert_look_y;
         self.drag_hold_seconds = prefs.drag_hold_seconds;
         set_scene_tree_drag_hold_seconds(self.drag_hold_seconds);
+        set_shadows_enabled(prefs.shadows);
         self.persist_prefs_if_changed();
     }
     /// True if the open scene has changes that haven't been saved.
@@ -6928,6 +7242,10 @@ impl ApplicationHandler for App {
                                         );
                                         ui.weak("How long to hold a row before it starts a drag-to-reparent. Lower is quicker; too low and a click can turn into a drag.");
                                         ui.add_space(6.0);
+                                        section_label(ui, "Rendering");
+                                        outerface_checkbox(ui, &mut prefs_edit.shadows, "Shadows");
+                                        ui.weak("The first directional Light casts shadows onto everything in the scene. Turn off if the viewport feels slow.");
+                                        ui.add_space(6.0);
                                         if ui.button("Reset to defaults").clicked() {
                                             prefs_edit = EditorPrefs {
                                                 show_help: prefs_edit.show_help,
@@ -7432,6 +7750,8 @@ struct EditorPrefs {
     invert_look_y: bool,
     // Seconds a Scene-tree row must be held before it counts as a drag.
     drag_hold_seconds: f32,
+    // Whether the directional light casts shadows.
+    shadows: bool,
 }
 
 impl Default for EditorPrefs {
@@ -7444,6 +7764,7 @@ impl Default for EditorPrefs {
             invert_look_x: false,
             invert_look_y: false,
             drag_hold_seconds: SCENE_TREE_DRAG_HOLD_DEFAULT,
+            shadows: true,
         }
     }
 }
@@ -8001,6 +8322,8 @@ fn build_instances(
 fn build_lights(world: &World) -> [LightRaw; MAX_LIGHTS] {
     let mut out = [LightRaw::zeroed(); MAX_LIGHTS];
     let mut count = 0usize;
+    // Only the first directional light casts the scene's shadow.
+    let mut shadow_caster_assigned = false;
     for (id, slot) in world.lights.iter().enumerate() {
         if count >= MAX_LIGHTS {
             break;
@@ -8025,9 +8348,18 @@ fn build_lights(world: &World) -> [LightRaw; MAX_LIGHTS] {
                 ([p.x, p.y, p.z, 0.0], 1.0, range)
             }
         };
+        let casts_shadow = kind_flag < 0.5 && light.intensity > 0.0 && !shadow_caster_assigned;
+        if casts_shadow {
+            shadow_caster_assigned = true;
+        }
         out[count] = LightRaw {
             position_or_direction,
-            params: [kind_flag, range, light.intensity, 0.0],
+            params: [
+                kind_flag,
+                range,
+                light.intensity,
+                if casts_shadow { 1.0 } else { 0.0 },
+            ],
         };
         count += 1;
     }
@@ -8314,6 +8646,7 @@ fn main() {
     let world = World::default();
     let prefs = load_prefs();
     set_scene_tree_drag_hold_seconds(prefs.drag_hold_seconds);
+    set_shadows_enabled(prefs.shadows);
     let mut app = App {
         window: None,
         gpu: None,
@@ -8450,6 +8783,7 @@ mod prefs_tests {
         assert_eq!(p.fly_speed, CAM_PAN_SPEED);
         assert_eq!(p.look_sensitivity, 1.0);
         assert_eq!(p.drag_hold_seconds, SCENE_TREE_DRAG_HOLD_DEFAULT);
+        assert!(p.shadows);
     }
 
     #[test]
@@ -8470,5 +8804,30 @@ mod prefs_tests {
         .sanitized();
         assert_eq!(bad.fly_speed, CAM_PAN_SPEED);
         assert_eq!(bad.look_sensitivity, 5.0);
+    }
+}
+
+#[cfg(test)]
+mod shader_tests {
+    use wgpu::naga;
+
+    fn validate(source: &str) {
+        let module = naga::front::wgsl::parse_str(source).expect("WGSL should parse");
+        naga::valid::Validator::new(
+            naga::valid::ValidationFlags::all(),
+            naga::valid::Capabilities::all(),
+        )
+        .validate(&module)
+        .expect("WGSL should validate");
+    }
+
+    #[test]
+    fn entity_shader_is_valid() {
+        validate(include_str!("shader.wgsl"));
+    }
+
+    #[test]
+    fn shadow_shader_is_valid() {
+        validate(include_str!("shadow.wgsl"));
     }
 }

@@ -80,7 +80,7 @@ The theme is an editor concern only. Nothing in the engine knows about it.
 
 ## Open questions
 
-Lighting and materials. Shading supports several lights: each fragment is lit by up to four `Light` components, and `Material` carries an emissive strength that blends a fragment toward its own flat colour as it rises toward 1.0. Imported models can be textured, and carry roughness and metalness values that bend the falloff (flatter when rough, punchier when metallic). That is an approximation, not a physically based specular highlight, which would need the camera's world position threaded into every render call site. There are still no shadows. That is fine for a debug and authoring viewport. Real view-dependent specular and shadows are a later, separate concern.
+Lighting and materials. Shading supports several lights: each fragment is lit by up to four `Light` components, and `Material` carries an emissive strength that blends a fragment toward its own flat colour as it rises toward 1.0. Imported models can be textured, and carry roughness and metalness values that bend the falloff (flatter when rough, punchier when metallic). That is an approximation, not a physically based specular highlight, which would need the camera's world position threaded into every render call site. Shadows: the first directional `Light` casts them. A depth-only pass draws every entity from the light's point of view into a 2048 by 2048 shadow map, fitted to the scene's bounds, and the entity shader compares each fragment against it with a 3x3 filtered lookup so edges are soft. Only that light's contribution is shadowed; the ambient floor is untouched, so shadows are never black. Point lights do not cast shadows yet (that needs a cube map), the map is one fixed size, and a very large ground plane lowers the resolution. Shadows can be switched off in Editor settings. Real view-dependent specular is a later, separate concern.
 
 Picking is approximate. Selection projects each entity's centre and a corner to the screen and does a rectangle hit-test against the cursor. It is a screen-space bounding box, not a true ray-versus-geometry pick. The box scales with the entity's `Scale`, so a resized entity stays clickable, but it is shape-agnostic: the same scale-box for a cube, a sphere, or a plane. A tighter, shape-aware pick may eventually be worth it.
 
@@ -209,7 +209,7 @@ In rough order:
 
 - Finish the Outerface V1 theme pass: selected-row highlight in the Scene tab, slider styling, and Inspector layout spacing.
 - Restore the exact pre-flight view when leaving the flythrough camera without picking an entity, so a look-around does not move the orbit.
-- A fuller material model (roughness, metalness) and shadows, now that there is a multi-light model for them to respond to.
+- A fuller material model (real specular), and shadows from point lights (cube maps) and spot lights, now that directional shadows exist.
 - Collision and physics refinements: rotated and mesh-accurate colliders, joints, and a broad phase if entity counts grow.
 - Networking: interest management, syncing the full component set, and a compact wire format.
 - Serializing dynamic components with the scene.
