@@ -113,9 +113,8 @@ pub struct RigidBody;
 /// marked entity found (lowest id), instead of the editor's own free orbit
 /// camera, when one exists in the scene; a scene with none is unaffected.
 /// Marker only, no fields yet: field of view and similar are possible later
-/// additions. Since `Rotation` is yaw-only across this whole engine, a
-/// camera can turn left and right (by turning itself, or by riding along on
-/// a `Parent` that turns) but can never tilt up or down.
+/// additions. The camera looks along its entity's `Rotation`, so yaw turns it
+/// left and right, pitch tips it up and down, and roll banks it.
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq)]
 pub struct Camera;
 
@@ -124,10 +123,11 @@ pub struct Camera;
 /// parent's, plus this local offset: `offset_x`/`offset_y`/`offset_z` are in
 /// the parent's own local space (offset_x to its right, positive offset_z
 /// behind it, matching the engine's yaw-0-faces-negative-Z convention) and
-/// rotate with the parent's yaw, so the offset stays in the same relative
-/// spot, behind-and-above, say, as the parent turns, the way a camera or a
-/// weapon mounted on a character would. `offset_yaw` adds directly to the
-/// parent's yaw, no rotation of its own.
+/// rotate with the parent's whole orientation (yaw, pitch and roll), so the
+/// offset stays in the same relative spot, behind-and-above, say, as the
+/// parent turns or tilts, the way a camera or a weapon mounted on a character
+/// would. `offset_yaw` is an extra turn around the parent's own vertical
+/// axis, added on top of the parent's orientation.
 ///
 /// Deliberately simple for this first pass: not `RigidBody`-aware itself (a
 /// parented entity just gets a `Position`/`Rotation` written onto it, same
@@ -527,29 +527,134 @@ impl Default for Material {
     }
 }
 
-/// Per-entity yaw rotation, in radians, around the world's vertical (Y) axis.
-/// Starts at a single angle rather than a full 3D orientation (pitch and roll
-/// too), the same "start minimal, grow later" path Material took with just
-/// emissive. 0.0 is unrotated, matching every entity's appearance before
-/// Rotation existed. Collision boxes stay axis-aligned and unrotated; a
-/// rotated entity's hitbox is a known, already-documented limitation, not a
-/// new one this introduces.
-#[derive(Serialize, Deserialize, Clone, Copy, PartialEq)]
+/// Per-entity rotation as three angles in radians: yaw, pitch and roll, the
+/// usual aircraft convention. All three are 0.0 for an unrotated entity.
+///
+/// - **yaw** turns around the world's vertical (Y) axis, clockwise seen from
+///   above: yaw 0 faces -Z, yaw pi/2 faces +X. This is the only angle that
+///   existed before pitch and roll were added, and its meaning is unchanged.
+/// - **pitch** tips the nose up (positive) or down (negative), around the
+///   entity's own left-right axis.
+/// - **roll** banks the entity around its own forward axis; positive leans
+///   its right side down.
+///
+/// Applied in the order roll, then pitch, then yaw (each around the entity's
+/// own axes), so the combined rotation is `Ry(-yaw) * Rx(pitch) * Rz(-roll)`
+/// in standard right-handed terms. The editor's shaders implement exactly
+/// this order; keep them in step with `matrix` below.
+///
+/// `pitch` and `roll` carry `serde(default)`, so a scene saved when only yaw
+/// existed loads unchanged, with both at 0.0.
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Debug)]
 pub struct Rotation {
     pub yaw: f32,
+    #[serde(default)]
+    pub pitch: f32,
+    #[serde(default)]
+    pub roll: f32,
 }
 
 impl Default for Rotation {
     fn default() -> Self {
-        Rotation { yaw: 0.0 }
+        Rotation {
+            yaw: 0.0,
+            pitch: 0.0,
+            roll: 0.0,
+        }
+    }
+}
+
+impl Rotation {
+    /// A rotation with only a yaw, the shape every entity had before pitch
+    /// and roll existed.
+    pub fn from_yaw(yaw: f32) -> Self {
+        Rotation {
+            yaw,
+            pitch: 0.0,
+            roll: 0.0,
+        }
+    }
+
+    /// True if this is a plain yaw turn (no pitch, no roll).
+    pub fn is_yaw_only(&self) -> bool {
+        self.pitch == 0.0 && self.roll == 0.0
+    }
+
+    /// The rotation as a 3x3 matrix, `m[row][column]`, turning a vector from
+    /// the entity's own space into world space.
+    pub fn matrix(&self) -> [[f32; 3]; 3] {
+        // The matrix is Ry(a) * Rx(b) * Rz(c) with a = -yaw, b = pitch and
+        // c = -roll, which expands to the entries below.
+        let (sa, ca) = (-self.yaw).sin_cos();
+        let (sb, cb) = self.pitch.sin_cos();
+        let (sc, cc) = (-self.roll).sin_cos();
+        [
+            [ca * cc + sa * sb * sc, -ca * sc + sa * sb * cc, sa * cb],
+            [cb * sc, cb * cc, -sb],
+            [-sa * cc + ca * sb * sc, sa * sc + ca * sb * cc, ca * cb],
+        ]
+    }
+
+    /// Rotate a vector from the entity's own space into world space.
+    pub fn apply(&self, v: [f32; 3]) -> [f32; 3] {
+        let m = self.matrix();
+        [
+            m[0][0] * v[0] + m[0][1] * v[1] + m[0][2] * v[2],
+            m[1][0] * v[0] + m[1][1] * v[1] + m[1][2] * v[2],
+            m[2][0] * v[0] + m[2][1] * v[1] + m[2][2] * v[2],
+        ]
+    }
+
+    /// The direction this rotation faces, in world space (-Z when unrotated).
+    pub fn forward(&self) -> [f32; 3] {
+        self.apply([0.0, 0.0, -1.0])
+    }
+
+    /// Recover yaw, pitch and roll from a rotation matrix (the inverse of
+    /// `matrix`). Pitch is limited to -90 to 90 degrees. Straight up or down
+    /// (gimbal lock) the roll is folded into the yaw, which describes the
+    /// same orientation.
+    pub fn from_matrix(m: [[f32; 3]; 3]) -> Self {
+        let sb = (-m[1][2]).clamp(-1.0, 1.0);
+        let pitch = sb.asin();
+        let (a, c) = if m[1][2].abs() < 0.999_999 {
+            (m[0][2].atan2(m[2][2]), m[1][0].atan2(m[1][1]))
+        } else {
+            ((-m[2][0]).atan2(m[0][0]), 0.0)
+        };
+        Rotation {
+            yaw: -a,
+            pitch,
+            roll: -c,
+        }
+    }
+
+    /// This rotation followed by an extra turn around the entity's own
+    /// vertical axis: how a `Parent` offset yaw is added on top of its
+    /// parent's orientation.
+    pub fn with_extra_yaw(&self, extra_yaw: f32) -> Self {
+        if self.is_yaw_only() {
+            // The common case, kept exact (no matrix round trip).
+            return Rotation::from_yaw(self.yaw + extra_yaw);
+        }
+        let p = self.matrix();
+        let (s, c) = extra_yaw.sin_cos();
+        // Ry(-extra_yaw) as a matrix.
+        let y = [[c, 0.0, -s], [0.0, 1.0, 0.0], [s, 0.0, c]];
+        let mut out = [[0.0f32; 3]; 3];
+        for (r, row) in out.iter_mut().enumerate() {
+            for (col, cell) in row.iter_mut().enumerate() {
+                *cell = p[r][0] * y[0][col] + p[r][1] * y[1][col] + p[r][2] * y[2][col];
+            }
+        }
+        Rotation::from_matrix(out)
     }
 }
 
 /// What kind of light source an entity with a `Light` component is.
-/// Deliberately not reusing `Rotation` for a directional light's direction:
-/// `Rotation` is yaw-only (a turn around the world's vertical axis), and a
-/// light angled down from the sky needs pitch too, a genuinely different
-/// thing from how an entity itself is turned.
+/// A directional light keeps its own direction vector rather than reading the
+/// entity's `Rotation`: a light is aimed at a direction, not turned like a
+/// mesh, and the vector is what the shader needs directly.
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq)]
 pub enum LightKind {
     /// An infinitely-distant light with a fixed direction, like a sun. No
@@ -675,7 +780,11 @@ impl Default for UiText {
             x: 0.5,
             y: 0.5,
             font_size: 24.0,
-            color: Color { r: 1.0, g: 1.0, b: 1.0 },
+            color: Color {
+                r: 1.0,
+                g: 1.0,
+                b: 1.0,
+            },
         }
     }
 }
@@ -1176,7 +1285,12 @@ impl World {
     /// `apply_parenting` recomputes it from the parent's real position plus
     /// this offset on the very next tick regardless, so this only avoids a
     /// one-frame jump from the origin before that first tick runs.
-    fn spawn_prefab_children(&mut self, parent_id: usize, root_position: Position, prefab: &Prefab) {
+    fn spawn_prefab_children(
+        &mut self,
+        parent_id: usize,
+        root_position: Position,
+        prefab: &Prefab,
+    ) {
         for child in &prefab.children {
             let child_id = self.spawn(
                 root_position,
@@ -1359,4 +1473,132 @@ pub trait ScriptRuntime {
 
     /// Run one entity's script for this tick, applying its effects to `world`.
     fn run(&mut self, world: &mut World, entity: usize);
+}
+
+#[cfg(test)]
+mod rotation_tests {
+    use super::*;
+
+    fn close(a: [f32; 3], b: [f32; 3]) -> bool {
+        a.iter().zip(b.iter()).all(|(x, y)| (x - y).abs() < 1e-5)
+    }
+
+    #[test]
+    fn unrotated_is_the_identity() {
+        let r = Rotation::default();
+        assert!(close(r.apply([1.0, 2.0, 3.0]), [1.0, 2.0, 3.0]));
+        assert!(close(r.forward(), [0.0, 0.0, -1.0]));
+    }
+
+    #[test]
+    fn yaw_matches_the_original_formula() {
+        // The shader and `apply_parenting` always did x' = x cos - z sin,
+        // z' = x sin + z cos. Yaw-only must stay exactly that.
+        for yaw in [-3.0f32, -1.0, 0.0, 0.5, 1.5707964, 2.9] {
+            let r = Rotation::from_yaw(yaw);
+            let (x, y, z) = (1.5f32, -2.0f32, 0.7f32);
+            let expected = [
+                x * yaw.cos() - z * yaw.sin(),
+                y,
+                x * yaw.sin() + z * yaw.cos(),
+            ];
+            assert!(close(r.apply([x, y, z]), expected), "yaw {yaw}");
+        }
+    }
+
+    #[test]
+    fn conventions_yaw_pitch_roll() {
+        use std::f32::consts::FRAC_PI_2;
+        // Yaw pi/2 faces +X.
+        assert!(close(
+            Rotation::from_yaw(FRAC_PI_2).forward(),
+            [1.0, 0.0, 0.0]
+        ));
+        // Positive pitch tips the nose up.
+        let up = Rotation {
+            yaw: 0.0,
+            pitch: FRAC_PI_2,
+            roll: 0.0,
+        };
+        assert!(close(up.forward(), [0.0, 1.0, 0.0]));
+        // Positive roll leans the right side down, forward unchanged.
+        let roll = Rotation {
+            yaw: 0.0,
+            pitch: 0.0,
+            roll: FRAC_PI_2,
+        };
+        assert!(close(roll.apply([1.0, 0.0, 0.0]), [0.0, -1.0, 0.0]));
+        assert!(close(roll.forward(), [0.0, 0.0, -1.0]));
+        // Order: roll, then pitch, then yaw. Pitch 90 then yaw 90 still
+        // points up; yaw only spins it around the vertical.
+        let both = Rotation {
+            yaw: FRAC_PI_2,
+            pitch: FRAC_PI_2,
+            roll: 0.0,
+        };
+        assert!(close(both.forward(), [0.0, 1.0, 0.0]));
+    }
+
+    #[test]
+    fn matrix_round_trips_through_euler_angles() {
+        for yaw in [-3.0f32, -1.2, 0.0, 0.8, 2.5] {
+            for pitch in [-1.4f32, -0.5, 0.0, 0.6, 1.4] {
+                for roll in [-2.0f32, -0.3, 0.0, 0.9, 3.0] {
+                    let r = Rotation { yaw, pitch, roll };
+                    let back = Rotation::from_matrix(r.matrix());
+                    for v in [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]] {
+                        assert!(close(r.apply(v), back.apply(v)), "{r:?} vs {back:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn straight_up_still_describes_the_same_orientation() {
+        let r = Rotation {
+            yaw: 0.7,
+            pitch: std::f32::consts::FRAC_PI_2,
+            roll: 0.4,
+        };
+        let back = Rotation::from_matrix(r.matrix());
+        for v in [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]] {
+            assert!(close(r.apply(v), back.apply(v)));
+        }
+    }
+
+    #[test]
+    fn extra_yaw_is_a_turn_around_the_parents_own_vertical() {
+        // Yaw-only parent: plain addition, exactly.
+        assert_eq!(
+            Rotation::from_yaw(0.5).with_extra_yaw(0.25),
+            Rotation::from_yaw(0.75)
+        );
+        // Tilted parent: the result is parent * Ry(-extra), checked by
+        // comparing the child's forward with the parent's own matrix applied
+        // to a yawed forward vector.
+        let parent = Rotation {
+            yaw: 0.3,
+            pitch: 0.5,
+            roll: -0.2,
+        };
+        let child = parent.with_extra_yaw(0.9);
+        let spun = Rotation::from_yaw(0.9).forward();
+        assert!(close(child.forward(), parent.apply(spun)));
+    }
+
+    #[test]
+    fn old_scenes_without_pitch_and_roll_still_load() {
+        let r: Rotation = ron::from_str("(yaw: 1.25)").unwrap();
+        assert_eq!(r, Rotation::from_yaw(1.25));
+        let full: Rotation = ron::from_str("(yaw: 1.0, pitch: 0.5, roll: -0.5)").unwrap();
+        assert_eq!(
+            full,
+            Rotation {
+                yaw: 1.0,
+                pitch: 0.5,
+                roll: -0.5
+            }
+        );
+    }
 }

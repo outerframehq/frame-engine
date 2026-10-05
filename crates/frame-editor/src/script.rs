@@ -65,7 +65,9 @@ const API_VARS: &[&str] = &[
     "scale",
     "color", // Single-value component data.
     "emissive",
-    "yaw", // Flat values (the original spelling, still supported).
+    "yaw",
+    "pitch",
+    "roll", // Flat values (the original spelling, still supported).
     "px",
     "py",
     "pz",
@@ -347,6 +349,8 @@ impl ScriptRuntime for RhaiRuntime {
         let (cr, cg, cb) = (color.r as f64, color.g as f64, color.b as f64);
         let emissive = material.emissive as f64;
         let yaw = rotation.yaw as f64;
+        let pitch = rotation.pitch as f64;
+        let roll = rotation.roll as f64;
         // Physics character state. `current_intent` is whatever the built-in
         // Controlled input (or an earlier script, in some future multi-script
         // setup) already asked for this tick; scripts run after input_movement
@@ -486,6 +490,8 @@ impl ScriptRuntime for RhaiRuntime {
         // Single-value component data. No vector/struct type needed for one number.
         scope.push("emissive", emissive);
         scope.push("yaw", yaw);
+        scope.push("pitch", pitch);
+        scope.push("roll", roll);
         // Dynamic component values, one per name this entity already has.
         for (name, value) in &custom {
             scope.push(format!("custom_{name}"), *value);
@@ -574,6 +580,8 @@ impl ScriptRuntime for RhaiRuntime {
 
         let f_yaw = scope.get_value::<f64>("yaw").unwrap_or(yaw);
         rotation.yaw = f_yaw as f32;
+        rotation.pitch = scope.get_value::<f64>("pitch").unwrap_or(pitch) as f32;
+        rotation.roll = scope.get_value::<f64>("roll").unwrap_or(roll) as f32;
         world.rotations.insert(entity, rotation);
 
         // Physics character control write-back. Unconditional re-insert, same

@@ -107,7 +107,8 @@ struct InstanceInput {
     @location(5) selected: f32,
     @location(6) scale: vec3<f32>,
     @location(7) emissive: f32,
-    @location(8) yaw: f32,
+    // x: yaw, y: pitch, z: roll, in radians (world::Rotation).
+    @location(8) rotation: vec3<f32>,
 };
 
 struct VertexOutput {
@@ -125,19 +126,32 @@ struct VertexOutput {
 // cube always was. NOTE: must match MESH_SIZE in main.rs (render and pick agree).
 const MESH_SIZE: f32 = 8.0;
 
+// Rotate a vector from the entity's own space into world space by yaw, pitch
+// and roll: roll first (around the forward axis), then pitch (around the
+// left-right axis), then yaw (around the vertical axis). Yaw turns clockwise
+// seen from above (yaw 0 faces -Z, yaw pi/2 faces +X); positive pitch tips the
+// nose up; positive roll leans the right side down. With pitch and roll at 0
+// this is exactly the old yaw-only rotation. MUST match `Rotation::matrix` in
+// the engine's world module (and the same function in shadow.wgsl).
+fn rotate_by(v: vec3<f32>, angles: vec3<f32>) -> vec3<f32> {
+    let cr = cos(angles.z);
+    let sr = sin(angles.z);
+    let rolled = vec3<f32>(v.x * cr + v.y * sr, -v.x * sr + v.y * cr, v.z);
+    let cp = cos(angles.y);
+    let sp = sin(angles.y);
+    let pitched = vec3<f32>(rolled.x, rolled.y * cp - rolled.z * sp, rolled.y * sp + rolled.z * cp);
+    let cy = cos(angles.x);
+    let sy = sin(angles.x);
+    return vec3<f32>(pitched.x * cy - pitched.z * sy, pitched.y, pitched.x * sy + pitched.z * cy);
+}
+
 @vertex
 fn vs_main(vertex: VertexInput, instance: InstanceInput) -> VertexOutput {
-    // Per-axis scale (component-wise), then yaw around the world's vertical
-    // (Y) axis, then place at the entity's position. Scale first so rotation
-    // spins the already-sized shape rather than an elongated axis.
+    // Per-axis scale (component-wise), then the entity's rotation, then place
+    // at the entity's position. Scale first so rotation spins the
+    // already-sized shape rather than an elongated axis.
     let scaled = vertex.position * MESH_SIZE * instance.scale;
-    let cos_y = cos(instance.yaw);
-    let sin_y = sin(instance.yaw);
-    let rotated = vec3<f32>(
-        scaled.x * cos_y - scaled.z * sin_y,
-        scaled.y,
-        scaled.x * sin_y + scaled.z * cos_y,
-    );
+    let rotated = rotate_by(scaled, instance.rotation);
     let world_pos = instance.position + rotated;
 
     // The mesh's own normal, rotated the same way the shape was, so shading
@@ -147,11 +161,7 @@ fn vs_main(vertex: VertexInput, instance: InstanceInput) -> VertexOutput {
     // approximately, which is fine here. Actual lighting now happens per
     // fragment, not here, so a point light's falloff varies smoothly across
     // a face instead of only being evaluated at each corner.
-    let rotated_normal = vec3<f32>(
-        vertex.normal.x * cos_y - vertex.normal.z * sin_y,
-        vertex.normal.y,
-        vertex.normal.x * sin_y + vertex.normal.z * cos_y,
-    );
+    let rotated_normal = rotate_by(vertex.normal, instance.rotation);
 
     var out: VertexOutput;
     out.clip_position = camera.view_proj * vec4<f32>(world_pos, 1.0);

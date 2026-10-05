@@ -3,21 +3,22 @@ use crate::world::World;
 use crate::world::{MoveIntent, QueryFilter, ScriptRuntime};
 
 /// Expand an axis-aligned box's half-extents to bound the same box after it's
-/// rotated by `yaw` around the world's vertical (Y) axis. This is a
-/// conservative over-approximation, an axis-aligned box that fully contains
-/// the rotated one, not true oriented-box precision. Two entities whose real
-/// rotated shapes don't actually touch can still be reported as colliding
-/// once both are turned; that's the honest cost of staying axis-aligned
-/// rather than doing real oriented-box math, a bigger, separate step. Y
-/// (height) is untouched, since rotation is yaw-only.
-fn expand_for_yaw(half: [f32; 3], yaw: f32) -> [f32; 3] {
-    let (sin, cos) = yaw.sin_cos();
-    let (sin, cos) = (sin.abs(), cos.abs());
-    [
-        half[0] * cos + half[2] * sin,
-        half[1],
-        half[0] * sin + half[2] * cos,
-    ]
+/// rotated (yaw, pitch and roll). This is a conservative over-approximation,
+/// an axis-aligned box that fully contains the rotated one, not true
+/// oriented-box precision: each world axis gets the sum of the rotation
+/// matrix's absolute row entries times the matching half-extents. Two
+/// entities whose real rotated shapes don't actually touch can still be
+/// reported as colliding once either is tilted; that's the honest cost of
+/// staying axis-aligned rather than doing real oriented-box math, a bigger,
+/// separate step. (Rapier-simulated entities use true oriented colliders.)
+fn expand_for_rotation(half: [f32; 3], rotation: &crate::world::Rotation) -> [f32; 3] {
+    let m = rotation.matrix();
+    let mut out = [0.0f32; 3];
+    for (axis, slot) in out.iter_mut().enumerate() {
+        *slot =
+            m[axis][0].abs() * half[0] + m[axis][1].abs() * half[1] + m[axis][2].abs() * half[2];
+    }
+    out
 }
 
 /// Half extents of an entity's axis aligned collision box, per axis. A Plane
@@ -79,8 +80,8 @@ pub fn collision(world: &mut World) {
     for (id, p) in world.positions.query().without(&world.rigid_bodies) {
         let s = world.scales.get(id).copied().unwrap_or_default();
         let mesh = world.meshes.get(id).cloned().unwrap_or_default();
-        let yaw = world.rotations.get(id).map(|r| r.yaw).unwrap_or(0.0);
-        let [hx, hy, hz] = expand_for_yaw(half_extents(&mesh, s, &world.mesh_meta), yaw);
+        let rotation = world.rotations.get(id).copied().unwrap_or_default();
+        let [hx, hy, hz] = expand_for_rotation(half_extents(&mesh, s, &world.mesh_meta), &rotation);
         boxes.push((
             id,
             [p.x - hx, p.y - hy, p.z - hz],
@@ -136,11 +137,11 @@ pub fn resolve_collisions(world: &mut World) {
         let s = world.scales.get(id).copied().unwrap_or_default();
         let mesh = world.meshes.get(id).cloned().unwrap_or_default();
         let is_static = world.statics.get(id).is_some();
-        let yaw = world.rotations.get(id).map(|r| r.yaw).unwrap_or(0.0);
+        let rotation = world.rotations.get(id).copied().unwrap_or_default();
         boxes.push((
             id,
             [p.x, p.y, p.z],
-            expand_for_yaw(half_extents(&mesh, s, &world.mesh_meta), yaw),
+            expand_for_rotation(half_extents(&mesh, s, &world.mesh_meta), &rotation),
             is_static,
         ));
     }
@@ -226,16 +227,13 @@ pub fn resolve_collisions(world: &mut World) {
 /// rider sees the parent's *final* position for that tick, not a stale one
 /// from before the parent moved.
 ///
-/// The offset rotates with the parent's yaw, using this engine's own
-/// clockwise-from-above convention (yaw 0 faces -Z; see `physics.rs`'s
-/// module doc comment for the fullest explanation of it). Worked out
-/// independently here rather than shared with `physics::rapier_rotation`,
-/// since that one builds a rapier `Rotation` type and this is a plain 2D
-/// rotation of an (x, z) offset: for a parent facing yaw, a purely-forward
-/// local offset (0, -1) should end up pointing the same way the parent's own
-/// forward vector does, and a purely-rightward one (1, 0) should end up
-/// pointing the same way the parent's own right side does as it turns; both
-/// were checked against yaw 0 and yaw pi/2 while this was built.
+/// The offset is rotated by the parent's whole orientation (yaw, pitch and
+/// roll; see `Rotation::apply`), so an entity mounted behind-and-above a
+/// parent stays there as the parent turns or tilts. The child takes the
+/// parent's orientation with `offset_yaw` added as an extra turn around the
+/// parent's own vertical axis (`Rotation::with_extra_yaw`). For a parent with
+/// only a yaw this is exactly the old behaviour: yaw 0 faces -Z, a purely
+/// forward local offset points where the parent faces.
 ///
 /// An entity with no `Parent`, or whose named parent has since despawned, is
 /// left untouched, the same tolerance a stale `Script` reference gets.
@@ -250,32 +248,28 @@ pub fn apply_parenting(world: &mut World) {
         let Some(parent_pos) = world.positions.get(parent.entity).copied() else {
             continue; // dangling or missing parent: leave this entity as it is
         };
-        let parent_yaw = world
+        let parent_rotation = world
             .rotations
             .get(parent.entity)
-            .map(|r| r.yaw)
-            .unwrap_or(0.0);
-        let (sin, cos) = parent_yaw.sin_cos();
-        let world_dx = parent.offset_x * cos - parent.offset_z * sin;
-        let world_dz = parent.offset_x * sin + parent.offset_z * cos;
+            .copied()
+            .unwrap_or_default();
+        let [world_dx, world_dy, world_dz] =
+            parent_rotation.apply([parent.offset_x, parent.offset_y, parent.offset_z]);
         if let Some(p) = world.positions.get_mut(id) {
             p.x = parent_pos.x + world_dx;
-            p.y = parent_pos.y + parent.offset_y;
+            p.y = parent_pos.y + world_dy;
             p.z = parent_pos.z + world_dz;
         }
         // Unconditional insert, not `get_mut`: a freshly spawned entity has
         // no `Rotation` at all until something gives it one (the Inspector
         // does, on first edit; a script never has to). A `Parent`-attached
-        // entity needs a real, current yaw to be worth attaching at all (a
-        // mounted camera's own facing depends on it), so this creates one
-        // rather than silently doing nothing for an entity that never
+        // entity needs a real, current orientation to be worth attaching at
+        // all (a mounted camera's own facing depends on it), so this creates
+        // one rather than silently doing nothing for an entity that never
         // happened to get a `Rotation` from anywhere else.
-        world.rotations.insert(
-            id,
-            crate::world::Rotation {
-                yaw: parent_yaw + parent.offset_yaw,
-            },
-        );
+        world
+            .rotations
+            .insert(id, parent_rotation.with_extra_yaw(parent.offset_yaw));
     }
 }
 
@@ -565,5 +559,81 @@ mod tests {
         let mut runtime = Recorder(Vec::new());
         run_scripts(&mut world, &mut runtime, &InputState::new());
         assert_eq!(runtime.0, vec![a, c]);
+    }
+
+    #[test]
+    fn a_tilted_box_gets_a_bigger_bounding_box() {
+        use crate::world::Rotation;
+        let half = [4.0, 4.0, 4.0];
+        // Unrotated: unchanged.
+        let flat = expand_for_rotation(half, &Rotation::default());
+        assert_eq!(flat, half);
+        // Yaw 45 degrees: x and z grow to 4*(cos+sin), y unchanged.
+        let yawed = expand_for_rotation(half, &Rotation::from_yaw(std::f32::consts::FRAC_PI_4));
+        let grown = 4.0 * std::f32::consts::SQRT_2;
+        assert!((yawed[0] - grown).abs() < 1e-4 && (yawed[2] - grown).abs() < 1e-4);
+        assert!((yawed[1] - 4.0).abs() < 1e-4);
+        // Pitch 45 degrees: y and z grow, x unchanged.
+        let pitched = expand_for_rotation(
+            half,
+            &Rotation {
+                yaw: 0.0,
+                pitch: std::f32::consts::FRAC_PI_4,
+                roll: 0.0,
+            },
+        );
+        assert!((pitched[0] - 4.0).abs() < 1e-4);
+        assert!((pitched[1] - grown).abs() < 1e-4 && (pitched[2] - grown).abs() < 1e-4);
+        // A flat plane (zero height) tipped on its side gains height.
+        let plane = expand_for_rotation(
+            [4.0, 0.0, 4.0],
+            &Rotation {
+                yaw: 0.0,
+                pitch: std::f32::consts::FRAC_PI_2,
+                roll: 0.0,
+            },
+        );
+        assert!((plane[1] - 4.0).abs() < 1e-4 && plane[2].abs() < 1e-4);
+    }
+
+    #[test]
+    fn a_child_follows_a_tilted_parent() {
+        use crate::world::Rotation;
+        let mut world = World::new();
+        let parent = at(&mut world, 0.0, 0.0, 0.0);
+        let child = at(&mut world, 0.0, 0.0, 0.0);
+        // Parent nose straight up: a child 2 units "forward" (-Z) ends up 2
+        // units above it.
+        world.rotations.insert(
+            parent,
+            Rotation {
+                yaw: 0.0,
+                pitch: std::f32::consts::FRAC_PI_2,
+                roll: 0.0,
+            },
+        );
+        world.parents.insert(
+            child,
+            Parent {
+                entity: parent,
+                offset_x: 0.0,
+                offset_y: 0.0,
+                offset_z: -2.0,
+                offset_yaw: 0.0,
+            },
+        );
+        apply_parenting(&mut world);
+        let p = world.positions.get(child).unwrap();
+        assert!(
+            p.x.abs() < 1e-5 && (p.y - 2.0).abs() < 1e-5 && p.z.abs() < 1e-5,
+            "{} {} {}",
+            p.x,
+            p.y,
+            p.z
+        );
+        // And it inherits the parent's tilt.
+        assert!(
+            (world.rotations.get(child).unwrap().pitch - std::f32::consts::FRAC_PI_2).abs() < 1e-5
+        );
     }
 }

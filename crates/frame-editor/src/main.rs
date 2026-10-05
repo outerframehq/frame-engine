@@ -424,7 +424,8 @@ struct InstanceRaw {
     selected: f32,
     scale: [f32; 3],
     emissive: f32,
-    yaw: f32,
+    // Yaw, pitch and roll in radians (see `world::Rotation`).
+    rotation: [f32; 3],
 }
 impl InstanceRaw {
     // Locations 0-2 belong to the mesh vertex buffer (MeshVertex, which grew
@@ -457,7 +458,7 @@ impl InstanceRaw {
             shader_location: 7,
         },
         wgpu::VertexAttribute {
-            format: wgpu::VertexFormat::Float32,
+            format: wgpu::VertexFormat::Float32x3,
             offset: std::mem::size_of::<[f32; 11]>() as wgpu::BufferAddress, // 44
             shader_location: 8,
         },
@@ -731,7 +732,8 @@ fn camera_view_proj(
 // Mixing the two conventions in one function is exactly the kind of mistake
 // that already had to be fixed once in physics.rs, so this works out the
 // entity's forward vector directly from the documented convention instead:
-// yaw 0 faces -Z, and yaw turns clockwise seen from above (towards +X).
+// yaw 0 faces -Z, and yaw turns clockwise seen from above (towards +X). Now
+// done through `Rotation::forward`/`apply`, the one place that convention lives.
 fn camera_entity_view_proj(
     world: &frame_engine::world::World,
     id: usize,
@@ -739,11 +741,14 @@ fn camera_entity_view_proj(
     height: u32,
 ) -> Option<[[f32; 4]; 4]> {
     let pos = world.positions.get(id)?;
-    let yaw = world.rotations.get(id).map(|r| r.yaw).unwrap_or(0.0);
+    let rotation = world.rotations.get(id).copied().unwrap_or_default();
     let eye = Vec3::new(pos.x, pos.y, pos.z);
-    let forward = Vec3::new(yaw.sin(), 0.0, -yaw.cos());
+    // The camera looks along its entity's full orientation: yaw turns it,
+    // pitch tips it, roll banks it (the "up" vector tilts with it).
+    let forward = Vec3::from(rotation.forward());
+    let up = Vec3::from(rotation.apply([0.0, 1.0, 0.0]));
     let aspect = width as f32 / height.max(1) as f32;
-    let view = Mat4::look_at_rh(eye, eye + forward, Vec3::Y);
+    let view = Mat4::look_at_rh(eye, eye + forward, up);
     let proj = Mat4::perspective_rh(FOV_DEGREES.to_radians(), aspect, 0.1, 10000.0);
     Some((proj * view).to_cols_array_2d())
 }
@@ -2866,17 +2871,39 @@ fn inspector_tab_ui(
             });
             ui.add_space(4.0);
             section_label(ui, "Rotation");
-            let mut yaw_degrees = rotation.yaw.to_degrees();
-            if ui
-                .add(
-                    egui::DragValue::new(&mut yaw_degrees)
-                        .speed(1.0)
-                        .suffix("°"),
-                )
-                .changed()
-            {
-                rotation.yaw = yaw_degrees.to_radians();
-            }
+            ui.horizontal(|ui| {
+                for (label, angle, hover) in [
+                    (
+                        "yaw",
+                        &mut rotation.yaw,
+                        "Turn left or right, around the vertical axis.",
+                    ),
+                    (
+                        "pitch",
+                        &mut rotation.pitch,
+                        "Tip the nose up (positive) or down.",
+                    ),
+                    (
+                        "roll",
+                        &mut rotation.roll,
+                        "Bank around the forward axis; positive leans the right side down.",
+                    ),
+                ] {
+                    let mut degrees = angle.to_degrees();
+                    if ui
+                        .add(
+                            egui::DragValue::new(&mut degrees)
+                                .speed(1.0)
+                                .prefix(format!("{label} "))
+                                .suffix("°"),
+                        )
+                        .on_hover_text(hover)
+                        .changed()
+                    {
+                        *angle = degrees.to_radians();
+                    }
+                }
+            });
             ui.add_space(4.0);
             section_label(ui, "Mesh");
             let mesh_label: String = match mesh {
@@ -2909,8 +2936,8 @@ fn inspector_tab_ui(
             outerface_checkbox(ui, is_camera, "Camera").on_hover_text(
                 "Play mode renders from the first Camera entity in the \
                      scene (lowest id) instead of the editor's own orbit \
-                     camera. Only its Position and yaw matter — no pitch, \
-                     since Rotation is yaw-only everywhere in this engine. \
+                     camera. It looks along its own Rotation: yaw turns it, \
+                     pitch tips it up or down, roll banks it. \
                      Attach it to a Parent below to have it ride along on \
                      another entity.",
             );
@@ -8381,7 +8408,7 @@ fn build_instances(
             selected: if Some(id) == selected { 1.0 } else { 0.0 },
             scale: [scale.x, scale.y, scale.z],
             emissive: material.emissive,
-            yaw: rotation.yaw,
+            rotation: [rotation.yaw, rotation.pitch, rotation.roll],
         };
         let bucket = match &mesh {
             Mesh::Cube => 0,
@@ -8933,7 +8960,7 @@ mod shadow_fit_tests {
             selected: 0.0,
             scale: [scale; 3],
             emissive: 0.0,
-            yaw: 0.0,
+            rotation: [0.0; 3],
         }
     }
 
@@ -8990,5 +9017,49 @@ mod shadow_fit_tests {
         let mut lights = sun();
         lights[0].params[3] = 0.0;
         assert_eq!(compute_shadow(&instances, &lights, camera()).params[0], 0.0);
+    }
+}
+
+#[cfg(test)]
+mod rotation_shader_tests {
+    use frame_engine::world::Rotation;
+
+    // A line-for-line copy of `rotate_by` in shader.wgsl and shadow.wgsl, so
+    // the hand-derived shader steps are checked against the engine's own
+    // `Rotation::apply` (the shaders can't be run without a GPU).
+    fn rotate_by(v: [f32; 3], angles: [f32; 3]) -> [f32; 3] {
+        let (sr, cr) = angles[2].sin_cos();
+        let rolled = [v[0] * cr + v[1] * sr, -v[0] * sr + v[1] * cr, v[2]];
+        let (sp, cp) = angles[1].sin_cos();
+        let pitched = [
+            rolled[0],
+            rolled[1] * cp - rolled[2] * sp,
+            rolled[1] * sp + rolled[2] * cp,
+        ];
+        let (sy, cy) = angles[0].sin_cos();
+        [
+            pitched[0] * cy - pitched[2] * sy,
+            pitched[1],
+            pitched[0] * sy + pitched[2] * cy,
+        ]
+    }
+
+    #[test]
+    fn shader_rotation_steps_match_the_engines() {
+        for yaw in [-2.0f32, 0.0, 0.9, 3.0] {
+            for pitch in [-1.0f32, 0.0, 0.8] {
+                for roll in [-1.5f32, 0.0, 2.2] {
+                    let r = Rotation { yaw, pitch, roll };
+                    for v in [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.3, -0.7, 2.0]] {
+                        let a = rotate_by(v, [yaw, pitch, roll]);
+                        let b = r.apply(v);
+                        assert!(
+                            a.iter().zip(b.iter()).all(|(p, q)| (p - q).abs() < 1e-5),
+                            "{r:?} {v:?}: {a:?} vs {b:?}"
+                        );
+                    }
+                }
+            }
+        }
     }
 }

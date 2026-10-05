@@ -13,9 +13,10 @@ lands and the patch version bumps for fixes and small additions.
 
 Engine:
 
+- Full 3D rotation. `Rotation` gains `pitch` and `roll` next to `yaw` (radians, applied roll then pitch then yaw; positive pitch tips the nose up, positive roll leans the right side down, yaw is unchanged). Scenes saved with only a yaw load unchanged. Everything that used yaw-only now uses the whole rotation: the entity and shadow shaders, the Camera entity's view (it can now look up and down and bank), parenting (the offset follows the parent's whole orientation, and the child inherits its tilt), the hand-rolled collision boxes (the bounding box now accounts for pitch and roll), and rapier bodies. The Inspector's Rotation section has yaw, pitch and roll fields, and scripts can read and write `pitch` and `roll` alongside `yaw`. Maths helpers `Rotation::matrix`, `apply`, `forward`, `from_matrix` and `with_extra_yaw` live in one place, with tests.
 - Query helpers on `ComponentStorage`: `query`/`query_mut`, `join`/`join_mut`, `join3`/`join3_mut`, `entities` and `contains`, plus `with`/`without` filters (`QueryFilter`), so a system can ask for every entity with certain components, and without others, instead of hand-writing an index loop. Plain iterators over the existing storage: no unsafe code, no new dependency, no change to scene files. `gravity`, `movement`, `collision`, `resolve_collisions`, `apply_parenting`, `run_scripts` and `input_movement` now use them, with unit tests for the helpers and for each of those systems (the engine had none before).
 - A `Material` component (an emissive strength, 0.0 to 1.0), per-entity appearance data serialized with the scene; defaults to 0.0, so older scenes load unchanged.
-- A `Rotation` component: a single yaw angle, in radians, around the world's vertical axis. Not full 3D orientation yet, pitch and roll aren't tracked. Serialized with the scene; defaults to 0.0, so older scenes load unchanged.
+- A `Rotation` component, now three angles in radians: yaw, pitch and roll (see Unreleased changes for pitch and roll). Serialized with the scene; defaults to 0.0, so older scenes load unchanged.
 - A contact point on collision detection. `World.collisions` now carries the centre of the overlap alongside each colliding pair, computed per axis as the midpoint between the two boxes' shared region, not just which two entities are involved.
 - `despawn` now clears any runtime-registered dynamic components too, alongside the built-in ones.
 - Runtime component registration. `World` can now hold component types it was never compiled knowing about, through `insert_dynamic`/`get_dynamic`/`get_dynamic_mut`/`remove_dynamic`, generic over `T: Clone + 'static` and keyed by string name. Doesn't serialize with the scene yet; a registered component resets on reload.
@@ -84,6 +85,8 @@ Editor (frame-editor):
 - Inspector hierarchy and checkboxes in the Outerface V1 style: section labels in the serif at a muted tone (`section_label`), the selected entity's title as a heading, and custom checkboxes (`outerface_checkbox`), a rounded box with an accent border and a diamond tick in place of egui's stock tick.
 
 ### Changed
+
+- Rapier bodies now follow the entity's full rotation. A `Static` body keeps its tilt, so a tilted ramp is a tilted collider. A dynamic body that is not a `Controlled` character is now free to tumble, and its orientation is read back into `Rotation` each tick, where before every body was held upright. A `Controlled` character is unchanged: it stays upright and only turns around Y. This is a visible change for any dynamic physics body that was previously kept from tipping over.
 
 Engine:
 

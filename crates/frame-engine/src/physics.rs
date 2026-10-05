@@ -18,9 +18,12 @@
 //!   character turns to face the way it's going, at `TURN_SPEED`. Not yet:
 //!   pushing dynamic bodies, or moving relative to the entity's yaw.
 //!   `Controlled` together with `Static` is contradictory and skipped.
-//! - Rotation is locked to the world's own Y axis only (`enabled_rotations`),
-//!   matching the engine's yaw-only `Rotation` component: a rapier body never
-//!   tumbles on an axis Frame Engine has no field to read it back from.
+//! - Orientation follows the full `Rotation` component (yaw, pitch and
+//!   roll). A `Static` body keeps whatever tilt it was given, so a tilted
+//!   ramp is a tilted collider. A dynamic body is free to tumble, and its
+//!   orientation is read back into `Rotation` every tick. A `Controlled`
+//!   character stays upright: its pitch and roll are ignored and it only
+//!   turns around the world's Y axis.
 //! - Scene persistence is deliberately out of scope: which entities opt in
 //!   is real scene data (the `RigidBody` marker, serialized like
 //!   `Static`/`Gravity`), but the rapier state itself (handles, bodies,
@@ -87,6 +90,40 @@ pub const JUMP_HEIGHT: f32 = 8.0;
 /// internally (checked in the rapier3d 0.35.3 source).
 fn rapier_rotation(yaw: f32) -> Rotation {
     Rotation::from_scaled_axis(Vector::new(0.0, -yaw, 0.0))
+}
+
+/// The full engine orientation as a rapier rotation: roll, then pitch, then
+/// yaw, the same order as `world::Rotation::matrix`, each angle's sign
+/// following the same convention as `rapier_rotation` above.
+fn rapier_orientation(rotation: &crate::world::Rotation) -> Rotation {
+    rapier_rotation(rotation.yaw)
+        * Rotation::from_scaled_axis(Vector::new(rotation.pitch, 0.0, 0.0))
+        * Rotation::from_scaled_axis(Vector::new(0.0, 0.0, -rotation.roll))
+}
+
+/// A rapier orientation (quaternion components) as the engine's yaw, pitch
+/// and roll. The inverse of `rapier_orientation`.
+fn engine_rotation(x: f32, y: f32, z: f32, w: f32) -> crate::world::Rotation {
+    // Standard quaternion to rotation-matrix conversion; the engine's own
+    // `Rotation::matrix` is this same matrix in the same space.
+    let m = [
+        [
+            1.0 - 2.0 * (y * y + z * z),
+            2.0 * (x * y - z * w),
+            2.0 * (x * z + y * w),
+        ],
+        [
+            2.0 * (x * y + z * w),
+            1.0 - 2.0 * (x * x + z * z),
+            2.0 * (y * z - x * w),
+        ],
+        [
+            2.0 * (x * z - y * w),
+            2.0 * (y * z + x * w),
+            1.0 - 2.0 * (x * x + y * y),
+        ],
+    ];
+    crate::world::Rotation::from_matrix(m)
 }
 
 /// The engine yaw that faces along (dx, dz). Matches `rapier_rotation`'s
@@ -212,7 +249,7 @@ impl Physics {
             let scale = world.scales.get(id).copied().unwrap_or_default();
             let mesh = world.meshes.get(id).cloned().unwrap_or_default();
             let [hx, hy, hz] = half_extents(&mesh, scale, &world.mesh_meta);
-            let yaw = world.rotations.get(id).map(|r| r.yaw).unwrap_or(0.0);
+            let engine_rot = world.rotations.get(id).copied().unwrap_or_default();
 
             let builder = if is_controlled {
                 // Moved by `move_characters`, not by forces.
@@ -222,12 +259,18 @@ impl Physics {
             } else {
                 RigidBodyBuilder::dynamic()
             };
-            let body = builder
-                .translation(Vector::new(position.x, position.y, position.z))
-                .rotation(rapier_rotation(yaw).to_scaled_axis())
-                // Yaw-only, matching `world::Rotation`.
-                .enabled_rotations(false, true, false)
-                .build();
+            // A character stays upright: yaw only, and locked to the Y axis.
+            // Everything else uses its full orientation and, if dynamic, may
+            // tumble freely.
+            let body = if is_controlled {
+                builder
+                    .rotation(rapier_rotation(engine_rot.yaw).to_scaled_axis())
+                    .enabled_rotations(false, true, false)
+            } else {
+                builder.rotation(rapier_orientation(&engine_rot).to_scaled_axis())
+            }
+            .translation(Vector::new(position.x, position.y, position.z))
+            .build();
             let body_handle = self.rapier.bodies.insert(body);
             let collider = ColliderBuilder::cuboid(hx, hy, hz).build();
             let collider_handle = self.rapier.colliders.insert_with_parent(
@@ -379,25 +422,156 @@ impl Physics {
                     z: translation.z,
                 };
             }
-            // `body.rotation()` is a quaternion (rapier3d's public API has
-            // been glam-based since 0.32; see the module doc comment).
-            // Read yaw back directly from its components rather than
-            // through `Quat::to_euler`: that needs a `glam::EulerRot`
-            // value, and the `glam` this crate depends on directly turned
-            // out not to be the same version rapier vendors internally
-            // through `glamx`, two nominally-identical but distinct types
-            // the compiler correctly refused to mix. Field access has no
-            // such problem, and `enabled_rotations(false, true, false)`
-            // above guarantees this is always a pure Y-axis rotation, so
-            // (w, x, y, z) = (cos(yaw/2), 0, sin(yaw/2), 0) and
-            // yaw = 2 * atan2(y, w) recovers it exactly.
-            let rotation_quat = body.rotation();
-            // Negated back into the engine's clockwise convention; see
-            // `rapier_rotation`.
-            let yaw = -2.0 * rotation_quat.y.atan2(rotation_quat.w);
+            // A fixed body never moves, so its authored rotation is left
+            // exactly as it is rather than round-tripped through a
+            // quaternion (which would only add float noise).
+            if body.is_fixed() {
+                continue;
+            }
+            // `body.rotation()` is a quaternion; its components are read
+            // directly (no `Quat::to_euler`, whose `EulerRot` type doesn't
+            // unify with this crate's own `glam` version, see the module
+            // doc comment) and turned into engine angles by
+            // `engine_rotation`.
+            let q = body.rotation();
+            let new_rotation = engine_rotation(q.x, q.y, q.z, q.w);
             if let Some(rotation) = world.rotations.get_mut(id) {
-                rotation.yaw = yaw;
+                if body.is_kinematic() {
+                    // A character only ever turns around Y.
+                    rotation.yaw = new_rotation.yaw;
+                } else {
+                    *rotation = new_rotation;
+                }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::world::{Gravity, Rotation as EngineRotation, Static, Velocity};
+
+    fn quat_of(r: &Rotation) -> (f32, f32, f32, f32) {
+        (r.x, r.y, r.z, r.w)
+    }
+
+    #[test]
+    fn engine_and_rapier_orientations_round_trip() {
+        for yaw in [-2.5f32, -0.4, 0.0, 1.1, 3.0] {
+            for pitch in [-1.2f32, 0.0, 0.7] {
+                for roll in [-1.5f32, 0.0, 2.0] {
+                    let original = EngineRotation { yaw, pitch, roll };
+                    let (x, y, z, w) = quat_of(&rapier_orientation(&original));
+                    let back = engine_rotation(x, y, z, w);
+                    for v in [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]] {
+                        let a = original.apply(v);
+                        let b = back.apply(v);
+                        assert!(
+                            a.iter().zip(b.iter()).all(|(p, q)| (p - q).abs() < 1e-4),
+                            "{original:?} -> {back:?}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn yaw_only_matches_the_old_rapier_rotation() {
+        let (x, y, z, w) = quat_of(&rapier_orientation(&EngineRotation::from_yaw(0.8)));
+        let (ox, oy, oz, ow) = quat_of(&rapier_rotation(0.8));
+        for (a, b) in [(x, ox), (y, oy), (z, oz), (w, ow)] {
+            assert!((a - b).abs() < 1e-6);
+        }
+    }
+
+    #[test]
+    fn a_tilted_static_body_keeps_its_authored_rotation() {
+        let mut world = World::new();
+        let ramp = world.spawn(
+            Position {
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+            },
+            Velocity {
+                dx: 0.0,
+                dy: 0.0,
+                dz: 0.0,
+            },
+        );
+        world.statics.insert(ramp, Static);
+        world.rigid_bodies.insert(ramp, crate::world::RigidBody);
+        let tilt = EngineRotation {
+            yaw: 0.4,
+            pitch: 0.3,
+            roll: -0.2,
+        };
+        world.rotations.insert(ramp, tilt);
+        let mut physics = Physics::new(GRAVITY_Y);
+        for _ in 0..5 {
+            physics.step(&mut world, 1.0 / 30.0);
+        }
+        assert_eq!(*world.rotations.get(ramp).unwrap(), tilt);
+    }
+
+    #[test]
+    fn a_box_dropped_on_a_tilted_ramp_slides_instead_of_resting_flat() {
+        let mut world = World::new();
+        let ramp = world.spawn(
+            Position {
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+            },
+            Velocity {
+                dx: 0.0,
+                dy: 0.0,
+                dz: 0.0,
+            },
+        );
+        world.statics.insert(ramp, Static);
+        world.rigid_bodies.insert(ramp, crate::world::RigidBody);
+        // A wide flat slab tipped 30 degrees about the forward axis.
+        world.scales.insert(
+            ramp,
+            crate::world::Scale {
+                x: 10.0,
+                y: 0.5,
+                z: 10.0,
+            },
+        );
+        world.rotations.insert(
+            ramp,
+            EngineRotation {
+                yaw: 0.0,
+                pitch: 0.0,
+                roll: 0.5,
+            },
+        );
+        let ball = world.spawn(
+            Position {
+                x: 0.0,
+                y: 12.0,
+                z: 0.0,
+            },
+            Velocity {
+                dx: 0.0,
+                dy: 0.0,
+                dz: 0.0,
+            },
+        );
+        world.gravities.insert(ball, Gravity);
+        world.rigid_bodies.insert(ball, crate::world::RigidBody);
+        let mut physics = Physics::new(GRAVITY_Y);
+        for _ in 0..90 {
+            physics.step(&mut world, 1.0 / 30.0);
+        }
+        let p = world.positions.get(ball).unwrap();
+        // It fell onto the slab and was carried sideways by the slope
+        // (positive roll leans the right side down, so it slides to +X).
+        assert!(p.y < 12.0, "it fell: {} {} {}", p.x, p.y, p.z);
+        assert!(p.x.abs() > 1.0, "it slid sideways: {} {} {}", p.x, p.y, p.z);
     }
 }

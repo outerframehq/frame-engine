@@ -21,18 +21,26 @@ struct VertexInput {
 struct InstanceInput {
     @location(3) position: vec3<f32>,
     @location(6) scale: vec3<f32>,
-    @location(8) yaw: f32,
+    @location(8) rotation: vec3<f32>,
 };
+
+// Same rotation as `rotate_by` in shader.wgsl (yaw, pitch, roll); keep them in
+// step, or shadows would drift away from their casters.
+fn rotate_by(v: vec3<f32>, angles: vec3<f32>) -> vec3<f32> {
+    let cr = cos(angles.z);
+    let sr = sin(angles.z);
+    let rolled = vec3<f32>(v.x * cr + v.y * sr, -v.x * sr + v.y * cr, v.z);
+    let cp = cos(angles.y);
+    let sp = sin(angles.y);
+    let pitched = vec3<f32>(rolled.x, rolled.y * cp - rolled.z * sp, rolled.y * sp + rolled.z * cp);
+    let cy = cos(angles.x);
+    let sy = sin(angles.x);
+    return vec3<f32>(pitched.x * cy - pitched.z * sy, pitched.y, pitched.x * sy + pitched.z * cy);
+}
 
 @vertex
 fn vs_main(vertex: VertexInput, instance: InstanceInput) -> @builtin(position) vec4<f32> {
     let scaled = vertex.position * MESH_SIZE * instance.scale;
-    let cos_y = cos(instance.yaw);
-    let sin_y = sin(instance.yaw);
-    let rotated = vec3<f32>(
-        scaled.x * cos_y - scaled.z * sin_y,
-        scaled.y,
-        scaled.x * sin_y + scaled.z * cos_y,
-    );
+    let rotated = rotate_by(scaled, instance.rotation);
     return shadow_cam.light_view_proj * vec4<f32>(instance.position + rotated, 1.0);
 }
