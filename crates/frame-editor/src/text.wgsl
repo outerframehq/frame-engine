@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 // Screen-space overlay shader for debug text. Each instance is a small white
 // rectangle already positioned in clip space (NDC) — so there is NO camera
 // here; the overlay stays anchored to the screen regardless of pan/zoom.

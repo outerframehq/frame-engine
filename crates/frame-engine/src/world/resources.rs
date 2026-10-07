@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! Named, typed, per-world resources: big or fast-changing data that belongs
 //! to a whole world rather than to one entity (a terrain's edits, a water
 //! grid). They live in the `World`, so everything that copies the world

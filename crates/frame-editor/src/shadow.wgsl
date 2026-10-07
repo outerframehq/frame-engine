@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 // Depth-only pass that draws every entity from the shadow-casting light's
 // point of view into the shadow map. The main shader (shader.wgsl) samples
 // the result to decide which fragments are in shadow.

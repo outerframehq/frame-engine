@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! rapier3d integration: the engine's physics-simulated entities.
 //!
 //! First real slice of the physics foundation named on the roadmap (see

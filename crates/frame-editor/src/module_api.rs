@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! How a crate outside the editor adds a feature to it.
 //!
 //! The editor knows nothing about any particular feature. A crate that wants

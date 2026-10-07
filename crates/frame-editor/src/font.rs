@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 // A tiny hand-rolled bitmap font for the editor's text overlays.
 //
 // Each glyph is 5 wide x 7 tall, stored as 7 bytes (one byte per row). In each
