@@ -1448,8 +1448,15 @@ impl GpuState {
             multiview_mask: None,
             cache: None,
         });
-        let module_gpu: Vec<Box<dyn ModuleGpu>> =
-            modules.iter().map(|m| m.new_gpu(&device)).collect();
+        let module_gpu: Vec<Box<dyn ModuleGpu>> = {
+            let context = module_api::GpuContext {
+                device: &device,
+                queue: &queue,
+                material_layout: &material_bind_group_layout,
+                material_sampler: &material_sampler,
+            };
+            modules.iter().map(|m| m.new_gpu(&context)).collect()
+        };
         (
             GpuState {
                 surface,
@@ -1785,6 +1792,9 @@ impl GpuState {
             if self.module_gpu.iter().any(|m| m.has_geometry()) {
                 render_pass.set_bind_group(1, &self.material_bind_groups[0], &[]);
                 for module in &self.module_gpu {
+                    // Every module starts from the default material, whatever
+                    // the one before it bound.
+                    render_pass.set_bind_group(1, &self.material_bind_groups[0], &[]);
                     module.draw(&mut render_pass);
                 }
             }
@@ -1792,6 +1802,7 @@ impl GpuState {
                 render_pass.set_pipeline(&self.transparent_pipeline);
                 render_pass.set_bind_group(1, &self.material_bind_groups[0], &[]);
                 for module in &self.module_gpu {
+                    render_pass.set_bind_group(1, &self.material_bind_groups[0], &[]);
                     module.draw_transparent(&mut render_pass);
                 }
             }
@@ -1944,6 +1955,9 @@ impl GpuState {
             if self.module_gpu.iter().any(|m| m.has_geometry()) {
                 render_pass.set_bind_group(1, &self.material_bind_groups[0], &[]);
                 for module in &self.module_gpu {
+                    // Every module starts from the default material, whatever
+                    // the one before it bound.
+                    render_pass.set_bind_group(1, &self.material_bind_groups[0], &[]);
                     module.draw(&mut render_pass);
                 }
             }
@@ -1951,6 +1965,7 @@ impl GpuState {
                 render_pass.set_pipeline(&self.transparent_pipeline);
                 render_pass.set_bind_group(1, &self.material_bind_groups[0], &[]);
                 for module in &self.module_gpu {
+                    render_pass.set_bind_group(1, &self.material_bind_groups[0], &[]);
                     module.draw_transparent(&mut render_pass);
                 }
             }

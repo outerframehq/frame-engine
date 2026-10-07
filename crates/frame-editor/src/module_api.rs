@@ -8,6 +8,7 @@
 //! - show an Inspector section for the selected entity ([`EditorModule::inspect`]),
 //! - build whatever it will draw from the world ([`EditorModule::build_scene`]),
 //! - make a per-window GPU copy of it ([`EditorModule::new_gpu`], [`ModuleGpu`]),
+//!   which can bring its own textures ([`GpuContext`], [`WorldMaterial`]),
 //! - and leave anchor entities out of the ordinary shape pass
 //!   ([`EditorModule::anchor_components`]).
 //!
@@ -64,7 +65,85 @@ pub trait EditorModule {
     fn tick(&mut self, _world: &mut World, _dt: f32) {}
 
     /// Make this module's GPU state for one window.
-    fn new_gpu(&self, device: &wgpu::Device) -> Box<dyn ModuleGpu>;
+    fn new_gpu(&self, gpu: &GpuContext) -> Box<dyn ModuleGpu>;
+}
+
+/// What a module gets when it makes its per-window GPU state.
+pub struct GpuContext<'a> {
+    pub device: &'a wgpu::Device,
+    pub queue: &'a wgpu::Queue,
+    pub(crate) material_layout: &'a wgpu::BindGroupLayout,
+    pub(crate) material_sampler: &'a wgpu::Sampler,
+}
+
+impl GpuContext<'_> {
+    /// A maker of [`WorldMaterial`]s that the module can keep, to build or
+    /// rebuild its textures whenever it syncs.
+    pub fn material_factory(&self) -> MaterialFactory {
+        MaterialFactory {
+            layout: self.material_layout.clone(),
+            sampler: self.material_sampler.clone(),
+        }
+    }
+}
+
+/// Makes [`WorldMaterial`]s for one window.
+#[derive(Clone)]
+pub struct MaterialFactory {
+    layout: wgpu::BindGroupLayout,
+    sampler: wgpu::Sampler,
+}
+
+/// Whether `len` bytes are exactly a `width` by `height` RGBA image.
+fn pixels_fit(width: u32, height: u32, len: usize) -> bool {
+    width > 0 && height > 0 && len == width as usize * height as usize * 4
+}
+
+impl MaterialFactory {
+    /// A material from an RGBA8 image (`width * height * 4` bytes, colours
+    /// in sRGB). The sampler filters linearly and repeats, so keep texture
+    /// coordinates a half texel inside the edges if blending across them
+    /// would be wrong. `roughness` and `metalness` are 0 to 1, as for a
+    /// mesh. Returns None if the pixel data is the wrong size.
+    pub fn create(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        width: u32,
+        height: u32,
+        rgba: &[u8],
+        roughness: f32,
+        metalness: f32,
+    ) -> Option<WorldMaterial> {
+        if !pixels_fit(width, height, rgba.len()) {
+            return None;
+        }
+        let view = create_material_texture(device, queue, width, height, rgba);
+        let bind_group = create_material_bind_group(
+            device,
+            &self.layout,
+            &self.sampler,
+            &view,
+            roughness.clamp(0.0, 1.0),
+            metalness.clamp(0.0, 1.0),
+            true,
+        );
+        Some(WorldMaterial { bind_group })
+    }
+}
+
+/// A texture and surface look a module's meshes can be drawn with. The
+/// mesh's `uv` picks the pixel, and the result multiplies the instance
+/// colour. The editor puts the default material back before every module's
+/// draw, so bind this at the start of your own.
+pub struct WorldMaterial {
+    bind_group: wgpu::BindGroup,
+}
+
+impl WorldMaterial {
+    pub fn bind(&self, pass: &mut wgpu::RenderPass<'_>) {
+        pass.set_bind_group(1, &self.bind_group, &[]);
+    }
 }
 
 /// One window's GPU side of a module.
@@ -391,7 +470,7 @@ mod tests {
                 },
             )]
         }
-        fn new_gpu(&self, _device: &wgpu::Device) -> Box<dyn ModuleGpu> {
+        fn new_gpu(&self, _gpu: &GpuContext) -> Box<dyn ModuleGpu> {
             unreachable!("no GPU in tests")
         }
     }
@@ -423,6 +502,15 @@ mod tests {
     }
 
     #[test]
+    fn a_material_needs_pixel_data_of_the_right_size() {
+        // `create` runs this check before any GPU call.
+        assert!(!pixels_fit(0, 4, 0));
+        assert!(!pixels_fit(4, 0, 0));
+        assert!(!pixels_fit(2, 2, 15));
+        assert!(pixels_fit(2, 2, 16));
+    }
+
+    #[test]
     fn modules_are_ticked_with_write_access_to_the_world() {
         struct Counter;
         impl EditorModule for Counter {
@@ -433,7 +521,7 @@ mod tests {
                 let n = world.resources.get::<f32>("t").copied().unwrap_or(0.0);
                 world.resources.insert("t", n + dt);
             }
-            fn new_gpu(&self, _device: &wgpu::Device) -> Box<dyn ModuleGpu> {
+            fn new_gpu(&self, _gpu: &GpuContext) -> Box<dyn ModuleGpu> {
                 unreachable!()
             }
         }
@@ -452,7 +540,7 @@ mod tests {
         fn anchor_components(&self) -> &'static [&'static str] {
             &["anchor_thing"]
         }
-        fn new_gpu(&self, _device: &wgpu::Device) -> Box<dyn ModuleGpu> {
+        fn new_gpu(&self, _gpu: &GpuContext) -> Box<dyn ModuleGpu> {
             unreachable!("no GPU in tests")
         }
     }
