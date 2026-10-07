@@ -898,6 +898,9 @@ struct GpuState {
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
     render_pipeline: wgpu::RenderPipeline,
+    /// The same shader with alpha blending and no depth writes, for
+    /// transparent module geometry drawn after everything opaque.
+    transparent_pipeline: wgpu::RenderPipeline,
     text_pipeline: wgpu::RenderPipeline,
     // One vertex buffer holding every primitive's geometry back to back, plus
     // each primitive's vertex range within it, ordered Cube, Sphere, Plane
@@ -1311,6 +1314,40 @@ impl GpuState {
             multiview_mask: None,
             cache: None,
         });
+        // Transparent module geometry: same layout and vertex shader, but the
+        // fragment alpha blends over what is already drawn, and it tests depth
+        // without writing it so it never hides anything behind it.
+        let transparent_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("transparent pipeline"),
+            layout: Some(&entity_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &entity_shader,
+                entry_point: Some("vs_main"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                buffers: &[MeshVertex::layout(), InstanceRaw::layout()],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &entity_shader,
+                entry_point: Some("fs_transparent"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: config.format,
+                    blend: Some(wgpu::BlendState::ALPHA_BLENDING),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::Less),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
         // --- Shadow pipeline (depth only, from the light's point of view) ---
         let shadow_pass_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -1420,6 +1457,7 @@ impl GpuState {
                 queue,
                 config,
                 render_pipeline,
+                transparent_pipeline,
                 text_pipeline,
                 mesh_vertex_buffer,
                 mesh_ranges,
@@ -1750,6 +1788,13 @@ impl GpuState {
                     module.draw(&mut render_pass);
                 }
             }
+            if self.module_gpu.iter().any(|m| m.has_transparent()) {
+                render_pass.set_pipeline(&self.transparent_pipeline);
+                render_pass.set_bind_group(1, &self.material_bind_groups[0], &[]);
+                for module in &self.module_gpu {
+                    module.draw_transparent(&mut render_pass);
+                }
+            }
             // text overlay (screen-space, drawn on top, no camera)
             render_pass.set_pipeline(&self.text_pipeline);
             if let Some(buffer) = &text_buffer {
@@ -1900,6 +1945,13 @@ impl GpuState {
                 render_pass.set_bind_group(1, &self.material_bind_groups[0], &[]);
                 for module in &self.module_gpu {
                     module.draw(&mut render_pass);
+                }
+            }
+            if self.module_gpu.iter().any(|m| m.has_transparent()) {
+                render_pass.set_pipeline(&self.transparent_pipeline);
+                render_pass.set_bind_group(1, &self.material_bind_groups[0], &[]);
+                for module in &self.module_gpu {
+                    module.draw_transparent(&mut render_pass);
                 }
             }
         }
@@ -9103,6 +9155,17 @@ mod shader_tests {
     #[test]
     fn entity_shader_is_valid() {
         validate(include_str!("shader.wgsl"));
+    }
+
+    #[test]
+    fn entity_shader_has_the_entry_points_the_pipelines_name() {
+        let module = naga::front::wgsl::parse_str(include_str!("shader.wgsl")).unwrap();
+        for name in ["vs_main", "fs_main", "fs_transparent"] {
+            assert!(
+                module.entry_points.iter().any(|e| e.name == name),
+                "missing entry point {name}"
+            );
+        }
     }
 
     #[test]

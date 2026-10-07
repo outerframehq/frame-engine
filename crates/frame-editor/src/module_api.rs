@@ -84,6 +84,18 @@ pub trait ModuleGpu {
     /// Draw it. The editor has already set the pipeline and bind groups, for
     /// both the shadow pass and the colour pass.
     fn draw(&self, pass: &mut wgpu::RenderPass<'_>);
+
+    /// Whether there is anything to draw with `draw_transparent`.
+    fn has_transparent(&self) -> bool {
+        false
+    }
+
+    /// Draw see-through geometry. Called after everything opaque (the
+    /// scene's entities and every module's `draw`) has been drawn, in the
+    /// colour pass only, so it casts no shadow. The pipeline blends by the
+    /// vertex's `uv.x` (0 clear, 1 solid), tests depth and does not write it.
+    /// Meshes are not sorted: draw the farthest first if several overlap.
+    fn draw_transparent(&self, _pass: &mut wgpu::RenderPass<'_>) {}
 }
 
 /// An editable copy of one entity's extension components, handed to

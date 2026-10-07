@@ -45,6 +45,7 @@ Engine:
 Editor (frame-editor):
 
 - `frame-editor` is now a library as well as a binary, with a module interface (`module_api`). A crate can add an Inspector section, build and draw its own geometry (shadows included) and hide anchor entities from the ordinary shape pass, without editing the editor. `frame_editor::run` takes the modules to load; the public editor passes none.
+- Editor modules can draw see-through geometry. `ModuleGpu::has_transparent` and `draw_transparent` run after everything opaque, in the colour pass only (so nothing casts a shadow), through a second pipeline that alpha blends by each vertex's `uv.x`, tests depth and does not write it. The entity shader's lighting moved into one function shared by the opaque and transparent entry points. Meshes are not sorted.
 - Editor modules get a per-tick hook (`EditorModule::tick`, with write access to the world) called once per simulation tick before collision is synced, in the editor's simulation, step-once and Play.
 - `Physics::sync_static_meshes` checks which sets are still wanted with a hash set instead of a scan, so it stays cheap with hundreds of sets.
 - Editor modules can supply collision geometry (`EditorModule::collision_meshes`). The editor hands it to physics before every physics step in the editor's own simulation, step-once and Play.

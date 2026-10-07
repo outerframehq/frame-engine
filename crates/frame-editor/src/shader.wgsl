@@ -174,8 +174,9 @@ fn vs_main(vertex: VertexInput, instance: InstanceInput) -> VertexOutput {
     return out;
 }
 
-@fragment
-fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+// The lit colour of one fragment, shared by the opaque and transparent entry
+// points below.
+fn shade_fragment(in: VertexOutput) -> vec3<f32> {
     // Base color: the entity's own vertex color, tinted by this mesh's
     // texture when it has one (textureSample reads (1,1,1,1) from the
     // shared default texture, a harmless no-op, when it doesn't).
@@ -248,5 +249,17 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 
     let lit = mix(shaded, base_color, in.emissive);
     let highlighted = mix(lit, vec3<f32>(1.0, 1.0, 1.0), 0.3 * in.selected);
-    return vec4<f32>(highlighted, 1.0);
+    return highlighted;
+}
+
+@fragment
+fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
+    return vec4<f32>(shade_fragment(in), 1.0);
+}
+
+// Transparent module geometry (see ModuleGpu::draw_transparent). Lit like
+// everything else; the vertex's uv.x is its opacity, 0 clear to 1 solid.
+@fragment
+fn fs_transparent(in: VertexOutput) -> @location(0) vec4<f32> {
+    return vec4<f32>(shade_fragment(in), clamp(in.uv.x, 0.0, 1.0));
 }
