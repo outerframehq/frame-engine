@@ -6,7 +6,7 @@ Frame Engine advances a world state forward in fixed, deterministic time steps. 
 
 ## Forking and contributing
 
-Frame Engine is built in the open and meant to be learned from. If it looks useful, fork it, clone it, and bend it to whatever you are making. The MIT licence means you can do that freely, for any purpose, with no permission asked.
+Frame Engine is built in the open and meant to be learned from. If it looks useful, fork it, clone it, and bend it to whatever you are making. The Mozilla Public License 2.0 means you can use it freely, for any purpose, including in closed commercial games, with no permission asked. The one thing it asks is that if you change the engine's own files and share the result, you share those changes under the same licence.
 
 A few things worth knowing before you dig in:
 
@@ -166,11 +166,18 @@ Editor controls:
 
 ## License
 
-MIT. See [LICENSE](LICENSE). The embedded fonts below are the exception, each under its own licence.
+Frame Engine is licensed under the [Mozilla Public License 2.0](LICENSE) (MPL-2.0). In plain terms:
+
+- You can use it, modify it and ship games or tools built on it, including closed-source and commercial ones.
+- Your own game code, scripts, assets and separate crates stay yours, under whatever licence you choose.
+- If you modify files that are part of Frame Engine and distribute the result, those modified files must be shared under the MPL-2.0 too.
+- The names "Frame Engine" and "Outer Frame Interactive" are not covered by the licence. See [TRADEMARKS.md](TRADEMARKS.md).
+
+Versions published before the licence changed to MPL-2.0 remain available under the MIT licence they were released with. The embedded fonts below are the exception to all of this, each under its own licence.
 
 ## Fonts
 
-The editor embeds three fonts from `crates/frame-editor/assets/fonts/`: [Manrope](https://fonts.google.com/specimen/Manrope), [Fraunces](https://fonts.google.com/specimen/Fraunces), and [JetBrains Mono](https://www.jetbrains.com/lp/mono/). All three are released under the SIL Open Font License 1.1, which allows use, modification, and redistribution, including inside software, as long as the licence travels with the fonts. They are not covered by this repository's MIT licence.
+The editor embeds three fonts from `crates/frame-editor/assets/fonts/`: [Manrope](https://fonts.google.com/specimen/Manrope), [Fraunces](https://fonts.google.com/specimen/Fraunces), and [JetBrains Mono](https://www.jetbrains.com/lp/mono/). All three are released under the SIL Open Font License 1.1, which allows use, modification, and redistribution, including inside software, as long as the licence travels with the fonts. They are not covered by this repository's MPL-2.0 licence.
 
 `Manrope-Regular.ttf` is the regular weight cut from the Manrope variable font. egui reads a variable font at its lightest weight, which looked far too thin, so a fixed weight is used instead.
 

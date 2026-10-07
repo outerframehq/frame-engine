@@ -9,6 +9,9 @@ lands and the patch version bumps for fixes and small additions.
 
 ## [Unreleased]
 
+### Changed
+- Licence changed from MIT to the Mozilla Public License 2.0. Games and tools built on the engine can stay closed and commercial; modified engine files that are distributed must be shared under the MPL-2.0. Earlier versions stay available under MIT. Added `TRADEMARKS.md` covering the project names.
+
 ### Added
 
 Engine:
