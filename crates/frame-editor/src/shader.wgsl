@@ -45,6 +45,40 @@ struct Shadow {
 @group(0) @binding(3) var shadow_map: texture_depth_2d;
 @group(0) @binding(4) var shadow_sampler: sampler_comparison;
 
+// The sky and the fog (see sky.rs, where every colour is decided). MUST match
+// SkyUniform in sky.rs field-for-field.
+struct Sky {
+    // Clip space back to world space, to find the direction a pixel looks in.
+    inv_view_proj: mat4x4<f32>,
+    // xyz: the camera's world position.
+    eye: vec4<f32>,
+    // xyz: unit direction toward the sun. w: how strongly to draw the disc.
+    sun_direction: vec4<f32>,
+    // rgb: the colour overhead. w: 1.0 if the sky is drawn.
+    zenith: vec4<f32>,
+    // rgb: the colour at the horizon, also the fog colour. w: fog density
+    // per world unit (0 means no fog).
+    horizon: vec4<f32>,
+    // rgb: the sun's colour.
+    sun_colour: vec4<f32>,
+    // rgb: the colour looking straight down.
+    ground: vec4<f32>,
+};
+@group(0) @binding(5) var<uniform> sky: Sky;
+
+// Blend a lit colour toward the horizon colour with distance from the camera,
+// so far-off ground dissolves into the sky. Exponential squared: clear up
+// close, thickening quickly. Mirrors fog_factor in sky.rs.
+fn apply_fog(colour: vec3<f32>, world_position: vec3<f32>) -> vec3<f32> {
+    let density = sky.horizon.w;
+    if (density <= 0.0) {
+        return colour;
+    }
+    let x = length(world_position - sky.eye.xyz) * density;
+    let amount = 1.0 - exp(-(x * x));
+    return mix(colour, sky.horizon.rgb, amount);
+}
+
 // 1.0 = fully lit, 0.0 = fully in shadow. Anything outside the shadow map's
 // area counts as lit. A 3x3 grid of comparison samples (each of which is
 // itself bilinear-filtered by the sampler) softens the edge. Uses the
@@ -258,7 +292,7 @@ fn shade_fragment(in: VertexOutput) -> vec3<f32> {
 
 @fragment
 fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
-    return vec4<f32>(shade_fragment(in), 1.0);
+    return vec4<f32>(apply_fog(shade_fragment(in), in.world_position), 1.0);
 }
 
 // Transparent module geometry (see ModuleGpu::draw_transparent), lit like
@@ -269,9 +303,52 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 // A mesh that doesn't want this sets uv.y to 1.
 @fragment
 fn fs_transparent(in: VertexOutput) -> @location(0) vec4<f32> {
-    let lit = shade_fragment(in);
+    let lit = apply_fog(shade_fragment(in), in.world_position);
     let thin = 1.0 - clamp(in.uv.y, 0.0, 1.0);
     let colour = min(lit + vec3<f32>(0.22, 0.38, 0.34) * thin, vec3<f32>(1.0, 1.0, 1.0));
     let alpha = clamp(in.uv.x, 0.0, 1.0) * (1.0 - 0.85 * thin);
     return vec4<f32>(colour, alpha);
+}
+
+// The sky: one triangle that covers the whole screen, drawn first with no
+// depth, so everything else draws over it.
+struct SkyVarying {
+    @builtin(position) position: vec4<f32>,
+    @location(0) ndc: vec2<f32>,
+};
+
+@vertex
+fn vs_sky(@builtin(vertex_index) index: u32) -> SkyVarying {
+    // Vertices (-1,-1), (1,-1) and (-1,3): a triangle larger than the screen.
+    let x = f32((index << 1u) & 2u);
+    let y = f32(index & 2u);
+    let ndc = vec2<f32>(x * 2.0 - 1.0, y * 2.0 - 1.0);
+    var out: SkyVarying;
+    out.position = vec4<f32>(ndc, 1.0, 1.0);
+    out.ndc = ndc;
+    return out;
+}
+
+@fragment
+fn fs_sky(in: SkyVarying) -> @location(0) vec4<f32> {
+    // The direction this pixel looks in: from the eye to its far-plane point.
+    let far = sky.inv_view_proj * vec4<f32>(in.ndc, 1.0, 1.0);
+    let direction = normalize(far.xyz / far.w - sky.eye.xyz);
+    let up = direction.y;
+
+    // Horizon to zenith, quick at first so the colour climbs off the horizon,
+    // then below the horizon down to the darker ground haze.
+    let above = pow(clamp(up, 0.0, 1.0), 0.45);
+    var colour = mix(sky.horizon.rgb, sky.zenith.rgb, above);
+    colour = mix(colour, sky.ground.rgb, smoothstep(0.0, 0.25, -up));
+
+    // The sun: a soft-edged disc with a glow around it. The disc is about
+    // two degrees across, bigger than the real one on purpose.
+    let cos_angle = dot(direction, sky.sun_direction.xyz);
+    let strength = sky.sun_direction.w;
+    let disc = smoothstep(0.9993, 0.9998, cos_angle) * strength;
+    let toward = max(cos_angle, 0.0);
+    let glow = (pow(toward, 48.0) * 0.45 + pow(toward, 6.0) * 0.12) * strength;
+    colour = mix(colour, sky.sun_colour.rgb * 1.4, disc) + sky.sun_colour.rgb * glow;
+    return vec4<f32>(min(colour, vec3<f32>(1.0, 1.0, 1.0)), 1.0);
 }

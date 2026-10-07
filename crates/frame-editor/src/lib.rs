@@ -24,6 +24,7 @@ use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Icon, Window, WindowId};
 mod font;
 mod script;
+mod sky;
 const TICK_RATE: u32 = 30;
 const MAX_CATCHUP_TICKS: u32 = 5;
 // Vertical field of view, shared by the projection and the pan maths.
@@ -127,6 +128,42 @@ fn shadows_enabled() -> bool {
 }
 fn set_shadows_enabled(on: bool) {
     SHADOWS_ENABLED.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+/// Process-wide switch for the sky and fog, and how thick the fog is, as f32
+/// bits. Editor preferences, kept as statics for the same reason as the
+/// shadow ones: the Play window has its own GpuState and both read them.
+static SKY_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+static FOG_AMOUNT_BITS: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(sky::FOG_AMOUNT_DEFAULT.to_bits());
+fn sky_enabled() -> bool {
+    SKY_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
+}
+fn set_sky_enabled(on: bool) {
+    SKY_ENABLED.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+fn fog_amount() -> f32 {
+    f32::from_bits(FOG_AMOUNT_BITS.load(std::sync::atomic::Ordering::Relaxed))
+}
+fn set_fog_amount(amount: f32) {
+    FOG_AMOUNT_BITS.store(amount.to_bits(), std::sync::atomic::Ordering::Relaxed);
+}
+/// The direction toward the sun for this frame's lights: the shadow-casting
+/// directional light if there is one, otherwise the first directional light.
+/// None when the scene has no directional light.
+fn sun_direction(lights: &[LightRaw; MAX_LIGHTS]) -> Option<[f32; 3]> {
+    let directional = |l: &&LightRaw| l.params[0] < 0.5 && l.params[2] > 0.0;
+    lights
+        .iter()
+        .filter(directional)
+        .find(|l| l.params[3] > 0.5)
+        .or_else(|| lights.iter().find(directional))
+        .map(|l| {
+            [
+                l.position_or_direction[0],
+                l.position_or_direction[1],
+                l.position_or_direction[2],
+            ]
+        })
 }
 /// Work out the shadow map's view for this frame: an orthographic box,
 /// looking along the first shadow-casting directional light, sized to just
@@ -913,6 +950,12 @@ struct GpuState {
     mesh_ranges: Vec<std::ops::Range<u32>>,
     camera_buffer: wgpu::Buffer,
     lights_buffer: wgpu::Buffer,
+    /// The sky and fog data for the main viewport's camera (scene bind group
+    /// binding 5), and the preview camera's own copy.
+    sky_buffer: wgpu::Buffer,
+    preview_sky_buffer: wgpu::Buffer,
+    /// Draws the sky as one screen-covering triangle before everything else.
+    sky_pipeline: wgpu::RenderPipeline,
     scene_bind_group: wgpu::BindGroup,
     depth_view: wgpu::TextureView,
     egui_renderer: egui_wgpu::Renderer,
@@ -1032,6 +1075,18 @@ impl GpuState {
             }]),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
+        // The sky and fog data. Zeroed until the first frame fills it in, which
+        // means no sky and no fog.
+        let sky_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("sky buffer"),
+            contents: bytemuck::cast_slice(&[sky::SkyUniform::zeroed()]),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        let preview_sky_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("preview sky buffer"),
+            contents: bytemuck::cast_slice(&[sky::SkyUniform::zeroed()]),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
         let scene_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 label: Some("scene bind group layout"),
@@ -1082,6 +1137,17 @@ impl GpuState {
                         binding: 4,
                         visibility: wgpu::ShaderStages::FRAGMENT,
                         ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Comparison),
+                        count: None,
+                    },
+                    wgpu::BindGroupLayoutEntry {
+                        binding: 5,
+                        // The sky and fog, read per fragment.
+                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        ty: wgpu::BindingType::Buffer {
+                            ty: wgpu::BufferBindingType::Uniform,
+                            has_dynamic_offset: false,
+                            min_binding_size: None,
+                        },
                         count: None,
                     },
                 ],
@@ -1141,6 +1207,10 @@ impl GpuState {
                 wgpu::BindGroupEntry {
                     binding: 4,
                     resource: wgpu::BindingResource::Sampler(&shadow_sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: sky_buffer.as_entire_binding(),
                 },
             ],
         });
@@ -1260,6 +1330,10 @@ impl GpuState {
                 wgpu::BindGroupEntry {
                     binding: 4,
                     resource: wgpu::BindingResource::Sampler(&shadow_sampler),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: preview_sky_buffer.as_entire_binding(),
                 },
             ],
         });
@@ -1412,6 +1486,45 @@ impl GpuState {
             multiview_mask: None,
             cache: None,
         });
+        // The sky: one triangle covering the screen, drawn first. It reads only
+        // the scene bind group, so its layout has no material group. No depth
+        // test and no depth write: everything else simply draws over it.
+        let sky_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("sky pipeline layout"),
+            bind_group_layouts: &[Some(&scene_bind_group_layout)],
+            immediate_size: 0,
+        });
+        let sky_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("sky pipeline"),
+            layout: Some(&sky_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &entity_shader,
+                entry_point: Some("vs_sky"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                buffers: &[],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &entity_shader,
+                entry_point: Some("fs_sky"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: config.format,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState::default(),
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: Some(false),
+                depth_compare: Some(wgpu::CompareFunction::Always),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
         // --- Text/overlay pipeline (screen-space, no camera) ---
         let text_shader = device.create_shader_module(wgpu::include_wgsl!("text.wgsl"));
         let text_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -1474,6 +1587,9 @@ impl GpuState {
                 mesh_ranges,
                 camera_buffer,
                 lights_buffer,
+                sky_buffer,
+                preview_sky_buffer,
+                sky_pipeline,
                 scene_bind_group,
                 depth_view,
                 egui_renderer,
@@ -1654,6 +1770,17 @@ impl GpuState {
             0,
             bytemuck::cast_slice(&[camera_uniform]),
         );
+        let sky_on = sky_enabled();
+        self.queue.write_buffer(
+            &self.sky_buffer,
+            0,
+            bytemuck::cast_slice(&[sky::sky_uniform(
+                view_proj,
+                sun_direction(lights),
+                sky_on,
+                fog_amount(),
+            )]),
+        );
         self.queue.write_buffer(
             &self.lights_buffer,
             0,
@@ -1755,6 +1882,12 @@ impl GpuState {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
+            // The sky first, behind everything (when it is switched on).
+            if sky_on {
+                render_pass.set_pipeline(&self.sky_pipeline);
+                render_pass.set_bind_group(0, &self.scene_bind_group, &[]);
+                render_pass.draw(0..3, 0..1);
+            }
             // entities — draw each primitive's instances against its own
             // geometry. The shared mesh buffer sits at slot 0; the per-entity
             // instance buffer (grouped by primitive) at slot 1. For each
@@ -1875,6 +2008,17 @@ impl GpuState {
             0,
             bytemuck::cast_slice(&[CameraUniform { view_proj }]),
         );
+        let sky_on = sky_enabled();
+        self.queue.write_buffer(
+            &self.preview_sky_buffer,
+            0,
+            bytemuck::cast_slice(&[sky::sky_uniform(
+                view_proj,
+                sun_direction(lights),
+                sky_on,
+                fog_amount(),
+            )]),
+        );
         self.queue.write_buffer(
             &self.lights_buffer,
             0,
@@ -1934,6 +2078,11 @@ impl GpuState {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
+            if sky_on {
+                render_pass.set_pipeline(&self.sky_pipeline);
+                render_pass.set_bind_group(0, &self.preview_bind_group, &[]);
+                render_pass.draw(0..3, 0..1);
+            }
             render_pass.set_pipeline(&self.render_pipeline);
             render_pass.set_bind_group(0, &self.preview_bind_group, &[]);
             if let Some(buffer) = &instance_buffer {
@@ -4435,6 +4584,8 @@ impl App {
             drag_hold_seconds: self.drag_hold_seconds,
             shadows: shadows_enabled(),
             shadow_distance: shadow_distance(),
+            sky: sky_enabled(),
+            fog_amount: fog_amount(),
         }
     }
     /// Write editor.ron, but only if something actually changed since the last
@@ -4459,6 +4610,8 @@ impl App {
         set_scene_tree_drag_hold_seconds(self.drag_hold_seconds);
         set_shadows_enabled(prefs.shadows);
         set_shadow_distance(prefs.shadow_distance);
+        set_sky_enabled(prefs.sky);
+        set_fog_amount(prefs.fog_amount);
         self.persist_prefs_if_changed();
     }
     /// True if the open scene has changes that haven't been saved.
@@ -7548,6 +7701,14 @@ impl ApplicationHandler for App {
                                                 .text("Shadow distance"),
                                         );
                                         ui.weak("The first directional Light casts shadows. A shorter distance gives sharper shadows near the camera; a longer one reaches further. Turn shadows off if the viewport feels slow.");
+                                        ui.add_space(4.0);
+                                        outerface_checkbox(ui, &mut prefs_edit.sky, "Sky and fog");
+                                        ui.add_enabled(
+                                            prefs_edit.sky,
+                                            egui::Slider::new(&mut prefs_edit.fog_amount, 0.0..=sky::FOG_AMOUNT_MAX)
+                                                .text("Fog"),
+                                        );
+                                        ui.weak("A sky behind the scene, lit by the first directional Light: lower the light toward the horizon for a sunset, below it for night. Distant ground fades into the horizon colour; 0 turns the fog off. With the sky off the viewport goes back to a plain background.");
                                         ui.add_space(6.0);
                                         if ui.button("Reset to defaults").clicked() {
                                             prefs_edit = EditorPrefs {
@@ -8062,6 +8223,10 @@ struct EditorPrefs {
     shadows: bool,
     // How far from the camera shadows reach, in world units.
     shadow_distance: f32,
+    // Whether the sky and the distance fog are drawn.
+    sky: bool,
+    // How thick the fog is, as a multiplier on the default (0 is none).
+    fog_amount: f32,
 }
 
 impl Default for EditorPrefs {
@@ -8076,6 +8241,8 @@ impl Default for EditorPrefs {
             drag_hold_seconds: SCENE_TREE_DRAG_HOLD_DEFAULT,
             shadows: true,
             shadow_distance: SHADOW_DISTANCE_DEFAULT,
+            sky: true,
+            fog_amount: sky::FOG_AMOUNT_DEFAULT,
         }
     }
 }
@@ -8094,6 +8261,7 @@ impl EditorPrefs {
         self.look_sensitivity = fix(self.look_sensitivity, 1.0, 0.1, 5.0);
         self.orbit_sensitivity = fix(self.orbit_sensitivity, 1.0, 0.1, 5.0);
         self.shadow_distance = fix(self.shadow_distance, SHADOW_DISTANCE_DEFAULT, 20.0, 2000.0);
+        self.fog_amount = fix(self.fog_amount, sky::FOG_AMOUNT_DEFAULT, 0.0, sky::FOG_AMOUNT_MAX);
         self.drag_hold_seconds = fix(
             self.drag_hold_seconds,
             SCENE_TREE_DRAG_HOLD_DEFAULT,
@@ -8995,6 +9163,8 @@ pub fn run_as(name: &str, app_id: &str, modules: Vec<Box<dyn EditorModule>>) {
     set_scene_tree_drag_hold_seconds(prefs.drag_hold_seconds);
     set_shadows_enabled(prefs.shadows);
     set_shadow_distance(prefs.shadow_distance);
+    set_sky_enabled(prefs.sky);
+    set_fog_amount(prefs.fog_amount);
     let mut app = App {
         window: None,
         gpu: None,
@@ -9134,6 +9304,57 @@ mod prefs_tests {
         assert_eq!(p.drag_hold_seconds, SCENE_TREE_DRAG_HOLD_DEFAULT);
         assert!(p.shadows);
         assert_eq!(p.shadow_distance, SHADOW_DISTANCE_DEFAULT);
+        assert!(p.sky);
+        assert_eq!(p.fog_amount, sky::FOG_AMOUNT_DEFAULT);
+    }
+
+    #[test]
+    fn sky_preferences_are_kept_in_range() {
+        let p = EditorPrefs {
+            fog_amount: 99.0,
+            ..EditorPrefs::default()
+        }
+        .sanitized();
+        assert_eq!(p.fog_amount, sky::FOG_AMOUNT_MAX);
+        let p = EditorPrefs {
+            fog_amount: f32::NAN,
+            sky: false,
+            ..EditorPrefs::default()
+        }
+        .sanitized();
+        assert_eq!(p.fog_amount, sky::FOG_AMOUNT_DEFAULT);
+        assert!(!p.sky);
+    }
+
+    #[test]
+    fn the_sun_is_the_shadow_casting_light_then_any_directional_light() {
+        let mut lights = [LightRaw::zeroed(); MAX_LIGHTS];
+        assert_eq!(sun_direction(&lights), None, "no lights, no sun");
+        // A point light is never the sun.
+        lights[0] = LightRaw {
+            position_or_direction: [5.0, 5.0, 5.0, 0.0],
+            params: [1.0, 50.0, 1.0, 0.0],
+        };
+        assert_eq!(sun_direction(&lights), None);
+        // A directional light that is not the shadow caster still counts...
+        lights[1] = LightRaw {
+            position_or_direction: [0.0, 1.0, 0.0, 0.0],
+            params: [0.0, 0.0, 1.0, 0.0],
+        };
+        assert_eq!(sun_direction(&lights), Some([0.0, 1.0, 0.0]));
+        // ...but the shadow caster wins.
+        lights[2] = LightRaw {
+            position_or_direction: [1.0, 0.5, 0.0, 0.0],
+            params: [0.0, 0.0, 1.0, 1.0],
+        };
+        assert_eq!(sun_direction(&lights), Some([1.0, 0.5, 0.0]));
+        // A switched-off light (intensity 0) is not a sun.
+        let mut off = [LightRaw::zeroed(); MAX_LIGHTS];
+        off[0] = LightRaw {
+            position_or_direction: [0.0, 1.0, 0.0, 0.0],
+            params: [0.0, 0.0, 0.0, 0.0],
+        };
+        assert_eq!(sun_direction(&off), None);
     }
 
     #[test]
@@ -9179,7 +9400,7 @@ mod shader_tests {
     #[test]
     fn entity_shader_has_the_entry_points_the_pipelines_name() {
         let module = naga::front::wgsl::parse_str(include_str!("shader.wgsl")).unwrap();
-        for name in ["vs_main", "fs_main", "fs_transparent"] {
+        for name in ["vs_main", "fs_main", "fs_transparent", "vs_sky", "fs_sky"] {
             assert!(
                 module.entry_points.iter().any(|e| e.name == name),
                 "missing entry point {name}"
