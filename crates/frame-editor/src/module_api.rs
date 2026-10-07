@@ -18,6 +18,7 @@ use super::*;
 use std::collections::{BTreeMap, BTreeSet};
 
 pub use frame_engine::assets::MeshVertexData;
+pub use frame_engine::physics::{StaticMesh, StaticMeshSet};
 
 /// Whatever a module builds from the world, shared between every window that
 /// draws it. The module downcasts it back to its own type in `ModuleGpu::sync`.
@@ -47,6 +48,20 @@ pub trait EditorModule {
     fn build_scene(&mut self, _world: &World, _hold: bool) -> Option<ModuleScene> {
         None
     }
+
+    /// Fixed collision geometry this module wants the simulation to have, as
+    /// named sets (see `StaticMeshSet`). Called every physics tick, so return
+    /// the same `key` while nothing changed and the physics side keeps what it
+    /// already built. Return an empty list for none.
+    fn collision_meshes(&mut self, _world: &World) -> Vec<(String, StaticMeshSet)> {
+        Vec::new()
+    }
+
+    /// Advance whatever this module simulates by `dt` seconds, with write
+    /// access to the world (including `world.resources`). Called once per
+    /// simulation tick, before collision is synced, in the editor viewport
+    /// and in Play alike. Do nothing when there is nothing to advance.
+    fn tick(&mut self, _world: &mut World, _dt: f32) {}
 
     /// Make this module's GPU state for one window.
     fn new_gpu(&self, device: &wgpu::Device) -> Box<dyn ModuleGpu>;
@@ -234,6 +249,35 @@ pub(crate) fn module_scenes(
         .collect()
 }
 
+/// Let every module advance its own simulation by `dt`. Called once per
+/// simulation tick, before `sync_collision`.
+pub(crate) fn tick_modules(
+    modules: &std::cell::RefCell<Vec<Box<dyn EditorModule>>>,
+    world: &mut World,
+    dt: f32,
+) {
+    for module in modules.borrow_mut().iter_mut() {
+        module.tick(world, dt);
+    }
+}
+
+/// Hand every module's collision geometry to `physics`. Called just before
+/// each physics step. A name given by two modules is the later module's.
+pub(crate) fn sync_collision(
+    modules: &std::cell::RefCell<Vec<Box<dyn EditorModule>>>,
+    world: &World,
+    physics: &mut frame_engine::physics::Physics,
+) {
+    let mut sets: Vec<(String, StaticMeshSet)> = Vec::new();
+    for module in modules.borrow_mut().iter_mut() {
+        for (name, set) in module.collision_meshes(world) {
+            sets.retain(|(n, _)| *n != name);
+            sets.push((name, set));
+        }
+    }
+    physics.sync_static_meshes(&sets);
+}
+
 pub(crate) fn anchor_names(
     modules: &std::cell::RefCell<Vec<Box<dyn EditorModule>>>,
 ) -> Vec<&'static str> {
@@ -306,6 +350,84 @@ mod tests {
         edit.apply(&mut world, id);
         assert_eq!(world.ext_get::<u32>("a", id), Some(5));
         assert_eq!(world.ext_get::<u32>("b", id), Some(99));
+    }
+
+    struct Floor {
+        key: u64,
+    }
+    impl EditorModule for Floor {
+        fn name(&self) -> &str {
+            "floor"
+        }
+        fn collision_meshes(&mut self, _world: &World) -> Vec<(String, StaticMeshSet)> {
+            let triangles = vec![
+                [-60.0, 0.0, -60.0],
+                [-60.0, 0.0, 60.0],
+                [60.0, 0.0, 60.0],
+                [-60.0, 0.0, -60.0],
+                [60.0, 0.0, 60.0],
+                [60.0, 0.0, -60.0],
+            ];
+            vec![(
+                "floor".to_string(),
+                StaticMeshSet {
+                    key: self.key,
+                    origin: [0.0; 3],
+                    meshes: Arc::new(vec![StaticMesh { triangles }]),
+                },
+            )]
+        }
+        fn new_gpu(&self, _device: &wgpu::Device) -> Box<dyn ModuleGpu> {
+            unreachable!("no GPU in tests")
+        }
+    }
+
+    #[test]
+    fn module_collision_reaches_the_physics_step() {
+        let (mut world, id) = world_with_entity();
+        world.positions.get_mut(id).unwrap().y = 12.0;
+        world.gravities.insert(id, frame_engine::world::Gravity);
+        world
+            .rigid_bodies
+            .insert(id, frame_engine::world::RigidBody);
+        let modules = RefCell::new(vec![Box::new(Floor { key: 1 }) as Box<dyn EditorModule>]);
+        let mut physics = Physics::new(GRAVITY_Y);
+        for _ in 0..120 {
+            sync_collision(&modules, &world, &mut physics);
+            physics.step(&mut world, 1.0 / 30.0);
+        }
+        let y = world.positions.get(id).unwrap().y;
+        assert!(
+            y > 1.0 && y < 12.0,
+            "it should rest on the module's floor: {y}"
+        );
+        assert_eq!(physics.static_mesh_collider_count(), 1);
+        // Removing the module removes the floor.
+        modules.borrow_mut().clear();
+        sync_collision(&modules, &world, &mut physics);
+        assert_eq!(physics.static_mesh_collider_count(), 0);
+    }
+
+    #[test]
+    fn modules_are_ticked_with_write_access_to_the_world() {
+        struct Counter;
+        impl EditorModule for Counter {
+            fn name(&self) -> &str {
+                "counter"
+            }
+            fn tick(&mut self, world: &mut World, dt: f32) {
+                let n = world.resources.get::<f32>("t").copied().unwrap_or(0.0);
+                world.resources.insert("t", n + dt);
+            }
+            fn new_gpu(&self, _device: &wgpu::Device) -> Box<dyn ModuleGpu> {
+                unreachable!()
+            }
+        }
+        let modules = RefCell::new(vec![Box::new(Counter) as Box<dyn EditorModule>]);
+        let mut world = World::new();
+        tick_modules(&modules, &mut world, 0.5);
+        tick_modules(&modules, &mut world, 0.5);
+        assert_eq!(world.resources.get::<f32>("t").copied(), Some(1.0));
     }
 
     struct Anchor;

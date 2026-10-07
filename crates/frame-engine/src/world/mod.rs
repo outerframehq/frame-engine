@@ -1,4 +1,6 @@
+mod resources;
 mod storage;
+pub use resources::{Resource, Resources};
 use serde::{Deserialize, Serialize};
 pub use storage::{ComponentStorage, HasEntity, QueryFilter};
 
@@ -946,6 +948,11 @@ pub struct World {
     /// instead of failing. Missing from an older scene file means none.
     #[serde(default)]
     pub extensions: std::collections::BTreeMap<String, ComponentStorage<ron::Value>>,
+    /// Named, typed data that belongs to the whole world rather than one
+    /// entity, such as a terrain's edits or a water grid. It is copied with
+    /// the world (Play, undo) and saved with the scene. See `Resources`.
+    #[serde(default)]
+    pub resources: Resources,
     /// Metadata for imported meshes, keyed by mesh name. Works like
     /// script_library does for scripts.
     #[serde(default)]

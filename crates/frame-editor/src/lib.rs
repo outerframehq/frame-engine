@@ -4332,8 +4332,10 @@ impl App {
     /// Advance the simulation exactly one tick. Only meaningful while paused.
     fn step_once(&mut self) {
         if self.paused {
+            module_api::tick_modules(&self.modules, &mut self.world, 1.0 / TICK_RATE as f32);
             systems::gravity(&mut self.world);
             systems::movement(&mut self.world);
+            module_api::sync_collision(&self.modules, &self.world, &mut self.physics);
             self.physics.step(&mut self.world, 1.0 / TICK_RATE as f32);
             systems::resolve_collisions(&mut self.world);
             systems::apply_parenting(&mut self.world);
@@ -4714,7 +4716,7 @@ impl App {
             let full_output = self.egui_ctx.run_ui(raw_input, |ui| {
                 egui::CentralPanel::default().show(ui, |ui| {
                     ui.add_space(12.0);
-                    ui.heading("Frame Editor");
+                                    ui.heading(app_name());
                     ui.add_space(10.0);
                     // Header bar: create a named project, or open an existing one.
                     ui.horizontal(|ui| {
@@ -5036,7 +5038,7 @@ impl App {
         self.world = World::default();
         self.recent_projects = sorted_recent_projects();
         if let Some(window) = &self.window {
-            window.set_title("Frame Editor");
+            window.set_title(app_name());
         }
         self.window_title.clear();
         self.mark_saved();
@@ -5262,9 +5264,11 @@ impl App {
                 // whatever the script just set.
                 systems::input_movement(world, &self.game_input);
                 systems::run_scripts(world, &mut self.script_runtime, &self.game_input);
+                module_api::tick_modules(&self.modules, world, 1.0 / TICK_RATE as f32);
                 systems::gravity(world);
                 systems::movement(world);
                 if let Some(physics) = self.game_physics.as_mut() {
+                    module_api::sync_collision(&self.modules, world, physics);
                     physics.step(world, 1.0 / TICK_RATE as f32);
                 }
                 systems::resolve_collisions(world);
@@ -5535,13 +5539,14 @@ impl App {
             return; // not currently docked — already popped out, or gone
         };
         self.dock_state.remove_tab(path);
-        let title = match tab {
-            Tab::Scene => "Frame Editor — Scene",
-            Tab::Inspector => "Frame Editor — Inspector",
-            Tab::Scripts => "Frame Editor — Script Editor",
-            Tab::Source => "Frame Editor — Source Control",
+        let part = match tab {
+            Tab::Scene => "Scene",
+            Tab::Inspector => "Inspector",
+            Tab::Scripts => "Script Editor",
+            Tab::Source => "Source Control",
             Tab::Viewport => unreachable!("Viewport is never popped out"),
         };
+        let title = format!("{} — {part}", app_name());
         let attributes = Window::default_attributes().with_title(title);
         let window = match event_loop.create_window(attributes) {
             Ok(w) => Arc::new(w),
@@ -6206,7 +6211,7 @@ impl App {
         self.paused = true;
         self.mode = AppMode::Editor;
         if let Some(window) = &self.window {
-            window.set_title(&format!("Frame Editor — {name}"));
+            window.set_title(&format!("{} — {name}", app_name()));
         }
         self.log(format!("Opened project '{name}'"));
         self.project_name = Some(name);
@@ -6389,14 +6394,14 @@ impl ApplicationHandler for App {
         apply_editor_theme(&self.egui_ctx);
         #[allow(unused_mut)]
         let mut attributes = Window::default_attributes()
-            .with_title("Frame Editor")
+            .with_title(app_name())
             .with_window_icon(load_window_icon());
         // Wayland ignores the in-process icon above; it matches this app-id to a
         // frame-editor.desktop file and reads the taskbar icon from there.
         #[cfg(target_os = "linux")]
         {
             use winit::platform::wayland::WindowAttributesExtWayland;
-            attributes = attributes.with_name("frame-editor", "frame-editor");
+            attributes = attributes.with_name(app_id(), app_id());
         }
         let window = Arc::new(event_loop.create_window(attributes).unwrap());
         let (gpu, shared) = GpuState::new(
@@ -6767,7 +6772,8 @@ impl ApplicationHandler for App {
                     (self.project_name.as_ref(), self.window.as_ref())
                 {
                     let title = format!(
-                        "Frame Editor — {name}{}",
+                        "{} — {name}{}",
+                        app_name(),
                         if self.is_dirty() { " *" } else { "" }
                     );
                     if title != self.window_title {
@@ -6823,8 +6829,14 @@ impl ApplicationHandler for App {
                     // than the keyboard unconditionally overwriting whatever
                     // the script just set.
                     systems::run_scripts(&mut self.world, &mut self.script_runtime, &self.input);
+                    module_api::tick_modules(
+                        &self.modules,
+                        &mut self.world,
+                        1.0 / TICK_RATE as f32,
+                    );
                     systems::gravity(&mut self.world);
                     systems::movement(&mut self.world);
+                    module_api::sync_collision(&self.modules, &self.world, &mut self.physics);
                     self.physics.step(&mut self.world, 1.0 / TICK_RATE as f32);
                     systems::resolve_collisions(&mut self.world);
                     // Last, so a mounted camera (or anything else riding on
@@ -8874,9 +8886,36 @@ fn default_world() -> World {
     );
     world
 }
+static APP_IDENTITY: std::sync::OnceLock<(String, String)> = std::sync::OnceLock::new();
+
+/// The name shown in window titles and the launcher heading.
+fn app_name() -> &'static str {
+    APP_IDENTITY
+        .get()
+        .map(|(name, _)| name.as_str())
+        .unwrap_or("Frame Editor")
+}
+
+/// The Linux application id, which the desktop uses to group windows and find
+/// the launcher entry and icon.
+fn app_id() -> &'static str {
+    APP_IDENTITY
+        .get()
+        .map(|(_, id)| id.as_str())
+        .unwrap_or("frame-editor")
+}
+
 /// Start the editor. `modules` are features added by other crates (see
 /// `module_api`); the public editor passes none.
 pub fn run(modules: Vec<Box<dyn EditorModule>>) {
+    run_as("Frame Editor", "frame-editor", modules);
+}
+
+/// Like `run`, with its own name (window titles, launcher heading) and Linux
+/// application id, so a build with extra features can be told apart from the
+/// plain editor in the window switcher.
+pub fn run_as(name: &str, app_id: &str, modules: Vec<Box<dyn EditorModule>>) {
+    let _ = APP_IDENTITY.set((name.to_string(), app_id.to_string()));
     let event_loop = EventLoop::new().unwrap();
     // The editor opens on the launcher screen with no project loaded, so it
     // starts from an empty world; creating or opening a project replaces it.

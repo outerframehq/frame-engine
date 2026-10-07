@@ -141,6 +141,25 @@ fn turn_towards(from: f32, to: f32, max_step: f32) -> f32 {
     (turned + PI).rem_euclid(TAU) - PI
 }
 
+/// One fixed triangle-mesh collider, supplied from outside the `World` (a
+/// generated terrain chunk, say). `triangles` is a flat list: every three
+/// points are one triangle, in the mesh's own local space.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct StaticMesh {
+    pub triangles: Vec<[f32; 3]>,
+}
+
+/// A group of fixed meshes that move together and are replaced together. All
+/// of them sit at `origin` in the world. `key` says which version this is:
+/// while it stays the same the physics side keeps what it already built, so
+/// handing the same set in every tick costs nothing.
+#[derive(Clone, Debug)]
+pub struct StaticMeshSet {
+    pub key: u64,
+    pub origin: [f32; 3],
+    pub meshes: std::sync::Arc<Vec<StaticMesh>>,
+}
+
 /// Frame Engine's physics state: a rapier3d `PhysicsWorld` plus the
 /// entity-id <-> rapier-handle mapping the raw crate has no notion of. Not
 /// named `PhysicsWorld` itself to avoid colliding with rapier's own type of
@@ -157,6 +176,9 @@ pub struct Physics {
     /// Per-character runtime state, keyed by entity id. An entity is in here
     /// exactly when it has a kinematic body driven by `controller`.
     characters: std::collections::BTreeMap<usize, Character>,
+    /// Fixed mesh colliders supplied from outside the world, by name: the key
+    /// of the version built, and the one fixed body holding all its colliders.
+    mesh_sets: std::collections::BTreeMap<String, (u64, RigidBodyHandle)>,
 }
 
 /// What a character needs to remember between ticks. Runtime only, rebuilt
@@ -192,6 +214,87 @@ impl Physics {
                 ..KinematicCharacterController::default()
             },
             characters: std::collections::BTreeMap::new(),
+            mesh_sets: std::collections::BTreeMap::new(),
+        }
+    }
+
+    /// Make the fixed mesh colliders match `sets`, which are named groups
+    /// supplied from outside the `World` (generated terrain, say). A name
+    /// that is no longer given is removed, a name whose `key` changed is
+    /// rebuilt, and one whose `key` is unchanged is left alone, so this is
+    /// cheap to call every tick. Meshes rapier cannot build a collider from
+    /// (empty or degenerate) are skipped.
+    pub fn sync_static_meshes(&mut self, sets: &[(String, StaticMeshSet)]) {
+        let given: std::collections::HashSet<&str> = sets.iter().map(|(n, _)| n.as_str()).collect();
+        let gone: Vec<String> = self
+            .mesh_sets
+            .keys()
+            .filter(|name| !given.contains(name.as_str()))
+            .cloned()
+            .collect();
+        for name in gone {
+            self.remove_mesh_set(&name);
+        }
+        for (name, set) in sets {
+            if self.mesh_sets.get(name).map(|(key, _)| *key) == Some(set.key) {
+                continue;
+            }
+            self.remove_mesh_set(name);
+            let body = RigidBodyBuilder::fixed()
+                .translation(Vector::new(set.origin[0], set.origin[1], set.origin[2]))
+                .build();
+            let body_handle = self.rapier.bodies.insert(body);
+            for mesh in set.meshes.iter() {
+                let count = mesh.triangles.len() / 3;
+                if count == 0 {
+                    continue;
+                }
+                let vertices: Vec<Vector> = mesh.triangles[..count * 3]
+                    .iter()
+                    .map(|p| Vector::new(p[0], p[1], p[2]))
+                    .collect();
+                let indices: Vec<[u32; 3]> = (0..count as u32)
+                    .map(|t| [t * 3, t * 3 + 1, t * 3 + 2])
+                    .collect();
+                // Welding shared corners and fixing internal edges stops a
+                // character or ball catching on the seams between triangles.
+                let Ok(builder) = ColliderBuilder::trimesh_with_flags(
+                    vertices,
+                    indices,
+                    TriMeshFlags::FIX_INTERNAL_EDGES | TriMeshFlags::DELETE_DEGENERATE_TRIANGLES,
+                ) else {
+                    continue;
+                };
+                self.rapier.colliders.insert_with_parent(
+                    builder.build(),
+                    body_handle,
+                    &mut self.rapier.bodies,
+                );
+            }
+            self.mesh_sets.insert(name.clone(), (set.key, body_handle));
+        }
+    }
+
+    /// How many fixed mesh colliders are currently built, across every named
+    /// set.
+    pub fn static_mesh_collider_count(&self) -> usize {
+        self.mesh_sets
+            .values()
+            .filter_map(|(_, body)| self.rapier.bodies.get(*body))
+            .map(|body| body.colliders().len())
+            .sum()
+    }
+
+    fn remove_mesh_set(&mut self, name: &str) {
+        if let Some((_, body_handle)) = self.mesh_sets.remove(name) {
+            self.rapier.bodies.remove(
+                body_handle,
+                &mut self.rapier.islands,
+                &mut self.rapier.colliders,
+                &mut self.rapier.impulse_joints,
+                &mut self.rapier.multibody_joints,
+                true,
+            );
         }
     }
 
@@ -573,5 +676,139 @@ mod tests {
         // (positive roll leans the right side down, so it slides to +X).
         assert!(p.y < 12.0, "it fell: {} {} {}", p.x, p.y, p.z);
         assert!(p.x.abs() > 1.0, "it slid sideways: {} {} {}", p.x, p.y, p.z);
+    }
+
+    fn floor_set(key: u64, origin: [f32; 3]) -> StaticMeshSet {
+        // One big square at y = 0, as two triangles.
+        let a = [-60.0, 0.0, -60.0];
+        let b = [60.0, 0.0, -60.0];
+        let c = [60.0, 0.0, 60.0];
+        let d = [-60.0, 0.0, 60.0];
+        StaticMeshSet {
+            key,
+            origin,
+            meshes: std::sync::Arc::new(vec![StaticMesh {
+                triangles: vec![a, d, c, a, c, b],
+            }]),
+        }
+    }
+
+    fn falling_box(world: &mut World, y: f32) -> usize {
+        let id = world.spawn(
+            Position { x: 0.0, y, z: 0.0 },
+            Velocity {
+                dx: 0.0,
+                dy: 0.0,
+                dz: 0.0,
+            },
+        );
+        world.gravities.insert(id, Gravity);
+        world.rigid_bodies.insert(id, crate::world::RigidBody);
+        id
+    }
+
+    #[test]
+    fn a_box_falls_through_empty_space_but_rests_on_a_static_mesh() {
+        let mut empty_world = World::new();
+        let lost = falling_box(&mut empty_world, 12.0);
+        let mut physics = Physics::new(GRAVITY_Y);
+        for _ in 0..120 {
+            physics.step(&mut empty_world, 1.0 / 30.0);
+        }
+        assert!(empty_world.positions.get(lost).unwrap().y < -20.0);
+
+        let mut world = World::new();
+        let id = falling_box(&mut world, 12.0);
+        let mut physics = Physics::new(GRAVITY_Y);
+        physics.sync_static_meshes(&[("ground".to_string(), floor_set(1, [0.0; 3]))]);
+        for _ in 0..120 {
+            physics.step(&mut world, 1.0 / 30.0);
+        }
+        let y = world.positions.get(id).unwrap().y;
+        assert!(y > 1.0 && y < 12.0, "it should rest on the floor: {y}");
+    }
+
+    #[test]
+    fn the_mesh_origin_moves_the_floor() {
+        let mut world = World::new();
+        let id = falling_box(&mut world, 62.0);
+        let mut physics = Physics::new(GRAVITY_Y);
+        physics.sync_static_meshes(&[("ground".to_string(), floor_set(1, [0.0, 50.0, 0.0]))]);
+        for _ in 0..150 {
+            physics.step(&mut world, 1.0 / 30.0);
+        }
+        let y = world.positions.get(id).unwrap().y;
+        assert!(
+            y > 51.0 && y < 62.0,
+            "it should rest on the raised floor: {y}"
+        );
+    }
+
+    #[test]
+    fn a_character_stands_on_a_static_mesh() {
+        let mut world = World::new();
+        let id = falling_box(&mut world, 10.0);
+        world.controlled.insert(id, crate::world::Controlled);
+        let mut physics = Physics::new(GRAVITY_Y);
+        physics.sync_static_meshes(&[("ground".to_string(), floor_set(1, [0.0; 3]))]);
+        for _ in 0..150 {
+            physics.step(&mut world, 1.0 / 30.0);
+        }
+        let y = world.positions.get(id).unwrap().y;
+        assert!(y > 1.0 && y < 10.0, "the character should stand on it: {y}");
+    }
+
+    #[test]
+    fn syncing_the_same_key_keeps_the_colliders_and_a_new_key_rebuilds() {
+        let mut physics = Physics::new(GRAVITY_Y);
+        assert_eq!(physics.static_mesh_collider_count(), 0);
+        let sets = [("ground".to_string(), floor_set(1, [0.0; 3]))];
+        physics.sync_static_meshes(&sets);
+        assert_eq!(physics.static_mesh_collider_count(), 1);
+        let before = physics.mesh_sets["ground"].1;
+        physics.sync_static_meshes(&sets);
+        assert_eq!(physics.mesh_sets["ground"].1, before, "same key: untouched");
+        physics.sync_static_meshes(&[("ground".to_string(), floor_set(2, [0.0; 3]))]);
+        assert_eq!(
+            physics.static_mesh_collider_count(),
+            1,
+            "replaced, not added"
+        );
+        assert_eq!(physics.mesh_sets["ground"].0, 2);
+    }
+
+    #[test]
+    fn a_set_that_is_no_longer_given_is_removed() {
+        let mut physics = Physics::new(GRAVITY_Y);
+        physics.sync_static_meshes(&[
+            ("a".to_string(), floor_set(1, [0.0; 3])),
+            ("b".to_string(), floor_set(1, [0.0; 3])),
+        ]);
+        assert_eq!(physics.static_mesh_collider_count(), 2);
+        physics.sync_static_meshes(&[("a".to_string(), floor_set(1, [0.0; 3]))]);
+        assert_eq!(physics.static_mesh_collider_count(), 1);
+        physics.sync_static_meshes(&[]);
+        assert_eq!(physics.static_mesh_collider_count(), 0);
+    }
+
+    #[test]
+    fn empty_and_degenerate_meshes_are_skipped_without_failing() {
+        let mut physics = Physics::new(GRAVITY_Y);
+        let set = StaticMeshSet {
+            key: 1,
+            origin: [0.0; 3],
+            meshes: std::sync::Arc::new(vec![
+                StaticMesh { triangles: vec![] },
+                StaticMesh {
+                    triangles: vec![[0.0; 3], [0.0; 3]],
+                },
+                StaticMesh {
+                    triangles: vec![[0.0; 3], [0.0; 3], [0.0; 3]],
+                },
+            ]),
+        };
+        physics.sync_static_meshes(&[("odd".to_string(), set)]);
+        // Nothing usable, but the set is still tracked and nothing panicked.
+        assert!(physics.static_mesh_collider_count() <= 1);
     }
 }
