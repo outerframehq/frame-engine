@@ -177,7 +177,7 @@ Versions published before the licence changed to MPL-2.0 remain available under 
 
 ## Fonts
 
-The editor embeds three fonts from `crates/frame-editor/assets/fonts/`: [Manrope](https://fonts.google.com/specimen/Manrope), [Fraunces](https://fonts.google.com/specimen/Fraunces), and [JetBrains Mono](https://www.jetbrains.com/lp/mono/). All three are released under the SIL Open Font License 1.1, which allows use, modification, and redistribution, including inside software, as long as the licence travels with the fonts. They are not covered by this repository's MPL-2.0 licence.
+The editor embeds three fonts from `crates/frame-editor/assets/fonts/`: [Manrope](https://fonts.google.com/specimen/Manrope), [Fraunces](https://fonts.google.com/specimen/Fraunces), and [JetBrains Mono](https://www.jetbrains.com/lp/mono/). All three are released under the SIL Open Font License 1.1, which allows use, modification, and redistribution, including inside software, as long as the licence travels with the fonts. The licence texts, with each font's copyright notice, sit next to the fonts: [Manrope](crates/frame-editor/assets/fonts/OFL-Manrope.txt), [Fraunces](crates/frame-editor/assets/fonts/OFL-Fraunces.txt) and [JetBrains Mono](crates/frame-editor/assets/fonts/OFL-JetBrainsMono.txt). They are not covered by this repository's MPL-2.0 licence.
 
 `Manrope-Regular.ttf` is the regular weight cut from the Manrope variable font. egui reads a variable font at its lightest weight, which looked far too thin, so a fixed weight is used instead.
 
