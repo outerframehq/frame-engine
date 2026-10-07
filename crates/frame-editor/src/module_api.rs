@@ -94,6 +94,8 @@ pub trait ModuleGpu {
     /// scene's entities and every module's `draw`) has been drawn, in the
     /// colour pass only, so it casts no shadow. The pipeline blends by the
     /// vertex's `uv.x` (0 clear, 1 solid), tests depth and does not write it.
+    /// `uv.y` is a 0 to 1 thickness: thin geometry lightens and fades, so set
+    /// it to 1 for an ordinary uniform mesh.
     /// Meshes are not sorted: draw the farthest first if several overlap.
     fn draw_transparent(&self, _pass: &mut wgpu::RenderPass<'_>) {}
 }

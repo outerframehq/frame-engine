@@ -257,9 +257,17 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
     return vec4<f32>(shade_fragment(in), 1.0);
 }
 
-// Transparent module geometry (see ModuleGpu::draw_transparent). Lit like
-// everything else; the vertex's uv.x is its opacity, 0 clear to 1 solid.
+// Transparent module geometry (see ModuleGpu::draw_transparent), lit like
+// everything else. uv.x is the opacity (0 clear to 1 solid). uv.y is the
+// thickness, 0 to 1: thin geometry lightens and fades out, thick geometry
+// keeps its colour and opacity. Water uses it for depth, so the shallows go
+// pale and clear and the shoreline dissolves instead of ending in a hard line.
+// A mesh that doesn't want this sets uv.y to 1.
 @fragment
 fn fs_transparent(in: VertexOutput) -> @location(0) vec4<f32> {
-    return vec4<f32>(shade_fragment(in), clamp(in.uv.x, 0.0, 1.0));
+    let lit = shade_fragment(in);
+    let thin = 1.0 - clamp(in.uv.y, 0.0, 1.0);
+    let colour = min(lit + vec3<f32>(0.22, 0.38, 0.34) * thin, vec3<f32>(1.0, 1.0, 1.0));
+    let alpha = clamp(in.uv.x, 0.0, 1.0) * (1.0 - 0.85 * thin);
+    return vec4<f32>(colour, alpha);
 }
