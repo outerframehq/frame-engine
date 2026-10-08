@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 //! How a crate outside the editor adds a feature to it.
 //!
 //! The editor knows nothing about any particular feature. A crate that wants
@@ -172,7 +176,19 @@ pub trait ModuleGpu {
     /// there is none. Called every frame, so do nothing when already current.
     fn sync(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, scene: Option<&ModuleScene>);
 
-    /// World-space box (min, max) of what this draws, so shadows can cover it.
+    /// Where the editor is drawing from this frame. The world's positions are
+    /// `f64`, but the graphics card works in `f32`, so everything is drawn
+    /// relative to a point near the camera (`origin`, in world units; it
+    /// changes only in large steps). Called every frame after `sync`, before
+    /// anything is drawn. A module that places geometry in the world keeps
+    /// its own `f64` position and draws at `position - origin`, cast to `f32`
+    /// only after the subtraction. A module whose geometry is placed some
+    /// other way can ignore this.
+    fn set_render_origin(&mut self, _queue: &wgpu::Queue, _origin: [f64; 3]) {}
+
+    /// Box (min, max) of what this draws, so shadows can cover it. In the same
+    /// space as everything is drawn in: relative to the origin given to
+    /// `set_render_origin`.
     fn shadow_bounds(&self) -> Option<([f32; 3], [f32; 3])> {
         None
     }
@@ -596,9 +612,10 @@ mod tests {
         let anchors = anchor_names(&modules);
         assert_eq!(anchors, vec!["anchor_thing"]);
         let none = std::collections::HashSet::new();
-        let (with, _) = build_instances(&world, None, &none, &[], &anchors, None);
+        let (with, _) =
+            build_instances(&world, None, &none, &[], &anchors, None, glam::DVec3::ZERO);
         assert_eq!(with.len(), 1, "only the ordinary entity is drawn");
-        let (without, _) = build_instances(&world, None, &none, &[], &[], None);
+        let (without, _) = build_instances(&world, None, &none, &[], &[], None, glam::DVec3::ZERO);
         assert_eq!(without.len(), 2, "no module: both drawn");
     }
 

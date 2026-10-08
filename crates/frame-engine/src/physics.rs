@@ -93,7 +93,7 @@ pub const JUMP_HEIGHT: f32 = 8.0;
 /// directions. `from_scaled_axis` is what `RigidBodyBuilder::rotation` uses
 /// internally (checked in the rapier3d 0.35.3 source).
 fn rapier_rotation(yaw: f32) -> Rotation {
-    Rotation::from_scaled_axis(Vector::new(0.0, -yaw, 0.0))
+    Rotation::from_scaled_axis(Vector::new(0.0, -f64::from(yaw), 0.0))
 }
 
 /// The full engine orientation as a rapier rotation: roll, then pitch, then
@@ -101,8 +101,8 @@ fn rapier_rotation(yaw: f32) -> Rotation {
 /// following the same convention as `rapier_rotation` above.
 fn rapier_orientation(rotation: &crate::world::Rotation) -> Rotation {
     rapier_rotation(rotation.yaw)
-        * Rotation::from_scaled_axis(Vector::new(rotation.pitch, 0.0, 0.0))
-        * Rotation::from_scaled_axis(Vector::new(0.0, 0.0, -rotation.roll))
+        * Rotation::from_scaled_axis(Vector::new(f64::from(rotation.pitch), 0.0, 0.0))
+        * Rotation::from_scaled_axis(Vector::new(0.0, 0.0, -f64::from(rotation.roll)))
 }
 
 /// A rapier orientation (quaternion components) as the engine's yaw, pitch
@@ -160,7 +160,7 @@ pub struct StaticMesh {
 #[derive(Clone, Debug)]
 pub struct StaticMeshSet {
     pub key: u64,
-    pub origin: [f32; 3],
+    pub origin: [f64; 3],
     pub meshes: std::sync::Arc<Vec<StaticMesh>>,
 }
 
@@ -208,7 +208,7 @@ impl Physics {
     /// own doc comment.
     pub fn new(gravity_y: f32) -> Self {
         let mut rapier = PhysicsWorld::new();
-        rapier.gravity = Vector::new(0.0, gravity_y, 0.0);
+        rapier.gravity = Vector::new(0.0, f64::from(gravity_y), 0.0);
         Physics {
             rapier,
             handles: std::collections::BTreeMap::new(),
@@ -255,7 +255,7 @@ impl Physics {
                 }
                 let vertices: Vec<Vector> = mesh.triangles[..count * 3]
                     .iter()
-                    .map(|p| Vector::new(p[0], p[1], p[2]))
+                    .map(|p| Vector::new(f64::from(p[0]), f64::from(p[1]), f64::from(p[2])))
                     .collect();
                 let indices: Vec<[u32; 3]> = (0..count as u32)
                     .map(|t| [t * 3, t * 3 + 1, t * 3 + 2])
@@ -312,7 +312,7 @@ impl Physics {
     pub fn step(&mut self, world: &mut World, dt: f32) {
         self.sync_new_and_removed(world);
         self.move_characters(world, dt);
-        self.rapier.integration_parameters.dt = dt;
+        self.rapier.integration_parameters.dt = f64::from(dt);
         self.rapier.step();
         self.write_back(world);
     }
@@ -379,7 +379,8 @@ impl Physics {
             .translation(Vector::new(position.x, position.y, position.z))
             .build();
             let body_handle = self.rapier.bodies.insert(body);
-            let collider = ColliderBuilder::cuboid(hx, hy, hz).build();
+            let collider =
+                ColliderBuilder::cuboid(f64::from(hx), f64::from(hy), f64::from(hz)).build();
             let collider_handle = self.rapier.colliders.insert_with_parent(
                 collider,
                 body_handle,
@@ -467,14 +468,18 @@ impl Physics {
                 // overshoots a little (about 0.4 units at 30 ticks/s).
                 character.fall_speed = (2.0 * -self.gravity_y * JUMP_HEIGHT).sqrt();
             }
-            let desired = Vector::new(intent.dx, character.fall_speed * dt, intent.dz);
+            let desired = Vector::new(
+                f64::from(intent.dx),
+                f64::from(character.fall_speed * dt),
+                f64::from(intent.dz),
+            );
 
             // Leave the character's own collider out of the obstacles it
             // checks against, or it would collide with itself.
             let filter = QueryFilter::default().exclude_rigid_body(body_handle);
             let queries = self.rapier.query_pipeline_with_filter(filter);
             let movement = self.controller.move_shape(
-                dt,
+                f64::from(dt),
                 &queries,
                 collider.shape(),
                 collider.position(),
@@ -524,9 +529,9 @@ impl Physics {
             let translation = body.translation();
             if let Some(position) = world.positions.get_mut(id) {
                 *position = Position {
-                    x: translation.x,
-                    y: translation.y,
-                    z: translation.z,
+                    x: f64::from(translation.x),
+                    y: f64::from(translation.y),
+                    z: f64::from(translation.z),
                 };
             }
             // A fixed body never moves, so its authored rotation is left
@@ -541,7 +546,7 @@ impl Physics {
             // doc comment) and turned into engine angles by
             // `engine_rotation`.
             let q = body.rotation();
-            let new_rotation = engine_rotation(q.x, q.y, q.z, q.w);
+            let new_rotation = engine_rotation(q.x as f32, q.y as f32, q.z as f32, q.w as f32);
             if let Some(rotation) = world.rotations.get_mut(id) {
                 if body.is_kinematic() {
                     // A character only ever turns around Y.
@@ -560,7 +565,7 @@ mod tests {
     use crate::world::{Gravity, Rotation as EngineRotation, Static, Velocity};
 
     fn quat_of(r: &Rotation) -> (f32, f32, f32, f32) {
-        (r.x, r.y, r.z, r.w)
+        (r.x as f32, r.y as f32, r.z as f32, r.w as f32)
     }
 
     #[test]
@@ -682,7 +687,7 @@ mod tests {
         assert!(p.x.abs() > 1.0, "it slid sideways: {} {} {}", p.x, p.y, p.z);
     }
 
-    fn floor_set(key: u64, origin: [f32; 3]) -> StaticMeshSet {
+    fn floor_set(key: u64, origin: [f64; 3]) -> StaticMeshSet {
         // One big square at y = 0, as two triangles.
         let a = [-60.0, 0.0, -60.0];
         let b = [60.0, 0.0, -60.0];
@@ -699,7 +704,11 @@ mod tests {
 
     fn falling_box(world: &mut World, y: f32) -> usize {
         let id = world.spawn(
-            Position { x: 0.0, y, z: 0.0 },
+            Position {
+                x: 0.0,
+                y: f64::from(y),
+                z: 0.0,
+            },
             Velocity {
                 dx: 0.0,
                 dy: 0.0,
@@ -760,6 +769,77 @@ mod tests {
         }
         let y = world.positions.get(id).unwrap().y;
         assert!(y > 1.0 && y < 10.0, "the character should stand on it: {y}");
+    }
+
+    /// Drop a body 10 units above a floor at `origin` and let it settle;
+    /// where it ends up, relative to `origin`.
+    fn settle_at(origin: [f64; 3], character: bool) -> [f64; 3] {
+        let mut world = World::new();
+        let id = world.spawn(
+            Position {
+                // Off to one side of the floor's centre, by an amount that
+                // is not a round number: with f32 positions out here that
+                // offset is lost (the nearest representable value can be
+                // tens of metres away at a billion units).
+                x: origin[0] + 3.3,
+                y: origin[1] + 10.0,
+                z: origin[2] + 1.7,
+            },
+            Velocity {
+                dx: 0.0,
+                dy: 0.0,
+                dz: 0.0,
+            },
+        );
+        world.gravities.insert(id, Gravity);
+        world.rigid_bodies.insert(id, crate::world::RigidBody);
+        if character {
+            world.controlled.insert(id, crate::world::Controlled);
+        }
+        let mut physics = Physics::new(GRAVITY_Y);
+        physics.sync_static_meshes(&[("ground".to_string(), floor_set(1, origin))]);
+        for _ in 0..150 {
+            physics.step(&mut world, 1.0 / 30.0);
+        }
+        let p = world.positions.get(id).unwrap();
+        [p.x - origin[0], p.y - origin[1], p.z - origin[2]]
+    }
+
+    #[test]
+    fn physics_behaves_the_same_twenty_thousand_kilometres_from_the_origin() {
+        // With f32 physics the floor and the body would each be rounded to
+        // the nearest couple of metres out here, so nothing could rest on
+        // anything. In f64 the result matches the one at the origin to
+        // within a couple of centimetres (a billion units out, the solver's
+        // own rounding is a few millimetres; f32 would be tens of metres off).
+        for character in [false, true] {
+            let near = settle_at([0.0; 3], character);
+            for far in [
+                [2.0e7, 0.0, 0.0],
+                [-2.0e7, 5.0, 2.0e7],
+                [1.0e9, 0.0, -1.0e9],
+            ] {
+                let got = settle_at(far, character);
+                for axis in 0..3 {
+                    assert!(
+                        (got[axis] - near[axis]).abs() < 0.02,
+                        "character={character} at {far:?}: {got:?} vs {near:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_body_far_from_the_origin_really_rests_on_the_floor() {
+        // Not just "the same as near the origin": it has landed on the floor
+        // (a half-extent above it), not fallen through or floated off.
+        let rest = settle_at([2.0e7, 0.0, 2.0e7], false);
+        assert!(rest[1] > 3.0 && rest[1] < 5.0, "{rest:?}");
+        assert!(
+            (rest[0] - 3.3).abs() < 0.5 && (rest[2] - 1.7).abs() < 0.5,
+            "it stayed where it was dropped: {rest:?}"
+        );
     }
 
     #[test]

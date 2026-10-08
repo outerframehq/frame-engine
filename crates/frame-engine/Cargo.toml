@@ -12,7 +12,7 @@ ron = "0.12"
 # DESIGN.md and Roadmap and Decisions). Pinned to a minor version rather than
 # a wildcard: rapier is still pre-1.0 and its own getting-started guide warns
 # the API still moves between minor releases.
-rapier3d = "0.35"
+rapier3d = { package = "rapier3d-f64", version = "0.35" }
 # No direct `glam` dependency here on purpose. rapier3d's public API is
 # glam-based internally (see `physics.rs`), but adding our own `glam` here
 # too resolved to a different version than the one rapier vendors through

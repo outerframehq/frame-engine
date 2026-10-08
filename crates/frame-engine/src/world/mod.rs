@@ -155,9 +155,9 @@ pub struct Parent {
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq)]
 pub struct Position {
-    pub x: f32,
-    pub y: f32,
-    pub z: f32,
+    pub x: f64,
+    pub y: f64,
+    pub z: f64,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq)]
@@ -1010,7 +1010,7 @@ pub struct World {
     /// state, recomputed each run and never saved with the scene, so it's
     /// skipped by serde and defaults empty.
     #[serde(skip)]
-    pub collisions: Vec<(usize, usize, [f32; 3])>,
+    pub collisions: Vec<(usize, usize, [f64; 3])>,
     /// Movement each physics-controlled entity asked for this tick. The input
     /// systems write it and `physics::Physics::step` uses it up, deciding how
     /// far the entity can really move. Transient like `collisions`, never
@@ -1798,5 +1798,47 @@ mod extension_tests {
         let id = entity(&mut world);
         world.ext_set("probe", id, &5u32).unwrap();
         assert_eq!(world.ext_get::<Probe>("probe", id), None);
+    }
+}
+
+#[cfg(test)]
+mod position_precision_tests {
+    use super::*;
+
+    #[test]
+    fn a_position_is_exact_at_planet_scale_and_survives_saving() {
+        // 20,000 km out in metres, with a fraction an f32 could not hold there.
+        let mut world = World::new();
+        let id = world.spawn(
+            Position {
+                x: 2.0e7 + 0.123456,
+                y: -3.0e7 + 0.5,
+                z: 1.0e9 + 0.001,
+            },
+            Velocity {
+                dx: 0.0,
+                dy: 0.0,
+                dz: 0.0,
+            },
+        );
+        let path =
+            std::env::temp_dir().join(format!("frame_pos_precision_{}.ron", std::process::id()));
+        world.save_to_file(&path).unwrap();
+        let loaded = World::load_from_file(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        let p = loaded.positions.get(id).unwrap();
+        assert_eq!(p.x, 2.0e7 + 0.123456);
+        assert_eq!(p.y, -3.0e7 + 0.5);
+        assert_eq!(p.z, 1.0e9 + 0.001);
+    }
+
+    #[test]
+    fn a_scene_saved_when_positions_were_f32_still_loads() {
+        // The old format wrote plain decimals, which read as f64 just the same.
+        let p: Position = ron::from_str("(x: 1.5, y: -2.25, z: 100.0)").unwrap();
+        assert_eq!((p.x, p.y, p.z), (1.5, -2.25, 100.0));
+        // A value an f32 had rounded, as written by the old format.
+        let q: Position = ron::from_str("(x: 0.1, y: 0.0, z: 0.0)").unwrap();
+        assert!((q.x - 0.1).abs() < 1e-12);
     }
 }

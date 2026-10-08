@@ -77,7 +77,7 @@ pub fn collision(world: &mut World) {
     // Snapshot every live entity's box first (this borrows the world's storages
     // immutably); the pairwise test below then only touches the local snapshot
     // and `world.collisions`, so there's no borrow clash.
-    let mut boxes: Vec<(usize, [f32; 3], [f32; 3])> = Vec::new();
+    let mut boxes: Vec<(usize, [f64; 3], [f64; 3])> = Vec::new();
     // A `RigidBody`-marked entity is detected and resolved by rapier
     // instead (see `physics::Physics::step`); including it here too
     // would report the same overlap twice, once from each system.
@@ -85,7 +85,8 @@ pub fn collision(world: &mut World) {
         let s = world.scales.get(id).copied().unwrap_or_default();
         let mesh = world.meshes.get(id).cloned().unwrap_or_default();
         let rotation = world.rotations.get(id).copied().unwrap_or_default();
-        let [hx, hy, hz] = expand_for_rotation(half_extents(&mesh, s, &world.mesh_meta), &rotation);
+        let [hx, hy, hz] =
+            expand_for_rotation(half_extents(&mesh, s, &world.mesh_meta), &rotation).map(f64::from);
         boxes.push((
             id,
             [p.x - hx, p.y - hy, p.z - hz],
@@ -109,7 +110,7 @@ pub fn collision(world: &mut World) {
                 // The contact point is the centre of the region the two boxes
                 // share: per axis, the midpoint between the later of the two
                 // mins and the earlier of the two maxes.
-                let mut point = [0.0f32; 3];
+                let mut point = [0.0f64; 3];
                 for axis in 0..3 {
                     let lo = min_a[axis].max(min_b[axis]);
                     let hi = max_a[axis].min(max_b[axis]);
@@ -134,7 +135,7 @@ pub fn collision(world: &mut World) {
 /// same axis-aligned scale-boxes as `collision`.
 pub fn resolve_collisions(world: &mut World) {
     // Snapshot each live entity's centre, half-extents, and static flag.
-    let mut boxes: Vec<(usize, [f32; 3], [f32; 3], bool)> = Vec::new();
+    let mut boxes: Vec<(usize, [f64; 3], [f64; 3], bool)> = Vec::new();
     // Same reasoning as `collision` above: rapier resolves a
     // `RigidBody`-marked entity's overlaps itself.
     for (id, p) in world.positions.query().without(&world.rigid_bodies) {
@@ -145,14 +146,14 @@ pub fn resolve_collisions(world: &mut World) {
         boxes.push((
             id,
             [p.x, p.y, p.z],
-            expand_for_rotation(half_extents(&mesh, s, &world.mesh_meta), &rotation),
+            expand_for_rotation(half_extents(&mesh, s, &world.mesh_meta), &rotation).map(f64::from),
             is_static,
         ));
     }
 
     // Accumulate corrections keyed by entity, then apply them all at once.
     // (entity id, resolution axis, direction it was pushed, position delta).
-    let mut corrections: Vec<(usize, usize, f32, [f32; 3])> = Vec::new();
+    let mut corrections: Vec<(usize, usize, f64, [f64; 3])> = Vec::new();
     for i in 0..boxes.len() {
         for j in (i + 1)..boxes.len() {
             let (id_a, c_a, h_a, static_a) = boxes[i];
@@ -161,7 +162,7 @@ pub fn resolve_collisions(world: &mut World) {
                 continue; // neither can move
             }
             // Overlap on each axis; if any is <= 0 the boxes don't intersect.
-            let mut overlap = [0.0f32; 3];
+            let mut overlap = [0.0f64; 3];
             let mut separated = false;
             for axis in 0..3 {
                 let o = (h_a[axis] + h_b[axis]) - (c_a[axis] - c_b[axis]).abs();
@@ -218,7 +219,7 @@ pub fn resolve_collisions(world: &mut World) {
                 1 => &mut v.dy,
                 _ => &mut v.dz,
             };
-            if *vc * dir < 0.0 {
+            if f64::from(*vc) * dir < 0.0 {
                 *vc = 0.0;
             }
         }
@@ -260,9 +261,9 @@ pub fn apply_parenting(world: &mut World) {
         let [world_dx, world_dy, world_dz] =
             parent_rotation.apply([parent.offset_x, parent.offset_y, parent.offset_z]);
         if let Some(p) = world.positions.get_mut(id) {
-            p.x = parent_pos.x + world_dx;
-            p.y = parent_pos.y + world_dy;
-            p.z = parent_pos.z + world_dz;
+            p.x = parent_pos.x + f64::from(world_dx);
+            p.y = parent_pos.y + f64::from(world_dy);
+            p.z = parent_pos.z + f64::from(world_dz);
         }
         // Unconditional insert, not `get_mut`: a freshly spawned entity has
         // no `Rotation` at all until something gives it one (the Inspector
@@ -317,9 +318,9 @@ pub fn movement(world: &mut World) {
         .join_mut(&world.velocities)
         .without(&world.rigid_bodies)
     {
-        position.x += velocity.dx;
-        position.y += velocity.dy;
-        position.z += velocity.dz;
+        position.x += f64::from(velocity.dx);
+        position.y += f64::from(velocity.dy);
+        position.z += f64::from(velocity.dz);
     }
 }
 
@@ -359,8 +360,8 @@ fn apply_move(world: &mut World, id: usize, intent: MoveIntent) {
     if world.rigid_bodies.get(id).is_some() {
         world.move_intents.insert(id, intent);
     } else if let Some(position) = world.positions.get_mut(id) {
-        position.x += intent.dx;
-        position.z += intent.dz;
+        position.x += f64::from(intent.dx);
+        position.z += f64::from(intent.dz);
     }
 }
 
@@ -405,7 +406,11 @@ mod tests {
 
     fn at(world: &mut World, x: f32, y: f32, z: f32) -> usize {
         world.spawn(
-            Position { x, y, z },
+            Position {
+                x: f64::from(x),
+                y: f64::from(y),
+                z: f64::from(z),
+            },
             Velocity {
                 dx: 0.0,
                 dy: 0.0,

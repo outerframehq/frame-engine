@@ -548,9 +548,9 @@ impl ScriptRuntime for RhaiRuntime {
             let fx = scope.get_value::<f64>("px").unwrap_or(px);
             let fy = scope.get_value::<f64>("py").unwrap_or(py);
             let fz = scope.get_value::<f64>("pz").unwrap_or(pz);
-            p.x = resolve(px, pos_s.x, fx) as f32;
-            p.y = resolve(py, pos_s.y, fy) as f32;
-            p.z = resolve(pz, pos_s.z, fz) as f32;
+            p.x = resolve(px, pos_s.x, fx);
+            p.y = resolve(py, pos_s.y, fy);
+            p.z = resolve(pz, pos_s.z, fz);
         }
         if let Some(vel) = world.velocities.get_mut(entity) {
             let fx = scope.get_value::<f64>("dx").unwrap_or(vdx);
@@ -629,9 +629,9 @@ impl ScriptRuntime for RhaiRuntime {
             });
             world.spawn(
                 Position {
-                    x: at.x as f32,
-                    y: at.y as f32,
-                    z: at.z as f32,
+                    x: at.x,
+                    y: at.y,
+                    z: at.z,
                 },
                 Velocity {
                     dx: 0.0,

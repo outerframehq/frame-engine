@@ -1042,7 +1042,7 @@ dependencies = [
 name = "frame-engine"
 version = "0.0.0"
 dependencies = [
- "rapier3d",
+ "rapier3d-f64",
  "ron",
  "serde",
 ]
@@ -2426,10 +2426,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "parry3d"
+name = "parry3d-f64"
 version = "0.30.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "01b00bf3ea4e0961a3f44aeb666b7dc3b0e87027b629561bd8283a7f6b2e2ed1"
+checksum = "8c5f71cd1d7f0c475116a52c61baa8d0de69fc258bc4debf86cb4c4ca8f35f3f"
 dependencies = [
  "approx",
  "arrayvec",
@@ -2449,7 +2449,6 @@ dependencies = [
  "slab",
  "smallvec",
  "spade",
- "static_assertions",
  "thiserror 2.0.18",
 ]
 
@@ -2686,10 +2685,10 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ca45419789ae5a7899559e9512e58ca889e41f04f1f2445e9f4b290ceccd1d08"
 
 [[package]]
-name = "rapier3d"
+name = "rapier3d-f64"
 version = "0.35.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0b14829af0960a134e2c39605bd6617a5c70e9837ce1b7c3c738efedc6fd8610"
+checksum = "1de28806014bf4f5e24be5d99ce7564c4f3cbd5b06b430eaa2192c1a0cd1dfba"
 dependencies = [
  "approx",
  "arrayvec",
@@ -2698,13 +2697,12 @@ dependencies = [
  "log",
  "nalgebra",
  "num-traits",
- "parry3d",
+ "parry3d-f64",
  "profiling",
  "serde",
  "simba",
  "static_assertions",
  "thiserror 2.0.18",
- "wide",
 ]
 
 [[package]]

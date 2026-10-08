@@ -76,9 +76,9 @@ use std::net::{TcpListener, TcpStream};
 #[derive(Serialize, Deserialize)]
 struct PositionUpdate {
     id: usize,
-    x: f32,
-    y: f32,
-    z: f32,
+    x: f64,
+    y: f64,
+    z: f64,
 }
 
 /// One broadcast message: every live entity's position, as of the moment the

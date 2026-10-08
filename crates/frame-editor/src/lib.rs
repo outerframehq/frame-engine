@@ -12,7 +12,7 @@ use frame_engine::world::{
     Camera, Controlled, Gravity, Light, LightKind, Mesh, Position, RigidBody, Script,
     ScriptRuntime, Sound, Static, Velocity, World,
 };
-use glam::{Mat4, Vec3, Vec4};
+use glam::{DVec3, Mat4, Vec3, Vec4};
 use std::sync::Arc;
 use wgpu::util::DeviceExt;
 use winit::application::ApplicationHandler;
@@ -23,6 +23,7 @@ use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Icon, Window, WindowId};
 mod font;
+mod origin;
 mod script;
 mod sky;
 mod sun;
@@ -818,10 +819,12 @@ fn camera_entity_view_proj(
     id: usize,
     width: u32,
     height: u32,
+    origin: DVec3,
 ) -> Option<[[f32; 4]; 4]> {
     let pos = world.positions.get(id)?;
     let rotation = world.rotations.get(id).copied().unwrap_or_default();
-    let eye = Vec3::new(pos.x, pos.y, pos.z);
+    // Relative to the render origin, like everything else that is drawn.
+    let eye = origin::relative(DVec3::new(pos.x, pos.y, pos.z), origin);
     // The camera looks along its entity's full orientation: yaw turns it,
     // pitch tips it, roll banks it (the "up" vector tilts with it).
     let forward = Vec3::from(rotation.forward());
@@ -1767,10 +1770,12 @@ impl GpuState {
     /// Make this window's module GPU state match `scenes` (one entry per
     /// module, in order; missing entries mean no scene). Cheap to call every
     /// frame.
-    fn sync_modules(&mut self, scenes: &[Option<ModuleScene>]) {
+    fn sync_modules(&mut self, scenes: &[Option<ModuleScene>], origin: DVec3) {
         for (i, module) in self.module_gpu.iter_mut().enumerate() {
             let scene = scenes.get(i).and_then(|s| s.as_ref());
             module.sync(&self.device, &self.queue, scene);
+            // After the sync, so a module places what it just built.
+            module.set_render_origin(&self.queue, [origin.x, origin.y, origin.z]);
         }
     }
     // Draw one frame: entities (world-space cubes) then text (screen overlay).
@@ -4406,8 +4411,8 @@ struct App {
     git_refresh_at: std::time::Instant,
     paused: bool,
     clock: Clock,
-    cam_focus_x: f32,
-    cam_focus_y: f32,
+    cam_focus_x: f64,
+    cam_focus_y: f64,
     cam_distance: f32,
     cam_yaw: f32,
     cam_pitch: f32,
@@ -4461,10 +4466,10 @@ struct App {
     // viewport. The cursor is grabbed and hidden, mouse motion looks around, and
     // WASD flies. A focus Z lets the camera move in the full look direction.
     fly_mode: bool,
-    cam_focus_z: f32,
+    cam_focus_z: f64,
     // Free-camera eye position, used only while flying. Seeded from the orbit eye
     // on entry; WASD moves it and mouselook turns it in place (no orbit pivot).
-    cam_eye: Vec3,
+    cam_eye: DVec3,
     // Whether an entity was picked during this fly session; if so, orbit resumes
     // around it on exit.
     fly_picked: bool,
@@ -4711,7 +4716,8 @@ impl App {
                 self.cam_pitch.sin(),
                 self.cam_pitch.cos() * self.cam_yaw.cos(),
             ) * self.cam_distance;
-            self.cam_eye = Vec3::new(self.cam_focus_x, self.cam_focus_y, self.cam_focus_z) + offset;
+            self.cam_eye = DVec3::new(self.cam_focus_x, self.cam_focus_y, self.cam_focus_z)
+                + offset.as_dvec3();
             self.fly_picked = false;
         } else {
             // Leaving flight: remember the fly speed if scrolling changed it.
@@ -4721,14 +4727,14 @@ impl App {
             // rebuild yaw/pitch/distance so the orbit eye stays where flight left
             // it (looking at the pivot).
             if !self.fly_picked {
-                let ahead =
-                    self.cam_eye + view_forward(self.cam_yaw, self.cam_pitch) * self.cam_distance;
+                let ahead = self.cam_eye
+                    + (view_forward(self.cam_yaw, self.cam_pitch) * self.cam_distance).as_dvec3();
                 self.cam_focus_x = ahead.x;
                 self.cam_focus_y = ahead.y;
                 self.cam_focus_z = ahead.z;
             }
-            let focus = Vec3::new(self.cam_focus_x, self.cam_focus_y, self.cam_focus_z);
-            let offset = self.cam_eye - focus;
+            let focus = DVec3::new(self.cam_focus_x, self.cam_focus_y, self.cam_focus_z);
+            let offset = (self.cam_eye - focus).as_vec3();
             let dist = offset.length();
             if dist > 0.001 {
                 self.cam_distance = dist.clamp(10.0, 2000.0);
@@ -5144,7 +5150,7 @@ impl App {
             (Vec::new(), egui::TexturesDelta::default(), 1.0)
         };
         if let Some(gpu) = &mut self.gpu {
-            gpu.sync_modules(&[]);
+            gpu.sync_modules(&[], DVec3::ZERO);
             gpu.render(
                 &[],
                 &[0, 0, 0],
@@ -5546,6 +5552,22 @@ impl App {
             .game_world
             .as_ref()
             .and_then(|world| find_camera_entity(world));
+        // Everything in Play is drawn relative to a point near what the player
+        // sees: the active Camera entity, or the editor's own focus when the
+        // scene has none.
+        let game_origin = self
+            .game_world
+            .as_ref()
+            .zip(active_camera_id)
+            .and_then(|(world, id)| world.positions.get(id))
+            .map(|p| origin::snap(DVec3::new(p.x, p.y, p.z)))
+            .unwrap_or_else(|| {
+                origin::snap(DVec3::new(
+                    self.cam_focus_x,
+                    self.cam_focus_y,
+                    self.cam_focus_z,
+                ))
+            });
         let (instances, group_counts, lights) = match &self.game_world {
             Some(world) => {
                 let anchors = module_api::anchor_names(&self.modules);
@@ -5557,10 +5579,11 @@ impl App {
                     &self.game_custom_names,
                     &anchors,
                     active_camera_id,
+                    game_origin,
                 );
                 // A module (a day-night clock, say) may move the sun.
                 sun::set_module_sun(module_api::module_sun(&self.modules, world));
-                (instances, group_counts, build_lights(world))
+                (instances, group_counts, build_lights(world, game_origin))
             }
             None => return,
         };
@@ -5570,12 +5593,15 @@ impl App {
         // (the pre-existing behaviour, unchanged for a scene with no camera).
         let view_proj = active_camera_id
             .zip(self.game_world.as_ref())
-            .and_then(|(id, world)| camera_entity_view_proj(world, id, width, height))
+            .and_then(|(id, world)| camera_entity_view_proj(world, id, width, height, game_origin))
             .unwrap_or_else(|| {
+                let focus = (DVec3::new(self.cam_focus_x, self.cam_focus_y, self.cam_focus_z)
+                    - game_origin)
+                    .as_vec3();
                 camera_view_proj(
-                    self.cam_focus_x,
-                    self.cam_focus_y,
-                    self.cam_focus_z,
+                    focus.x,
+                    focus.y,
+                    focus.z,
                     self.cam_distance,
                     self.cam_yaw,
                     self.cam_pitch,
@@ -5590,7 +5616,7 @@ impl App {
             .map(|world| module_api::module_scenes(&self.modules, world, false))
             .unwrap_or_default();
         if let Some(gpu) = self.game_gpu.as_mut() {
-            gpu.sync_modules(&module_scenes);
+            gpu.sync_modules(&module_scenes, game_origin);
             gpu.render(
                 &instances,
                 &group_counts,
@@ -6464,20 +6490,39 @@ impl App {
         self.window_title.clear();
         self.mark_saved();
     }
-    /// The current view-projection matrix: an orbit around the focus normally, or
-    /// a free camera from `cam_eye` while flying.
+    /// The point everything is drawn relative to this frame: the camera's
+    /// position (the free-camera eye while flying, the orbit focus otherwise),
+    /// snapped to a grid. See `origin`.
+    fn view_origin(&self) -> DVec3 {
+        let reference = if self.fly_mode {
+            self.cam_eye
+        } else {
+            DVec3::new(self.cam_focus_x, self.cam_focus_y, self.cam_focus_z)
+        };
+        origin::snap(reference)
+    }
+    /// A world position as drawn this frame: relative to the render origin.
+    fn rel(&self, p: &Position) -> Vec3 {
+        origin::relative(DVec3::new(p.x, p.y, p.z), self.view_origin())
+    }
+    /// The current view-projection matrix, in render-origin space: an orbit
+    /// around the focus normally, or a free camera from `cam_eye` while flying.
     fn view_matrix(&self, width: u32, height: u32) -> Mat4 {
+        let origin = self.view_origin();
         if self.fly_mode {
             let aspect = width as f32 / height.max(1) as f32;
             let forward = view_forward(self.cam_yaw, self.cam_pitch);
-            let view = Mat4::look_at_rh(self.cam_eye, self.cam_eye + forward, Vec3::Y);
+            let eye = (self.cam_eye - origin).as_vec3();
+            let view = Mat4::look_at_rh(eye, eye + forward, Vec3::Y);
             let proj = Mat4::perspective_rh(FOV_DEGREES.to_radians(), aspect, 0.1, 10000.0);
             proj * view
         } else {
+            let focus = (DVec3::new(self.cam_focus_x, self.cam_focus_y, self.cam_focus_z) - origin)
+                .as_vec3();
             camera_matrix(
-                self.cam_focus_x,
-                self.cam_focus_y,
-                self.cam_focus_z,
+                focus.x,
+                focus.y,
+                focus.z,
                 self.cam_distance,
                 self.cam_yaw,
                 self.cam_pitch,
@@ -6486,18 +6531,21 @@ impl App {
             )
         }
     }
-    /// Where the camera actually is: the free-camera eye while flying, or the
-    /// orbit eye (focus plus the orbit offset) otherwise.
+    /// Where the camera actually is, in render-origin space: the free-camera
+    /// eye while flying, or the orbit eye (focus plus the orbit offset)
+    /// otherwise.
     fn camera_eye(&self) -> Vec3 {
+        let origin = self.view_origin();
         if self.fly_mode {
-            self.cam_eye
+            (self.cam_eye - origin).as_vec3()
         } else {
             let offset = Vec3::new(
                 self.cam_pitch.cos() * self.cam_yaw.sin(),
                 self.cam_pitch.sin(),
                 self.cam_pitch.cos() * self.cam_yaw.cos(),
             ) * self.cam_distance;
-            Vec3::new(self.cam_focus_x, self.cam_focus_y, self.cam_focus_z) + offset
+            (DVec3::new(self.cam_focus_x, self.cam_focus_y, self.cam_focus_z) - origin).as_vec3()
+                + offset
         }
     }
 
@@ -6522,13 +6570,14 @@ impl App {
         };
         let (w, h) = (width as f32, height as f32);
         let eye = self.camera_eye();
-        let dist = (Vec3::new(p.x, p.y, p.z) - eye).length();
+        let pr = self.rel(&p);
+        let dist = (pr - eye).length();
         let len = (dist * GIZMO_SCREEN_FRAC).max(1.0);
         let vp = self.view_matrix(width, height);
-        let origin = project(vp, p.x, p.y, p.z, w, h);
-        let ex = project(vp, p.x + len, p.y, p.z, w, h);
-        let ey = project(vp, p.x, p.y + len, p.z, w, h);
-        let ez = project(vp, p.x, p.y, p.z + len, w, h);
+        let origin = project(vp, pr.x, pr.y, pr.z, w, h);
+        let ex = project(vp, pr.x + len, pr.y, pr.z, w, h);
+        let ey = project(vp, pr.x, pr.y + len, pr.z, w, h);
+        let ez = project(vp, pr.x, pr.y, pr.z + len, w, h);
         if let (Some(origin), Some(ex), Some(ey), Some(ez)) = (origin, ex, ey, ez) {
             self.gizmo = Some(GizmoScreen {
                 origin,
@@ -6574,6 +6623,7 @@ impl App {
         let width = width_u as f32;
         let height = height_u as f32;
         let vp = self.view_matrix(width_u, height_u);
+        let pick_origin = self.view_origin();
         // While flying the cursor is locked, so aim from screen centre (a
         // crosshair): look at an entity and click to pick it. Otherwise use the
         // cursor.
@@ -6589,8 +6639,9 @@ impl App {
                 let scale = self.world.scales.get(id).copied().unwrap_or_default();
                 let half_x = QUAD_SIZE * 0.5 * scale.x;
                 let half_y = QUAD_SIZE * 0.5 * scale.y;
-                let center = project(vp, p.x, p.y, p.z, width, height);
-                let corner = project(vp, p.x + half_x, p.y + half_y, p.z, width, height);
+                let pr = origin::relative(DVec3::new(p.x, p.y, p.z), pick_origin);
+                let center = project(vp, pr.x, pr.y, pr.z, width, height);
+                let corner = project(vp, pr.x + half_x, pr.y + half_y, pr.z, width, height);
                 if let (Some((cx, cy)), Some((ex, ey))) = (center, corner) {
                     let half_w = (ex - cx).abs();
                     let half_h = (ey - cy).abs();
@@ -6855,9 +6906,9 @@ impl ApplicationHandler for App {
                         let step = t * g.len;
                         if let Some(p) = self.world.positions.get_mut(id) {
                             match axis {
-                                0 => p.x += step,
-                                1 => p.y += step,
-                                _ => p.z += step,
+                                0 => p.x += f64::from(step),
+                                1 => p.y += f64::from(step),
+                                _ => p.z += f64::from(step),
                             }
                         }
                     }
@@ -6874,8 +6925,8 @@ impl ApplicationHandler for App {
                         let visible_world_height =
                             2.0 * self.cam_distance * (FOV_DEGREES.to_radians() * 0.5).tan();
                         let world_per_px = visible_world_height / height_px;
-                        self.cam_focus_x -= dx * world_per_px;
-                        self.cam_focus_y += dy * world_per_px;
+                        self.cam_focus_x -= f64::from(dx * world_per_px);
+                        self.cam_focus_y += f64::from(dy * world_per_px);
                     }
                 }
                 self.last_cursor = (position.x, position.y);
@@ -6969,9 +7020,9 @@ impl ApplicationHandler for App {
                                     self.push_undo();
                                 }
                                 if let Some(p) = self.world.positions.get_mut(id) {
-                                    p.x += dx;
-                                    p.y += dy;
-                                    p.z += dz;
+                                    p.x += f64::from(dx);
+                                    p.y += f64::from(dy);
+                                    p.z += f64::from(dz);
                                 }
                             }
                         } else if !event.repeat {
@@ -7044,7 +7095,7 @@ impl ApplicationHandler for App {
                     if self.input.is_held(Button::Left) {
                         mv -= right;
                     }
-                    self.cam_eye += mv.normalize_or_zero() * self.fly_speed;
+                    self.cam_eye += (mv.normalize_or_zero() * self.fly_speed).as_dvec3();
                 }
                 let owed = self.clock.advance(!self.paused);
                 // Same folder the Assets tab and imported models resolve
@@ -7114,6 +7165,7 @@ impl ApplicationHandler for App {
                 // Per-primitive instance buckets from the world (see build_instances).
                 let custom_names: Vec<String> = self.custom_meshes.keys().cloned().collect();
                 let anchors = module_api::anchor_names(&self.modules);
+                let view_origin = self.view_origin();
                 let (instances, group_counts) = build_instances(
                     &self.world,
                     selected,
@@ -7121,9 +7173,10 @@ impl ApplicationHandler for App {
                     &custom_names,
                     &anchors,
                     None,
+                    view_origin,
                 );
                 sun::set_module_sun(module_api::module_sun(&self.modules, &self.world));
-                let lights = build_lights(&self.world);
+                let lights = build_lights(&self.world, view_origin);
                 // Features from editor modules. While a mouse button is held
                 // (dragging an Inspector slider, say) they keep showing what
                 // they had rather than rebuilding every frame.
@@ -8173,9 +8226,18 @@ impl ApplicationHandler for App {
                 // not last frame's.
                 if let Some(id) = self.selected {
                     if self.world.cameras.get(id).is_some() {
-                        if let Some(preview_view_proj) =
-                            camera_entity_view_proj(&self.world, id, PREVIEW_WIDTH, PREVIEW_HEIGHT)
-                        {
+                        // The preview shares the viewport's render origin, because
+                        // module geometry is placed once per frame. It only loses
+                        // precision if the previewed camera is very far (hundreds
+                        // of kilometres) from the editor camera.
+                        let preview_origin = view_origin;
+                        if let Some(preview_view_proj) = camera_entity_view_proj(
+                            &self.world,
+                            id,
+                            PREVIEW_WIDTH,
+                            PREVIEW_HEIGHT,
+                            preview_origin,
+                        ) {
                             // Excludes the camera's own entity: otherwise its
                             // eye sits somewhere inside its own mesh (the
                             // main viewport draws it as an ordinary cube, so
@@ -8192,9 +8254,10 @@ impl ApplicationHandler for App {
                                 &custom_names,
                                 &anchors,
                                 Some(id),
+                                preview_origin,
                             );
                             if let Some(gpu) = &mut self.gpu {
-                                gpu.sync_modules(&module_scenes);
+                                gpu.sync_modules(&module_scenes, view_origin);
                                 gpu.render_preview(
                                     &preview_instances,
                                     &preview_group_counts,
@@ -8206,7 +8269,7 @@ impl ApplicationHandler for App {
                     }
                 }
                 if let Some(gpu) = &mut self.gpu {
-                    gpu.sync_modules(&module_scenes);
+                    gpu.sync_modules(&module_scenes, view_origin);
                     gpu.render(
                         &instances,
                         &group_counts,
@@ -8788,6 +8851,8 @@ fn build_instances(
     // other caller (the main orbit viewport, Play with no Camera), which
     // draws every entity as normal.
     exclude: Option<usize>,
+    // The render origin (see `origin`): every position is drawn relative to it.
+    origin: DVec3,
 ) -> (Vec<InstanceRaw>, Vec<u32>) {
     // One bucket per mesh: the three primitives, then the imported models in
     // the same sorted name order the mesh buffer uses.
@@ -8822,7 +8887,7 @@ fn build_instances(
             [color.r, color.g, color.b]
         };
         let raw = InstanceRaw {
-            position: [p.x, p.y, p.z],
+            position: origin::relative(DVec3::new(p.x, p.y, p.z), origin).to_array(),
             color: rgb,
             selected: if Some(id) == selected { 1.0 } else { 0.0 },
             scale: [scale.x, scale.y, scale.z],
@@ -8853,7 +8918,7 @@ fn build_instances(
 /// limitation rather than an unbounded per-frame cost. Unused slots are
 /// left zeroed (intensity 0.0), which the shader's loop reads as "nothing
 /// here".
-fn build_lights(world: &World) -> [LightRaw; MAX_LIGHTS] {
+fn build_lights(world: &World, origin: DVec3) -> [LightRaw; MAX_LIGHTS] {
     let mut out = [LightRaw::zeroed(); MAX_LIGHTS];
     let mut count = 0usize;
     // Only the first directional light casts the scene's shadow.
@@ -8879,7 +8944,8 @@ fn build_lights(world: &World) -> [LightRaw; MAX_LIGHTS] {
                     y: 0.0,
                     z: 0.0,
                 });
-                ([p.x, p.y, p.z, 0.0], 1.0, range)
+                let r = origin::relative(DVec3::new(p.x, p.y, p.z), origin);
+                ([r.x, r.y, r.z, 0.0], 1.0, range)
             }
         };
         let casts_shadow = kind_flag < 0.5 && light.intensity > 0.0 && !shadow_caster_assigned;
@@ -9301,7 +9367,7 @@ pub fn run_as(name: &str, app_id: &str, modules: Vec<Box<dyn EditorModule>>) {
         viewport_rect: None,
         fly_mode: false,
         cam_focus_z: 0.0,
-        cam_eye: Vec3::ZERO,
+        cam_eye: DVec3::ZERO,
         fly_picked: false,
         console_tab: ConsoleTab::Output,
         log_lines: vec!["Frame Editor started.".to_string()],
@@ -9580,6 +9646,125 @@ mod rotation_shader_tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod far_from_the_origin_tests {
+    use super::*;
+    use frame_engine::world::{Camera, Velocity};
+
+    fn spawn_at(world: &mut World, x: f64, y: f64, z: f64) -> usize {
+        world.spawn(
+            Position { x, y, z },
+            Velocity {
+                dx: 0.0,
+                dy: 0.0,
+                dz: 0.0,
+            },
+        )
+    }
+
+    #[test]
+    fn an_entity_twenty_thousand_km_out_is_drawn_exactly_where_it_is() {
+        let eye = DVec3::new(2.0e7, 0.0, 0.0);
+        let mut world = World::new();
+        let id = spawn_at(&mut world, 2.0e7 + 5.25, 1.5, -3.125);
+        let origin = origin::snap(eye);
+        let (instances, _) = build_instances(
+            &world,
+            None,
+            &std::collections::HashSet::new(),
+            &[],
+            &[],
+            None,
+            origin,
+        );
+        assert_eq!(instances.len(), 1);
+        let drawn = instances[0].position;
+        let back = [
+            f64::from(drawn[0]) + origin.x,
+            f64::from(drawn[1]) + origin.y,
+            f64::from(drawn[2]) + origin.z,
+        ];
+        assert_eq!(back, [2.0e7 + 5.25, 1.5, -3.125], "entity {id}");
+        assert!(
+            drawn.iter().all(|v| v.abs() < 200.0),
+            "small numbers: {drawn:?}"
+        );
+    }
+
+    #[test]
+    fn two_entities_keep_their_exact_spacing_far_from_the_origin() {
+        let mut world = World::new();
+        spawn_at(&mut world, 1.0e9 + 0.5, 0.0, 1.0e9);
+        spawn_at(&mut world, 1.0e9 + 1.75, 0.0, 1.0e9);
+        let origin = origin::snap(DVec3::new(1.0e9, 0.0, 1.0e9));
+        let (instances, _) = build_instances(
+            &world,
+            None,
+            &std::collections::HashSet::new(),
+            &[],
+            &[],
+            None,
+            origin,
+        );
+        let gap = instances[1].position[0] - instances[0].position[0];
+        assert_eq!(
+            gap, 1.25,
+            "an f32 position at a billion units could not tell these apart"
+        );
+    }
+
+    #[test]
+    fn a_point_light_far_out_is_placed_relative_to_the_origin() {
+        use frame_engine::world::{Light, LightKind};
+        let mut world = World::new();
+        let id = spawn_at(&mut world, 2.0e7 + 2.0, 4.0, 2.0e7 - 6.0);
+        world.lights.insert(
+            id,
+            Light {
+                kind: LightKind::Point { range: 30.0 },
+                intensity: 1.0,
+            },
+        );
+        let origin = origin::snap(DVec3::new(2.0e7, 0.0, 2.0e7));
+        let lights = build_lights(&world, origin);
+        assert_eq!(lights[0].position_or_direction[..3], [2.0, 4.0, -6.0]);
+    }
+
+    #[test]
+    fn a_camera_far_out_looks_at_what_is_in_front_of_it() {
+        // The camera and a target 10 units ahead of it (-Z at yaw 0), 20,000
+        // km out: the target projects to the middle of the screen.
+        let mut world = World::new();
+        let cam = spawn_at(&mut world, 2.0e7 + 0.3, 2.0, 2.0e7 + 0.7);
+        world.cameras.insert(cam, Camera);
+        let origin = origin::snap(DVec3::new(2.0e7, 0.0, 2.0e7));
+        let vp = Mat4::from_cols_array_2d(
+            &camera_entity_view_proj(&world, cam, 800, 600, origin).unwrap(),
+        );
+        let target = origin::relative(DVec3::new(2.0e7 + 0.3, 2.0, 2.0e7 + 0.7 - 10.0), origin);
+        let (x, y) = project(vp, target.x, target.y, target.z, 800.0, 600.0).unwrap();
+        assert!(
+            (x - 400.0).abs() < 0.01 && (y - 300.0).abs() < 0.01,
+            "{x} {y}"
+        );
+    }
+
+    #[test]
+    fn the_orbit_camera_far_out_frames_its_focus() {
+        // `view_matrix` for the orbit camera is the focus, relative to the
+        // origin, through `camera_matrix`; the focus lands mid-screen.
+        let focus = DVec3::new(2.0e7 + 12.5, 3.0, -2.0e7 + 0.125);
+        let origin = origin::snap(focus);
+        let f = origin::relative(focus, origin);
+        let vp = camera_matrix(f.x, f.y, f.z, 50.0, 0.7, 0.4, 800, 600);
+        let (x, y) = project(vp, f.x, f.y, f.z, 800.0, 600.0).unwrap();
+        assert!(
+            (x - 400.0).abs() < 0.01 && (y - 300.0).abs() < 0.01,
+            "{x} {y}"
+        );
     }
 }
 
