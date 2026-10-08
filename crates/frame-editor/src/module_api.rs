@@ -1,7 +1,3 @@
-// This Source Code Form is subject to the terms of the Mozilla Public
-// License, v. 2.0. If a copy of the MPL was not distributed with this
-// file, You can obtain one at https://mozilla.org/MPL/2.0/.
-
 //! How a crate outside the editor adds a feature to it.
 //!
 //! The editor knows nothing about any particular feature. A crate that wants
@@ -13,8 +9,9 @@
 //! - build whatever it will draw from the world ([`EditorModule::build_scene`]),
 //! - make a per-window GPU copy of it ([`EditorModule::new_gpu`], [`ModuleGpu`]),
 //!   which can bring its own textures ([`GpuContext`], [`WorldMaterial`]),
-//! - and leave anchor entities out of the ordinary shape pass
-//!   ([`EditorModule::anchor_components`]).
+//! - leave anchor entities out of the ordinary shape pass
+//!   ([`EditorModule::anchor_components`]),
+//! - and place the sun, if it wants to ([`EditorModule::sun`]).
 //!
 //! A module's own data lives in the world as named extension components
 //! (`World::ext_set` / `ext_get`), so it saves and loads with the scene.
@@ -68,8 +65,27 @@ pub trait EditorModule {
     /// and in Play alike. Do nothing when there is nothing to advance.
     fn tick(&mut self, _world: &mut World, _dt: f32) {}
 
+    /// Where this module wants the sun, if it does. Called once per frame
+    /// for each window drawn, with the world being drawn, before the lights
+    /// are built. Return `Some` to take over the sun from the scene's Light
+    /// (and from the editor's own time-of-day setting): lights, shadows, sky
+    /// and fog all follow it. The scene itself is never changed. Return
+    /// `None` to leave the sun alone. If several modules answer, the first
+    /// wins.
+    fn sun(&mut self, _world: &World) -> Option<SunOverride> {
+        None
+    }
+
     /// Make this module's GPU state for one window.
     fn new_gpu(&self, gpu: &GpuContext) -> Box<dyn ModuleGpu>;
+}
+
+/// A sun supplied by a module (see [`EditorModule::sun`]).
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct SunOverride {
+    /// Unit vector pointing toward the sun: X east, Y up, Z south. A negative
+    /// Y puts the sun below the horizon, which is night.
+    pub direction: [f32; 3],
 }
 
 /// What a module gets when it makes its per-window GPU state.
@@ -344,6 +360,17 @@ pub(crate) fn module_scenes(
         .iter_mut()
         .map(|m| m.build_scene(world, hold))
         .collect()
+}
+
+/// The first sun any module asks for this frame, if any.
+pub(crate) fn module_sun(
+    modules: &std::cell::RefCell<Vec<Box<dyn EditorModule>>>,
+    world: &World,
+) -> Option<SunOverride> {
+    modules
+        .borrow_mut()
+        .iter_mut()
+        .find_map(|module| module.sun(world))
 }
 
 /// Let every module advance its own simulation by `dt`. Called once per

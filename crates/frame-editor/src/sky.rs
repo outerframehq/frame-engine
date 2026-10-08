@@ -129,6 +129,32 @@ impl SkyColours {
     }
 }
 
+/// How much of its full strength the sun's light has when the sun is at this
+/// height (the y component of the unit vector toward it): 0 once it is below
+/// the horizon, 1 once it is well up, with a short fade around sunrise and
+/// sunset. Used to fade the scene's sun light with the day-night cycle.
+pub(crate) fn sun_light_scale(height: f32) -> f32 {
+    if !height.is_finite() {
+        return 1.0;
+    }
+    smoothstep(-0.04, 0.12, height)
+}
+
+/// How much of its daytime strength the ambient (unlit) light keeps at night.
+/// Lower is darker. Only applies while the day-night cycle is on.
+pub(crate) const NIGHT_AMBIENT_SCALE: f32 = 0.6;
+
+/// The scale on the ambient light for a sun at this height (the y component of
+/// the unit vector toward it): 1.0 by day, falling to `NIGHT_AMBIENT_SCALE` at
+/// night, on the same curve as the sky's own day and night colours.
+pub(crate) fn ambient_scale(height: f32) -> f32 {
+    if !height.is_finite() {
+        return 1.0;
+    }
+    let day = smoothstep(-0.12, 0.28, height);
+    NIGHT_AMBIENT_SCALE + (1.0 - NIGHT_AMBIENT_SCALE) * day
+}
+
 /// The fog density per world unit for a fog amount (0 turns fog off).
 pub(crate) fn fog_density(amount: f32) -> f32 {
     if !amount.is_finite() {
@@ -388,5 +414,62 @@ mod tests {
         let u = sky_uniform(vp, Some([0.3, -0.8, 0.2]), true, 1.0);
         assert_eq!(u.sun_direction[3], 0.0);
         assert!(luma([u.zenith[0], u.zenith[1], u.zenith[2]]) < 0.05);
+    }
+}
+
+#[cfg(test)]
+mod light_scale_tests {
+    use super::*;
+
+    #[test]
+    fn the_sun_light_is_off_below_the_horizon_and_full_when_high() {
+        assert_eq!(sun_light_scale(-0.5), 0.0);
+        assert_eq!(sun_light_scale(-0.04), 0.0);
+        assert_eq!(sun_light_scale(0.12), 1.0);
+        assert_eq!(sun_light_scale(1.0), 1.0);
+    }
+
+    #[test]
+    fn the_sun_light_fades_smoothly_through_sunrise() {
+        let mut last = 0.0;
+        for i in 0..=160 {
+            let h = -0.04 + 0.16 * (i as f32 / 160.0);
+            let s = sun_light_scale(h);
+            assert!(s >= last - 1e-6, "never gets darker as the sun rises");
+            assert!(s - last < 0.05, "no sudden jump: {last} to {s} at {h}");
+            last = s;
+        }
+    }
+
+    #[test]
+    fn a_broken_height_does_not_black_out_the_scene() {
+        assert_eq!(sun_light_scale(f32::NAN), 1.0);
+    }
+}
+
+#[cfg(test)]
+mod ambient_tests {
+    use super::*;
+
+    #[test]
+    fn the_ambient_light_is_full_by_day_and_dimmed_at_night() {
+        assert_eq!(ambient_scale(1.0), 1.0);
+        assert_eq!(ambient_scale(0.28), 1.0);
+        assert_eq!(ambient_scale(-0.12), NIGHT_AMBIENT_SCALE);
+        assert_eq!(ambient_scale(-1.0), NIGHT_AMBIENT_SCALE);
+    }
+
+    #[test]
+    fn the_ambient_light_changes_smoothly_and_never_goes_out() {
+        let mut last = ambient_scale(-1.0);
+        for i in 0..=200 {
+            let h = -1.0 + 2.0 * (i as f32 / 200.0);
+            let s = ambient_scale(h);
+            assert!(s >= NIGHT_AMBIENT_SCALE && s <= 1.0);
+            assert!(s >= last - 1e-6, "never darker as the sun rises");
+            assert!(s - last < 0.05, "no jump at {h}");
+            last = s;
+        }
+        assert_eq!(ambient_scale(f32::NAN), 1.0);
     }
 }

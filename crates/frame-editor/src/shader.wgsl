@@ -61,7 +61,8 @@ struct Sky {
     horizon: vec4<f32>,
     // rgb: the sun's colour.
     sun_colour: vec4<f32>,
-    // rgb: the colour looking straight down.
+    // rgb: the colour looking straight down. w: the ambient light scale (1.0
+    // by day; the day-night cycle dims it at night; 0 or less means 1.0).
     ground: vec4<f32>,
 };
 @group(0) @binding(5) var<uniform> sky: Sky;
@@ -232,7 +233,10 @@ fn shade_fragment(in: VertexOutput) -> vec3<f32> {
     // with no Light entities at all falls back to just this floor, flatter
     // than before, a real, one-time visible change on upgrade rather than a
     // hidden fallback light.
-    var accumulated: f32 = 0.4;
+    // The ambient floor, scaled by the sky uniform's ambient scale: 1.0 unless
+    // the day-night cycle has dimmed it for night (a zero means "not set").
+    let ambient = 0.4 * select(sky.ground.w, 1.0, sky.ground.w <= 0.0);
+    var accumulated: f32 = ambient;
     let normal = normalize(in.world_normal);
     for (var i: u32 = 0u; i < MAX_LIGHTS; i = i + 1u) {
         let light = lights.lights[i];
@@ -277,7 +281,7 @@ fn shade_fragment(in: VertexOutput) -> vec3<f32> {
     // reads darker than a non-metal's; scale just the ambient floor down by
     // metalness rather than the whole shaded result, so a lit metal doesn't
     // simply look dimmer overall.
-    let shade_metal_adjusted = min(shade - 0.4 * metalness, 1.0);
+    let shade_metal_adjusted = min(shade - ambient * metalness, 1.0);
 
     // Each entity draws in its own (possibly textured) colour. Emissive
     // blends between normal shading and full unlit brightness, so a high

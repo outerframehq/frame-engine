@@ -25,6 +25,7 @@ use winit::window::{Icon, Window, WindowId};
 mod font;
 mod script;
 mod sky;
+mod sun;
 const TICK_RATE: u32 = 30;
 const MAX_CATCHUP_TICKS: u32 = 5;
 // Vertical field of view, shared by the projection and the pan maths.
@@ -75,7 +76,7 @@ struct CameraUniform {
 // 16-byte-aligned multiple in the uniform buffer, sidestepping WGSL's
 // alignment rules for vec3.
 #[repr(C)]
-#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+#[derive(Copy, Clone, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
 struct LightRaw {
     // xyz: direction toward the light (directional) or world position
     // (point). w unused.
@@ -164,6 +165,29 @@ fn sun_direction(lights: &[LightRaw; MAX_LIGHTS]) -> Option<[f32; 3]> {
                 l.position_or_direction[2],
             ]
         })
+}
+/// Where the sky should put the sun this frame: the time-of-day (or a
+/// module's) sun when one is active, even if the scene has no light of its own,
+/// otherwise the scene's sun light.
+fn effective_sun(lights: &[LightRaw; MAX_LIGHTS]) -> Option<[f32; 3]> {
+    sun::current()
+        .map(|s| s.direction)
+        .or_else(|| sun_direction(lights))
+}
+/// The sky's uniform for this frame. The ambient light scale rides along in
+/// the unused `ground.w`: 1.0 normally, dimmed at night while a time-of-day
+/// sun is active.
+fn sky_uniform_for_frame(
+    view_proj: [[f32; 4]; 4],
+    lights: &[LightRaw; MAX_LIGHTS],
+    enabled: bool,
+) -> sky::SkyUniform {
+    let mut uniform = sky::sky_uniform(view_proj, effective_sun(lights), enabled, fog_amount());
+    uniform.ground[3] = match sun::current() {
+        Some(sun) => sky::ambient_scale(sun.direction[1]),
+        None => 1.0,
+    };
+    uniform
 }
 /// Work out the shadow map's view for this frame: an orthographic box,
 /// looking along the first shadow-casting directional light, sized to just
@@ -1774,12 +1798,7 @@ impl GpuState {
         self.queue.write_buffer(
             &self.sky_buffer,
             0,
-            bytemuck::cast_slice(&[sky::sky_uniform(
-                view_proj,
-                sun_direction(lights),
-                sky_on,
-                fog_amount(),
-            )]),
+            bytemuck::cast_slice(&[sky_uniform_for_frame(view_proj, lights, sky_on)]),
         );
         self.queue.write_buffer(
             &self.lights_buffer,
@@ -2012,12 +2031,7 @@ impl GpuState {
         self.queue.write_buffer(
             &self.preview_sky_buffer,
             0,
-            bytemuck::cast_slice(&[sky::sky_uniform(
-                view_proj,
-                sun_direction(lights),
-                sky_on,
-                fog_amount(),
-            )]),
+            bytemuck::cast_slice(&[sky_uniform_for_frame(view_proj, lights, sky_on)]),
         );
         self.queue.write_buffer(
             &self.lights_buffer,
@@ -4586,6 +4600,8 @@ impl App {
             shadow_distance: shadow_distance(),
             sky: sky_enabled(),
             fog_amount: fog_amount(),
+            sun_time: sun::time_of_day_enabled(),
+            time_of_day: sun::time_of_day_hours(),
         }
     }
     /// Write editor.ron, but only if something actually changed since the last
@@ -4612,6 +4628,7 @@ impl App {
         set_shadow_distance(prefs.shadow_distance);
         set_sky_enabled(prefs.sky);
         set_fog_amount(prefs.fog_amount);
+        apply_sun_prefs(&prefs);
         self.persist_prefs_if_changed();
     }
     /// True if the open scene has changes that haven't been saved.
@@ -5541,6 +5558,8 @@ impl App {
                     &anchors,
                     active_camera_id,
                 );
+                // A module (a day-night clock, say) may move the sun.
+                sun::set_module_sun(module_api::module_sun(&self.modules, world));
                 (instances, group_counts, build_lights(world))
             }
             None => return,
@@ -7103,6 +7122,7 @@ impl ApplicationHandler for App {
                     &anchors,
                     None,
                 );
+                sun::set_module_sun(module_api::module_sun(&self.modules, &self.world));
                 let lights = build_lights(&self.world);
                 // Features from editor modules. While a mouse button is held
                 // (dragging an Inspector slider, say) they keep showing what
@@ -7709,6 +7729,17 @@ impl ApplicationHandler for App {
                                                 .text("Fog"),
                                         );
                                         ui.weak("A sky behind the scene, lit by the first directional Light: lower the light toward the horizon for a sunset, below it for night. Distant ground fades into the horizon colour; 0 turns the fog off. With the sky off the viewport goes back to a plain background.");
+                                        ui.add_space(4.0);
+                                        outerface_checkbox(ui, &mut prefs_edit.sun_time, "Sun by time of day");
+                                        ui.add_enabled(
+                                            prefs_edit.sun_time,
+                                            egui::Slider::new(&mut prefs_edit.time_of_day, 0.0..=24.0)
+                                                .custom_formatter(|h, _| {
+                                                    format!("{:02}:{:02}", h as u32, (h.fract() * 60.0) as u32)
+                                                })
+                                                .text("Time of day"),
+                                        );
+                                        ui.weak("Puts the sun where it would be at this hour instead of using the Light's direction: it rises in the east, climbs, and sets in the west, and lights, shadows, sky and fog follow. The scene is not changed; turn this off and the Light's own direction is back. Nights are darker.");
                                         ui.add_space(6.0);
                                         if ui.button("Reset to defaults").clicked() {
                                             prefs_edit = EditorPrefs {
@@ -8227,6 +8258,10 @@ struct EditorPrefs {
     sky: bool,
     // How thick the fog is, as a multiplier on the default (0 is none).
     fog_amount: f32,
+    // Whether the sun is placed by the time of day instead of the Light.
+    sun_time: bool,
+    // The hour (0 to 24) the sun is placed for.
+    time_of_day: f32,
 }
 
 impl Default for EditorPrefs {
@@ -8243,6 +8278,8 @@ impl Default for EditorPrefs {
             shadow_distance: SHADOW_DISTANCE_DEFAULT,
             sky: true,
             fog_amount: sky::FOG_AMOUNT_DEFAULT,
+            sun_time: false,
+            time_of_day: sun::DEFAULT_HOUR,
         }
     }
 }
@@ -8261,7 +8298,13 @@ impl EditorPrefs {
         self.look_sensitivity = fix(self.look_sensitivity, 1.0, 0.1, 5.0);
         self.orbit_sensitivity = fix(self.orbit_sensitivity, 1.0, 0.1, 5.0);
         self.shadow_distance = fix(self.shadow_distance, SHADOW_DISTANCE_DEFAULT, 20.0, 2000.0);
-        self.fog_amount = fix(self.fog_amount, sky::FOG_AMOUNT_DEFAULT, 0.0, sky::FOG_AMOUNT_MAX);
+        self.fog_amount = fix(
+            self.fog_amount,
+            sky::FOG_AMOUNT_DEFAULT,
+            0.0,
+            sky::FOG_AMOUNT_MAX,
+        );
+        self.time_of_day = fix(self.time_of_day, sun::DEFAULT_HOUR, 0.0, 24.0);
         self.drag_hold_seconds = fix(
             self.drag_hold_seconds,
             SCENE_TREE_DRAG_HOLD_DEFAULT,
@@ -8270,6 +8313,11 @@ impl EditorPrefs {
         );
         self
     }
+}
+
+/// Hand the time-of-day preferences to the sun.
+fn apply_sun_prefs(prefs: &EditorPrefs) {
+    sun::set_time_of_day(prefs.sun_time, prefs.time_of_day);
 }
 
 fn prefs_file() -> Option<std::path::PathBuf> {
@@ -8849,6 +8897,8 @@ fn build_lights(world: &World) -> [LightRaw; MAX_LIGHTS] {
         };
         count += 1;
     }
+    // With a time-of-day (or module) sun, it turns the scene's sun light.
+    sun::apply_to_lights(&mut out, sun::current());
     out
 }
 
@@ -9165,6 +9215,7 @@ pub fn run_as(name: &str, app_id: &str, modules: Vec<Box<dyn EditorModule>>) {
     set_shadow_distance(prefs.shadow_distance);
     set_sky_enabled(prefs.sky);
     set_fog_amount(prefs.fog_amount);
+    apply_sun_prefs(&prefs);
     let mut app = App {
         window: None,
         gpu: None,
@@ -9529,5 +9580,50 @@ mod rotation_shader_tests {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod sun_prefs_tests {
+    use super::*;
+
+    #[test]
+    fn the_time_of_day_sun_is_off_by_default_and_an_old_prefs_file_still_loads() {
+        let p = EditorPrefs::default();
+        assert!(!p.sun_time);
+        let old: EditorPrefs = ron::from_str("(fly_speed: 30.0)").expect("old file loads");
+        assert!(!old.sun_time);
+        // A file written by the earlier clock build still loads.
+        let older: EditorPrefs =
+            ron::from_str("(clock: true, day_hours: 13.0, year_days: 120.0)").expect("loads");
+        assert!(!older.sun_time);
+    }
+
+    #[test]
+    fn the_time_of_day_is_kept_in_range() {
+        let p = EditorPrefs {
+            time_of_day: 99.0,
+            ..EditorPrefs::default()
+        }
+        .sanitized();
+        assert_eq!(p.time_of_day, 24.0);
+        let p = EditorPrefs {
+            time_of_day: f32::NAN,
+            ..EditorPrefs::default()
+        }
+        .sanitized();
+        assert_eq!(p.time_of_day, sun::DEFAULT_HOUR);
+    }
+}
+
+#[cfg(test)]
+mod ambient_tests {
+    use super::*;
+
+    #[test]
+    fn the_ambient_light_is_untouched_while_the_cycle_is_off() {
+        let lights = [LightRaw::zeroed(); MAX_LIGHTS];
+        let uniform = sky_uniform_for_frame(Mat4::IDENTITY.to_cols_array_2d(), &lights, true);
+        assert_eq!(uniform.ground[3], 1.0);
     }
 }
