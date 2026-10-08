@@ -15,6 +15,8 @@
 //!   which can bring its own textures ([`GpuContext`], [`WorldMaterial`]),
 //! - leave anchor entities out of the ordinary shape pass
 //!   ([`EditorModule::anchor_components`]),
+//! - say where the viewers are, so it can build detail around them
+//!   ([`EditorModule::set_viewers`]),
 //! - and place the sun, if it wants to ([`EditorModule::sun`]).
 //!
 //! A module's own data lives in the world as named extension components
@@ -45,6 +47,16 @@ pub trait EditorModule {
     /// Add this module's section to the Inspector for the selected entity.
     /// Read and write the entity's components through `entity`.
     fn inspect(&mut self, _ui: &mut egui::Ui, _entity: &mut ExtEdit) {}
+
+    /// Where the viewers are, in world space, just before `build_scene`. The
+    /// first is the camera about to be drawn from (the editor camera in the
+    /// viewport, the active Camera entity in the Play window); while Play
+    /// runs the other window's camera follows, so a module can build for both
+    /// and neither window waits on the other. A module that builds more
+    /// detail near the viewer than far away (a streamed landscape) keeps
+    /// these; a module that doesn't care ignores them. The list is never
+    /// empty: with no Camera entity the viewer is the editor's focus point.
+    fn set_viewers(&mut self, _viewers: &[[f64; 3]]) {}
 
     /// Build what should be drawn for `world`, or None for nothing. Called
     /// every frame for each world being drawn, so reuse the last result when
@@ -370,11 +382,15 @@ pub(crate) fn module_scenes(
     modules: &std::cell::RefCell<Vec<Box<dyn EditorModule>>>,
     world: &World,
     hold: bool,
+    viewers: &[[f64; 3]],
 ) -> Vec<Option<ModuleScene>> {
     modules
         .borrow_mut()
         .iter_mut()
-        .map(|m| m.build_scene(world, hold))
+        .map(|m| {
+            m.set_viewers(viewers);
+            m.build_scene(world, hold)
+        })
         .collect()
 }
 
@@ -490,6 +506,35 @@ mod tests {
         edit.apply(&mut world, id);
         assert_eq!(world.ext_get::<u32>("a", id), Some(5));
         assert_eq!(world.ext_get::<u32>("b", id), Some(99));
+    }
+
+    /// A module that only remembers where the viewers were.
+    struct Watcher {
+        seen: std::rc::Rc<std::cell::RefCell<Vec<[f64; 3]>>>,
+    }
+    impl EditorModule for Watcher {
+        fn name(&self) -> &str {
+            "watcher"
+        }
+        fn set_viewers(&mut self, viewers: &[[f64; 3]]) {
+            *self.seen.borrow_mut() = viewers.to_vec();
+        }
+        fn new_gpu(&self, _gpu: &GpuContext) -> Box<dyn ModuleGpu> {
+            unreachable!("no GPU in tests")
+        }
+    }
+
+    #[test]
+    fn modules_are_told_where_the_viewers_are_before_they_build() {
+        let (world, _) = world_with_entity();
+        let seen = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let modules = std::cell::RefCell::new(vec![
+            Box::new(Watcher { seen: seen.clone() }) as Box<dyn EditorModule>
+        ]);
+        let far = [2.0e7, 120.0, -3.5e6];
+        let _ = module_scenes(&modules, &world, false, &[far]);
+        // Full precision: a viewer 20,000 km out is not rounded to f32.
+        assert_eq!(*seen.borrow(), vec![far]);
     }
 
     struct Floor {

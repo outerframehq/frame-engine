@@ -5568,6 +5568,15 @@ impl App {
                     self.cam_focus_z,
                 ))
             });
+        // Where Play is looking from, for modules that stream detail around
+        // the viewer: the active Camera entity, or the editor's own focus.
+        let game_viewer = self
+            .game_world
+            .as_ref()
+            .zip(active_camera_id)
+            .and_then(|(world, id)| world.positions.get(id))
+            .map(|p| [p.x, p.y, p.z])
+            .unwrap_or([self.cam_focus_x, self.cam_focus_y, self.cam_focus_z]);
         let (instances, group_counts, lights) = match &self.game_world {
             Some(world) => {
                 let anchors = module_api::anchor_names(&self.modules);
@@ -5613,7 +5622,15 @@ impl App {
         let module_scenes = self
             .game_world
             .as_ref()
-            .map(|world| module_api::module_scenes(&self.modules, world, false))
+            .map(|world| {
+                let eye = self.viewer_world();
+                module_api::module_scenes(
+                    &self.modules,
+                    world,
+                    false,
+                    &[game_viewer, [eye.x, eye.y, eye.z]],
+                )
+            })
             .unwrap_or_default();
         if let Some(gpu) = self.game_gpu.as_mut() {
             gpu.sync_modules(&module_scenes, game_origin);
@@ -6501,6 +6518,31 @@ impl App {
         };
         origin::snap(reference)
     }
+    /// Where the viewport camera really is, in world space (`f64`): the
+    /// free-camera eye while flying, or the orbit eye otherwise.
+    fn viewer_world(&self) -> DVec3 {
+        if self.fly_mode {
+            self.cam_eye
+        } else {
+            let offset = DVec3::new(
+                (self.cam_pitch.cos() * self.cam_yaw.sin()) as f64,
+                self.cam_pitch.sin() as f64,
+                (self.cam_pitch.cos() * self.cam_yaw.cos()) as f64,
+            ) * self.cam_distance as f64;
+            DVec3::new(self.cam_focus_x, self.cam_focus_y, self.cam_focus_z) + offset
+        }
+    }
+    /// Where Play is looking from, in world space, while Play is running: the
+    /// active Camera entity, or the editor's own focus when the scene has none.
+    fn game_viewer_world(&self) -> Option<[f64; 3]> {
+        let world = self.game_world.as_ref()?;
+        Some(
+            find_camera_entity(world)
+                .and_then(|id| world.positions.get(id))
+                .map(|p| [p.x, p.y, p.z])
+                .unwrap_or([self.cam_focus_x, self.cam_focus_y, self.cam_focus_z]),
+        )
+    }
     /// A world position as drawn this frame: relative to the render origin.
     fn rel(&self, p: &Position) -> Vec3 {
         origin::relative(DVec3::new(p.x, p.y, p.z), self.view_origin())
@@ -7182,7 +7224,12 @@ impl ApplicationHandler for App {
                 // they had rather than rebuilding every frame.
                 let module_scenes = {
                     let hold = self.egui_ctx.input(|i| i.pointer.any_down());
-                    module_api::module_scenes(&self.modules, &self.world, hold)
+                    let eye = self.viewer_world();
+                    let mut viewers = vec![[eye.x, eye.y, eye.z]];
+                    // While Play runs its camera is a viewer too, so a module
+                    // builds for both windows and neither waits on the other.
+                    viewers.extend(self.game_viewer_world());
+                    module_api::module_scenes(&self.modules, &self.world, hold, &viewers)
                 };
                 let (width, height) = match &self.window {
                     Some(window) => {

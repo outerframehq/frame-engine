@@ -16,6 +16,10 @@ lands and the patch version bumps for fixes and small additions.
 
 ### Added
 
+Editor:
+
+- `EditorModule::set_viewers`. Before a module builds its scene each frame it is told where the viewers are, in world space and full `f64`: the camera about to be drawn from first (the free-camera eye or orbit eye in the viewport, the active Camera entity in the Play window), then the other window's camera while Play runs, so a module can build for both. A module that builds detail around the viewer, such as a streamed landscape with finer chunks nearby and coarser ones further out, uses it; every other module ignores it (the default does nothing). Covered by a test with a viewer 20,000 km out.
+
 Engine:
 
 - Extension components. `World.extensions` holds named components that belong to crates outside the engine, with `ext_set`, `ext_get`, `ext_has`, `ext_remove` and `ext_ids`. Any serde type works, the values are saved and loaded with the scene, older scenes load unchanged, and a component nobody has loaded is kept when the scene is saved again. Despawning clears them.
