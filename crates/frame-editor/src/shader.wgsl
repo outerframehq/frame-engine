@@ -50,7 +50,8 @@ struct Shadow {
 struct Sky {
     // Clip space back to world space, to find the direction a pixel looks in.
     inv_view_proj: mat4x4<f32>,
-    // xyz: the camera's world position.
+    // xyz: the camera's position as drawn (relative to the render origin).
+    // w: the render origin's height above the world's zero.
     eye: vec4<f32>,
     // xyz: unit direction toward the sun. w: how strongly to draw the disc.
     sun_direction: vec4<f32>,
@@ -67,15 +68,30 @@ struct Sky {
 };
 @group(0) @binding(5) var<uniform> sky: Sky;
 
+// How quickly fog thins with altitude, in world units per factor of e.
+// MUST match FOG_HEIGHT_SCALE in sky.rs.
+const FOG_HEIGHT_SCALE: f32 = 1200.0;
+
 // Blend a lit colour toward the horizon colour with distance from the camera,
 // so far-off ground dissolves into the sky. Exponential squared: clear up
-// close, thickening quickly. Mirrors fog_factor in sky.rs.
+// close, thickening quickly. The fog is thick in the low air and thins with
+// altitude, so a summit far away stays visible while lowland the same
+// distance off fades out; the thickness is averaged along the line of sight
+// (the exact integral of an exponential falloff). Mirrors fog_factor_between
+// in sky.rs.
 fn apply_fog(colour: vec3<f32>, world_position: vec3<f32>) -> vec3<f32> {
     let density = sky.horizon.w;
     if (density <= 0.0) {
         return colour;
     }
-    let x = length(world_position - sky.eye.xyz) * density;
+    let k = 1.0 / FOG_HEIGHT_SCALE;
+    let h1 = max(sky.eye.y + sky.eye.w, 0.0);
+    let h2 = max(world_position.y + sky.eye.w, 0.0);
+    var thin = exp(-k * h1);
+    if (abs(h2 - h1) > 1.0) {
+        thin = (exp(-k * h1) - exp(-k * h2)) / (k * (h2 - h1));
+    }
+    let x = length(world_position - sky.eye.xyz) * density * thin;
     let amount = 1.0 - exp(-(x * x));
     return mix(colour, sky.horizon.rgb, amount);
 }

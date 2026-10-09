@@ -27,6 +27,12 @@ pub(crate) const VIVID: f32 = 0.65;
 /// thousand units.
 pub(crate) const FOG_REFERENCE_DISTANCE: f32 = 1800.0;
 
+/// How quickly fog thins with altitude: it is `1 / e` as thick every this
+/// many world units higher. The air near the ground is the hazy part, so a
+/// peak a few thousand units up stays clear while the lowland around it
+/// fades out, and a camera above the haze sees the ground below through it.
+pub(crate) const FOG_HEIGHT_SCALE: f32 = 1200.0;
+
 /// The most fog the preference allows (a multiplier on the default).
 pub(crate) const FOG_AMOUNT_MAX: f32 = 4.0;
 /// The fog a fresh install starts with.
@@ -40,7 +46,9 @@ pub(crate) struct SkyUniform {
     /// Turns a clip-space point back into a world-space point, to find the
     /// direction each pixel looks in.
     pub inv_view_proj: [[f32; 4]; 4],
-    /// xyz: the camera's world position. w: unused.
+    /// xyz: the camera's position as drawn (relative to the render origin).
+    /// w: the render origin's height above the world's zero, so fog can tell
+    /// a surface's real altitude.
     pub eye: [f32; 4],
     /// xyz: unit direction toward the sun. w: how strongly to draw the sun
     /// disc (0 when there is no light to be the sun, or it is below the
@@ -171,6 +179,23 @@ pub(crate) fn fog_factor(distance: f32, density: f32) -> f32 {
     1.0 - (-(x * x)).exp()
 }
 
+/// Like `fog_factor`, for a view from altitude `from_y` to altitude `to_y`
+/// (world heights, never taken below 0): the fog thins with height, so the
+/// view is thick only where it passes through low air. Mirrors `apply_fog`
+/// in `shader.wgsl`.
+#[cfg(test)]
+pub(crate) fn fog_factor_between(from_y: f32, to_y: f32, distance: f32, density: f32) -> f32 {
+    let k = 1.0 / FOG_HEIGHT_SCALE;
+    let (h1, h2) = (from_y.max(0.0), to_y.max(0.0));
+    let thin = if (h2 - h1).abs() > 1.0 {
+        ((-k * h1).exp() - (-k * h2).exp()) / (k * (h2 - h1))
+    } else {
+        (-k * h1).exp()
+    };
+    let x = distance.max(0.0) * density * thin;
+    1.0 - (-(x * x)).exp()
+}
+
 /// Where the camera is, found from its view-projection matrix: the eye is the
 /// one point that every perspective projection sends to w = 0.
 pub(crate) fn eye_from_view_proj(view_proj: &Mat4) -> Vec3 {
@@ -198,6 +223,7 @@ pub(crate) fn sky_uniform(
     sun: Option<[f32; 3]>,
     enabled: bool,
     fog_amount: f32,
+    origin_y: f32,
 ) -> SkyUniform {
     let vp = Mat4::from_cols_array_2d(&view_proj);
     let inverse = vp.inverse();
@@ -221,7 +247,12 @@ pub(crate) fn sky_uniform(
         } else {
             Mat4::IDENTITY.to_cols_array_2d()
         },
-        eye: [eye.x, eye.y, eye.z, 0.0],
+        eye: [
+            eye.x,
+            eye.y,
+            eye.z,
+            if origin_y.is_finite() { origin_y } else { 0.0 },
+        ],
         sun_direction: [direction.x, direction.y, direction.z, disc],
         zenith: [
             colours.zenith[0],
@@ -357,6 +388,31 @@ mod tests {
     }
 
     #[test]
+    fn fog_thins_with_altitude() {
+        let d = fog_density(1.0);
+        // On the flat it is the same as plain fog.
+        let flat = fog_factor_between(0.0, 0.0, 3000.0, d);
+        assert!((flat - fog_factor(3000.0, d)).abs() < 1e-5);
+        // A summit far up the same distance away is much clearer than
+        // lowland that far away.
+        let summit = fog_factor_between(0.0, 4000.0, 6000.0, d);
+        let lowland = fog_factor_between(0.0, 0.0, 6000.0, d);
+        assert!(lowland > 0.99, "lowland at 6 km is fogged out: {lowland}");
+        assert!(summit < 0.9, "a 4 km summit at 6 km still shows: {summit}");
+        // High above the haze the ground below is seen through little of it.
+        assert!(fog_factor_between(4000.0, 0.0, 3000.0, d) < flat);
+        // The order of the two ends doesn't matter, and nothing is NaN.
+        let a = fog_factor_between(100.0, 2500.0, 5000.0, d);
+        let b = fog_factor_between(2500.0, 100.0, 5000.0, d);
+        assert!((a - b).abs() < 1e-5 && a.is_finite());
+        // Below the world's zero counts as zero, not thicker.
+        assert_eq!(
+            fog_factor_between(-500.0, 0.0, 2000.0, d),
+            fog_factor_between(0.0, 0.0, 2000.0, d)
+        );
+    }
+
+    #[test]
     fn the_eye_is_recovered_from_the_view_projection() {
         let eye = Vec3::new(12.0, 34.0, -56.0);
         let view = Mat4::look_at_rh(eye, eye + Vec3::new(0.3, -0.2, -1.0), Vec3::Y);
@@ -377,7 +433,7 @@ mod tests {
         let eye = Vec3::new(0.0, 50.0, 200.0);
         let vp = Mat4::perspective_rh(1.0, 1.5, 0.1, 4000.0)
             * Mat4::look_at_rh(eye, Vec3::ZERO, Vec3::Y);
-        let u = sky_uniform(vp.to_cols_array_2d(), Some([0.0, 2.0, 0.0]), true, 1.0);
+        let u = sky_uniform(vp.to_cols_array_2d(), Some([0.0, 2.0, 0.0]), true, 1.0, 0.0);
         assert_eq!(
             &u.sun_direction[..3],
             &[0.0, 1.0, 0.0],
@@ -388,22 +444,28 @@ mod tests {
         assert!(u.horizon[3] > 0.0, "fog on");
         assert!((Vec3::new(u.eye[0], u.eye[1], u.eye[2]) - eye).length() < 0.05);
 
-        let off = sky_uniform(vp.to_cols_array_2d(), Some([0.0, 2.0, 0.0]), false, 1.0);
+        let off = sky_uniform(
+            vp.to_cols_array_2d(),
+            Some([0.0, 2.0, 0.0]),
+            false,
+            1.0,
+            0.0,
+        );
         assert_eq!(off.zenith[3], 0.0, "sky off");
         assert_eq!(off.horizon[3], 0.0, "and no fog with it");
 
         // No light in the scene: still a sky, but no sun disc is drawn.
-        let none = sky_uniform(vp.to_cols_array_2d(), None, true, 1.0);
+        let none = sky_uniform(vp.to_cols_array_2d(), None, true, 1.0, 0.0);
         assert_eq!(none.sun_direction[3], 0.0);
         assert!(none.sun_direction[1] > 0.0, "a daytime sky");
         // A zero-length direction counts as no light too.
-        let zero = sky_uniform(vp.to_cols_array_2d(), Some([0.0; 3]), true, 1.0);
+        let zero = sky_uniform(vp.to_cols_array_2d(), Some([0.0; 3]), true, 1.0, 0.0);
         assert_eq!(zero.sun_direction[3], 0.0);
     }
 
     #[test]
     fn a_broken_matrix_never_puts_nan_in_the_uniform() {
-        let u = sky_uniform([[0.0; 4]; 4], Some([0.0, 1.0, 0.0]), true, 1.0);
+        let u = sky_uniform([[0.0; 4]; 4], Some([0.0, 1.0, 0.0]), true, 1.0, 0.0);
         let bytes: &[f32] = bytemuck::cast_slice(std::slice::from_ref(&u));
         assert!(bytes.iter().all(|v| v.is_finite()), "{u:?}");
     }
@@ -411,7 +473,7 @@ mod tests {
     #[test]
     fn a_sun_below_the_horizon_hides_the_disc_and_darkens_the_sky() {
         let vp = Mat4::IDENTITY.to_cols_array_2d();
-        let u = sky_uniform(vp, Some([0.3, -0.8, 0.2]), true, 1.0);
+        let u = sky_uniform(vp, Some([0.3, -0.8, 0.2]), true, 1.0, 0.0);
         assert_eq!(u.sun_direction[3], 0.0);
         assert!(luma([u.zenith[0], u.zenith[1], u.zenith[2]]) < 0.05);
     }

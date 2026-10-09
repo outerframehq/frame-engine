@@ -182,8 +182,15 @@ fn sky_uniform_for_frame(
     view_proj: [[f32; 4]; 4],
     lights: &[LightRaw; MAX_LIGHTS],
     enabled: bool,
+    origin_y: f32,
 ) -> sky::SkyUniform {
-    let mut uniform = sky::sky_uniform(view_proj, effective_sun(lights), enabled, fog_amount());
+    let mut uniform = sky::sky_uniform(
+        view_proj,
+        effective_sun(lights),
+        enabled,
+        fog_amount(),
+        origin_y,
+    );
     uniform.ground[3] = match sun::current() {
         Some(sun) => sky::ambient_scale(sun.direction[1]),
         None => 1.0,
@@ -1019,6 +1026,10 @@ struct GpuState {
     shadow_map_view: wgpu::TextureView,
     // One GPU side per editor module (see `module_api`).
     module_gpu: Vec<Box<dyn ModuleGpu>>,
+    // How high the render origin is above the world's zero, so the fog can
+    // tell how high up a surface really is. Set by `sync_modules`, which runs
+    // just before each draw with that frame's origin.
+    origin_y: f32,
 }
 impl GpuState {
     /// Builds a GpuState for one window. `shared` is `None` exactly once per
@@ -1633,6 +1644,7 @@ impl GpuState {
                 shadow_pass_bind_group,
                 shadow_map_view,
                 module_gpu,
+                origin_y: 0.0,
             },
             shared_out,
         )
@@ -1771,6 +1783,7 @@ impl GpuState {
     /// module, in order; missing entries mean no scene). Cheap to call every
     /// frame.
     fn sync_modules(&mut self, scenes: &[Option<ModuleScene>], origin: DVec3) {
+        self.origin_y = origin.y as f32;
         for (i, module) in self.module_gpu.iter_mut().enumerate() {
             let scene = scenes.get(i).and_then(|s| s.as_ref());
             module.sync(&self.device, &self.queue, scene);
@@ -1803,7 +1816,12 @@ impl GpuState {
         self.queue.write_buffer(
             &self.sky_buffer,
             0,
-            bytemuck::cast_slice(&[sky_uniform_for_frame(view_proj, lights, sky_on)]),
+            bytemuck::cast_slice(&[sky_uniform_for_frame(
+                view_proj,
+                lights,
+                sky_on,
+                self.origin_y,
+            )]),
         );
         self.queue.write_buffer(
             &self.lights_buffer,
@@ -2036,7 +2054,12 @@ impl GpuState {
         self.queue.write_buffer(
             &self.preview_sky_buffer,
             0,
-            bytemuck::cast_slice(&[sky_uniform_for_frame(view_proj, lights, sky_on)]),
+            bytemuck::cast_slice(&[sky_uniform_for_frame(
+                view_proj,
+                lights,
+                sky_on,
+                self.origin_y,
+            )]),
         );
         self.queue.write_buffer(
             &self.lights_buffer,
@@ -9855,7 +9878,7 @@ mod ambient_tests {
     #[test]
     fn the_ambient_light_is_untouched_while_the_cycle_is_off() {
         let lights = [LightRaw::zeroed(); MAX_LIGHTS];
-        let uniform = sky_uniform_for_frame(Mat4::IDENTITY.to_cols_array_2d(), &lights, true);
+        let uniform = sky_uniform_for_frame(Mat4::IDENTITY.to_cols_array_2d(), &lights, true, 0.0);
         assert_eq!(uniform.ground[3], 1.0);
     }
 }
