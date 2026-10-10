@@ -5,6 +5,8 @@
 // Camera (shared view-projection matrix), set once per frame.
 struct Camera {
     view_proj: mat4x4<f32>,
+    // xyz: the camera's position as drawn (relative to the render origin).
+    eye: vec4<f32>,
 };
 @group(0) @binding(0) var<uniform> camera: Camera;
 
@@ -40,6 +42,8 @@ struct Shadow {
     // z: normal-offset bias, in world units.
     // w: size of one shadow-map texel in UV space (1 / map size).
     params: vec4<f32>,
+    // The viewing camera, for the shadow pass (see shadow.wgsl).
+    eye: vec4<f32>,
 };
 @group(0) @binding(2) var<uniform> shadow: Shadow;
 @group(0) @binding(3) var shadow_map: texture_depth_2d;
@@ -152,6 +156,10 @@ struct VertexInput {
     @location(0) position: vec3<f32>,
     @location(1) normal: vec3<f32>,
     @location(2) uv: vec2<f32>,
+    // x: height offset when fully morphed. y, z: the distance band. All zero
+    // for a mesh that does not morph (see VertexMorph in module_api.rs).
+    @location(9) morph: vec3<f32>,
+    @location(10) morph_normal: vec3<f32>,
 };
 
 // Per-entity instance data (matches InstanceRaw in main.rs). Bound at slot 1.
@@ -200,14 +208,34 @@ fn rotate_by(v: vec3<f32>, angles: vec3<f32>) -> vec3<f32> {
     return vec3<f32>(pitched.x * cy - pitched.z * sy, pitched.y, pitched.x * sy + pitched.z * cy);
 }
 
+// How far through its morph a vertex at `world` is, 0 to 1, seen from `eye`.
+// Distance is across the ground, the larger of x and z, so the bands are
+// squares. MUST match `morph_amount` in shadow.wgsl.
+fn morph_amount(world: vec3<f32>, eye: vec3<f32>, band: vec2<f32>) -> f32 {
+    if (band.y <= band.x) {
+        return 0.0;
+    }
+    let d = max(abs(world.x - eye.x), abs(world.z - eye.z));
+    return clamp((d - band.x) / (band.y - band.x), 0.0, 1.0);
+}
+
 @vertex
 fn vs_main(vertex: VertexInput, instance: InstanceInput) -> VertexOutput {
     // Per-axis scale (component-wise), then the entity's rotation, then place
     // at the entity's position. Scale first so rotation spins the
     // already-sized shape rather than an elongated axis.
-    let scaled = vertex.position * MESH_SIZE * instance.scale;
+    let unmorphed = instance.position
+        + rotate_by(vertex.position * MESH_SIZE * instance.scale, instance.rotation);
+    // A level-of-detail mesh slides toward its coarser shape with distance.
+    let t = morph_amount(unmorphed, camera.eye.xyz, vertex.morph.yz);
+    let local = vertex.position + vec3<f32>(0.0, vertex.morph.x * t, 0.0);
+    let scaled = local * MESH_SIZE * instance.scale;
     let rotated = rotate_by(scaled, instance.rotation);
     let world_pos = instance.position + rotated;
+    var normal = vertex.normal;
+    if (t > 0.0) {
+        normal = normalize(mix(vertex.normal, vertex.morph_normal, t));
+    }
 
     // The mesh's own normal, rotated the same way the shape was, so shading
     // stays correct as an entity turns. A diagonal scale leaves an
@@ -216,7 +244,7 @@ fn vs_main(vertex: VertexInput, instance: InstanceInput) -> VertexOutput {
     // approximately, which is fine here. Actual lighting now happens per
     // fragment, not here, so a point light's falloff varies smoothly across
     // a face instead of only being evaluated at each corner.
-    let rotated_normal = rotate_by(vertex.normal, instance.rotation);
+    let rotated_normal = rotate_by(normal, instance.rotation);
 
     var out: VertexOutput;
     out.clip_position = camera.view_proj * vec4<f32>(world_pos, 1.0);

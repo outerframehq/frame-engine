@@ -298,6 +298,24 @@ impl ExtEdit {
     }
 }
 
+/// How one vertex of a level-of-detail mesh slides toward a coarser shape as
+/// the camera gets further away, so that switching to the coarser mesh shows
+/// no jump. Distance is measured across the ground only, as the larger of the
+/// x and z distances from the camera (a square, matching square rings of
+/// detail). Nearer than `start` the vertex is where its mesh puts it; past
+/// `end` it is fully moved; in between it blends. `end` at or below `start`
+/// means no morph.
+#[derive(Copy, Clone, Debug, Default, PartialEq)]
+pub struct VertexMorph {
+    /// How far the vertex moves up (down if negative) when fully morphed, in
+    /// the mesh's own units.
+    pub offset_y: f32,
+    /// The normal it has when fully morphed.
+    pub normal: [f32; 3],
+    pub start: f32,
+    pub end: f32,
+}
+
 /// A triangle mesh on the GPU, in world units, for a module to draw.
 pub struct WorldMesh {
     buffer: wgpu::Buffer,
@@ -312,21 +330,47 @@ impl WorldMesh {
         }
         let verts: Vec<MeshVertex> = vertices
             .iter()
-            .map(|v| MeshVertex {
-                position: v.position,
-                normal: v.normal,
-                uv: v.uv,
+            .map(|v| MeshVertex::plain(v.position, v.normal, v.uv))
+            .collect();
+        Some(Self::upload(device, &verts))
+    }
+
+    /// Like `new`, with each vertex morphing as its `morphs` entry says (see
+    /// [`VertexMorph`]). `morphs` holds one entry per vertex; a missing entry
+    /// means that vertex does not morph.
+    pub fn new_morphing(
+        device: &wgpu::Device,
+        vertices: &[MeshVertexData],
+        morphs: &[VertexMorph],
+    ) -> Option<Self> {
+        if vertices.is_empty() {
+            return None;
+        }
+        let verts: Vec<MeshVertex> = vertices
+            .iter()
+            .enumerate()
+            .map(|(i, v)| {
+                let mut out = MeshVertex::plain(v.position, v.normal, v.uv);
+                if let Some(m) = morphs.get(i) {
+                    out.morph = [m.offset_y, m.start, m.end];
+                    out.morph_normal = m.normal;
+                }
+                out
             })
             .collect();
+        Some(Self::upload(device, &verts))
+    }
+
+    fn upload(device: &wgpu::Device, verts: &[MeshVertex]) -> Self {
         let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("module mesh buffer"),
-            contents: bytemuck::cast_slice(&verts),
+            contents: bytemuck::cast_slice(verts),
             usage: wgpu::BufferUsages::VERTEX,
         });
-        Some(WorldMesh {
+        WorldMesh {
             buffer,
             count: verts.len() as u32,
-        })
+        }
     }
 
     /// Draw it. Call `WorldInstance::bind` first.

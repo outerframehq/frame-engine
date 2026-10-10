@@ -70,6 +70,18 @@ const GIZMO_PICK_PX: f32 = 10.0;
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 struct CameraUniform {
     view_proj: [[f32; 4]; 4],
+    // xyz: the camera's position as drawn (relative to the render origin),
+    // for vertex morphing. w unused.
+    eye: [f32; 4],
+}
+impl CameraUniform {
+    fn new(view_proj: [[f32; 4]; 4]) -> Self {
+        let eye = sky::eye_from_view_proj(&Mat4::from_cols_array_2d(&view_proj));
+        CameraUniform {
+            view_proj,
+            eye: [eye.x, eye.y, eye.z, 0.0],
+        }
+    }
 }
 // One light's data handed to the shader. Must match the `Light` struct in
 // shader.wgsl field-for-field, including the deliberate use of [f32; 4]
@@ -109,6 +121,9 @@ struct ShadowUniform {
     // x: 1.0 when shadows are active this frame. y: depth bias. z: normal
     // offset in world units. w: one texel in UV space.
     params: [f32; 4],
+    // xyz: the viewing camera's position as drawn, so the shadow pass morphs
+    // vertices the same way the colour pass does. w unused.
+    eye: [f32; 4],
 }
 /// Process-wide switch for shadows (an editor preference). A static rather
 /// than an App field because the Play window has its own GpuState and both
@@ -212,6 +227,7 @@ fn compute_shadow(
     let off = ShadowUniform {
         light_view_proj: Mat4::IDENTITY.to_cols_array_2d(),
         params: [0.0; 4],
+        eye: [0.0; 4],
     };
     if !shadows_enabled() || (instances.is_empty() && extra_bounds.is_none()) {
         return off;
@@ -330,6 +346,7 @@ fn compute_shadow(
             texel_world * 1.5,
             1.0 / SHADOW_MAP_SIZE as f32,
         ],
+        eye: [0.0; 4],
     }
 }
 // One mesh's material data handed to the shader (group 1, binding 2). Must
@@ -367,9 +384,24 @@ struct MeshVertex {
     // Sphere, Plane), which stay untextured in this first pass; a real value
     // only ever comes from an imported model's own parsed UVs.
     uv: [f32; 2],
+    // Vertex morph (see `module_api::VertexMorph`): x is the height offset,
+    // y and z the start and end of the distance band. All zero for no morph.
+    morph: [f32; 3],
+    // The normal the vertex blends to as it morphs.
+    morph_normal: [f32; 3],
 }
 impl MeshVertex {
-    const ATTRIBS: [wgpu::VertexAttribute; 3] = [
+    /// A vertex that never morphs.
+    fn plain(position: [f32; 3], normal: [f32; 3], uv: [f32; 2]) -> Self {
+        MeshVertex {
+            position,
+            normal,
+            uv,
+            morph: [0.0; 3],
+            morph_normal: [0.0; 3],
+        }
+    }
+    const ATTRIBS: [wgpu::VertexAttribute; 5] = [
         wgpu::VertexAttribute {
             format: wgpu::VertexFormat::Float32x3,
             offset: 0,
@@ -384,6 +416,17 @@ impl MeshVertex {
             format: wgpu::VertexFormat::Float32x2,
             offset: std::mem::size_of::<[f32; 6]>() as wgpu::BufferAddress, // 24
             shader_location: 2,
+        },
+        // Locations 3 to 8 are the instance's.
+        wgpu::VertexAttribute {
+            format: wgpu::VertexFormat::Float32x3,
+            offset: std::mem::size_of::<[f32; 8]>() as wgpu::BufferAddress, // 32
+            shader_location: 9,
+        },
+        wgpu::VertexAttribute {
+            format: wgpu::VertexFormat::Float32x3,
+            offset: std::mem::size_of::<[f32; 11]>() as wgpu::BufferAddress, // 44
+            shader_location: 10,
         },
     ];
     fn layout() -> wgpu::VertexBufferLayout<'static> {
@@ -428,11 +471,7 @@ fn cube_vertices() -> Vec<MeshVertex> {
     let mut verts = Vec::with_capacity(36);
     for (indices, normal) in FACES {
         for i in indices {
-            verts.push(MeshVertex {
-                position: C[i],
-                normal,
-                uv: [0.0, 0.0],
-            });
+            verts.push(MeshVertex::plain(C[i], normal, [0.0, 0.0]));
         }
     }
     verts
@@ -454,10 +493,12 @@ fn sphere_vertices() -> Vec<MeshVertex> {
             theta.sin() * phi.sin(),
         ]
     };
-    let vert = |unit: [f32; 3]| MeshVertex {
-        position: [unit[0] * RADIUS, unit[1] * RADIUS, unit[2] * RADIUS],
-        normal: unit,
-        uv: [0.0, 0.0],
+    let vert = |unit: [f32; 3]| {
+        MeshVertex::plain(
+            [unit[0] * RADIUS, unit[1] * RADIUS, unit[2] * RADIUS],
+            unit,
+            [0.0, 0.0],
+        )
     };
     let mut verts = Vec::new();
     for lat in 0..LAT {
@@ -487,11 +528,7 @@ fn sphere_vertices() -> Vec<MeshVertex> {
 // off, so it's visible from below too.
 fn plane_vertices() -> Vec<MeshVertex> {
     let normal = [0.0, 1.0, 0.0];
-    let v = |x: f32, z: f32| MeshVertex {
-        position: [x, 0.0, z],
-        normal,
-        uv: [0.0, 0.0],
-    };
+    let v = |x: f32, z: f32| MeshVertex::plain([x, 0.0, z], normal, [0.0, 0.0]);
     vec![
         v(-0.5, -0.5),
         v(0.5, -0.5),
@@ -932,11 +969,7 @@ fn build_mesh_buffer(
         let verts: Vec<MeshVertex> = data
             .vertices
             .iter()
-            .map(|v| MeshVertex {
-                position: v.position,
-                normal: v.normal,
-                uv: v.uv,
-            })
+            .map(|v| MeshVertex::plain(v.position, v.normal, v.uv))
             .collect();
         push(verts, &mut mesh_verts, &mut ranges);
     }
@@ -1095,9 +1128,7 @@ impl GpuState {
             config.format,
             egui_wgpu::RendererOptions::default(),
         );
-        let camera_uniform = CameraUniform {
-            view_proj: Mat4::IDENTITY.to_cols_array_2d(),
-        };
+        let camera_uniform = CameraUniform::new(Mat4::IDENTITY.to_cols_array_2d());
         let camera_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("camera buffer"),
             contents: bytemuck::cast_slice(&[camera_uniform]),
@@ -1335,9 +1366,9 @@ impl GpuState {
         let preview_depth_view = create_depth_view(&device, PREVIEW_WIDTH, PREVIEW_HEIGHT);
         let preview_camera_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("preview camera buffer"),
-            contents: bytemuck::cast_slice(&[CameraUniform {
-                view_proj: Mat4::IDENTITY.to_cols_array_2d(),
-            }]),
+            contents: bytemuck::cast_slice(&[CameraUniform::new(
+                Mat4::IDENTITY.to_cols_array_2d(),
+            )]),
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
         // Its own bind group, not a shared one: writing this camera's
@@ -1734,7 +1765,8 @@ impl GpuState {
             }
         }
         let has_module_geometry = self.module_gpu.iter().any(|m| m.has_geometry());
-        let uniform = compute_shadow(instances, lights, view_proj, extra_bounds);
+        let mut uniform = compute_shadow(instances, lights, view_proj, extra_bounds);
+        uniform.eye = CameraUniform::new(view_proj).eye;
         self.queue
             .write_buffer(&self.shadow_buffer, 0, bytemuck::cast_slice(&[uniform]));
         if instance_buffer.is_none() && !has_module_geometry {
@@ -1806,7 +1838,7 @@ impl GpuState {
         egui_textures_delta: &egui::TexturesDelta,
         egui_ppp: f32,
     ) {
-        let camera_uniform = CameraUniform { view_proj };
+        let camera_uniform = CameraUniform::new(view_proj);
         self.queue.write_buffer(
             &self.camera_buffer,
             0,
@@ -2048,7 +2080,7 @@ impl GpuState {
         self.queue.write_buffer(
             &self.preview_camera_buffer,
             0,
-            bytemuck::cast_slice(&[CameraUniform { view_proj }]),
+            bytemuck::cast_slice(&[CameraUniform::new(view_proj)]),
         );
         let sky_on = sky_enabled();
         self.queue.write_buffer(
@@ -3237,6 +3269,7 @@ fn inspector_tab_ui(
                 Mesh::Sphere => "Sphere".to_string(),
                 Mesh::Plane => "Plane".to_string(),
                 Mesh::Custom(name) => name.clone(),
+                Mesh::Empty => "None".to_string(),
             };
             egui::ComboBox::from_id_salt("mesh_picker")
                 .selected_text(mesh_label)
@@ -3244,6 +3277,12 @@ fn inspector_tab_ui(
                     ui.selectable_value(mesh, Mesh::Cube, "Cube");
                     ui.selectable_value(mesh, Mesh::Sphere, "Sphere");
                     ui.selectable_value(mesh, Mesh::Plane, "Plane");
+                    ui.selectable_value(mesh, Mesh::Empty, "None")
+                        .on_hover_text(
+                            "No mesh: not drawn, no collision, no physics body. \
+                         Select it from the Scene list or by clicking where it \
+                         is, and move it with the gizmo.",
+                        );
                     // Imported models come after the primitives.
                     for name in custom_mesh_names {
                         ui.selectable_value(mesh, Mesh::Custom(name.clone()), name);
@@ -8941,9 +8980,22 @@ fn build_instances(
             continue;
         }
         let Some(p) = slot.as_ref() else { continue };
+        let mesh = world.meshes.get(id).cloned().unwrap_or_default();
+        let bucket = match &mesh {
+            // Nothing to draw.
+            Mesh::Empty => continue,
+            Mesh::Cube => 0,
+            Mesh::Sphere => 1,
+            Mesh::Plane => 2,
+            // An imported model draws with its own vertices. A name with no
+            // loaded model falls back to the cube.
+            Mesh::Custom(name) => match custom_names.iter().position(|n| n == name) {
+                Some(i) => 3 + i,
+                None => 0,
+            },
+        };
         let color = world.colors.get(id).copied().unwrap_or_default();
         let scale = world.scales.get(id).copied().unwrap_or_default();
-        let mesh = world.meshes.get(id).cloned().unwrap_or_default();
         let material = world.materials.get(id).copied().unwrap_or_default();
         let rotation = world.rotations.get(id).copied().unwrap_or_default();
         let rgb = if colliding.contains(&id) {
@@ -8963,17 +9015,6 @@ fn build_instances(
             scale: [scale.x, scale.y, scale.z],
             emissive: material.emissive,
             rotation: [rotation.yaw, rotation.pitch, rotation.roll],
-        };
-        let bucket = match &mesh {
-            Mesh::Cube => 0,
-            Mesh::Sphere => 1,
-            Mesh::Plane => 2,
-            // An imported model draws with its own vertices. A name with no
-            // loaded model falls back to the cube.
-            Mesh::Custom(name) => match custom_names.iter().position(|n| n == name) {
-                Some(i) => 3 + i,
-                None => 0,
-            },
         };
         buckets[bucket].push(raw);
     }
@@ -9599,6 +9640,61 @@ mod shader_tests {
     fn shadow_shader_is_valid() {
         validate(include_str!("shadow.wgsl"));
     }
+
+    /// The size the shader gives a uniform, by its variable name.
+    fn uniform_size(source: &str, name: &str) -> u32 {
+        let module = naga::front::wgsl::parse_str(source).unwrap();
+        let mut layouter = naga::proc::Layouter::default();
+        layouter.update(module.to_ctx()).unwrap();
+        let (_, var) = module
+            .global_variables
+            .iter()
+            .find(|(_, v)| v.name.as_deref() == Some(name))
+            .expect("uniform declared");
+        layouter[var.ty].size
+    }
+
+    #[test]
+    fn the_uniforms_are_the_same_size_on_both_sides() {
+        let main = include_str!("shader.wgsl");
+        let shadow = include_str!("shadow.wgsl");
+        let camera = std::mem::size_of::<super::CameraUniform>() as u32;
+        let shadow_uniform = std::mem::size_of::<super::ShadowUniform>() as u32;
+        assert_eq!(uniform_size(main, "camera"), camera);
+        assert_eq!(uniform_size(main, "shadow"), shadow_uniform);
+        assert_eq!(uniform_size(shadow, "shadow_cam"), shadow_uniform);
+    }
+
+    #[test]
+    fn the_vertex_layout_matches_the_shader_inputs() {
+        let module = naga::front::wgsl::parse_str(include_str!("shader.wgsl")).unwrap();
+        let entry = module
+            .entry_points
+            .iter()
+            .find(|e| e.name == "vs_main")
+            .unwrap();
+        let vertex_ty = entry.function.arguments[0].ty;
+        let naga::TypeInner::Struct { members, .. } = &module.types[vertex_ty].inner else {
+            panic!("vertex input is a struct");
+        };
+        let locations: Vec<u32> = members
+            .iter()
+            .filter_map(|m| match m.binding {
+                Some(naga::Binding::Location { location, .. }) => Some(location),
+                _ => None,
+            })
+            .collect();
+        let ours: Vec<u32> = super::MeshVertex::ATTRIBS
+            .iter()
+            .map(|a| a.shader_location)
+            .collect();
+        assert_eq!(locations, ours);
+        let last = super::MeshVertex::ATTRIBS.last().unwrap();
+        assert_eq!(
+            last.offset as usize + 12,
+            std::mem::size_of::<super::MeshVertex>()
+        );
+    }
 }
 
 #[cfg(test)]
@@ -9733,6 +9829,29 @@ mod far_from_the_origin_tests {
                 dz: 0.0,
             },
         )
+    }
+
+    #[test]
+    fn a_meshless_entity_is_not_drawn_and_saves_and_loads() {
+        let mut world = World::new();
+        let shown = spawn_at(&mut world, 0.0, 0.0, 0.0);
+        let hidden = spawn_at(&mut world, 3.0, 0.0, 0.0);
+        world.meshes.insert(hidden, Mesh::Empty);
+        let (instances, counts) = build_instances(
+            &world,
+            None,
+            &std::collections::HashSet::new(),
+            &[],
+            &[],
+            None,
+            DVec3::ZERO,
+        );
+        assert_eq!(instances.len(), 1, "entity {shown} only");
+        assert_eq!(counts.iter().sum::<u32>(), 1);
+        let text = ron::to_string(&world).expect("saves");
+        let back: World = ron::from_str(&text).expect("loads");
+        assert!(back.meshes.get(hidden) == Some(&Mesh::Empty));
+        assert!(back.meshes.get(shown) == Some(&Mesh::Cube));
     }
 
     #[test]

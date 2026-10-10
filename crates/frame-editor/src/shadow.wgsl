@@ -8,8 +8,12 @@
 //
 // The vertex transform here MUST match vs_main in shader.wgsl (same scale,
 // yaw and placement), or shadows would drift away from their casters.
+// The same buffer as `Shadow` in shader.wgsl.
 struct ShadowCam {
     light_view_proj: mat4x4<f32>,
+    params: vec4<f32>,
+    // The viewing camera, so vertices morph exactly as they are drawn.
+    eye: vec4<f32>,
 };
 @group(0) @binding(0) var<uniform> shadow_cam: ShadowCam;
 
@@ -18,6 +22,7 @@ const MESH_SIZE: f32 = 8.0;
 
 struct VertexInput {
     @location(0) position: vec3<f32>,
+    @location(9) morph: vec3<f32>,
 };
 
 // Only the instance fields that affect geometry are declared; the buffer
@@ -42,9 +47,22 @@ fn rotate_by(v: vec3<f32>, angles: vec3<f32>) -> vec3<f32> {
     return vec3<f32>(pitched.x * cy - pitched.z * sy, pitched.y, pitched.x * sy + pitched.z * cy);
 }
 
+// Same as `morph_amount` in shader.wgsl; keep them in step.
+fn morph_amount(world: vec3<f32>, eye: vec3<f32>, band: vec2<f32>) -> f32 {
+    if (band.y <= band.x) {
+        return 0.0;
+    }
+    let d = max(abs(world.x - eye.x), abs(world.z - eye.z));
+    return clamp((d - band.x) / (band.y - band.x), 0.0, 1.0);
+}
+
 @vertex
 fn vs_main(vertex: VertexInput, instance: InstanceInput) -> @builtin(position) vec4<f32> {
-    let scaled = vertex.position * MESH_SIZE * instance.scale;
+    let unmorphed = instance.position
+        + rotate_by(vertex.position * MESH_SIZE * instance.scale, instance.rotation);
+    let t = morph_amount(unmorphed, shadow_cam.eye.xyz, vertex.morph.yz);
+    let local = vertex.position + vec3<f32>(0.0, vertex.morph.x * t, 0.0);
+    let scaled = local * MESH_SIZE * instance.scale;
     let rotated = rotate_by(scaled, instance.rotation);
     return shadow_cam.light_view_proj * vec4<f32>(instance.position + rotated, 1.0);
 }
