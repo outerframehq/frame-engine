@@ -33,6 +33,19 @@ const TICK_RATE: u32 = 30;
 const MAX_CATCHUP_TICKS: u32 = 5;
 // Vertical field of view, shared by the projection and the pan maths.
 const FOV_DEGREES: f32 = 45.0;
+/// The camera's near plane, in world units. There is no far plane: depth is
+/// "reversed", with the near plane at depth 1 and infinity at depth 0, which
+/// spreads the 32-bit float depth buffer's precision evenly over distance. So
+/// the view reaches as far as anything is drawn, with no z-fighting far out.
+const NEAR: f32 = 0.1;
+/// What the depth buffers clear to: as far as reversed depth goes.
+const DEPTH_CLEAR: f32 = 0.0;
+/// The camera's projection for a viewport `aspect` (width over height), with
+/// reversed depth (see `NEAR`). Pipelines draw a fragment when its depth is
+/// greater than what is there.
+fn camera_projection(aspect: f32) -> Mat4 {
+    Mat4::perspective_infinite_reverse_rh(FOV_DEGREES.to_radians(), aspect, NEAR)
+}
 // World-space size of an entity, used for picking. Defined once in the engine
 // (it's a simulation fact — collision boxes use it too); we reference it here so
 // pick and collision can't drift. MESH_SIZE in shader.wgsl must match it by hand.
@@ -192,6 +205,17 @@ fn set_shadows_enabled(on: bool) {
 static SKY_ENABLED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
 static FOG_AMOUNT_BITS: std::sync::atomic::AtomicU32 =
     std::sync::atomic::AtomicU32::new(sky::FOG_AMOUNT_DEFAULT.to_bits());
+/// How far the drawn world reaches from the viewer this frame, as f32 bits
+/// (0 for no module that draws to a distance). Set with the module sun before
+/// each window draws; the fog thins to suit it (see `sky::fog_density`).
+static VIEW_REACH_BITS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+fn view_reach() -> f32 {
+    f32::from_bits(VIEW_REACH_BITS.load(std::sync::atomic::Ordering::Relaxed))
+}
+fn set_view_reach(reach: Option<f64>) {
+    let reach = reach.filter(|r| r.is_finite() && *r > 0.0).unwrap_or(0.0) as f32;
+    VIEW_REACH_BITS.store(reach.to_bits(), std::sync::atomic::Ordering::Relaxed);
+}
 fn sky_enabled() -> bool {
     SKY_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
 }
@@ -244,6 +268,7 @@ fn sky_uniform_for_frame(
         effective_sun(lights),
         enabled,
         fog_amount(),
+        view_reach(),
         origin_y,
     );
     uniform.ground[3] = match sun::current() {
@@ -326,8 +351,10 @@ fn compute_shadow(
     };
     let mut slice_points = Vec::with_capacity(8);
     for (x, y) in [(-1.0, -1.0), (1.0, -1.0), (1.0, 1.0), (-1.0, 1.0)] {
-        let near = unproject(x, y, 0.0);
-        let far = unproject(x, y, 1.0);
+        // Depth is reversed with no far plane (see `NEAR`): the near plane
+        // is at depth 1, and depth `NEAR / d` is `d` units in front.
+        let near = unproject(x, y, 1.0);
+        let far = unproject(x, y, NEAR / shadow_distance());
         let ray = far - near;
         if !(near.is_finite() && far.is_finite()) || ray.length() < 1e-4 {
             slice_points.clear();
@@ -874,7 +901,7 @@ fn camera_matrix(
     let eye = target + offset;
     let up = Vec3::Y;
     let view = Mat4::look_at_rh(eye, target, up);
-    let proj = Mat4::perspective_rh(FOV_DEGREES.to_radians(), aspect, 0.1, 10000.0);
+    let proj = camera_projection(aspect);
     proj * view
 }
 fn camera_view_proj(
@@ -924,7 +951,7 @@ fn camera_entity_view_proj(
     let up = Vec3::from(rotation.apply([0.0, 1.0, 0.0]));
     let aspect = width as f32 / height.max(1) as f32;
     let view = Mat4::look_at_rh(eye, eye + forward, up);
-    let proj = Mat4::perspective_rh(FOV_DEGREES.to_radians(), aspect, 0.1, 10000.0);
+    let proj = camera_projection(aspect);
     Some((proj * view).to_cols_array_2d())
 }
 // The scene's active Camera entity, if any: the lowest id. What Play mode
@@ -1506,10 +1533,11 @@ impl GpuState {
             // Entities test AND write depth: nearer fragments win and record
             // their depth, so a later-drawn far fragment is correctly discarded.
             // This is what makes a solid cube (front faces hide back faces).
+            // Depth is reversed (see `NEAR`), so nearer is greater.
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: DEPTH_FORMAT,
                 depth_write_enabled: Some(true),
-                depth_compare: Some(wgpu::CompareFunction::Less),
+                depth_compare: Some(wgpu::CompareFunction::Greater),
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
             }),
@@ -1543,7 +1571,7 @@ impl GpuState {
             depth_stencil: Some(wgpu::DepthStencilState {
                 format: DEPTH_FORMAT,
                 depth_write_enabled: Some(false),
-                depth_compare: Some(wgpu::CompareFunction::Less),
+                depth_compare: Some(wgpu::CompareFunction::Greater),
                 stencil: wgpu::StencilState::default(),
                 bias: wgpu::DepthBiasState::default(),
             }),
@@ -2005,11 +2033,11 @@ impl GpuState {
                         store: wgpu::StoreOp::Store,
                     },
                 })],
-                // Clear depth to 1.0 (farthest) at the start of every frame.
+                // Clear depth to the farthest (0, reversed) every frame.
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: &self.depth_view,
                     depth_ops: Some(wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(1.0),
+                        load: wgpu::LoadOp::Clear(DEPTH_CLEAR),
                         store: wgpu::StoreOp::Store,
                     }),
                     stencil_ops: None,
@@ -2205,7 +2233,7 @@ impl GpuState {
                 depth_stencil_attachment: Some(wgpu::RenderPassDepthStencilAttachment {
                     view: &self.preview_depth_view,
                     depth_ops: Some(wgpu::Operations {
-                        load: wgpu::LoadOp::Clear(1.0),
+                        load: wgpu::LoadOp::Clear(DEPTH_CLEAR),
                         store: wgpu::StoreOp::Store,
                     }),
                     stencil_ops: None,
@@ -5858,6 +5886,7 @@ impl App {
                 );
                 // A module (a day-night clock, say) may move the sun.
                 sun::set_module_sun(module_api::module_sun(&self.modules, world));
+                set_view_reach(module_api::module_view_distance(&self.modules, world));
                 (instances, group_counts, build_lights(world, game_origin))
             }
             None => return,
@@ -6822,7 +6851,7 @@ impl App {
             let forward = view_forward(self.cam_yaw, self.cam_pitch);
             let eye = (self.cam_eye - origin).as_vec3();
             let view = Mat4::look_at_rh(eye, eye + forward, Vec3::Y);
-            let proj = Mat4::perspective_rh(FOV_DEGREES.to_radians(), aspect, 0.1, 10000.0);
+            let proj = camera_projection(aspect);
             proj * view
         } else {
             let focus = (DVec3::new(self.cam_focus_x, self.cam_focus_y, self.cam_focus_z) - origin)
@@ -7508,6 +7537,10 @@ impl ApplicationHandler for App {
                     view_origin,
                 );
                 sun::set_module_sun(module_api::module_sun(&self.modules, &self.world));
+                set_view_reach(module_api::module_view_distance(
+                    &self.modules,
+                    &self.world,
+                ));
                 let lights = build_lights(&self.world, view_origin);
                 // Features from editor modules. While a mouse button is held
                 // (dragging an Inspector slider, say) they keep showing what
@@ -10038,6 +10071,23 @@ mod shader_tests {
 mod shadow_fit_tests {
     use super::*;
 
+    #[test]
+    fn the_projection_has_no_far_plane_and_keeps_far_depths_apart() {
+        let p = camera_projection(16.0 / 9.0);
+        // Depth of a point straight ahead, `d` units out.
+        let depth = |d: f32| {
+            let c = p * Vec4::new(0.0, 0.0, -d, 1.0);
+            c.z / c.w
+        };
+        assert!((depth(NEAR) - 1.0).abs() < 1e-6, "the near plane is 1");
+        assert!(depth(10.0) > depth(1_000.0), "nearer is greater");
+        // 100 km out is still in front of the camera and drawn.
+        let far = depth(100_000.0);
+        assert!(far > DEPTH_CLEAR && far < 1e-5, "{far}");
+        // Two surfaces a metre apart 50 km away still get different depths.
+        assert!(depth(50_000.0) > depth(50_001.0));
+    }
+
     fn instance(position: [f32; 3], scale: f32) -> InstanceRaw {
         InstanceRaw {
             position,
@@ -10064,7 +10114,7 @@ mod shadow_fit_tests {
             Vec3::new(0.0, 0.0, -20.0),
             Vec3::Y,
         );
-        let proj = Mat4::perspective_rh(FOV_DEGREES.to_radians(), 16.0 / 9.0, 0.1, 10000.0);
+        let proj = camera_projection(16.0 / 9.0);
         (proj * view).to_cols_array_2d()
     }
 

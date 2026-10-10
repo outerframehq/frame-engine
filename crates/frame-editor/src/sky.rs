@@ -217,12 +217,26 @@ pub(crate) fn fog_colour(colours: &SkyColours, sun: Vec3, sun_strength: f32, vie
     ]
 }
 
-/// The fog density per world unit for a fog amount (0 turns fog off).
-pub(crate) fn fog_density(amount: f32) -> f32 {
+/// With a scene that draws out to a distance (see
+/// `EditorModule::view_distance`), how thick the fog is at that distance at
+/// the default amount, as the `x` of `1 - exp(-x * x)`: 1.73 is 95 percent,
+/// so the far edge all but fades into the sky.
+pub(crate) const FOG_AT_REACH: f32 = 1.73;
+
+/// The fog density per world unit for a fog amount (0 turns fog off) and
+/// how far the drawn world reaches (0 when nothing says). A far reach thins
+/// the fog to suit it, so a view of tens of kilometres is not lost in haze a
+/// few kilometres out; it is never thicker than the usual.
+pub(crate) fn fog_density(amount: f32, reach: f32) -> f32 {
     if !amount.is_finite() {
         return 0.0;
     }
-    amount.clamp(0.0, FOG_AMOUNT_MAX) / FOG_REFERENCE_DISTANCE
+    let reference = if reach.is_finite() && reach > 0.0 {
+        (reach / FOG_AT_REACH).max(FOG_REFERENCE_DISTANCE)
+    } else {
+        FOG_REFERENCE_DISTANCE
+    };
+    amount.clamp(0.0, FOG_AMOUNT_MAX) / reference
 }
 
 /// How much of the fog colour covers something `distance` away: 0 is none,
@@ -277,6 +291,7 @@ pub(crate) fn sky_uniform(
     sun: Option<[f32; 3]>,
     enabled: bool,
     fog_amount: f32,
+    reach: f32,
     origin_y: f32,
 ) -> SkyUniform {
     let vp = Mat4::from_cols_array_2d(&view_proj);
@@ -319,7 +334,7 @@ pub(crate) fn sky_uniform(
             colours.horizon[1],
             colours.horizon[2],
             if enabled {
-                fog_density(fog_amount) * haze_scale(direction.y)
+                fog_density(fog_amount, reach) * haze_scale(direction.y)
             } else {
                 0.0
             },
@@ -363,10 +378,10 @@ mod tests {
         assert!(haze_scale(0.1) < haze_scale(0.3));
         // The uniform carries the thinner haze.
         let vp = Mat4::IDENTITY.to_cols_array_2d();
-        let sunset = sky_uniform(vp, Some([1.0, 0.02, 0.0]), true, 1.0, 0.0);
-        let noon = sky_uniform(vp, Some([0.0, 1.0, 0.0]), true, 1.0, 0.0);
+        let sunset = sky_uniform(vp, Some([1.0, 0.02, 0.0]), true, 1.0, 0.0, 0.0);
+        let noon = sky_uniform(vp, Some([0.0, 1.0, 0.0]), true, 1.0, 0.0, 0.0);
         assert!(sunset.horizon[3] < 0.6 * noon.horizon[3]);
-        assert!((noon.horizon[3] - fog_density(1.0)).abs() < 1e-9);
+        assert!((noon.horizon[3] - fog_density(1.0, 0.0)).abs() < 1e-9);
         // And says how much twilight there is.
         assert!(sunset.sun_colour[3] > 0.9 && noon.sun_colour[3] < 0.01);
     }
@@ -479,7 +494,7 @@ mod tests {
 
     #[test]
     fn fog_grows_with_distance_and_with_the_amount() {
-        let d = fog_density(1.0);
+        let d = fog_density(1.0, 0.0);
         assert_eq!(fog_factor(0.0, d), 0.0);
         let near = fog_factor(100.0, d);
         let mid = fog_factor(1800.0, d);
@@ -490,15 +505,20 @@ mod tests {
             "63 percent at the reference distance: {mid}"
         );
         assert!(far > 0.99, "everything is fogged out far away: {far}");
-        assert!(fog_factor(1000.0, fog_density(2.0)) > fog_factor(1000.0, fog_density(1.0)));
-        assert_eq!(fog_density(0.0), 0.0);
-        assert_eq!(fog_density(f32::NAN), 0.0);
-        assert_eq!(fog_density(100.0), FOG_AMOUNT_MAX / FOG_REFERENCE_DISTANCE);
+        assert!(
+            fog_factor(1000.0, fog_density(2.0, 0.0)) > fog_factor(1000.0, fog_density(1.0, 0.0))
+        );
+        assert_eq!(fog_density(0.0, 0.0), 0.0);
+        assert_eq!(fog_density(f32::NAN, 0.0), 0.0);
+        assert_eq!(
+            fog_density(100.0, 0.0),
+            FOG_AMOUNT_MAX / FOG_REFERENCE_DISTANCE
+        );
     }
 
     #[test]
     fn fog_thins_with_altitude() {
-        let d = fog_density(1.0);
+        let d = fog_density(1.0, 0.0);
         // On the flat it is the same as plain fog.
         let flat = fog_factor_between(0.0, 0.0, 3000.0, d);
         assert!((flat - fog_factor(3000.0, d)).abs() < 1e-5);
@@ -535,14 +555,24 @@ mod tests {
             (found - Vec3::new(0.0, 100.0, 0.0)).length() < 0.05,
             "{found:?}"
         );
+        // And through the editor's own projection, which has no far plane.
+        let view = Mat4::look_at_rh(eye, eye + Vec3::new(0.3, -0.2, -1.0), Vec3::Y);
+        let found = eye_from_view_proj(&(crate::camera_projection(16.0 / 9.0) * view));
+        assert!((found - eye).length() < 0.05, "{found:?} vs {eye:?}");
     }
 
     #[test]
     fn the_uniform_carries_the_sun_the_eye_and_the_switch() {
         let eye = Vec3::new(0.0, 50.0, 200.0);
-        let vp = Mat4::perspective_rh(1.0, 1.5, 0.1, 4000.0)
-            * Mat4::look_at_rh(eye, Vec3::ZERO, Vec3::Y);
-        let u = sky_uniform(vp.to_cols_array_2d(), Some([0.0, 2.0, 0.0]), true, 1.0, 0.0);
+        let vp = crate::camera_projection(1.5) * Mat4::look_at_rh(eye, Vec3::ZERO, Vec3::Y);
+        let u = sky_uniform(
+            vp.to_cols_array_2d(),
+            Some([0.0, 2.0, 0.0]),
+            true,
+            1.0,
+            0.0,
+            0.0,
+        );
         assert_eq!(
             &u.sun_direction[..3],
             &[0.0, 1.0, 0.0],
@@ -559,22 +589,23 @@ mod tests {
             false,
             1.0,
             0.0,
+            0.0,
         );
         assert_eq!(off.zenith[3], 0.0, "sky off");
         assert_eq!(off.horizon[3], 0.0, "and no fog with it");
 
         // No light in the scene: still a sky, but no sun disc is drawn.
-        let none = sky_uniform(vp.to_cols_array_2d(), None, true, 1.0, 0.0);
+        let none = sky_uniform(vp.to_cols_array_2d(), None, true, 1.0, 0.0, 0.0);
         assert_eq!(none.sun_direction[3], 0.0);
         assert!(none.sun_direction[1] > 0.0, "a daytime sky");
         // A zero-length direction counts as no light too.
-        let zero = sky_uniform(vp.to_cols_array_2d(), Some([0.0; 3]), true, 1.0, 0.0);
+        let zero = sky_uniform(vp.to_cols_array_2d(), Some([0.0; 3]), true, 1.0, 0.0, 0.0);
         assert_eq!(zero.sun_direction[3], 0.0);
     }
 
     #[test]
     fn a_broken_matrix_never_puts_nan_in_the_uniform() {
-        let u = sky_uniform([[0.0; 4]; 4], Some([0.0, 1.0, 0.0]), true, 1.0, 0.0);
+        let u = sky_uniform([[0.0; 4]; 4], Some([0.0, 1.0, 0.0]), true, 1.0, 0.0, 0.0);
         let bytes: &[f32] = bytemuck::cast_slice(std::slice::from_ref(&u));
         assert!(bytes.iter().all(|v| v.is_finite()), "{u:?}");
     }
@@ -582,7 +613,7 @@ mod tests {
     #[test]
     fn a_sun_below_the_horizon_hides_the_disc_and_darkens_the_sky() {
         let vp = Mat4::IDENTITY.to_cols_array_2d();
-        let u = sky_uniform(vp, Some([0.3, -0.8, 0.2]), true, 1.0, 0.0);
+        let u = sky_uniform(vp, Some([0.3, -0.8, 0.2]), true, 1.0, 0.0, 0.0);
         assert_eq!(u.sun_direction[3], 0.0);
         assert!(luma([u.zenith[0], u.zenith[1], u.zenith[2]]) < 0.05);
     }
@@ -642,5 +673,41 @@ mod ambient_tests {
             last = s;
         }
         assert_eq!(ambient_scale(f32::NAN), 1.0);
+    }
+
+    #[test]
+    fn a_far_reaching_world_thins_the_fog_to_fade_out_at_its_edge() {
+        // Nothing reaching far: the usual fog.
+        assert_eq!(fog_density(1.0, 0.0), 1.0 / FOG_REFERENCE_DISTANCE);
+        assert_eq!(fog_density(1.0, f32::NAN), 1.0 / FOG_REFERENCE_DISTANCE);
+        // A world reaching 20 km: about 95 percent fog at its edge, and clear
+        // enough a few kilometres out.
+        let d = fog_density(1.0, 20_000.0);
+        let edge = fog_factor(20_000.0, d);
+        assert!((edge - 0.95).abs() < 0.01, "{edge}");
+        assert!(fog_factor(4_000.0, d) < 0.15);
+        // The fog amount still scales it.
+        assert!(fog_density(2.0, 20_000.0) > d);
+        // A short reach never makes the fog thicker than usual.
+        assert_eq!(fog_density(1.0, 500.0), fog_density(1.0, 0.0));
+        // And it reaches the shader.
+        let vp = Mat4::IDENTITY.to_cols_array_2d();
+        let u = sky_uniform(vp, Some([0.0, 1.0, 0.0]), true, 1.0, 20_000.0, 0.0);
+        assert!((u.horizon[3] - d).abs() < 1e-12);
+    }
+
+    #[test]
+    fn the_sky_direction_is_exact_through_the_far_reaching_projection() {
+        // The shader unprojects each pixel at depth 0.0001 and looks from the
+        // eye to that point. Check that gives the true line of sight.
+        let eye = Vec3::new(120.0, 2500.0, -80.0);
+        let look = Vec3::new(0.4, -0.1, -1.0).normalize();
+        let vp = crate::camera_projection(16.0 / 9.0) * Mat4::look_at_rh(eye, eye + look, Vec3::Y);
+        let inverse = vp.inverse();
+        let p = inverse * glam::Vec4::new(0.0, 0.0, 0.0001, 1.0);
+        let point = p.truncate() / p.w;
+        let direction = (point - eye).normalize();
+        assert!(direction.dot(look) > 0.999_999, "{direction:?}");
+        assert!(((point - eye).length() - 1000.0).abs() < 1.0);
     }
 }

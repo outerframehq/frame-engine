@@ -409,8 +409,11 @@ fn vs_sky(@builtin(vertex_index) index: u32) -> SkyVarying {
 
 @fragment
 fn fs_sky(in: SkyVarying) -> @location(0) vec4<f32> {
-    // The direction this pixel looks in: from the eye to its far-plane point.
-    let far = sky.inv_view_proj * vec4<f32>(in.ndc, 1.0, 1.0);
+    // The direction this pixel looks in: from the eye to a point down its
+    // line of sight. Depth is reversed with no far plane, and depth 0.0001 is
+    // ten thousand near-plane distances out (1 km), far enough for an exact
+    // direction.
+    let far = sky.inv_view_proj * vec4<f32>(in.ndc, 0.0001, 1.0);
     let direction = normalize(far.xyz / far.w - sky.eye.xyz);
     let up = direction.y;
 

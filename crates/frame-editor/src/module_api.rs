@@ -94,6 +94,16 @@ pub trait EditorModule {
         None
     }
 
+    /// How far from the viewer this module's scene is sure to reach, in world
+    /// units, if it draws out to a distance (a landscape, say). Called once
+    /// per frame for each window drawn, like `sun`. The editor thins its fog
+    /// so that it is nearly full at the farthest reach any module gives,
+    /// and the scene's far edge fades into the sky instead of ending in a
+    /// line. The default is None: the fog keeps its usual thickness.
+    fn view_distance(&self, _world: &World) -> Option<f64> {
+        None
+    }
+
     /// Whether this module is still working in the background (building
     /// something it will want to show). While any module is, the editor keeps
     /// drawing every frame so the results appear as they arrive; otherwise an
@@ -577,6 +587,20 @@ pub(crate) fn module_sun(
         .find_map(|module| module.sun(world))
 }
 
+/// The farthest any module's scene reaches (see
+/// [`EditorModule::view_distance`]), or None when none draws to a distance.
+pub(crate) fn module_view_distance(
+    modules: &std::cell::RefCell<Vec<Box<dyn EditorModule>>>,
+    world: &World,
+) -> Option<f64> {
+    modules
+        .borrow()
+        .iter()
+        .filter_map(|m| m.view_distance(world))
+        .filter(|r| r.is_finite() && *r > 0.0)
+        .reduce(f64::max)
+}
+
 /// Let every module advance its own simulation by `dt`. Called once per
 /// simulation tick, before `sync_collision`.
 pub(crate) fn tick_modules(
@@ -886,7 +910,7 @@ mod tests {
             params: [0.0, 0.0, 1.0, 1.0],
         };
         let view = Mat4::look_at_rh(Vec3::new(0.0, 30.0, 60.0), Vec3::ZERO, Vec3::Y);
-        let proj = Mat4::perspective_rh(FOV_DEGREES.to_radians(), 16.0 / 9.0, 0.1, 10000.0);
+        let proj = camera_projection(16.0 / 9.0);
         let camera = (proj * view).to_cols_array_2d();
         let bounds = Some((
             Vec3::new(-200.0, -30.0, -200.0),
@@ -929,5 +953,41 @@ mod tests {
         assert_eq!(out[1].morph_uv, [0.3, 0.4]);
         assert_eq!(out[2].morph_uv, [0.5, 0.6]);
         assert_eq!(out[2].morph, [0.0; 3]);
+    }
+
+    /// A module that draws out to a fixed distance (or not at all).
+    struct Landscape {
+        reach: Option<f64>,
+    }
+    impl EditorModule for Landscape {
+        fn name(&self) -> &str {
+            "landscape"
+        }
+        fn view_distance(&self, _world: &World) -> Option<f64> {
+            self.reach
+        }
+        fn new_gpu(&self, _gpu: &GpuContext) -> Box<dyn ModuleGpu> {
+            unreachable!("no GPU in tests")
+        }
+    }
+
+    #[test]
+    fn the_farthest_module_reach_sets_the_view_distance() {
+        let (world, _) = world_with_entity();
+        let modules = |reaches: &[Option<f64>]| {
+            std::cell::RefCell::new(
+                reaches
+                    .iter()
+                    .map(|&reach| Box::new(Landscape { reach }) as Box<dyn EditorModule>)
+                    .collect::<Vec<_>>(),
+            )
+        };
+        assert_eq!(module_view_distance(&modules(&[]), &world), None);
+        assert_eq!(module_view_distance(&modules(&[None]), &world), None);
+        let mixed = modules(&[Some(12_000.0), None, Some(48_000.0)]);
+        assert_eq!(module_view_distance(&mixed, &world), Some(48_000.0));
+        // Nonsense answers are ignored.
+        let odd = modules(&[Some(f64::NAN), Some(-5.0), Some(f64::INFINITY)]);
+        assert_eq!(module_view_distance(&odd, &world), None);
     }
 }
