@@ -178,6 +178,7 @@ pub struct Color {
 /// same footing as `Color` and `Scale`: the engine stores and serializes it but
 /// never draws. The editor turns it into geometry. Defaults to `Cube`, so
 /// scenes saved before meshes existed load and look exactly as they did.
+/// `Empty` is an entity with no shape at all (see the variant).
 #[derive(Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
 pub enum Mesh {
     #[default]
@@ -188,6 +189,17 @@ pub enum Mesh {
     /// folder ("tree" for assets/tree.obj). Its collision half extents live
     /// in World::mesh_meta under the same name.
     Custom(String),
+    /// No mesh: the entity is a point in the world, such as a spawn marker,
+    /// a sound source or a holder for settings. It is never drawn, has no
+    /// collision box, and gets no physics body.
+    Empty,
+}
+
+impl Mesh {
+    /// Whether this entity has a shape (anything but `Empty`).
+    pub fn has_shape(&self) -> bool {
+        !matches!(self, Mesh::Empty)
+    }
 }
 
 /// A material for an imported model, keyed the same way as the `MeshMeta` it

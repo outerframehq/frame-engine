@@ -355,6 +355,11 @@ impl Physics {
 
             let scale = world.scales.get(id).copied().unwrap_or_default();
             let mesh = world.meshes.get(id).cloned().unwrap_or_default();
+            if !mesh.has_shape() {
+                // Nothing to collide with, so nothing to simulate. Retried
+                // every tick, like the cases above, in case it gets a mesh.
+                continue;
+            }
             let [hx, hy, hz] = half_extents(&mesh, scale, &world.mesh_meta);
             let engine_rot = world.rotations.get(id).copied().unwrap_or_default();
 
@@ -566,6 +571,35 @@ mod tests {
 
     fn quat_of(r: &Rotation) -> (f32, f32, f32, f32) {
         (r.x as f32, r.y as f32, r.z as f32, r.w as f32)
+    }
+
+    #[test]
+    fn a_meshless_entity_gets_no_physics_body_until_it_has_a_mesh() {
+        let mut world = World::new();
+        let id = world.spawn(
+            crate::world::Position {
+                x: 0.0,
+                y: 5.0,
+                z: 0.0,
+            },
+            Velocity {
+                dx: 0.0,
+                dy: 0.0,
+                dz: 0.0,
+            },
+        );
+        world.rigid_bodies.insert(id, crate::world::RigidBody);
+        world.gravities.insert(id, Gravity);
+        world.meshes.insert(id, crate::world::Mesh::Empty);
+        let mut physics = Physics::new(GRAVITY_Y);
+        for _ in 0..30 {
+            physics.step(&mut world, 1.0 / 30.0);
+        }
+        assert!(!physics.handles.contains_key(&id));
+        assert_eq!(world.positions.get(id).unwrap().y, 5.0);
+        world.meshes.insert(id, crate::world::Mesh::Cube);
+        physics.step(&mut world, 1.0 / 30.0);
+        assert!(physics.handles.contains_key(&id));
     }
 
     #[test]

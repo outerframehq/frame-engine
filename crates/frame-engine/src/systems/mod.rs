@@ -44,6 +44,7 @@ pub(crate) fn half_extents(
     use crate::world::{ENTITY_SIZE, Mesh};
     let h = ENTITY_SIZE * 0.5;
     match mesh {
+        Mesh::Empty => [0.0, 0.0, 0.0],
         Mesh::Plane => [h * scale.x, 0.0, h * scale.z],
         Mesh::Custom(name) => match meta.get(name) {
             // Unit half extents map to world size through ENTITY_SIZE (a unit
@@ -84,6 +85,10 @@ pub fn collision(world: &mut World) {
     for (id, p) in world.positions.query().without(&world.rigid_bodies) {
         let s = world.scales.get(id).copied().unwrap_or_default();
         let mesh = world.meshes.get(id).cloned().unwrap_or_default();
+        // A meshless entity has no box to touch anything with.
+        if !mesh.has_shape() {
+            continue;
+        }
         let rotation = world.rotations.get(id).copied().unwrap_or_default();
         let [hx, hy, hz] =
             expand_for_rotation(half_extents(&mesh, s, &world.mesh_meta), &rotation).map(f64::from);
@@ -141,6 +146,9 @@ pub fn resolve_collisions(world: &mut World) {
     for (id, p) in world.positions.query().without(&world.rigid_bodies) {
         let s = world.scales.get(id).copied().unwrap_or_default();
         let mesh = world.meshes.get(id).cloned().unwrap_or_default();
+        if !mesh.has_shape() {
+            continue;
+        }
         let is_static = world.statics.get(id).is_some();
         let rotation = world.rotations.get(id).copied().unwrap_or_default();
         boxes.push((
@@ -417,6 +425,23 @@ mod tests {
                 dz: 0.0,
             },
         )
+    }
+
+    #[test]
+    fn a_meshless_entity_neither_collides_nor_gets_pushed() {
+        let mut world = World::new();
+        let wall = at(&mut world, 0.0, 0.0, 0.0);
+        let ghost = at(&mut world, 0.2, 0.0, 0.0);
+        world.statics.insert(wall, Static);
+        world.meshes.insert(ghost, crate::world::Mesh::Empty);
+        collision(&mut world);
+        assert!(world.collisions.is_empty());
+        resolve_collisions(&mut world);
+        assert_eq!(world.positions.get(ghost).unwrap().x, 0.2f32 as f64);
+        // The same two with a mesh do touch.
+        world.meshes.insert(ghost, crate::world::Mesh::Cube);
+        collision(&mut world);
+        assert!(!world.collisions.is_empty());
     }
 
     #[test]
