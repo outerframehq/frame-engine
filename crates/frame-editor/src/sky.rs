@@ -33,6 +33,24 @@ pub(crate) const FOG_REFERENCE_DISTANCE: f32 = 1800.0;
 /// fades out, and a camera above the haze sees the ground below through it.
 pub(crate) const FOG_HEIGHT_SCALE: f32 = 1200.0;
 
+/// How thin the haze gets with the sun on the horizon: fog thickness is
+/// multiplied by `1 - TWILIGHT_THINNING` at sunrise and sunset, easing back to
+/// full by day and by night. The low sun's warm haze otherwise lies over every
+/// distant thing at full strength and washes the mountains out.
+pub(crate) const TWILIGHT_THINNING: f32 = 0.45;
+
+/// At twilight, how far the haze looking away from the sun leans from the
+/// horizon colour toward the colour overhead (0 not at all, 1 all the way).
+/// The warm glow belongs on the sun's side of the sky; the far side is cooler,
+/// so hills facing away keep their contrast. Mirrors `AWAY_COOLING` in
+/// `shader.wgsl`.
+pub(crate) const AWAY_COOLING: f32 = 0.35;
+
+/// How much of the sun's colour the haze toward the sun takes on, at most.
+/// The same broad glow the sky draws around the sun, so ground fading into
+/// the sky there meets it with no seam. Mirrors `SUN_HAZE` in `shader.wgsl`.
+pub(crate) const SUN_HAZE: f32 = 0.12;
+
 /// The most fog the preference allows (a multiplier on the default).
 pub(crate) const FOG_AMOUNT_MAX: f32 = 4.0;
 /// The fog a fresh install starts with.
@@ -97,6 +115,8 @@ pub(crate) struct SkyColours {
     pub sun: Rgb,
     /// 0 when the sun is well below the horizon, 1 once it is up.
     pub sun_strength: f32,
+    /// 1 with the sun on the horizon, falling away above and below it.
+    pub twilight: f32,
 }
 
 impl SkyColours {
@@ -133,6 +153,7 @@ impl SkyColours {
             ground,
             sun,
             sun_strength,
+            twilight,
         }
     }
 }
@@ -161,6 +182,33 @@ pub(crate) fn ambient_scale(height: f32) -> f32 {
     }
     let day = smoothstep(-0.12, 0.28, height);
     NIGHT_AMBIENT_SCALE + (1.0 - NIGHT_AMBIENT_SCALE) * day
+}
+
+/// How thick the haze is, as a multiplier on the fog density, for a sun at
+/// this height: full by day and by night, thinner around sunrise and sunset.
+pub(crate) fn haze_scale(height: f32) -> f32 {
+    if !height.is_finite() {
+        return 1.0;
+    }
+    let twilight = (-(height.clamp(-1.0, 1.0) / 0.2).powi(2)).exp();
+    1.0 - TWILIGHT_THINNING * twilight
+}
+
+/// The colour of the haze (and of the sky at the horizon) looking in
+/// direction `view` (a unit vector): the horizon colour, cooled toward the
+/// colour overhead on the side away from the sun at twilight, and warmed by
+/// the sun's glow on its side. Mirrors `fog_colour` in `shader.wgsl`.
+#[cfg(test)]
+pub(crate) fn fog_colour(colours: &SkyColours, sun: Vec3, sun_strength: f32, view: Vec3) -> Rgb {
+    let toward = view.dot(sun).max(0.0);
+    let away = (1.0 - toward) * colours.twilight * AWAY_COOLING;
+    let base = mix(colours.horizon, colours.zenith, away);
+    let glow = toward.powf(6.0) * SUN_HAZE * sun_strength;
+    [
+        base[0] + colours.sun[0] * glow,
+        base[1] + colours.sun[1] * glow,
+        base[2] + colours.sun[2] * glow,
+    ]
 }
 
 /// The fog density per world unit for a fog amount (0 turns fog off).
@@ -265,12 +313,17 @@ pub(crate) fn sky_uniform(
             colours.horizon[1],
             colours.horizon[2],
             if enabled {
-                fog_density(fog_amount)
+                fog_density(fog_amount) * haze_scale(direction.y)
             } else {
                 0.0
             },
         ],
-        sun_colour: [colours.sun[0], colours.sun[1], colours.sun[2], 0.0],
+        sun_colour: [
+            colours.sun[0],
+            colours.sun[1],
+            colours.sun[2],
+            colours.twilight,
+        ],
         ground: [colours.ground[0], colours.ground[1], colours.ground[2], 0.0],
     }
 }
@@ -281,6 +334,56 @@ mod tests {
 
     fn luma(c: Rgb) -> f32 {
         0.2126 * c[0] + 0.7152 * c[1] + 0.0722 * c[2]
+    }
+
+    #[test]
+    fn the_shader_uses_the_same_haze_numbers() {
+        let shader = include_str!("shader.wgsl");
+        for (name, value) in [
+            ("FOG_HEIGHT_SCALE", FOG_HEIGHT_SCALE),
+            ("AWAY_COOLING", AWAY_COOLING),
+            ("SUN_HAZE", SUN_HAZE),
+        ] {
+            let line = format!("const {name}: f32 = {value:?};");
+            assert!(shader.contains(&line), "shader.wgsl should have `{line}`");
+        }
+    }
+
+    #[test]
+    fn the_haze_thins_at_sunset_and_is_full_by_day_and_night() {
+        assert!((haze_scale(0.0) - (1.0 - TWILIGHT_THINNING)).abs() < 1e-6);
+        assert!(haze_scale(0.9) > 0.99);
+        assert!(haze_scale(-0.6) > 0.99);
+        assert!(haze_scale(0.1) < haze_scale(0.3));
+        // The uniform carries the thinner haze.
+        let vp = Mat4::IDENTITY.to_cols_array_2d();
+        let sunset = sky_uniform(vp, Some([1.0, 0.02, 0.0]), true, 1.0, 0.0);
+        let noon = sky_uniform(vp, Some([0.0, 1.0, 0.0]), true, 1.0, 0.0);
+        assert!(sunset.horizon[3] < 0.6 * noon.horizon[3]);
+        assert!((noon.horizon[3] - fog_density(1.0)).abs() < 1e-9);
+        // And says how much twilight there is.
+        assert!(sunset.sun_colour[3] > 0.9 && noon.sun_colour[3] < 0.01);
+    }
+
+    #[test]
+    fn at_sunset_the_haze_is_warm_toward_the_sun_and_cooler_away_from_it() {
+        let sun = Vec3::new(1.0, 0.02, 0.0).normalize();
+        let c = SkyColours::for_sun_height(sun.y);
+        let toward = fog_colour(&c, sun, c.sun_strength, Vec3::X);
+        let away = fog_colour(&c, sun, c.sun_strength, -Vec3::X);
+        let warmth = |rgb: Rgb| rgb[0] - rgb[2];
+        assert!(
+            warmth(toward) > warmth(away) + 0.1,
+            "{toward:?} vs {away:?}"
+        );
+        // At noon there is no twilight, so only the glow differs, and only
+        // a little.
+        let sun = Vec3::Y;
+        let c = SkyColours::for_sun_height(1.0);
+        let side = fog_colour(&c, sun, c.sun_strength, Vec3::X);
+        let other = fog_colour(&c, sun, c.sun_strength, -Vec3::X);
+        assert_eq!(side, other);
+        assert_eq!(side, c.horizon);
     }
 
     #[test]

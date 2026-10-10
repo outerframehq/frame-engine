@@ -75,6 +75,31 @@ struct Sky {
 // How quickly fog thins with altitude, in world units per factor of e.
 // MUST match FOG_HEIGHT_SCALE in sky.rs.
 const FOG_HEIGHT_SCALE: f32 = 1200.0;
+// At twilight, how far the haze away from the sun leans toward the colour
+// overhead. MUST match AWAY_COOLING in sky.rs.
+const AWAY_COOLING: f32 = 0.35;
+// How much of the sun's colour the haze toward the sun takes on. MUST match
+// SUN_HAZE in sky.rs (and the broad glow in fs_sky uses the same).
+const SUN_HAZE: f32 = 0.12;
+
+// The horizon colour looking in `direction` (a unit vector): cooled toward
+// the colour overhead on the side away from the sun at twilight
+// (sky.sun_colour.w is how much twilight there is).
+fn horizon_colour(direction: vec3<f32>) -> vec3<f32> {
+    let toward = max(dot(direction, sky.sun_direction.xyz), 0.0);
+    let away = (1.0 - toward) * sky.sun_colour.w * AWAY_COOLING;
+    return mix(sky.horizon.rgb, sky.zenith.rgb, away);
+}
+
+// The haze colour looking in `direction`: the horizon colour there, warmed
+// by the sun's broad glow on its side, exactly as the sky draws it, so
+// distant ground fades into the sky behind it with no seam. MUST match
+// fog_colour in sky.rs.
+fn fog_colour(direction: vec3<f32>) -> vec3<f32> {
+    let toward = max(dot(direction, sky.sun_direction.xyz), 0.0);
+    let glow = pow(toward, 6.0) * SUN_HAZE * sky.sun_direction.w;
+    return horizon_colour(direction) + sky.sun_colour.rgb * glow;
+}
 
 // Blend a lit colour toward the horizon colour with distance from the camera,
 // so far-off ground dissolves into the sky. Exponential squared: clear up
@@ -95,9 +120,12 @@ fn apply_fog(colour: vec3<f32>, world_position: vec3<f32>) -> vec3<f32> {
     if (abs(h2 - h1) > 1.0) {
         thin = (exp(-k * h1) - exp(-k * h2)) / (k * (h2 - h1));
     }
-    let x = length(world_position - sky.eye.xyz) * density * thin;
+    let offset = world_position - sky.eye.xyz;
+    let distance = length(offset);
+    let x = distance * density * thin;
     let amount = 1.0 - exp(-(x * x));
-    return mix(colour, sky.horizon.rgb, amount);
+    let direction = offset / max(distance, 1e-6);
+    return mix(colour, fog_colour(direction), amount);
 }
 
 // 1.0 = fully lit, 0.0 = fully in shadow. Anything outside the shadow map's
@@ -387,7 +415,7 @@ fn fs_sky(in: SkyVarying) -> @location(0) vec4<f32> {
     // Horizon to zenith, quick at first so the colour climbs off the horizon,
     // then below the horizon down to the darker ground haze.
     let above = pow(clamp(up, 0.0, 1.0), 0.45);
-    var colour = mix(sky.horizon.rgb, sky.zenith.rgb, above);
+    var colour = mix(horizon_colour(direction), sky.zenith.rgb, above);
     colour = mix(colour, sky.ground.rgb, smoothstep(0.0, 0.25, -up));
 
     // The sun: a soft-edged disc with a glow around it. The disc is about
@@ -396,7 +424,7 @@ fn fs_sky(in: SkyVarying) -> @location(0) vec4<f32> {
     let strength = sky.sun_direction.w;
     let disc = smoothstep(0.9993, 0.9998, cos_angle) * strength;
     let toward = max(cos_angle, 0.0);
-    let glow = (pow(toward, 48.0) * 0.45 + pow(toward, 6.0) * 0.12) * strength;
+    let glow = (pow(toward, 48.0) * 0.45 + pow(toward, 6.0) * SUN_HAZE) * strength;
     colour = mix(colour, sky.sun_colour.rgb * 1.4, disc) + sky.sun_colour.rgb * glow;
     return vec4<f32>(min(colour, vec3<f32>(1.0, 1.0, 1.0)), 1.0);
 }
