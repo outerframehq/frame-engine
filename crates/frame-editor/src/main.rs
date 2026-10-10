@@ -4,6 +4,10 @@
 
 // The public editor: no extra modules. Private builds with extra features
 // call `frame_editor::run` themselves with their own modules.
+// Counts the memory in use, for the performance overlay (F3).
+#[global_allocator]
+static ALLOC: frame_editor::CountingAlloc = frame_editor::CountingAlloc;
+
 fn main() {
     frame_editor::run(Vec::new());
 }

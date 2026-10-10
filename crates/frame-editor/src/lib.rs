@@ -25,6 +25,7 @@ use winit::window::{Icon, Window, WindowId};
 mod font;
 mod origin;
 mod perf;
+pub use perf::CountingAlloc;
 mod script;
 mod sky;
 mod sun;
@@ -144,6 +145,28 @@ fn set_shadow_distance(distance: f32) {
 fn shadows_enabled() -> bool {
     SHADOWS_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
 }
+/// Process-wide switch for vsync (an editor preference): on, a window never
+/// draws faster than the screen shows. Off, it draws as fast as it can, which
+/// is only useful to measure how fast that is.
+static VSYNC: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(true);
+fn vsync_enabled() -> bool {
+    VSYNC.load(std::sync::atomic::Ordering::Relaxed)
+}
+fn set_vsync(on: bool) {
+    VSYNC.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+/// The present mode for the vsync setting. The Auto modes fall back to one
+/// every system supports, so this never fails to configure.
+fn present_mode_for(vsync: bool) -> wgpu::PresentMode {
+    if vsync {
+        wgpu::PresentMode::AutoVsync
+    } else {
+        wgpu::PresentMode::AutoNoVsync
+    }
+}
+/// How often an idle editor still draws a frame, so slow-changing things
+/// (Source Control status, the overlay) stay fresh without drawing nonstop.
+const IDLE_REFRESH: std::time::Duration = std::time::Duration::from_secs(1);
 fn set_shadows_enabled(on: bool) {
     SHADOWS_ENABLED.store(on, std::sync::atomic::Ordering::Relaxed);
 }
@@ -1117,9 +1140,13 @@ impl GpuState {
             device: device.clone(),
             queue: queue.clone(),
         };
-        let config = surface
+        let mut config = surface
             .get_default_config(&adapter, size.width.max(1), size.height.max(1))
             .unwrap();
+        // The default is whatever mode the system lists first, which on some
+        // drivers never waits for the screen and draws thousands of frames a
+        // second for nothing.
+        config.present_mode = present_mode_for(vsync_enabled());
         surface.configure(&device, &config);
         let depth_view = create_depth_view(&device, config.width, config.height);
         // egui's renderer. It draws in its own pass with no depth attachment,
@@ -1870,6 +1897,11 @@ impl GpuState {
             size_in_pixels: [self.config.width, self.config.height],
             pixels_per_point: egui_ppp,
         };
+        let present_mode = present_mode_for(vsync_enabled());
+        if self.config.present_mode != present_mode {
+            self.config.present_mode = present_mode;
+            self.surface.configure(&self.device, &self.config);
+        }
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame)
             | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
@@ -4513,6 +4545,11 @@ struct App {
     show_stats: bool,
     // Frame timing for the performance overlay.
     perf: perf::FrameStats,
+    // Why the editor is drawing every frame right now, or None when it only
+    // draws on change (shown in the performance overlay).
+    redraw_reason: Option<String>,
+    // When an idle editor next draws on its own.
+    idle_wake: Option<std::time::Instant>,
     // Unsaved-changes tracking. `dirty` is set by any authoring edit (every
     // mutating gesture pushes an undo snapshot) and cleared on save/load; the
     // script library is compared against `saved_scripts` as well, since typing
@@ -4669,13 +4706,90 @@ impl App {
         self.show_stats = !self.show_stats;
         self.persist_prefs_if_changed();
     }
+    /// Why the editor should draw the next frame straight away, or None when
+    /// nothing is moving and it can wait for something to happen.
+    fn continuous_reason(&self, egui_delay: std::time::Duration) -> Option<String> {
+        use frame_engine::input::Button;
+        if !self.paused {
+            return Some("simulation running".to_string());
+        }
+        if self.fly_mode {
+            return Some("flying".to_string());
+        }
+        let held = [
+            Button::Up,
+            Button::Down,
+            Button::Left,
+            Button::Right,
+            Button::Jump,
+        ]
+        .iter()
+        .any(|&b| self.input.is_held(b));
+        if held {
+            return Some("keys held".to_string());
+        }
+        if self.game_window.is_some() {
+            return Some("Play window open".to_string());
+        }
+        if let Some(name) = module_api::busy_module(&self.modules) {
+            return Some(format!("{name} working"));
+        }
+        if egui_delay.is_zero() {
+            return Some("panels animating".to_string());
+        }
+        None
+    }
     /// The performance overlay's lines: frame times and memory, then each
     /// module's own lines, for the editor's and (while Play runs) the Play
     /// window's GPU copies.
     fn stats_lines(&self) -> Vec<String> {
         let mut lines = self.perf.lines();
+        lines.push(match &self.redraw_reason {
+            Some(why) => format!("drawing every frame ({why})"),
+            None => "drawing only on change".to_string(),
+        });
         let entities = self.world.positions.iter().filter(|p| p.is_some()).count();
         lines.push(format!("entities {entities}"));
+        lines.push(format!(
+            "undo {} steps, redo {} (each a whole copy of the world)",
+            self.undo_stack.len(),
+            self.redo_stack.len()
+        ));
+        let textures: usize = self
+            .texture_cache
+            .values()
+            .map(|(_, _, rgba)| rgba.len())
+            .sum();
+        let models: usize = self
+            .custom_meshes
+            .values()
+            .map(|m| m.vertices.len() * std::mem::size_of::<frame_engine::assets::MeshVertexData>())
+            .sum();
+        let sounds: usize = self
+            .sound_cache
+            .values()
+            .map(|s| s.frames.len() * std::mem::size_of::<kira::Frame>())
+            .sum();
+        lines.push(format!(
+            "textures {} ({}), models {} ({}), sounds {} ({})",
+            perf::megabytes(textures as u64),
+            self.texture_cache.len(),
+            perf::megabytes(models as u64),
+            self.custom_meshes.len(),
+            perf::megabytes(sounds as u64),
+            self.sound_cache.len()
+        ));
+        if let Some(report) = self
+            .gpu
+            .as_ref()
+            .and_then(|g| g.device.generate_allocator_report())
+        {
+            lines.push(format!(
+                "GPU allocator {} in use, {} reserved",
+                perf::megabytes(report.total_allocated_bytes),
+                perf::megabytes(report.total_reserved_bytes)
+            ));
+        }
         lines.extend(module_api::module_stats(&self.modules));
         for (label, gpu) in [
             ("viewport", self.gpu.as_ref()),
@@ -4695,6 +4809,7 @@ impl App {
         EditorPrefs {
             show_help: self.show_help,
             show_stats: self.show_stats,
+            vsync: vsync_enabled(),
             fly_speed: self.fly_speed,
             look_sensitivity: self.look_sensitivity,
             orbit_sensitivity: self.orbit_sensitivity,
@@ -4723,6 +4838,7 @@ impl App {
         let prefs = prefs.sanitized();
         self.show_help = prefs.show_help;
         self.show_stats = prefs.show_stats;
+        set_vsync(prefs.vsync);
         self.fly_speed = prefs.fly_speed;
         self.look_sensitivity = prefs.look_sensitivity;
         self.orbit_sensitivity = prefs.orbit_sensitivity;
@@ -6862,7 +6978,21 @@ impl ApplicationHandler for App {
         window.request_redraw();
         self.window = Some(window);
     }
-    fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        // An idle editor sleeps until its next wake time (see RedrawRequested).
+        match self.idle_wake {
+            Some(at) if std::time::Instant::now() >= at => {
+                self.idle_wake = None;
+                if let Some(window) = &self.window {
+                    window.request_redraw();
+                }
+                event_loop.set_control_flow(winit::event_loop::ControlFlow::Wait);
+            }
+            Some(at) => {
+                event_loop.set_control_flow(winit::event_loop::ControlFlow::WaitUntil(at));
+            }
+            None => event_loop.set_control_flow(winit::event_loop::ControlFlow::Wait),
+        }
         // Tear down a closing game window here, after all events for this cycle
         // are dispatched. Dropping the wgpu surface from inside the window's own
         // CloseRequested handler segfaults on Wayland; doing it here — outside
@@ -6934,6 +7064,13 @@ impl ApplicationHandler for App {
         {
             self.popped_out_window_event(tab, event);
             return;
+        }
+        // Anything that happens to the window (a key, the mouse, a resize) is
+        // a reason to draw again. Drawing itself is not.
+        if !matches!(event, WindowEvent::RedrawRequested) {
+            if let Some(window) = &self.window {
+                window.request_redraw();
+            }
         }
         // Feed every event to egui so its own widgets (dragging the panel,
         // future buttons/sliders) keep working. We deliberately ignore the
@@ -7617,6 +7754,9 @@ impl ApplicationHandler for App {
                     save_prefab_request: None,
                     modules: self.modules.clone(),
                 };
+                // How soon the UI wants to draw again (a blinking cursor, an
+                // animation); `MAX` for not at all.
+                let mut egui_delay = std::time::Duration::MAX;
                 let (egui_paint_jobs, egui_textures_delta, egui_ppp) = if let (
                     Some(state),
                     Some(window),
@@ -7922,6 +8062,9 @@ impl ApplicationHandler for App {
                                         ui.weak("How long to hold a row before it starts a drag-to-reparent. Lower is quicker; too low and a click can turn into a drag.");
                                         ui.add_space(6.0);
                                         section_label(ui, "Rendering");
+                                        outerface_checkbox(ui, &mut prefs_edit.vsync, "Limit to the screen's refresh rate (VSync)");
+                                        ui.weak("On, the editor never draws faster than your screen shows, and draws nothing while nothing changes. Turn it off only to measure how fast it can go.");
+                                        ui.add_space(4.0);
                                         outerface_checkbox(ui, &mut prefs_edit.shadows, "Shadows");
                                         ui.add(
                                             egui::Slider::new(&mut prefs_edit.shadow_distance, 20.0..=2000.0)
@@ -8073,6 +8216,9 @@ impl ApplicationHandler for App {
                                         .show_inside(ui, &mut viewer);
                                 });
                         });
+                    if let Some(v) = full_output.viewport_output.get(&egui::ViewportId::ROOT) {
+                        egui_delay = v.repaint_delay;
+                    }
                     state.handle_platform_output(window, full_output.platform_output);
                     let ppp = full_output.pixels_per_point;
                     let jobs = self.egui_ctx.tessellate(full_output.shapes, ppp);
@@ -8437,9 +8583,18 @@ impl ApplicationHandler for App {
                         egui_ppp,
                     );
                 }
-                self.perf.end(std::time::Instant::now());
-                if let Some(window) = &self.window {
-                    window.request_redraw();
+                let now = std::time::Instant::now();
+                self.perf.end(now);
+                self.redraw_reason = self.continuous_reason(egui_delay);
+                if self.redraw_reason.is_some() {
+                    self.idle_wake = None;
+                    if let Some(window) = &self.window {
+                        window.request_redraw();
+                    }
+                } else {
+                    // Nothing moving: sleep until something happens, the UI
+                    // asks to draw again, or the idle refresh is due.
+                    self.idle_wake = Some(now + egui_delay.min(IDLE_REFRESH));
                 }
             }
             _ => {}
@@ -8465,6 +8620,8 @@ struct EditorPrefs {
     show_help: bool,
     // Whether the performance overlay shows (View, Performance overlay, or F3).
     show_stats: bool,
+    // Whether drawing waits for the screen's refresh.
+    vsync: bool,
     fly_speed: f32,
     look_sensitivity: f32,
     orbit_sensitivity: f32,
@@ -8491,6 +8648,7 @@ impl Default for EditorPrefs {
         Self {
             show_help: true,
             show_stats: false,
+            vsync: true,
             fly_speed: CAM_PAN_SPEED,
             look_sensitivity: 1.0,
             orbit_sensitivity: 1.0,
@@ -9529,6 +9687,8 @@ pub fn run_as(name: &str, app_id: &str, modules: Vec<Box<dyn EditorModule>>) {
         show_help: prefs.show_help,
         show_stats: prefs.show_stats,
         perf: perf::FrameStats::new(std::time::Instant::now()),
+        redraw_reason: None,
+        idle_wake: None,
         dirty: false,
         saved_scripts: std::collections::BTreeMap::new(),
         pending_unsaved: None,
@@ -9596,6 +9756,16 @@ pub fn run_as(name: &str, app_id: &str, modules: Vec<Box<dyn EditorModule>>) {
 #[cfg(test)]
 mod prefs_tests {
     use super::*;
+
+    #[test]
+    fn vsync_is_on_unless_turned_off_and_an_old_prefs_file_keeps_it_on() {
+        assert!(EditorPrefs::default().vsync);
+        let old: EditorPrefs = ron::from_str("(show_help: true)").unwrap();
+        assert!(old.vsync);
+        assert!(!old.show_stats);
+        assert_eq!(present_mode_for(true), wgpu::PresentMode::AutoVsync);
+        assert_eq!(present_mode_for(false), wgpu::PresentMode::AutoNoVsync);
+    }
 
     #[test]
     fn old_editor_ron_still_loads_with_defaults() {

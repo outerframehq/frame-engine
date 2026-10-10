@@ -8,7 +8,72 @@
 //! second the numbers so far are summed up into a summary, so the overlay
 //! holds still long enough to read.
 
+use std::alloc::{GlobalAlloc, Layout, System};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
+
+/// Bytes the program has asked for and not yet given back, and the most
+/// that has been true at once. Only counted when the binary uses
+/// [`CountingAlloc`].
+static IN_USE: AtomicUsize = AtomicUsize::new(0);
+static PEAK: AtomicUsize = AtomicUsize::new(0);
+
+/// The system allocator, counting what is in use so the performance overlay
+/// can tell memory the program holds from memory the system has kept for it
+/// (freed memory not handed back, the graphics driver, the program itself).
+/// A binary opts in with
+/// `#[global_allocator] static ALLOC: frame_editor::CountingAlloc = frame_editor::CountingAlloc;`.
+/// The cost is two atomic additions per allocation.
+pub struct CountingAlloc;
+
+unsafe impl GlobalAlloc for CountingAlloc {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        // SAFETY: the caller's contract for `alloc` is passed straight on.
+        let p = unsafe { System.alloc(layout) };
+        if !p.is_null() {
+            added(layout.size());
+        }
+        p
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        // SAFETY: as for `alloc`.
+        let p = unsafe { System.alloc_zeroed(layout) };
+        if !p.is_null() {
+            added(layout.size());
+        }
+        p
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        // SAFETY: as for `alloc`; `ptr` came from this allocator, which is
+        // the system's.
+        unsafe { System.dealloc(ptr, layout) };
+        IN_USE.fetch_sub(layout.size(), Ordering::Relaxed);
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        // SAFETY: as for `dealloc`.
+        let p = unsafe { System.realloc(ptr, layout, new_size) };
+        if !p.is_null() {
+            IN_USE.fetch_sub(layout.size(), Ordering::Relaxed);
+            added(new_size);
+        }
+        p
+    }
+}
+
+fn added(size: usize) {
+    let now = IN_USE.fetch_add(size, Ordering::Relaxed) + size;
+    PEAK.fetch_max(now, Ordering::Relaxed);
+}
+
+/// Heap bytes in use and the peak so far, or None when the binary does not
+/// count (see [`CountingAlloc`]).
+fn heap() -> Option<(usize, usize)> {
+    let peak = PEAK.load(Ordering::Relaxed);
+    (peak > 0).then(|| (IN_USE.load(Ordering::Relaxed), peak))
+}
 
 /// How often the summary is refreshed.
 const PERIOD: Duration = Duration::from_millis(500);
@@ -102,8 +167,25 @@ impl FrameStats {
             ),
             format!("editor work {:.1} ms a frame", s.work_ms),
         ];
-        if let Some(bytes) = s.resident {
-            out.push(format!("memory {}", megabytes(bytes)));
+        match (s.resident, heap()) {
+            (Some(resident), Some((in_use, peak))) => {
+                out.push(format!(
+                    "memory {} held by the process",
+                    megabytes(resident)
+                ));
+                out.push(format!(
+                    "  {} in use by the program (peak {}), the rest freed but kept, the graphics driver and the program itself",
+                    megabytes(in_use as u64),
+                    megabytes(peak as u64)
+                ));
+            }
+            (Some(resident), None) => out.push(format!("memory {}", megabytes(resident))),
+            (None, Some((in_use, peak))) => out.push(format!(
+                "memory in use {} (peak {})",
+                megabytes(in_use as u64),
+                megabytes(peak as u64)
+            )),
+            (None, None) => {}
         }
         out
     }

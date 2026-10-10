@@ -94,6 +94,14 @@ pub trait EditorModule {
         None
     }
 
+    /// Whether this module is still working in the background (building
+    /// something it will want to show). While any module is, the editor keeps
+    /// drawing every frame so the results appear as they arrive; otherwise an
+    /// idle editor only draws when something changes. The default is never.
+    fn busy(&self) -> bool {
+        false
+    }
+
     /// Lines for the performance overlay (View, Performance overlay): how
     /// much this module holds and is doing, in plain words ("cache 120 MB",
     /// say). Called once per frame only while the overlay is shown. The
@@ -465,6 +473,17 @@ pub(crate) fn module_scenes(
         .collect()
 }
 
+/// The name of the first module still working in the background, if any.
+pub(crate) fn busy_module(
+    modules: &std::cell::RefCell<Vec<Box<dyn EditorModule>>>,
+) -> Option<String> {
+    modules
+        .borrow()
+        .iter()
+        .find(|m| m.busy())
+        .map(|m| m.name().to_string())
+}
+
 /// Every module's overlay lines, each headed by the module's name.
 pub(crate) fn module_stats(
     modules: &std::cell::RefCell<Vec<Box<dyn EditorModule>>>,
@@ -621,6 +640,40 @@ mod tests {
         let _ = module_scenes(&modules, &world, false, &[far]);
         // Full precision: a viewer 20,000 km out is not rounded to f32.
         assert_eq!(*seen.borrow(), vec![far]);
+    }
+
+    /// A module that is busy or not, and says so in the overlay.
+    struct Worker {
+        busy: bool,
+    }
+    impl EditorModule for Worker {
+        fn name(&self) -> &str {
+            "worker"
+        }
+        fn busy(&self) -> bool {
+            self.busy
+        }
+        fn stats(&self) -> Vec<String> {
+            vec!["jobs 3".to_string()]
+        }
+        fn new_gpu(&self, _gpu: &GpuContext) -> Box<dyn ModuleGpu> {
+            unreachable!("no GPU in tests")
+        }
+    }
+
+    #[test]
+    fn a_busy_module_keeps_the_editor_drawing_and_reports_its_stats() {
+        let modules = RefCell::new(vec![
+            Box::new(Watcher {
+                seen: std::rc::Rc::new(RefCell::new(Vec::new())),
+            }) as Box<dyn EditorModule>,
+            Box::new(Worker { busy: false }),
+        ]);
+        assert_eq!(busy_module(&modules), None);
+        // Only modules with something to say get lines, under their name.
+        assert_eq!(module_stats(&modules), vec!["worker:", "  jobs 3"]);
+        modules.borrow_mut()[1] = Box::new(Worker { busy: true });
+        assert_eq!(busy_module(&modules), Some("worker".to_string()));
     }
 
     struct Floor {
