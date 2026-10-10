@@ -24,6 +24,7 @@ use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Icon, Window, WindowId};
 mod font;
 mod origin;
+mod perf;
 mod script;
 mod sky;
 mod sun;
@@ -2264,6 +2265,7 @@ enum MenuAction {
     TogglePause,
     StepOnce,
     ToggleHelp,
+    ToggleStats,
     OpenEditorSettings,
     About,
     Quit,
@@ -3933,6 +3935,8 @@ struct EditorTabViewer {
     viewport_rect: Option<egui::Rect>,
     // The translate gizmo to paint over the viewport, if anything is selected.
     gizmo: Option<GizmoDraw>,
+    // The performance overlay's lines, when it is shown.
+    stats: Option<Vec<String>>,
     // Set by context_menu when the user picks "Open in new window" on a tab;
     // the caller pops it out (see App::pop_out_tab) after the egui pass, the
     // same lift-then-write-back pattern menu_action uses.
@@ -3999,6 +4003,9 @@ impl egui_dock::TabViewer for EditorTabViewer {
                         );
                         painter.circle_filled(g.ends[axis], if lit { 6.0 } else { 4.5 }, color);
                     }
+                }
+                if let Some(lines) = &self.stats {
+                    paint_stats(ui, lines);
                 }
             }
             Tab::Scene => {
@@ -4502,6 +4509,10 @@ struct App {
     last_cursor: (f64, f64),
     selected: Option<usize>,
     show_help: bool,
+    // Whether the performance overlay shows (a saved preference).
+    show_stats: bool,
+    // Frame timing for the performance overlay.
+    perf: perf::FrameStats,
     // Unsaved-changes tracking. `dirty` is set by any authoring edit (every
     // mutating gesture pushes an undo snapshot) and cleared on save/load; the
     // script library is compared against `saved_scripts` as well, since typing
@@ -4653,10 +4664,37 @@ impl App {
         self.show_help = !self.show_help;
         self.persist_prefs_if_changed();
     }
+    /// Toggle the performance overlay. The choice persists across runs.
+    fn toggle_stats(&mut self) {
+        self.show_stats = !self.show_stats;
+        self.persist_prefs_if_changed();
+    }
+    /// The performance overlay's lines: frame times and memory, then each
+    /// module's own lines, for the editor's and (while Play runs) the Play
+    /// window's GPU copies.
+    fn stats_lines(&self) -> Vec<String> {
+        let mut lines = self.perf.lines();
+        let entities = self.world.positions.iter().filter(|p| p.is_some()).count();
+        lines.push(format!("entities {entities}"));
+        lines.extend(module_api::module_stats(&self.modules));
+        for (label, gpu) in [
+            ("viewport", self.gpu.as_ref()),
+            ("Play", self.game_gpu.as_ref()),
+        ] {
+            let Some(gpu) = gpu else { continue };
+            let gpu_lines: Vec<String> = gpu.module_gpu.iter().flat_map(|m| m.stats()).collect();
+            if !gpu_lines.is_empty() {
+                lines.push(format!("GPU, {label} window:"));
+                lines.extend(gpu_lines.into_iter().map(|l| format!("  {l}")));
+            }
+        }
+        lines
+    }
     /// The preferences as the editor holds them right now.
     fn current_prefs(&self) -> EditorPrefs {
         EditorPrefs {
             show_help: self.show_help,
+            show_stats: self.show_stats,
             fly_speed: self.fly_speed,
             look_sensitivity: self.look_sensitivity,
             orbit_sensitivity: self.orbit_sensitivity,
@@ -4684,6 +4722,7 @@ impl App {
     fn apply_prefs(&mut self, prefs: EditorPrefs) {
         let prefs = prefs.sanitized();
         self.show_help = prefs.show_help;
+        self.show_stats = prefs.show_stats;
         self.fly_speed = prefs.fly_speed;
         self.look_sensitivity = prefs.look_sensitivity;
         self.orbit_sensitivity = prefs.orbit_sensitivity;
@@ -7141,6 +7180,8 @@ impl ApplicationHandler for App {
                                 KeyCode::Escape => self.clear_selection(),
                                 // H: toggle the controls overlay.
                                 KeyCode::KeyH => self.toggle_help(),
+                                // F3: toggle the performance overlay.
+                                KeyCode::F3 => self.toggle_stats(),
                                 // N: spawn a new entity at the camera focus, and select it.
                                 KeyCode::KeyN => self.spawn_at_focus(),
                                 // Delete: despawn the selected entity.
@@ -7164,6 +7205,7 @@ impl ApplicationHandler for App {
                     self.draw_launcher(event_loop);
                     return;
                 }
+                self.perf.begin(std::time::Instant::now());
                 // Window title: the project name, with " *" while there are
                 // unsaved changes.
                 if let (Some(name), Some(window)) =
@@ -7568,6 +7610,7 @@ impl ApplicationHandler for App {
                     // Reset each frame; the Viewport tab sets it if it's visible.
                     viewport_rect: None,
                     gizmo: gizmo_draw,
+                    stats: self.show_stats.then(|| self.stats_lines()),
                     pop_out_request: None,
                     preview_texture_id: self.gpu.as_ref().map(|g| g.preview_texture_id),
                     new_prefab_name,
@@ -7678,6 +7721,9 @@ impl ApplicationHandler for App {
                                         ui.separator();
                                         if ui.button("Controls overlay").clicked() {
                                             menu_action = Some(MenuAction::ToggleHelp);
+                                        }
+                                        if ui.button("Performance overlay (F3)").clicked() {
+                                            menu_action = Some(MenuAction::ToggleStats);
                                         }
                                     });
                                     ui.menu_button("Help", |ui| {
@@ -8322,6 +8368,7 @@ impl ApplicationHandler for App {
                     Some(MenuAction::TogglePause) => self.toggle_pause(),
                     Some(MenuAction::StepOnce) => self.step_once(),
                     Some(MenuAction::ToggleHelp) => self.toggle_help(),
+                    Some(MenuAction::ToggleStats) => self.toggle_stats(),
                     Some(MenuAction::OpenEditorSettings) => self.editor_settings_open = true,
                     Some(MenuAction::About) => {
                         self.log("Frame Editor — a hand-rolled Rust simulation engine and editor.");
@@ -8390,6 +8437,7 @@ impl ApplicationHandler for App {
                         egui_ppp,
                     );
                 }
+                self.perf.end(std::time::Instant::now());
                 if let Some(window) = &self.window {
                     window.request_redraw();
                 }
@@ -8415,6 +8463,8 @@ fn recent_projects_file() -> Option<std::path::PathBuf> {
 #[serde(default)]
 struct EditorPrefs {
     show_help: bool,
+    // Whether the performance overlay shows (View, Performance overlay, or F3).
+    show_stats: bool,
     fly_speed: f32,
     look_sensitivity: f32,
     orbit_sensitivity: f32,
@@ -8440,6 +8490,7 @@ impl Default for EditorPrefs {
     fn default() -> Self {
         Self {
             show_help: true,
+            show_stats: false,
             fly_speed: CAM_PAN_SPEED,
             look_sensitivity: 1.0,
             orbit_sensitivity: 1.0,
@@ -8936,6 +8987,27 @@ fn format_edited(modified: Option<std::time::SystemTime>) -> String {
             .to_string(),
         None => "unknown".to_string(),
     }
+}
+
+/// Paint the performance overlay in the viewport's top-right corner: plain
+/// monospace lines on a dark box, so it reads over any scene.
+fn paint_stats(ui: &egui::Ui, lines: &[String]) {
+    let painter = ui.painter();
+    let font = egui::FontId::monospace(12.0);
+    let galley = painter.layout_no_wrap(
+        lines.join("\n"),
+        font,
+        egui::Color32::from_rgb(0xe8, 0xe8, 0xe8),
+    );
+    let margin = egui::vec2(8.0, 6.0);
+    let area = ui.max_rect();
+    let size = galley.size() + margin * 2.0;
+    let rect = egui::Rect::from_min_size(
+        egui::pos2(area.right() - size.x - 8.0, area.top() + 8.0),
+        size,
+    );
+    painter.rect_filled(rect, 4.0, egui::Color32::from_black_alpha(170));
+    painter.galley(rect.min + margin, galley, egui::Color32::WHITE);
 }
 
 /// Build per-primitive instance buckets from a world, in the engine's Mesh order
@@ -9455,6 +9527,8 @@ pub fn run_as(name: &str, app_id: &str, modules: Vec<Box<dyn EditorModule>>) {
         last_cursor: (0.0, 0.0),
         selected: None,
         show_help: prefs.show_help,
+        show_stats: prefs.show_stats,
+        perf: perf::FrameStats::new(std::time::Instant::now()),
         dirty: false,
         saved_scripts: std::collections::BTreeMap::new(),
         pending_unsaved: None,

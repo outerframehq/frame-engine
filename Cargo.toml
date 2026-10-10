@@ -3,3 +3,10 @@ resolver = "3"
 members = ["crates/frame-editor",
     "crates/frame-engine",
 ]
+
+# `cargo run` builds in debug mode. Our own crates stay fast to rebuild, but
+# the libraries underneath (wgpu, egui, rapier, image, rhai, kira) run many
+# times slower unoptimised, which shows in every frame, in loading textures
+# and in physics. They rarely change, so optimise them once and keep them.
+[profile.dev.package."*"]
+opt-level = 2

@@ -25,6 +25,8 @@
 use super::*;
 use std::collections::{BTreeMap, BTreeSet};
 
+/// Bytes as megabytes, worded the way the performance overlay shows them.
+pub use crate::perf::megabytes;
 pub use frame_engine::assets::MeshVertexData;
 pub use frame_engine::physics::{StaticMesh, StaticMeshSet};
 
@@ -90,6 +92,14 @@ pub trait EditorModule {
     /// wins.
     fn sun(&mut self, _world: &World) -> Option<SunOverride> {
         None
+    }
+
+    /// Lines for the performance overlay (View, Performance overlay): how
+    /// much this module holds and is doing, in plain words ("cache 120 MB",
+    /// say). Called once per frame only while the overlay is shown. The
+    /// default shows nothing.
+    fn stats(&self) -> Vec<String> {
+        Vec::new()
     }
 
     /// Make this module's GPU state for one window.
@@ -225,6 +235,13 @@ pub trait ModuleGpu {
     /// it to 1 for an ordinary uniform mesh.
     /// Meshes are not sorted: draw the farthest first if several overlap.
     fn draw_transparent(&self, _pass: &mut wgpu::RenderPass<'_>) {}
+
+    /// Lines for the performance overlay about this window's GPU copy (how
+    /// many meshes, how much memory). Called once per frame only while the
+    /// overlay is shown. The default shows nothing.
+    fn stats(&self) -> Vec<String> {
+        Vec::new()
+    }
 }
 
 /// An editable copy of one entity's extension components, handed to
@@ -373,6 +390,16 @@ impl WorldMesh {
         }
     }
 
+    /// How many vertices it holds.
+    pub fn vertex_count(&self) -> u32 {
+        self.count
+    }
+
+    /// How much GPU memory its buffer takes, in bytes.
+    pub fn bytes(&self) -> u64 {
+        self.buffer.size()
+    }
+
     /// Draw it. Call `WorldInstance::bind` first.
     pub fn draw(&self, pass: &mut wgpu::RenderPass<'_>) {
         pass.set_vertex_buffer(0, self.buffer.slice(..));
@@ -436,6 +463,21 @@ pub(crate) fn module_scenes(
             m.build_scene(world, hold)
         })
         .collect()
+}
+
+/// Every module's overlay lines, each headed by the module's name.
+pub(crate) fn module_stats(
+    modules: &std::cell::RefCell<Vec<Box<dyn EditorModule>>>,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    for m in modules.borrow().iter() {
+        let lines = m.stats();
+        if !lines.is_empty() {
+            out.push(format!("{}:", m.name()));
+            out.extend(lines.into_iter().map(|l| format!("  {l}")));
+        }
+    }
+    out
 }
 
 /// The first sun any module asks for this frame, if any.
