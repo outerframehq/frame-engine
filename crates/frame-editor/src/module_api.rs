@@ -187,21 +187,88 @@ impl MaterialFactory {
         roughness: f32,
         metalness: f32,
     ) -> Option<WorldMaterial> {
+        self.create_with_look(
+            device,
+            queue,
+            width,
+            height,
+            rgba,
+            MaterialLook {
+                roughness,
+                metalness,
+                detail: 0.0,
+            },
+        )
+    }
+
+    /// Like `create`, with the whole [`MaterialLook`].
+    pub fn create_with_look(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        width: u32,
+        height: u32,
+        rgba: &[u8],
+        look: MaterialLook,
+    ) -> Option<WorldMaterial> {
         if !pixels_fit(width, height, rgba.len()) {
             return None;
         }
         let view = create_material_texture(device, queue, width, height, rgba);
-        let bind_group = create_material_bind_group(
+        let bind_group = create_material_bind_group_with(
             device,
             &self.layout,
             &self.sampler,
             &view,
-            roughness.clamp(0.0, 1.0),
-            metalness.clamp(0.0, 1.0),
-            true,
+            [
+                look.roughness.clamp(0.0, 1.0),
+                look.metalness.clamp(0.0, 1.0),
+                1.0,
+                0.0,
+            ],
+            [look.detail.clamp(0.0, 1.0), 0.0, 0.0, 0.0],
         );
         Some(WorldMaterial { bind_group })
     }
+
+    /// A material for a see-through liquid surface drawn in the transparent
+    /// pass (water). It is smooth and untextured, and the shader gives it
+    /// moving waves, `ripples` (0 to 1) choppy, that fade out with distance;
+    /// the sky reflected more strongly the lower the view; and a glint of the
+    /// sun, small up close and a broad glittering path far out. The waves
+    /// move only while the world does. The vertex `uv` keeps its meaning for
+    /// the transparent pass (opacity and thickness).
+    pub fn create_liquid(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        ripples: f32,
+    ) -> WorldMaterial {
+        let view = create_default_white_texture(device, queue);
+        let bind_group = create_material_bind_group_with(
+            device,
+            &self.layout,
+            &self.sampler,
+            &view,
+            [0.05, 0.0, 0.0, ripples.clamp(0.0, 1.0).max(1e-3)],
+            [0.0; 4],
+        );
+        WorldMaterial { bind_group }
+    }
+}
+
+/// How a material's surface looks, beyond its texture.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct MaterialLook {
+    /// 0 smooth to 1 rough, as for a mesh.
+    pub roughness: f32,
+    /// 0 to 1, as for a mesh.
+    pub metalness: f32,
+    /// 0 to 1: soft light and dark patches laid over the texture at a few
+    /// sizes (from about 4 to 256 world units), fixed to the world, so large
+    /// areas of one colour (ground seen up close) are not flat. Each size
+    /// fades out with distance before it could shimmer. 0 is none.
+    pub detail: f32,
 }
 
 /// A texture and surface look a module's meshes can be drawn with. The
@@ -552,15 +619,194 @@ impl WorldMesh {
 
     /// Draw it. Call `WorldInstance::bind` first.
     pub fn draw(&self, pass: &mut wgpu::RenderPass<'_>) {
+        self.draw_copies(pass, 1);
+    }
+
+    /// Draw a copy of it at every placement in `instances`, all in one draw
+    /// call (see [`WorldInstances`]). Binds the placements itself.
+    pub fn draw_instanced(&self, pass: &mut wgpu::RenderPass<'_>, instances: &WorldInstances) {
+        if instances.count == 0 {
+            return;
+        }
+        pass.set_vertex_buffer(1, instances.buffer.slice(..));
+        self.draw_copies(pass, instances.count);
+    }
+
+    /// Draw `copies` copies, one per placement in the bound instance buffer.
+    fn draw_copies(&self, pass: &mut wgpu::RenderPass<'_>, copies: u32) {
         pass.set_vertex_buffer(0, self.buffer.slice(..));
         match &self.indices {
             Some((indices, n)) => {
                 pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint32);
-                pass.draw_indexed(0..*n, 0, 0..1);
+                pass.draw_indexed(0..*n, 0, 0..copies);
             }
-            None => pass.draw(0..self.count, 0..1),
+            None => pass.draw(0..self.count, 0..copies),
         }
     }
+}
+
+/// Where one copy of a mesh goes, for [`WorldInstances`].
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct Placement {
+    /// Where the mesh's origin goes, in world units, relative to the set's
+    /// anchor (see `WorldInstances::new`).
+    pub position: [f32; 3],
+    /// Yaw, pitch and roll in radians, applied roll, then pitch, then yaw,
+    /// as for an entity's `Rotation`.
+    pub rotation: [f32; 3],
+    /// How much bigger than the mesh's own size, along each axis (1 is the
+    /// mesh as built).
+    pub scale: [f32; 3],
+    /// Multiplies the mesh's colour (its material's texture), so copies of
+    /// one mesh can differ a little. White leaves it as it is.
+    pub color: [f32; 3],
+}
+
+impl Placement {
+    /// At `position` relative to the anchor, unturned, at the mesh's own
+    /// size and colour.
+    pub fn at(position: [f32; 3]) -> Placement {
+        Placement {
+            position,
+            rotation: [0.0; 3],
+            scale: [1.0; 3],
+            color: [1.0; 3],
+        }
+    }
+}
+
+/// Many copies of a mesh: one placement each, drawn in a single draw call
+/// by `WorldMesh::draw_instanced`. A forest is one tree mesh and one set of
+/// placements, not a mesh per tree, so the graphics card does the
+/// repetition and the CPU sends one command.
+///
+/// Placements are given relative to an `anchor` in full `f64` world space
+/// (the corner of a chunk of ground, say), so they stay small numbers. The
+/// set keeps them and, whenever the render origin moves, works out each
+/// copy's position relative to it in `f64` before it drops to `f32`, so
+/// copies are as precise far from the world's centre as near it.
+pub struct WorldInstances {
+    buffer: wgpu::Buffer,
+    count: u32,
+    anchor: [f64; 3],
+    placements: Vec<Placement>,
+    origin: Option<[f64; 3]>,
+}
+
+impl WorldInstances {
+    /// Upload `placements` around `anchor`. Call `set_render_origin` before
+    /// the first draw. None when there are no placements.
+    pub fn new(device: &wgpu::Device, anchor: [f64; 3], placements: &[Placement]) -> Option<Self> {
+        if placements.is_empty() {
+            return None;
+        }
+        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("module instances"),
+            size: (placements.len() * std::mem::size_of::<InstanceRaw>()) as wgpu::BufferAddress,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        Some(WorldInstances {
+            buffer,
+            count: placements.len() as u32,
+            anchor,
+            placements: placements.to_vec(),
+            origin: None,
+        })
+    }
+
+    /// Where the editor draws from this frame (see
+    /// `ModuleGpu::set_render_origin`). Rewrites the copies' positions only
+    /// when the origin has moved, which is rare.
+    pub fn set_render_origin(&mut self, queue: &wgpu::Queue, origin: [f64; 3]) {
+        if self.origin == Some(origin) {
+            return;
+        }
+        self.origin = Some(origin);
+        let raw = raw_instances(self.anchor, origin, &self.placements);
+        queue.write_buffer(&self.buffer, 0, bytemuck::cast_slice(&raw));
+    }
+
+    /// How many copies there are.
+    pub fn len(&self) -> u32 {
+        self.count
+    }
+
+    /// Never true: an empty set is never made.
+    pub fn is_empty(&self) -> bool {
+        self.count == 0
+    }
+
+    /// A box (min, max) around every copy, relative to the render origin,
+    /// for a mesh that reaches at most `radius` world units from its own
+    /// origin at scale 1, so the whole set can be skipped when a view cannot
+    /// see it (`DrawView::sees_box`). None before `set_render_origin`.
+    pub fn bounds(&self, radius: f32) -> Option<([f32; 3], [f32; 3])> {
+        let origin = self.origin?;
+        Some(placement_bounds(
+            self.anchor,
+            origin,
+            &self.placements,
+            radius,
+        ))
+    }
+
+    /// GPU memory the placements take, in bytes.
+    pub fn bytes(&self) -> u64 {
+        self.buffer.size()
+    }
+}
+
+/// The instance records for `placements` around `anchor`, drawn relative to
+/// `origin`: the subtraction is done in `f64`, then each position drops to
+/// `f32`. The shader blows every mesh up by the entity size, so the scale is
+/// divided by it to leave the mesh in world units.
+fn raw_instances(anchor: [f64; 3], origin: [f64; 3], placements: &[Placement]) -> Vec<InstanceRaw> {
+    let base = [
+        anchor[0] - origin[0],
+        anchor[1] - origin[1],
+        anchor[2] - origin[2],
+    ];
+    placements
+        .iter()
+        .map(|p| InstanceRaw {
+            position: [
+                (base[0] + f64::from(p.position[0])) as f32,
+                (base[1] + f64::from(p.position[1])) as f32,
+                (base[2] + f64::from(p.position[2])) as f32,
+            ],
+            color: p.color,
+            selected: 0.0,
+            scale: p.scale.map(|s| s / QUAD_SIZE),
+            emissive: 0.0,
+            rotation: p.rotation,
+        })
+        .collect()
+}
+
+/// The box around every copy of a mesh reaching `radius` (see
+/// `WorldInstances::bounds`).
+fn placement_bounds(
+    anchor: [f64; 3],
+    origin: [f64; 3],
+    placements: &[Placement],
+    radius: f32,
+) -> ([f32; 3], [f32; 3]) {
+    let mut min = [f32::MAX; 3];
+    let mut max = [f32::MIN; 3];
+    for raw in raw_instances(anchor, origin, placements)
+        .iter()
+        .zip(placements)
+        .map(|(r, p)| (r.position, p.scale))
+    {
+        let (position, scale) = raw;
+        let reach = radius.max(0.0) * scale.iter().fold(0.0f32, |a, s| a.max(s.abs()));
+        for a in 0..3 {
+            min[a] = min[a].min(position[a] - reach);
+            max[a] = max[a].max(position[a] + reach);
+        }
+    }
+    (min, max)
 }
 
 /// The single placement a module's meshes are drawn with: a world position
@@ -1095,5 +1341,50 @@ mod tests {
         assert!(view.shadow);
         assert!(view.sees_box([-5.0, 0.0, -5.0], [5.0, 10.0, 5.0]));
         assert!(!view.sees_box([400.0, 0.0, 400.0], [410.0, 10.0, 410.0]));
+    }
+
+    #[test]
+    fn placements_become_instance_records_relative_to_the_render_origin() {
+        // An anchor 20,000 km out, drawn from an origin near it.
+        let anchor = [2.0e7, 100.0, -3.0e6];
+        let origin = [2.0e7 + 256.0, 0.0, -3.0e6 - 512.0];
+        let placements = [
+            Placement::at([10.5, 2.0, -3.25]),
+            Placement {
+                position: [0.0; 3],
+                rotation: [1.0, 0.0, 0.5],
+                scale: [2.0, 3.0, 2.0],
+                color: [0.5, 0.8, 0.5],
+            },
+        ];
+        let raw = raw_instances(anchor, origin, &placements);
+        assert_eq!(raw.len(), 2);
+        // Exact, though the anchor alone would round badly as f32.
+        assert_eq!(raw[0].position, [10.5 - 256.0, 102.0, -3.25 + 512.0]);
+        assert_eq!(raw[1].position, [-256.0, 100.0, 512.0]);
+        // Scale is in mesh units: one entity size per world unit.
+        assert_eq!(raw[0].scale, [1.0 / QUAD_SIZE; 3]);
+        assert_eq!(
+            raw[1].scale,
+            [2.0 / QUAD_SIZE, 3.0 / QUAD_SIZE, 2.0 / QUAD_SIZE]
+        );
+        assert_eq!(raw[1].rotation, [1.0, 0.0, 0.5]);
+        assert_eq!(raw[1].color, [0.5, 0.8, 0.5]);
+        assert_eq!(raw[0].selected, 0.0);
+    }
+
+    #[test]
+    fn the_bounds_hold_every_copy_at_its_size() {
+        let placements = [
+            Placement::at([0.0, 0.0, 0.0]),
+            Placement {
+                scale: [1.0, 4.0, 1.0],
+                ..Placement::at([100.0, 10.0, -50.0])
+            },
+        ];
+        let (min, max) = placement_bounds([1000.0, 0.0, 0.0], [1000.0, 0.0, 0.0], &placements, 2.0);
+        // The tall copy reaches 4 times the radius.
+        assert_eq!(min, [-2.0, -2.0, -58.0]);
+        assert_eq!(max, [108.0, 18.0, 2.0]);
     }
 }
