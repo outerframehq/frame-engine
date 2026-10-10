@@ -1892,8 +1892,9 @@ impl GpuState {
                 instance_start += count;
             }
         }
+        let view = module_api::DrawView::from_view_proj(uniform.light_view_proj, true);
         for module in &self.module_gpu {
-            module.draw(&mut pass);
+            module.draw_in_view(&mut pass, &view);
         }
     }
     /// Make this window's module GPU state match `scenes` (one entry per
@@ -2090,13 +2091,15 @@ impl GpuState {
                     instance_start += count;
                 }
             }
+            // What the camera can see, so modules skip what is out of view.
+            let view = module_api::DrawView::from_view_proj(view_proj, false);
             if self.module_gpu.iter().any(|m| m.has_geometry()) {
                 render_pass.set_bind_group(1, &self.material_bind_groups[0], &[]);
                 for module in &self.module_gpu {
                     // Every module starts from the default material, whatever
                     // the one before it bound.
                     render_pass.set_bind_group(1, &self.material_bind_groups[0], &[]);
-                    module.draw(&mut render_pass);
+                    module.draw_in_view(&mut render_pass, &view);
                 }
             }
             if self.module_gpu.iter().any(|m| m.has_transparent()) {
@@ -2104,7 +2107,7 @@ impl GpuState {
                 render_pass.set_bind_group(1, &self.material_bind_groups[0], &[]);
                 for module in &self.module_gpu {
                     render_pass.set_bind_group(1, &self.material_bind_groups[0], &[]);
-                    module.draw_transparent(&mut render_pass);
+                    module.draw_transparent_in_view(&mut render_pass, &view);
                 }
             }
             // text overlay (screen-space, drawn on top, no camera)
@@ -2269,13 +2272,15 @@ impl GpuState {
                     instance_start += count;
                 }
             }
+            // What the camera can see, so modules skip what is out of view.
+            let view = module_api::DrawView::from_view_proj(view_proj, false);
             if self.module_gpu.iter().any(|m| m.has_geometry()) {
                 render_pass.set_bind_group(1, &self.material_bind_groups[0], &[]);
                 for module in &self.module_gpu {
                     // Every module starts from the default material, whatever
                     // the one before it bound.
                     render_pass.set_bind_group(1, &self.material_bind_groups[0], &[]);
-                    module.draw(&mut render_pass);
+                    module.draw_in_view(&mut render_pass, &view);
                 }
             }
             if self.module_gpu.iter().any(|m| m.has_transparent()) {
@@ -2283,7 +2288,7 @@ impl GpuState {
                 render_pass.set_bind_group(1, &self.material_bind_groups[0], &[]);
                 for module in &self.module_gpu {
                     render_pass.set_bind_group(1, &self.material_bind_groups[0], &[]);
-                    module.draw_transparent(&mut render_pass);
+                    module.draw_transparent_in_view(&mut render_pass, &view);
                 }
             }
         }

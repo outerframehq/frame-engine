@@ -248,6 +248,21 @@ pub trait ModuleGpu {
     /// both the shadow pass and the colour pass.
     fn draw(&self, pass: &mut wgpu::RenderPass<'_>);
 
+    /// Like `draw`, for one view: `view` tells what this draw can see, so a
+    /// module with many meshes can skip those that would not show (see
+    /// [`DrawView::sees_box`]). The editor calls this, not `draw`, for the
+    /// colour pass, the shadow pass and the Camera preview. The default
+    /// draws everything with `draw`.
+    fn draw_in_view(&self, pass: &mut wgpu::RenderPass<'_>, _view: &DrawView) {
+        self.draw(pass);
+    }
+
+    /// Like `draw_transparent`, for one view (see `draw_in_view`). The
+    /// default draws everything with `draw_transparent`.
+    fn draw_transparent_in_view(&self, pass: &mut wgpu::RenderPass<'_>, _view: &DrawView) {
+        self.draw_transparent(pass);
+    }
+
     /// Whether there is anything to draw with `draw_transparent`.
     fn has_transparent(&self) -> bool {
         false
@@ -267,6 +282,62 @@ pub trait ModuleGpu {
     /// overlay is shown. The default shows nothing.
     fn stats(&self) -> Vec<String> {
         Vec::new()
+    }
+}
+
+/// What one draw can see: the six sides of its view, in the same space as
+/// everything is drawn in (relative to the render origin). Handed to
+/// [`ModuleGpu::draw_in_view`] so a module can skip meshes outside it. For
+/// the colour pass and the Camera preview it is the camera's view; for the
+/// shadow pass it is the box the sun's shadow map covers, which is only the
+/// ground near the camera.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct DrawView {
+    /// Each side as `[a, b, c, d]`: a point `p` is on the inside when
+    /// `a * p.x + b * p.y + c * p.z + d >= 0`. None sees everything.
+    planes: Option<[[f32; 4]; 6]>,
+    /// True for the shadow pass, which draws depth only, seen from the sun.
+    pub shadow: bool,
+}
+
+impl DrawView {
+    /// The view of a view-projection matrix (a camera's, or the shadow
+    /// map's). A broken matrix gives a view that sees everything.
+    pub fn from_view_proj(view_proj: [[f32; 4]; 4], shadow: bool) -> DrawView {
+        let m = Mat4::from_cols_array_2d(&view_proj);
+        let (r0, r1, r2, r3) = (m.row(0), m.row(1), m.row(2), m.row(3));
+        // Clip space keeps -w <= x, y <= w and 0 <= z <= w; each side is one
+        // of those, written in terms of the point before projection.
+        let sides = [r3 + r0, r3 - r0, r3 + r1, r3 - r1, r2, r3 - r2];
+        let planes = sides
+            .iter()
+            .all(|p| p.is_finite())
+            .then(|| sides.map(|p| p.to_array()));
+        DrawView { planes, shadow }
+    }
+
+    /// A view that sees everything.
+    pub fn everything() -> DrawView {
+        DrawView {
+            planes: None,
+            shadow: false,
+        }
+    }
+
+    /// Whether any part of the box from `min` to `max` may be seen. Never
+    /// says no to something that shows; it can say yes to a box that only
+    /// just misses a corner of the view.
+    pub fn sees_box(&self, min: [f32; 3], max: [f32; 3]) -> bool {
+        let Some(planes) = &self.planes else {
+            return true;
+        };
+        planes.iter().all(|[a, b, c, d]| {
+            // The box's corner furthest along this side's inward direction.
+            let x = if *a >= 0.0 { max[0] } else { min[0] };
+            let y = if *b >= 0.0 { max[1] } else { min[1] };
+            let z = if *c >= 0.0 { max[2] } else { min[2] };
+            a * x + b * y + c * z + d >= 0.0
+        })
     }
 }
 
@@ -989,5 +1060,40 @@ mod tests {
         // Nonsense answers are ignored.
         let odd = modules(&[Some(f64::NAN), Some(-5.0), Some(f64::INFINITY)]);
         assert_eq!(module_view_distance(&odd, &world), None);
+    }
+
+    #[test]
+    fn a_draw_view_keeps_what_the_camera_sees_and_drops_the_rest() {
+        let eye = Vec3::new(0.0, 50.0, 0.0);
+        // Looking along -Z, with the editor's own projection.
+        let vp = crate::camera_projection(16.0 / 9.0)
+            * Mat4::look_at_rh(eye, eye + Vec3::new(0.0, 0.0, -1.0), Vec3::Y);
+        let view = DrawView::from_view_proj(vp.to_cols_array_2d(), false);
+        let around =
+            |x: f32, z: f32, r: f32| view.sees_box([x - r, 40.0, z - r], [x + r, 60.0, z + r]);
+        // Ahead, near and very far (there is no far plane).
+        assert!(around(0.0, -100.0, 10.0));
+        assert!(around(0.0, -90_000.0, 1000.0));
+        // Behind, and far off to the side.
+        assert!(!around(0.0, 100.0, 10.0));
+        assert!(!around(5_000.0, -100.0, 10.0));
+        // A big box the camera stands in is seen.
+        assert!(around(0.0, 0.0, 500.0));
+        // Below the view, straight down out of sight.
+        assert!(!view.sees_box([-10.0, -9_000.0, -110.0], [10.0, -8_000.0, -90.0]));
+        // A broken matrix sees everything, as does `everything`.
+        let broken = DrawView::from_view_proj([[f32::NAN; 4]; 4], true);
+        assert!(broken.sees_box([1e9; 3], [1e9; 3]));
+        assert!(DrawView::everything().sees_box([0.0; 3], [0.0; 3]));
+    }
+
+    #[test]
+    fn a_shadow_view_sees_only_its_box() {
+        let vp = Mat4::orthographic_rh(-100.0, 100.0, -100.0, 100.0, 0.1, 500.0)
+            * Mat4::look_at_rh(Vec3::new(0.0, 300.0, 0.0), Vec3::ZERO, Vec3::Z);
+        let view = DrawView::from_view_proj(vp.to_cols_array_2d(), true);
+        assert!(view.shadow);
+        assert!(view.sees_box([-5.0, 0.0, -5.0], [5.0, 10.0, 5.0]));
+        assert!(!view.sees_box([400.0, 0.0, 400.0], [410.0, 10.0, 410.0]));
     }
 }
