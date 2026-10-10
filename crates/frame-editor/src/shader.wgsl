@@ -188,6 +188,8 @@ struct VertexInput {
     // for a mesh that does not morph (see VertexMorph in module_api.rs).
     @location(9) morph: vec3<f32>,
     @location(10) morph_normal: vec3<f32>,
+    // The texture coordinates when fully morphed; equal to `uv` otherwise.
+    @location(11) morph_uv: vec2<f32>,
 };
 
 // Per-entity instance data (matches InstanceRaw in main.rs). Bound at slot 1.
@@ -281,7 +283,7 @@ fn vs_main(vertex: VertexInput, instance: InstanceInput) -> VertexOutput {
     out.emissive = instance.emissive;
     out.world_position = world_pos;
     out.world_normal = rotated_normal;
-    out.uv = vertex.uv;
+    out.uv = mix(vertex.uv, vertex.morph_uv, t);
     return out;
 }
 

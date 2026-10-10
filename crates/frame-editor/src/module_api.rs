@@ -148,6 +148,14 @@ pub struct MaterialFactory {
     sampler: wgpu::Sampler,
 }
 
+/// Whether `indices` are whole triangles that all point at one of `vertices`
+/// vertices.
+fn indices_fit(indices: &[u32], vertices: usize) -> bool {
+    !indices.is_empty()
+        && indices.len() % 3 == 0
+        && indices.iter().all(|&i| (i as usize) < vertices)
+}
+
 /// Whether `len` bytes are exactly a `width` by `height` RGBA image.
 fn pixels_fit(width: u32, height: u32, len: usize) -> bool {
     width > 0 && height > 0 && len == width as usize * height as usize * 4
@@ -339,12 +347,41 @@ pub struct VertexMorph {
     pub normal: [f32; 3],
     pub start: f32,
     pub end: f32,
+    /// The texture coordinates it has when fully morphed, so a colour read
+    /// from the mesh's texture slides too. None keeps its own.
+    pub uv: Option<[f32; 2]>,
+}
+
+/// The vertices as the renderer stores them, each with its `morphs` entry
+/// (none past the end of `morphs`).
+fn morphing_vertices(vertices: &[MeshVertexData], morphs: &[VertexMorph]) -> Vec<MeshVertex> {
+    vertices
+        .iter()
+        .enumerate()
+        .map(|(i, v)| {
+            let mut out = MeshVertex::plain(v.position, v.normal, v.uv);
+            if let Some(m) = morphs.get(i) {
+                out.morph = [m.offset_y, m.start, m.end];
+                out.morph_normal = m.normal;
+                out.morph_uv = m.uv.unwrap_or(v.uv);
+            }
+            out
+        })
+        .collect()
 }
 
 /// A triangle mesh on the GPU, in world units, for a module to draw.
+///
+/// Every window shares one graphics device, so a `WorldMesh` made while one
+/// window syncs can be kept (in an `Arc`) and drawn by any other window too,
+/// instead of each window uploading its own copy.
 pub struct WorldMesh {
     buffer: wgpu::Buffer,
+    /// Vertices in the buffer.
     count: u32,
+    /// For an indexed mesh: the triangle corners, as positions in `buffer`,
+    /// and how many there are.
+    indices: Option<(wgpu::Buffer, u32)>,
 }
 
 impl WorldMesh {
@@ -371,19 +408,34 @@ impl WorldMesh {
         if vertices.is_empty() {
             return None;
         }
-        let verts: Vec<MeshVertex> = vertices
-            .iter()
-            .enumerate()
-            .map(|(i, v)| {
-                let mut out = MeshVertex::plain(v.position, v.normal, v.uv);
-                if let Some(m) = morphs.get(i) {
-                    out.morph = [m.offset_y, m.start, m.end];
-                    out.morph_normal = m.normal;
-                }
-                out
-            })
-            .collect();
+        let verts = morphing_vertices(vertices, morphs);
         Some(Self::upload(device, &verts))
+    }
+
+    /// An indexed mesh: each vertex stored once, and `indices` listing the
+    /// three corners of every triangle as positions in `vertices`. A smooth
+    /// surface shares each vertex between about six triangles, so this takes
+    /// a fraction of the memory of a flat triangle list. Each vertex morphs as
+    /// its `morphs` entry says (none when `morphs` is shorter). None when there
+    /// are no triangles or an index points past the vertices.
+    pub fn new_indexed(
+        device: &wgpu::Device,
+        vertices: &[MeshVertexData],
+        morphs: &[VertexMorph],
+        indices: &[u32],
+    ) -> Option<Self> {
+        if !indices_fit(indices, vertices.len()) {
+            return None;
+        }
+        let verts = morphing_vertices(vertices, morphs);
+        let mut mesh = Self::upload(device, &verts);
+        let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("module mesh indices"),
+            contents: bytemuck::cast_slice(indices),
+            usage: wgpu::BufferUsages::INDEX,
+        });
+        mesh.indices = Some((index_buffer, indices.len() as u32));
+        Some(mesh)
     }
 
     fn upload(device: &wgpu::Device, verts: &[MeshVertex]) -> Self {
@@ -395,6 +447,7 @@ impl WorldMesh {
         WorldMesh {
             buffer,
             count: verts.len() as u32,
+            indices: None,
         }
     }
 
@@ -403,15 +456,29 @@ impl WorldMesh {
         self.count
     }
 
-    /// How much GPU memory its buffer takes, in bytes.
+    /// How many triangles it draws.
+    pub fn triangle_count(&self) -> u32 {
+        match &self.indices {
+            Some((_, n)) => n / 3,
+            None => self.count / 3,
+        }
+    }
+
+    /// How much GPU memory its buffers take, in bytes.
     pub fn bytes(&self) -> u64 {
-        self.buffer.size()
+        self.buffer.size() + self.indices.as_ref().map_or(0, |(b, _)| b.size())
     }
 
     /// Draw it. Call `WorldInstance::bind` first.
     pub fn draw(&self, pass: &mut wgpu::RenderPass<'_>) {
         pass.set_vertex_buffer(0, self.buffer.slice(..));
-        pass.draw(0..self.count, 0..1);
+        match &self.indices {
+            Some((indices, n)) => {
+                pass.set_index_buffer(indices.slice(..), wgpu::IndexFormat::Uint32);
+                pass.draw_indexed(0..*n, 0, 0..1);
+            }
+            None => pass.draw(0..self.count, 0..1),
+        }
     }
 }
 
@@ -642,6 +709,14 @@ mod tests {
         assert_eq!(*seen.borrow(), vec![far]);
     }
 
+    #[test]
+    fn only_whole_triangles_inside_the_vertices_make_an_indexed_mesh() {
+        assert!(indices_fit(&[0, 1, 2, 2, 1, 3], 4));
+        assert!(!indices_fit(&[], 4));
+        assert!(!indices_fit(&[0, 1], 4));
+        assert!(!indices_fit(&[0, 1, 4], 4));
+    }
+
     /// A module that is busy or not, and says so in the overlay.
     struct Worker {
         busy: bool,
@@ -827,5 +902,32 @@ mod tests {
         // entity size, so the instance scale must be its inverse.
         assert_eq!(QUAD_SIZE * (1.0 / QUAD_SIZE), 1.0);
         assert_eq!(QUAD_SIZE, 8.0, "shader.wgsl's MESH_SIZE must match");
+    }
+
+    #[test]
+    fn a_morph_carries_its_texture_coordinates_and_plain_vertices_keep_their_own() {
+        let v = |uv: [f32; 2]| MeshVertexData {
+            position: [0.0; 3],
+            normal: [0.0, 1.0, 0.0],
+            uv,
+        };
+        let morph = |uv: Option<[f32; 2]>| VertexMorph {
+            offset_y: 2.0,
+            normal: [0.0, 1.0, 0.0],
+            start: 10.0,
+            end: 20.0,
+            uv,
+        };
+        let out = morphing_vertices(
+            &[v([0.1, 0.2]), v([0.3, 0.4]), v([0.5, 0.6])],
+            &[morph(Some([0.9, 0.8])), morph(None)],
+        );
+        // Slides to the given coordinates.
+        assert_eq!(out[0].morph_uv, [0.9, 0.8]);
+        assert_eq!(out[0].morph, [2.0, 10.0, 20.0]);
+        // No coordinates given, or no morph at all: stays on its own.
+        assert_eq!(out[1].morph_uv, [0.3, 0.4]);
+        assert_eq!(out[2].morph_uv, [0.5, 0.6]);
+        assert_eq!(out[2].morph, [0.0; 3]);
     }
 }

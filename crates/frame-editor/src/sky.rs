@@ -31,6 +31,8 @@ pub(crate) const FOG_REFERENCE_DISTANCE: f32 = 1800.0;
 /// many world units higher. The air near the ground is the hazy part, so a
 /// peak a few thousand units up stays clear while the lowland around it
 /// fades out, and a camera above the haze sees the ground below through it.
+/// The shader holds the working value; tests check this one matches it.
+#[cfg(test)]
 pub(crate) const FOG_HEIGHT_SCALE: f32 = 1200.0;
 
 /// How thin the haze gets with the sun on the horizon: fog thickness is
@@ -44,11 +46,15 @@ pub(crate) const TWILIGHT_THINNING: f32 = 0.45;
 /// The warm glow belongs on the sun's side of the sky; the far side is cooler,
 /// so hills facing away keep their contrast. Mirrors `AWAY_COOLING` in
 /// `shader.wgsl`.
+/// The shader holds the working value; tests check this one matches it.
+#[cfg(test)]
 pub(crate) const AWAY_COOLING: f32 = 0.35;
 
 /// How much of the sun's colour the haze toward the sun takes on, at most.
 /// The same broad glow the sky draws around the sun, so ground fading into
 /// the sky there meets it with no seam. Mirrors `SUN_HAZE` in `shader.wgsl`.
+/// The shader holds the working value; tests check this one matches it.
+#[cfg(test)]
 pub(crate) const SUN_HAZE: f32 = 0.12;
 
 /// The most fog the preference allows (a multiplier on the default).

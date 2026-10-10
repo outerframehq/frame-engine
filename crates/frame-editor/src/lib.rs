@@ -155,13 +155,29 @@ fn vsync_enabled() -> bool {
 fn set_vsync(on: bool) {
     VSYNC.store(on, std::sync::atomic::Ordering::Relaxed);
 }
-/// The present mode for the vsync setting. The Auto modes fall back to one
-/// every system supports, so this never fails to configure.
+/// The present mode for the vsync setting. With vsync, plain `Fifo`: every
+/// system supports it, and it is the steadiest (the Auto choice would take
+/// `FifoRelaxed` where offered, which tears when a frame is late). Without,
+/// `AutoNoVsync`, which falls back to a mode the system has.
 fn present_mode_for(vsync: bool) -> wgpu::PresentMode {
     if vsync {
-        wgpu::PresentMode::AutoVsync
+        wgpu::PresentMode::Fifo
     } else {
         wgpu::PresentMode::AutoNoVsync
+    }
+}
+/// The mode a window really gets for `wanted`, given the modes the system
+/// offers: the Auto modes resolve the way wgpu resolves them.
+fn resolved_present_mode(
+    wanted: wgpu::PresentMode,
+    offered: &[wgpu::PresentMode],
+) -> wgpu::PresentMode {
+    use wgpu::PresentMode as P;
+    let first_offered = |modes: &[P]| modes.iter().copied().find(|m| offered.contains(m));
+    match wanted {
+        P::AutoVsync => first_offered(&[P::FifoRelaxed, P::Fifo]).unwrap_or(P::Fifo),
+        P::AutoNoVsync => first_offered(&[P::Immediate, P::Mailbox, P::Fifo]).unwrap_or(P::Fifo),
+        other => other,
     }
 }
 /// How often an idle editor still draws a frame, so slow-changing things
@@ -413,6 +429,9 @@ struct MeshVertex {
     morph: [f32; 3],
     // The normal the vertex blends to as it morphs.
     morph_normal: [f32; 3],
+    // The texture coordinates it blends to as it morphs. The same as `uv`
+    // for a vertex whose colour does not slide.
+    morph_uv: [f32; 2],
 }
 impl MeshVertex {
     /// A vertex that never morphs.
@@ -423,9 +442,10 @@ impl MeshVertex {
             uv,
             morph: [0.0; 3],
             morph_normal: [0.0; 3],
+            morph_uv: uv,
         }
     }
-    const ATTRIBS: [wgpu::VertexAttribute; 5] = [
+    const ATTRIBS: [wgpu::VertexAttribute; 6] = [
         wgpu::VertexAttribute {
             format: wgpu::VertexFormat::Float32x3,
             offset: 0,
@@ -451,6 +471,11 @@ impl MeshVertex {
             format: wgpu::VertexFormat::Float32x3,
             offset: std::mem::size_of::<[f32; 11]>() as wgpu::BufferAddress, // 44
             shader_location: 10,
+        },
+        wgpu::VertexAttribute {
+            format: wgpu::VertexFormat::Float32x2,
+            offset: std::mem::size_of::<[f32; 14]>() as wgpu::BufferAddress, // 56
+            shader_location: 11,
         },
     ];
     fn layout() -> wgpu::VertexBufferLayout<'static> {
@@ -1029,6 +1054,8 @@ struct GpuState {
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
+    // The present modes this window's surface offers (for the overlay).
+    present_modes: Vec<wgpu::PresentMode>,
     render_pipeline: wgpu::RenderPipeline,
     /// The same shader with alpha blending and no depth writes, for
     /// transparent module geometry drawn after everything opaque.
@@ -1148,6 +1175,7 @@ impl GpuState {
         // second for nothing.
         config.present_mode = present_mode_for(vsync_enabled());
         surface.configure(&device, &config);
+        let present_modes = surface.get_capabilities(&adapter).present_modes;
         let depth_view = create_depth_view(&device, config.width, config.height);
         // egui's renderer. It draws in its own pass with no depth attachment,
         // so RendererOptions::default() (depth_stencil_format: None) is correct.
@@ -1677,6 +1705,7 @@ impl GpuState {
                 device,
                 queue,
                 config,
+                present_modes,
                 render_pipeline,
                 transparent_pipeline,
                 text_pipeline,
@@ -4550,6 +4579,9 @@ struct App {
     redraw_reason: Option<String>,
     // When an idle editor next draws on its own.
     idle_wake: Option<std::time::Instant>,
+    // Where in the code the UI last asked to draw again straight away (from
+    // egui's own record), for the overlay.
+    egui_cause: Option<String>,
     // Unsaved-changes tracking. `dirty` is set by any authoring edit (every
     // mutating gesture pushes an undo snapshot) and cleared on save/load; the
     // script library is compared against `saved_scripts` as well, since typing
@@ -4706,6 +4738,19 @@ impl App {
         self.show_stats = !self.show_stats;
         self.persist_prefs_if_changed();
     }
+    /// The overlay's line about vsync: what is asked for, what the window
+    /// really gets, and what the system offers.
+    fn present_line(&self) -> Option<String> {
+        let gpu = self.gpu.as_ref()?;
+        let wanted = present_mode_for(vsync_enabled());
+        let got = resolved_present_mode(wanted, &gpu.present_modes);
+        let offered: Vec<String> = gpu.present_modes.iter().map(|m| format!("{m:?}")).collect();
+        Some(format!(
+            "vsync {} ({got:?}; offered {})",
+            if vsync_enabled() { "on" } else { "off" },
+            offered.join(", ")
+        ))
+    }
     /// Why the editor should draw the next frame straight away, or None when
     /// nothing is moving and it can wait for something to happen.
     fn continuous_reason(&self, egui_delay: std::time::Duration) -> Option<String> {
@@ -4735,7 +4780,10 @@ impl App {
             return Some(format!("{name} working"));
         }
         if egui_delay.is_zero() {
-            return Some("panels animating".to_string());
+            return Some(match &self.egui_cause {
+                Some(cause) => format!("panels asked: {cause}"),
+                None => "panels asked".to_string(),
+            });
         }
         None
     }
@@ -4748,6 +4796,7 @@ impl App {
             Some(why) => format!("drawing every frame ({why})"),
             None => "drawing only on change".to_string(),
         });
+        lines.extend(self.present_line());
         let entities = self.world.positions.iter().filter(|p| p.is_some()).count();
         lines.push(format!("entities {entities}"));
         lines.push(format!(
@@ -8219,6 +8268,11 @@ impl ApplicationHandler for App {
                     if let Some(v) = full_output.viewport_output.get(&egui::ViewportId::ROOT) {
                         egui_delay = v.repaint_delay;
                     }
+                    self.egui_cause = if egui_delay.is_zero() {
+                        self.egui_ctx.repaint_causes().first().map(short_cause)
+                    } else {
+                        None
+                    };
                     state.handle_platform_output(window, full_output.platform_output);
                     let ppp = full_output.pixels_per_point;
                     let jobs = self.egui_ctx.tessellate(full_output.shapes, ppp);
@@ -8585,6 +8639,14 @@ impl ApplicationHandler for App {
                 }
                 let now = std::time::Instant::now();
                 self.perf.end(now);
+                if let Some(jump) = self.perf.take_jump() {
+                    // Say what the editor was doing, to find what caused it.
+                    let doing = match &self.redraw_reason {
+                        Some(why) => why.clone(),
+                        None => "idle".to_string(),
+                    };
+                    self.log(format!("{jump}, while {doing}"));
+                }
                 self.redraw_reason = self.continuous_reason(egui_delay);
                 if self.redraw_reason.is_some() {
                     self.idle_wake = None;
@@ -9147,6 +9209,23 @@ fn format_edited(modified: Option<std::time::SystemTime>) -> String {
     }
 }
 
+/// egui's record of a repaint request, shortened to the file inside its crate,
+/// the line and the reason.
+fn short_cause(cause: &egui::RepaintCause) -> String {
+    let file = cause
+        .file
+        .rsplit_once("/src/")
+        .map_or(cause.file, |(_, f)| f);
+    let crate_name = cause
+        .file
+        .split('/')
+        .find(|part| part.starts_with("egui") || part.starts_with("frame-"))
+        .unwrap_or("");
+    format!("{crate_name} {file}:{} {}", cause.line, cause.reason)
+        .trim()
+        .to_string()
+}
+
 /// Paint the performance overlay in the viewport's top-right corner: plain
 /// monospace lines on a dark box, so it reads over any scene.
 fn paint_stats(ui: &egui::Ui, lines: &[String]) {
@@ -9689,6 +9768,7 @@ pub fn run_as(name: &str, app_id: &str, modules: Vec<Box<dyn EditorModule>>) {
         perf: perf::FrameStats::new(std::time::Instant::now()),
         redraw_reason: None,
         idle_wake: None,
+        egui_cause: None,
         dirty: false,
         saved_scripts: std::collections::BTreeMap::new(),
         pending_unsaved: None,
@@ -9763,8 +9843,21 @@ mod prefs_tests {
         let old: EditorPrefs = ron::from_str("(show_help: true)").unwrap();
         assert!(old.vsync);
         assert!(!old.show_stats);
-        assert_eq!(present_mode_for(true), wgpu::PresentMode::AutoVsync);
-        assert_eq!(present_mode_for(false), wgpu::PresentMode::AutoNoVsync);
+        use wgpu::PresentMode as P;
+        assert_eq!(present_mode_for(true), P::Fifo);
+        assert_eq!(present_mode_for(false), P::AutoNoVsync);
+        // Without vsync the fastest offered mode wins; with it, plain Fifo.
+        let offered = [P::Fifo, P::Mailbox, P::Immediate];
+        assert_eq!(
+            resolved_present_mode(P::AutoNoVsync, &offered),
+            P::Immediate
+        );
+        assert_eq!(
+            resolved_present_mode(P::AutoNoVsync, &[P::Fifo, P::Mailbox]),
+            P::Mailbox
+        );
+        assert_eq!(resolved_present_mode(P::Fifo, &offered), P::Fifo);
+        assert_eq!(resolved_present_mode(P::AutoVsync, &[P::Fifo]), P::Fifo);
     }
 
     #[test]
@@ -9935,7 +10028,7 @@ mod shader_tests {
         assert_eq!(locations, ours);
         let last = super::MeshVertex::ATTRIBS.last().unwrap();
         assert_eq!(
-            last.offset as usize + 12,
+            (last.offset + last.format.size()) as usize,
             std::mem::size_of::<super::MeshVertex>()
         );
     }
