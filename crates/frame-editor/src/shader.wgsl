@@ -553,7 +553,11 @@ fn liquid(in: VertexOutput, thin: f32, alpha: f32, ripples: f32) -> vec4<f32> {
     let glint = pow(max(dot(r, sky.sun_direction.xyz), 0.0), sharpness)
         * mix(4.0, 0.8, far) * sky.sun_direction.w;
     var colour = mix(lit, mirrored, fresnel) + sky.sun_colour.rgb * glint;
-    var opacity = clamp(max(alpha, fresnel) + glint, 0.0, 1.0);
+    // The mirror fades out with the surface itself: where a mesh fades its
+    // edge out (uv.x near 0) and at the very waterline, so a low view does
+    // not show the edge's triangles as a hard, bright line.
+    let present = smoothstep(0.0, 0.25, in.uv.x) * (1.0 - smoothstep(0.75, 1.0, thin));
+    var opacity = clamp(max(alpha, fresnel * present) + glint * present, 0.0, 1.0);
     if (white > 0.0) {
         let daylight = clamp(sky.sun_direction.y * 4.0 + 0.4, 0.0, 1.0);
         let foam = mix(vec3<f32>(0.93, 0.96, 0.98), sky.sun_colour.rgb, 0.25)
