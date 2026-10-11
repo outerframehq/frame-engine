@@ -6,6 +6,7 @@
 struct Camera {
     view_proj: mat4x4<f32>,
     // xyz: the camera's position as drawn (relative to the render origin).
+    // w: the tide, how far the sea stands over its still level.
     eye: vec4<f32>,
 };
 @group(0) @binding(0) var<uniform> camera: Camera;
@@ -69,6 +70,12 @@ struct Sky {
     // rgb: the colour looking straight down. w: the ambient light scale (1.0
     // by day; the day-night cycle dims it at night; 0 or less means 1.0).
     ground: vec4<f32>,
+    // For liquid surfaces: x is seconds of moving water, y and z the render
+    // origin's x and z wrapped to WAVE_PERIOD. w unused.
+    motion: vec4<f32>,
+    // The cloud layer: x how much of the sky it covers (0 none, 1 overcast),
+    // y and z the render origin's x and z wrapped to CLOUD_PERIOD. w unused.
+    clouds: vec4<f32>,
 };
 @group(0) @binding(5) var<uniform> sky: Sky;
 
@@ -110,7 +117,10 @@ fn fog_colour(direction: vec3<f32>) -> vec3<f32> {
 // in sky.rs.
 fn apply_fog(colour: vec3<f32>, world_position: vec3<f32>) -> vec3<f32> {
     let density = sky.horizon.w;
-    if (density <= 0.0) {
+    // The near haze (aerial perspective) builds up from close range; the
+    // fog, squared, stays clear until far out. See AERIAL_RANGE in sky.rs.
+    let aerial = sky.motion.w;
+    if (density <= 0.0 && aerial <= 0.0) {
         return colour;
     }
     let k = 1.0 / FOG_HEIGHT_SCALE;
@@ -123,7 +133,7 @@ fn apply_fog(colour: vec3<f32>, world_position: vec3<f32>) -> vec3<f32> {
     let offset = world_position - sky.eye.xyz;
     let distance = length(offset);
     let x = distance * density * thin;
-    let amount = 1.0 - exp(-(x * x));
+    let amount = 1.0 - exp(-(x * x) - distance * aerial * thin);
     let direction = offset / max(distance, 1e-6);
     return mix(colour, fog_colour(direction), amount);
 }
@@ -170,8 +180,10 @@ struct MaterialParams {
     // x: roughness (0 smooth .. 1 rough). y: metalness (0 .. 1 metal).
     // z: 1.0 if material_texture holds a real texture, 0.0 for the shared
     // default (a textureless mesh samples pure white, a harmless no-op).
-    // w unused.
+    // w: how choppy a liquid surface's waves are (0: not a liquid).
     params: vec4<f32>,
+    // x: ground detail, 0 to 1 (see MaterialLook). yzw unused.
+    extra: vec4<f32>,
 };
 @group(1) @binding(0) var material_texture: texture_2d<f32>;
 @group(1) @binding(1) var material_sampler: sampler;
@@ -190,7 +202,16 @@ struct VertexInput {
     @location(10) morph_normal: vec3<f32>,
     // The texture coordinates when fully morphed; equal to `uv` otherwise.
     @location(11) morph_uv: vec2<f32>,
+    // For liquid surfaces (see WaterFlow in module_api.rs), each -1 to 1:
+    // x and z the velocity over FLOW_RANGE, then the tide rule (1 follows the
+    // tide, -1 floods where the tide is higher, 0 still), then for flooding
+    // water the still sea level less the vertex's height, over TIDE_REACH.
+    @location(12) water: vec4<f32>,
 };
+
+// MUST match FLOW_RANGE and TIDE_REACH in module_api.rs.
+const FLOW_RANGE: f32 = 16.0;
+const TIDE_REACH: f32 = 512.0;
 
 // Per-entity instance data (matches InstanceRaw in main.rs). Bound at slot 1.
 // Locations continue after the mesh attributes above.
@@ -212,6 +233,9 @@ struct VertexOutput {
     @location(3) world_position: vec3<f32>,
     @location(4) world_normal: vec3<f32>,
     @location(5) uv: vec2<f32>,
+    // A liquid surface's velocity across the ground (x, z), world units a
+    // second. Zero for everything else.
+    @location(6) flow: vec2<f32>,
 };
 
 // World size of a primitive at scale 1. Primitives are generated at ~unit size
@@ -261,7 +285,16 @@ fn vs_main(vertex: VertexInput, instance: InstanceInput) -> VertexOutput {
     let local = vertex.position + vec3<f32>(0.0, vertex.morph.x * t, 0.0);
     let scaled = local * MESH_SIZE * instance.scale;
     let rotated = rotate_by(scaled, instance.rotation);
-    let world_pos = instance.position + rotated;
+    var world_pos = instance.position + rotated;
+    // Liquid surfaces follow the tide: the sea rises and falls with it, and
+    // water it can reach is lifted where it stands higher.
+    let size = MESH_SIZE * instance.scale.y;
+    let tide = camera.eye.w;
+    if (vertex.water.z > 0.5) {
+        world_pos.y = world_pos.y + tide;
+    } else if (vertex.water.z < -0.5) {
+        world_pos.y = world_pos.y + max(vertex.water.w * TIDE_REACH * size + tide, 0.0);
+    }
     var normal = vertex.normal;
     if (t > 0.0) {
         normal = normalize(mix(vertex.normal, vertex.morph_normal, t));
@@ -284,6 +317,8 @@ fn vs_main(vertex: VertexInput, instance: InstanceInput) -> VertexOutput {
     out.world_position = world_pos;
     out.world_normal = rotated_normal;
     out.uv = mix(vertex.uv, vertex.morph_uv, t);
+    let velocity = vec3<f32>(vertex.water.x, 0.0, vertex.water.y) * FLOW_RANGE;
+    out.flow = rotate_by(velocity * MESH_SIZE * instance.scale, instance.rotation).xz;
     return out;
 }
 
@@ -298,6 +333,10 @@ fn shade_fragment(in: VertexOutput) -> vec3<f32> {
     if (has_texture > 0.5) {
         let sampled = textureSample(material_texture, material_sampler, in.uv);
         base_color = base_color * sampled.rgb;
+    }
+    let detail = material.extra.x;
+    if (detail > 0.0) {
+        base_color = base_color * ground_detail(in.world_position, detail);
     }
     let roughness = material.params.x;
     let metalness = material.params.y;
@@ -381,11 +420,164 @@ fn fs_main(in: VertexOutput) -> @location(0) vec4<f32> {
 // A mesh that doesn't want this sets uv.y to 1.
 @fragment
 fn fs_transparent(in: VertexOutput) -> @location(0) vec4<f32> {
-    let lit = apply_fog(shade_fragment(in), in.world_position);
     let thin = 1.0 - clamp(in.uv.y, 0.0, 1.0);
-    let colour = min(lit + vec3<f32>(0.22, 0.38, 0.34) * thin, vec3<f32>(1.0, 1.0, 1.0));
     let alpha = clamp(in.uv.x, 0.0, 1.0) * (1.0 - 0.85 * thin);
+    let ripples = material.params.w;
+    if (ripples > 0.0) {
+        let surface = liquid(in, thin, alpha, ripples);
+        return vec4<f32>(apply_fog(surface.rgb, in.world_position), surface.a);
+    }
+    let lit = apply_fog(shade_fragment(in), in.world_position);
+    let colour = min(lit + vec3<f32>(0.22, 0.38, 0.34) * thin, vec3<f32>(1.0, 1.0, 1.0));
     return vec4<f32>(colour, alpha);
+}
+
+// Liquid surfaces (a material whose params.w, the ripples, is above 0; see
+// MaterialFactory::create_liquid). Waves repeat exactly every WAVE_PERIOD
+// units along x and z: each one runs a whole number of cycles across it. That
+// lets the shader take the render origin wrapped to the period, so the waves
+// never jump when the origin moves. MUST match WAVE_PERIOD in lib.rs.
+const WAVE_PERIOD: f32 = 4096.0;
+// Running water's ripples: each layer is carried for this many seconds (it
+// MUST divide WAVE_WRAP in lib.rs, so the cycle never jumps when the water's
+// clock wraps), drawn this many times finer than the sea's, and break white
+// from this speed (world units a second) up to twice it.
+const FLOW_CYCLE: f32 = 2.0;
+const RUNNING_SCALE: f32 = 3.0;
+const RAPID_SPEED: f32 = 3.0;
+const TAU: f32 = 6.2831853;
+
+// The slope (x and z) of one wave at `p` after `t` seconds. `cycles` is how
+// many times it repeats across WAVE_PERIOD along x and z, `slope` how steep
+// it gets. It moves at the speed of a wave that long on deep water.
+fn wave_slope(p: vec2<f32>, t: f32, cycles: vec2<f32>, slope: f32) -> vec2<f32> {
+    let k = cycles * (TAU / WAVE_PERIOD);
+    let omega = sqrt(9.81 * length(k));
+    return normalize(k) * slope * cos(dot(k, p) - omega * t);
+}
+
+// The surface normal of moving water at `p` (true world x and z, wrapped),
+// `amount` 0 (flat) to 1. Nine waves from about 90 m long down to 3 m, across
+// each other at odd angles so no pattern shows.
+fn liquid_normal(p: vec2<f32>, t: f32, amount: f32) -> vec3<f32> {
+    var g = wave_slope(p, t, vec2<f32>(40.0, 18.0), 0.03);
+    g = g + wave_slope(p, t, vec2<f32>(-25.0, 52.0), 0.03);
+    g = g + wave_slope(p, t, vec2<f32>(75.0, -130.0), 0.03);
+    g = g + wave_slope(p, t, vec2<f32>(110.0, 170.0), 0.03);
+    g = g + wave_slope(p, t, vec2<f32>(-260.0, -150.0), 0.028);
+    g = g + wave_slope(p, t, vec2<f32>(-180.0, 340.0), 0.026);
+    g = g + wave_slope(p, t, vec2<f32>(430.0, 310.0), 0.024);
+    g = g + wave_slope(p, t, vec2<f32>(-700.0, 560.0), 0.02);
+    g = g + wave_slope(p, t, vec2<f32>(1210.0, -330.0), 0.018);
+    g = g * amount;
+    return normalize(vec3<f32>(-g.x, 1.0, -g.y));
+}
+
+// Foam on running water at `p`, 0 to 1: noise stretched `STREAK` times along
+// the flow (`along`, a unit vector), in two sizes, so it breaks into streaks
+// the way fast water does rather than round patches.
+fn white_water(p: vec2<f32>, along: vec2<f32>) -> f32 {
+    let across = vec2<f32>(-along.y, along.x);
+    let q = vec2<f32>(dot(p, across), dot(p, along) / STREAK);
+    return 0.65 * lattice_noise(q, 1.6, WAVE_PERIOD) + 0.35 * lattice_noise(q, 0.6, WAVE_PERIOD);
+}
+const STREAK: f32 = 4.0;
+
+// The sky's colour looking in `direction`, without the sun's disc: the same
+// gradient fs_sky draws, with the sun's broad glow.
+fn sky_gradient(direction: vec3<f32>) -> vec3<f32> {
+    let up = direction.y;
+    let above = pow(clamp(up, 0.0, 1.0), 0.45);
+    var colour = mix(horizon_colour(direction), sky.zenith.rgb, above);
+    colour = mix(colour, sky.ground.rgb, smoothstep(0.0, 0.25, -up));
+    let toward = max(dot(direction, sky.sun_direction.xyz), 0.0);
+    let glow = (pow(toward, 48.0) * 0.45 + pow(toward, 6.0) * SUN_HAZE) * sky.sun_direction.w;
+    return colour + sky.sun_colour.rgb * glow;
+}
+
+// A liquid surface's colour and opacity, before fog. Lit with the moving
+// waves' normal, tinted pale where thin, then mirrors the sky more the lower
+// the view (Fresnel), plus a glint of the sun.
+fn liquid(in: VertexOutput, thin: f32, alpha: f32, ripples: f32) -> vec4<f32> {
+    // The eye from the sky uniform: the camera uniform is the vertex stage's
+    // only.
+    let to_eye = sky.eye.xyz - in.world_position;
+    let dist = max(length(to_eye), 1e-3);
+    let v = to_eye / dist;
+    // Waves too small to see far away would only shimmer, so they calm down
+    // with distance.
+    let calm = 1.0 - smoothstep(400.0, 6000.0, dist);
+    let p_wave = in.world_position.xz + sky.motion.yz;
+    var n = liquid_normal(p_wave, sky.motion.x, ripples * calm);
+    // Running water: finer ripples carried along with the flow. Two layers,
+    // half a cycle apart, each carried for one cycle and then started again,
+    // weighted so each fades out before it restarts: the ripples move
+    // downstream without ever stretching.
+    let speed = length(in.flow);
+    let running = smoothstep(0.05, 0.4, speed);
+    var white = 0.0;
+    if (running > 0.0) {
+        let phase = fract(sky.motion.x / FLOW_CYCLE);
+        let phase_b = fract(phase + 0.5);
+        let carried = in.flow * FLOW_CYCLE;
+        let still = sky.motion.x * 0.15;
+        let na = liquid_normal((p_wave - carried * phase) * RUNNING_SCALE, still, ripples * calm);
+        let nb = liquid_normal((p_wave - carried * phase_b) * RUNNING_SCALE, still, ripples * calm);
+        let weight = 1.0 - abs(2.0 * phase - 1.0);
+        let flowing = normalize(na * weight + nb * (1.0 - weight));
+        n = normalize(mix(n, flowing, running));
+        // White water where it runs fast: streaks drawn out along the flow,
+        // carried with it.
+        let rapid = smoothstep(RAPID_SPEED, 2.0 * RAPID_SPEED, speed)
+            * (1.0 - smoothstep(300.0, 3000.0, dist));
+        if (rapid > 0.0) {
+            let along = in.flow / speed;
+            let foam_a = white_water(p_wave - carried * phase, along);
+            let foam_b = white_water(p_wave - carried * phase_b, along);
+            white = rapid * smoothstep(0.42, 0.72, foam_a * weight + foam_b * (1.0 - weight));
+        }
+    }
+    var surface = in;
+    surface.world_normal = n;
+    let lit = min(shade_fragment(surface) + vec3<f32>(0.22, 0.38, 0.34) * thin, vec3<f32>(1.0, 1.0, 1.0));
+    // Schlick's Fresnel for water: 2% straight down, all of it at the horizon.
+    let facing = clamp(dot(n, v), 0.0, 1.0);
+    let fresnel = 0.02 + 0.98 * pow(1.0 - facing, 5.0);
+    var r = reflect(-v, n);
+    r = normalize(vec3<f32>(r.x, max(r.y, 0.01), r.z));
+    let mirrored = with_clouds(sky_gradient(r), r);
+    // The sun's glint: a tight spot up close, a broad path far out, where the
+    // many small waves it would really sparkle on are too small to draw.
+    let far = smoothstep(200.0, 20000.0, dist);
+    let sharpness = mix(1200.0, 60.0, far);
+    let glint = pow(max(dot(r, sky.sun_direction.xyz), 0.0), sharpness)
+        * mix(4.0, 0.8, far) * sky.sun_direction.w;
+    var colour = mix(lit, mirrored, fresnel) + sky.sun_colour.rgb * glint;
+    var opacity = clamp(max(alpha, fresnel) + glint, 0.0, 1.0);
+    if (white > 0.0) {
+        let daylight = clamp(sky.sun_direction.y * 4.0 + 0.4, 0.0, 1.0);
+        let foam = mix(vec3<f32>(0.93, 0.96, 0.98), sky.sun_colour.rgb, 0.25)
+            * (0.35 + 0.65 * daylight);
+        colour = mix(colour, foam, white);
+        opacity = max(opacity, white * 0.9);
+    }
+    // Surf: bands of foam rolling in over the shallowest water, toward the
+    // shore (where the water thins out), broken up by noise fixed to the
+    // world. Gone far off, like the waves.
+    let shallow = smoothstep(0.3, 0.85, thin) * (1.0 - smoothstep(300.0, 2500.0, dist));
+    if (shallow > 0.0) {
+        let p = in.world_position.xz + sky.motion.yz;
+        let roll = 0.5 + 0.5 * sin(thin * 26.0 - sky.motion.x * 1.4);
+        let breakup = 0.6 * lattice_noise(p, 8.0, WAVE_PERIOD)
+            + 0.4 * lattice_noise(p + vec2<f32>(sky.motion.x * 0.6, 0.0), 2.0, WAVE_PERIOD);
+        let foam = shallow * smoothstep(0.5, 0.8, 0.55 * roll + 0.6 * breakup);
+        let daylight = clamp(sky.sun_direction.y * 4.0 + 0.4, 0.0, 1.0);
+        let white = mix(vec3<f32>(0.93, 0.96, 0.98), sky.sun_colour.rgb, 0.25);
+        let foam_colour = white * (0.35 + 0.65 * daylight);
+        colour = mix(colour, foam_colour, foam);
+        opacity = max(opacity, foam * 0.9);
+    }
+    return vec4<f32>(colour, opacity);
 }
 
 // The sky: one triangle that covers the whole screen, drawn first with no
@@ -431,5 +623,99 @@ fn fs_sky(in: SkyVarying) -> @location(0) vec4<f32> {
     let toward = max(cos_angle, 0.0);
     let glow = (pow(toward, 48.0) * 0.45 + pow(toward, 6.0) * SUN_HAZE) * strength;
     colour = mix(colour, sky.sun_colour.rgb * 1.4, disc) + sky.sun_colour.rgb * glow;
+    colour = with_clouds(colour, direction);
     return vec4<f32>(min(colour, vec3<f32>(1.0, 1.0, 1.0)), 1.0);
+}
+
+// The cloud layer: a flat sheet at CLOUD_HEIGHT (world height), its pattern
+// from noise that repeats exactly every CLOUD_PERIOD units, so the render
+// origin can be handed in wrapped to it. It drifts on the wind while the
+// world moves (the same clock as the waves). MUST match CLOUD_PERIOD in
+// lib.rs.
+const CLOUD_HEIGHT: f32 = 2500.0;
+const CLOUD_PERIOD: f32 = 262144.0;
+const CLOUD_WIND: vec2<f32> = vec2<f32>(6.0, 2.0);
+
+// A random number from 0 to 1 for a lattice point.
+fn lattice_hash(x: i32, z: i32) -> f32 {
+    var h = u32(x) * 374761393u + u32(z) * 668265263u;
+    h = (h ^ (h >> 13u)) * 1274126177u;
+    h = h ^ (h >> 16u);
+    return f32(h & 0xffffffu) / 16777215.0;
+}
+
+// Smooth noise, 0 to 1, on a lattice `cell` units apart that wraps every
+// `period` units (`cell` must divide it), so a position wrapped to the period
+// gives the same noise as the real one.
+fn lattice_noise(p: vec2<f32>, cell: f32, period: f32) -> f32 {
+    let n = i32(period / cell);
+    let q = p / cell;
+    let i = floor(q);
+    let f = q - i;
+    let u = f * f * (3.0 - 2.0 * f);
+    let x0 = ((i32(i.x) % n) + n) % n;
+    let z0 = ((i32(i.y) % n) + n) % n;
+    let x1 = (x0 + 1) % n;
+    let z1 = (z0 + 1) % n;
+    let top = mix(lattice_hash(x0, z0), lattice_hash(x1, z0), u.x);
+    let bottom = mix(lattice_hash(x0, z1), lattice_hash(x1, z1), u.x);
+    return mix(top, bottom, u.y);
+}
+
+// Cloud noise wraps with the clouds.
+fn cloud_noise(p: vec2<f32>, cell: f32) -> f32 {
+    return lattice_noise(p, cell, CLOUD_PERIOD);
+}
+
+// Ground detail (MaterialLook::detail): a brightness factor around 1 from
+// noise at 256, 64, 16 and 4 units, fixed to the world (the position wrapped
+// to WAVE_PERIOD, which every size divides). Each size fades out with
+// distance before it gets smaller than a few pixels, so it never shimmers.
+fn ground_detail(world: vec3<f32>, detail: f32) -> f32 {
+    let p = world.xz + sky.motion.yz;
+    let d = length(sky.eye.xyz - world);
+    let a = (lattice_noise(p, 256.0, WAVE_PERIOD) - 0.5) * (1.0 - smoothstep(6000.0, 25000.0, d));
+    let b = (lattice_noise(p, 64.0, WAVE_PERIOD) - 0.5) * (1.0 - smoothstep(1500.0, 6000.0, d));
+    let c = (lattice_noise(p, 16.0, WAVE_PERIOD) - 0.5) * (1.0 - smoothstep(400.0, 1500.0, d));
+    let e = (lattice_noise(p, 4.0, WAVE_PERIOD) - 0.5) * (1.0 - smoothstep(100.0, 400.0, d));
+    return 1.0 + detail * (0.45 * a + 0.4 * b + 0.3 * c + 0.25 * e);
+}
+
+// How much cloud there is at `p` on the sheet, 0 to 1: big billows with
+// smaller ones on their edges.
+fn cloud_density(p: vec2<f32>) -> f32 {
+    return 0.5 * cloud_noise(p, 8192.0)
+        + 0.25 * cloud_noise(p, 4096.0)
+        + 0.15 * cloud_noise(p, 2048.0)
+        + 0.1 * cloud_noise(p, 512.0);
+}
+
+// `colour`, the sky looking in `direction`, with the cloud layer over it.
+// Clouds are lit by the sun's colour on top and take the sky's colour in
+// their thick middles, so they glow warm at dawn and dusk and go dark at
+// night. Far off they fade into the horizon.
+fn with_clouds(colour: vec3<f32>, direction: vec3<f32>) -> vec3<f32> {
+    let cover = sky.clouds.x;
+    let eye_height = sky.eye.y + sky.eye.w;
+    if (cover <= 0.0 || direction.y <= 0.0 || eye_height >= CLOUD_HEIGHT) {
+        return colour;
+    }
+    let t = (CLOUD_HEIGHT - eye_height) / direction.y;
+    let p = sky.eye.xz + direction.xz * t + sky.clouds.yz + CLOUD_WIND * sky.motion.x;
+    // Stretch the noise's spread so the cover setting really ranges from
+    // a few puffs to overcast.
+    let d = clamp((cloud_density(p) - 0.5) * 2.2 + 0.5, 0.0, 1.0);
+    let edge = 1.0 - cover;
+    let amount = smoothstep(edge - 0.05, edge + 0.12, d);
+    if (amount <= 0.0) {
+        return colour;
+    }
+    let core = smoothstep(edge + 0.1, edge + 0.5, d);
+    let daylight = clamp(sky.sun_direction.y * 4.0 + 0.4, 0.0, 1.0);
+    let toward = max(dot(direction, sky.sun_direction.xyz), 0.0);
+    let sunlit = sky.sun_colour.rgb * (0.85 + 0.6 * pow(toward, 4.0)) * daylight;
+    let shaded = mix(sky.zenith.rgb, horizon_colour(direction), 0.5) * 0.85;
+    let cloud = mix(max(sunlit, shaded), shaded, core * 0.65);
+    let fade = exp(-t / 90000.0);
+    return mix(colour, cloud, amount * fade * 0.95);
 }

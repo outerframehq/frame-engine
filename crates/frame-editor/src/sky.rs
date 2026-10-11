@@ -57,6 +57,27 @@ pub(crate) const AWAY_COOLING: f32 = 0.35;
 #[cfg(test)]
 pub(crate) const SUN_HAZE: f32 = 0.12;
 
+/// The near haze (aerial perspective): through low air at the default fog
+/// amount, it covers 63 percent of a view this many world units long. It
+/// builds up from close range, unlike the distance fog, which stays clear
+/// until far out, so hills a few kilometres off fade paler and bluer and the
+/// scene has depth. It thins with altitude like the fog. The shader gets
+/// the density in the sky uniform's `motion.w`.
+pub(crate) const AERIAL_RANGE: f32 = 25_000.0;
+
+/// The near haze's density per world unit for a fog amount (see
+/// `AERIAL_RANGE`).
+pub(crate) fn aerial_density(amount: f32) -> f32 {
+    if !amount.is_finite() {
+        return 0.0;
+    }
+    amount.clamp(0.0, FOG_AMOUNT_MAX) / AERIAL_RANGE
+}
+
+/// How much of the sky clouds cover, 0 (none) to 1 (overcast), on a fresh
+/// install.
+pub(crate) const CLOUDS_DEFAULT: f32 = 0.45;
+
 /// The most fog the preference allows (a multiplier on the default).
 pub(crate) const FOG_AMOUNT_MAX: f32 = 4.0;
 /// The fog a fresh install starts with.
@@ -85,8 +106,18 @@ pub(crate) struct SkyUniform {
     pub horizon: [f32; 4],
     /// rgb: the colour of the sun and its glow. w: unused.
     pub sun_colour: [f32; 4],
-    /// rgb: the colour looking straight down, below the horizon. w: unused.
+    /// rgb: the colour looking straight down, below the horizon. w: the
+    /// ambient light scale.
     pub ground: [f32; 4],
+    /// x is seconds of moving water (waves and clouds), y and z the render
+    /// origin's x and z wrapped to the waves' period (for waves, surf and
+    /// ground detail). w: the near haze's density per world unit (see
+    /// `AERIAL_RANGE`), 0 with the sky off.
+    pub motion: [f32; 4],
+    /// The cloud layer: x is how much of the sky it covers (0 none, 1
+    /// overcast), y and z the render origin's x and z wrapped to the clouds'
+    /// period. w unused.
+    pub clouds: [f32; 4],
 }
 
 type Rgb = [f32; 3];
@@ -249,10 +280,23 @@ pub(crate) fn fog_factor(distance: f32, density: f32) -> f32 {
 
 /// Like `fog_factor`, for a view from altitude `from_y` to altitude `to_y`
 /// (world heights, never taken below 0): the fog thins with height, so the
-/// view is thick only where it passes through low air. Mirrors `apply_fog`
-/// in `shader.wgsl`.
+/// view is thick only where it passes through low air. With no near haze;
+/// see `haze_between` for both. Mirrors `apply_fog` in `shader.wgsl`.
 #[cfg(test)]
 pub(crate) fn fog_factor_between(from_y: f32, to_y: f32, distance: f32, density: f32) -> f32 {
+    haze_between(from_y, to_y, distance, density, 0.0)
+}
+
+/// The whole haze over a view: the distance fog (`density`) and the near
+/// haze (`aerial`), both thinned with altitude. Mirrors `apply_fog`.
+#[cfg(test)]
+pub(crate) fn haze_between(
+    from_y: f32,
+    to_y: f32,
+    distance: f32,
+    density: f32,
+    aerial: f32,
+) -> f32 {
     let k = 1.0 / FOG_HEIGHT_SCALE;
     let (h1, h2) = (from_y.max(0.0), to_y.max(0.0));
     let thin = if (h2 - h1).abs() > 1.0 {
@@ -260,8 +304,9 @@ pub(crate) fn fog_factor_between(from_y: f32, to_y: f32, distance: f32, density:
     } else {
         (-k * h1).exp()
     };
-    let x = distance.max(0.0) * density * thin;
-    1.0 - (-(x * x)).exp()
+    let d = distance.max(0.0);
+    let x = d * density * thin;
+    1.0 - (-(x * x) - d * aerial * thin).exp()
 }
 
 /// Where the camera is, found from its view-projection matrix: the eye is the
@@ -346,6 +391,17 @@ pub(crate) fn sky_uniform(
             colours.twilight,
         ],
         ground: [colours.ground[0], colours.ground[1], colours.ground[2], 0.0],
+        motion: [
+            0.0,
+            0.0,
+            0.0,
+            if enabled {
+                aerial_density(fog_amount) * haze_scale(direction.y)
+            } else {
+                0.0
+            },
+        ],
+        clouds: [0.0; 4],
     }
 }
 
@@ -410,7 +466,7 @@ mod tests {
     #[test]
     fn the_uniform_has_a_layout_the_shader_can_read() {
         // A mat4 and six vec4s, with no padding to go wrong.
-        assert_eq!(std::mem::size_of::<SkyUniform>(), 64 + 6 * 16);
+        assert_eq!(std::mem::size_of::<SkyUniform>(), 64 + 8 * 16);
         assert_eq!(std::mem::size_of::<SkyUniform>() % 16, 0);
     }
 
@@ -709,5 +765,32 @@ mod ambient_tests {
         let direction = (point - eye).normalize();
         assert!(direction.dot(look) > 0.999_999, "{direction:?}");
         assert!(((point - eye).length() - 1000.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn the_near_haze_gives_hills_depth_without_hiding_the_foreground() {
+        let a = aerial_density(1.0);
+        let d = fog_density(1.0, 98_000.0);
+        // Through low air: little at a few hundred metres, a third by ten
+        // kilometres, while the distance fog alone would still be clear.
+        let at = |dist: f32| haze_between(0.0, 0.0, dist, d, a);
+        assert!(at(300.0) < 0.02);
+        assert!(
+            at(10_000.0) > 0.3 && at(10_000.0) < 0.45,
+            "{}",
+            at(10_000.0)
+        );
+        assert!(fog_factor(10_000.0, d) < 0.05);
+        // Summits and views from high up are clearer, as with the fog.
+        assert!(haze_between(0.0, 3000.0, 10_000.0, d, a) < at(10_000.0));
+        // The fog amount scales it, and the sky switch turns it off.
+        assert_eq!(aerial_density(0.0), 0.0);
+        assert!(aerial_density(2.0) > a);
+        assert_eq!(aerial_density(f32::NAN), 0.0);
+        let vp = Mat4::IDENTITY.to_cols_array_2d();
+        let on = sky_uniform(vp, Some([0.0, 1.0, 0.0]), true, 1.0, 0.0, 0.0);
+        let off = sky_uniform(vp, Some([0.0, 1.0, 0.0]), false, 1.0, 0.0, 0.0);
+        assert!((on.motion[3] - a).abs() < 1e-12);
+        assert_eq!(off.motion[3], 0.0);
     }
 }

@@ -86,7 +86,8 @@ const GIZMO_PICK_PX: f32 = 10.0;
 struct CameraUniform {
     view_proj: [[f32; 4]; 4],
     // xyz: the camera's position as drawn (relative to the render origin),
-    // for vertex morphing. w unused.
+    // for vertex morphing. w: the tide, how far the sea stands over its still
+    // level (see `EditorModule::tide`).
     eye: [f32; 4],
 }
 impl CameraUniform {
@@ -94,7 +95,7 @@ impl CameraUniform {
         let eye = sky::eye_from_view_proj(&Mat4::from_cols_array_2d(&view_proj));
         CameraUniform {
             view_proj,
-            eye: [eye.x, eye.y, eye.z, 0.0],
+            eye: [eye.x, eye.y, eye.z, tide()],
         }
     }
 }
@@ -212,9 +213,51 @@ static VIEW_REACH_BITS: std::sync::atomic::AtomicU32 = std::sync::atomic::Atomic
 fn view_reach() -> f32 {
     f32::from_bits(VIEW_REACH_BITS.load(std::sync::atomic::Ordering::Relaxed))
 }
+/// The tide a module keeps (see `EditorModule::tide`), as f32 bits: how far
+/// the sea stands over its still level this frame, 0 when no module keeps
+/// one.
+static TIDE_BITS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+fn set_tide(tide: Option<f32>) {
+    let tide = tide.filter(|t| t.is_finite()).unwrap_or(0.0);
+    TIDE_BITS.store(tide.to_bits(), std::sync::atomic::Ordering::Relaxed);
+}
+fn tide() -> f32 {
+    f32::from_bits(TIDE_BITS.load(std::sync::atomic::Ordering::Relaxed))
+}
 fn set_view_reach(reach: Option<f64>) {
     let reach = reach.filter(|r| r.is_finite() && *r > 0.0).unwrap_or(0.0) as f32;
     VIEW_REACH_BITS.store(reach.to_bits(), std::sync::atomic::Ordering::Relaxed);
+}
+/// Seconds of moving water, for the waves of liquid surfaces, as f32 bits.
+/// Runs with wall time only while the world moves (the editor playing or the
+/// Play window open), so water is still while everything is paused, and the
+/// idle editor need not keep drawing. Wraps every `WAVE_WRAP` seconds.
+static WAVE_SECONDS_BITS: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+const WAVE_WRAP: f32 = 3600.0;
+/// Waves repeat exactly every this many world units along x and z, so the
+/// render origin can be handed to the shader wrapped to it (see
+/// `GpuState::wave_origin`). MUST match WAVE_PERIOD in shader.wgsl.
+const WAVE_PERIOD: f64 = 4096.0;
+/// The clouds' pattern repeats exactly every this many world units along x
+/// and z (a few hundred kilometres, so it never shows). MUST match
+/// CLOUD_PERIOD in shader.wgsl.
+const CLOUD_PERIOD: f64 = 262_144.0;
+/// How much of the sky clouds cover, 0 to 1, as f32 bits. An editor
+/// preference, read by every window like the fog.
+static CLOUD_AMOUNT_BITS: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(sky::CLOUDS_DEFAULT.to_bits());
+fn cloud_amount() -> f32 {
+    f32::from_bits(CLOUD_AMOUNT_BITS.load(std::sync::atomic::Ordering::Relaxed))
+}
+fn set_cloud_amount(amount: f32) {
+    CLOUD_AMOUNT_BITS.store(amount.to_bits(), std::sync::atomic::Ordering::Relaxed);
+}
+fn wave_seconds() -> f32 {
+    f32::from_bits(WAVE_SECONDS_BITS.load(std::sync::atomic::Ordering::Relaxed))
+}
+fn advance_waves(dt: f32) {
+    let t = (wave_seconds() + dt.clamp(0.0, 0.1)).rem_euclid(WAVE_WRAP);
+    WAVE_SECONDS_BITS.store(t.to_bits(), std::sync::atomic::Ordering::Relaxed);
 }
 fn sky_enabled() -> bool {
     SKY_ENABLED.load(std::sync::atomic::Ordering::Relaxed)
@@ -262,6 +305,8 @@ fn sky_uniform_for_frame(
     lights: &[LightRaw; MAX_LIGHTS],
     enabled: bool,
     origin_y: f32,
+    wave_origin: [f32; 2],
+    cloud_origin: [f32; 2],
 ) -> sky::SkyUniform {
     let mut uniform = sky::sky_uniform(
         view_proj,
@@ -271,6 +316,12 @@ fn sky_uniform_for_frame(
         view_reach(),
         origin_y,
     );
+    // The near haze in motion.w is the sky's own; the rest is the frame's.
+    uniform.motion[0] = wave_seconds();
+    uniform.motion[1] = wave_origin[0];
+    uniform.motion[2] = wave_origin[1];
+    let cover = if enabled { cloud_amount() } else { 0.0 };
+    uniform.clouds = [cover, cloud_origin[0], cloud_origin[1], 0.0];
     uniform.ground[3] = match sun::current() {
         Some(sun) => sky::ambient_scale(sun.direction[1]),
         None => 1.0,
@@ -417,15 +468,17 @@ fn compute_shadow(
     }
 }
 // One mesh's material data handed to the shader (group 1, binding 2). Must
-// match MaterialParams in shader.wgsl field-for-field. x/y/z used, w padding,
-// the same "everything a clean 16-byte multiple" reasoning LightRaw already
-// uses.
+// match MaterialParams in shader.wgsl field-for-field, each field a clean
+// 16 bytes, the same reasoning LightRaw uses.
 #[repr(C)]
 #[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
 struct MaterialUniform {
     // x: roughness, y: metalness, z: 1.0 if a real texture is bound (0.0 for
-    // the shared default white texture), w unused.
+    // the shared default white texture), w: how choppy a liquid surface's
+    // waves are (0 for anything that is not a liquid).
     params: [f32; 4],
+    // x: ground detail, 0 to 1 (see `module_api::MaterialLook`). yzw unused.
+    extra: [f32; 4],
 }
 /// Decoded, GPU-ready form of one mesh's `world::MeshMaterial`. Decoding a
 /// PNG (the `image` crate call) happens once per file, cached by name at the
@@ -459,6 +512,12 @@ struct MeshVertex {
     // The texture coordinates it blends to as it morphs. The same as `uv`
     // for a vertex whose colour does not slide.
     morph_uv: [f32; 2],
+    // For liquid surfaces (see `module_api::WaterFlow`), each from -1 to 1:
+    // x and z the water's velocity over FLOW_RANGE, then the tide rule (1
+    // follows the tide, -1 floods when the tide is higher, 0 still), then
+    // for flooding water the still sea level less the vertex's height, over
+    // TIDE_REACH. All zero for anything else.
+    water: [i16; 4],
 }
 impl MeshVertex {
     /// A vertex that never morphs.
@@ -470,9 +529,10 @@ impl MeshVertex {
             morph: [0.0; 3],
             morph_normal: [0.0; 3],
             morph_uv: uv,
+            water: [0; 4],
         }
     }
-    const ATTRIBS: [wgpu::VertexAttribute; 6] = [
+    const ATTRIBS: [wgpu::VertexAttribute; 7] = [
         wgpu::VertexAttribute {
             format: wgpu::VertexFormat::Float32x3,
             offset: 0,
@@ -503,6 +563,11 @@ impl MeshVertex {
             format: wgpu::VertexFormat::Float32x2,
             offset: std::mem::size_of::<[f32; 14]>() as wgpu::BufferAddress, // 56
             shader_location: 11,
+        },
+        wgpu::VertexAttribute {
+            format: wgpu::VertexFormat::Snorm16x4,
+            offset: std::mem::size_of::<[f32; 16]>() as wgpu::BufferAddress, // 64
+            shader_location: 12,
         },
     ];
     fn layout() -> wgpu::VertexBufferLayout<'static> {
@@ -792,14 +857,27 @@ fn create_material_bind_group(
     metalness: f32,
     has_texture: bool,
 ) -> wgpu::BindGroup {
-    let uniform = MaterialUniform {
-        params: [
-            roughness,
-            metalness,
-            if has_texture { 1.0 } else { 0.0 },
-            0.0,
-        ],
-    };
+    create_material_bind_group_with(
+        device,
+        layout,
+        sampler,
+        texture_view,
+        [roughness, metalness, if has_texture { 1.0 } else { 0.0 }, 0.0],
+        [0.0; 4],
+    )
+}
+/// Like `create_material_bind_group`, with the whole `MaterialUniform`
+/// params (w is the ripples of a liquid surface; see
+/// `MaterialFactory::create_liquid`).
+fn create_material_bind_group_with(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    sampler: &wgpu::Sampler,
+    texture_view: &wgpu::TextureView,
+    params: [f32; 4],
+    extra: [f32; 4],
+) -> wgpu::BindGroup {
+    let uniform = MaterialUniform { params, extra };
     let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("material params buffer"),
         contents: bytemuck::cast_slice(&[uniform]),
@@ -1141,6 +1219,10 @@ struct GpuState {
     // tell how high up a surface really is. Set by `sync_modules`, which runs
     // just before each draw with that frame's origin.
     origin_y: f32,
+    // The render origin's x and z wrapped to `WAVE_PERIOD`, for the waves,
+    // and to `CLOUD_PERIOD`, for the clouds.
+    wave_origin: [f32; 2],
+    cloud_origin: [f32; 2],
 }
 impl GpuState {
     /// Builds a GpuState for one window. `shared` is `None` exactly once per
@@ -1761,6 +1843,8 @@ impl GpuState {
                 shadow_map_view,
                 module_gpu,
                 origin_y: 0.0,
+                wave_origin: [0.0; 2],
+                cloud_origin: [0.0; 2],
             },
             shared_out,
         )
@@ -1902,6 +1986,14 @@ impl GpuState {
     /// frame.
     fn sync_modules(&mut self, scenes: &[Option<ModuleScene>], origin: DVec3) {
         self.origin_y = origin.y as f32;
+        self.wave_origin = [
+            origin.x.rem_euclid(WAVE_PERIOD) as f32,
+            origin.z.rem_euclid(WAVE_PERIOD) as f32,
+        ];
+        self.cloud_origin = [
+            origin.x.rem_euclid(CLOUD_PERIOD) as f32,
+            origin.z.rem_euclid(CLOUD_PERIOD) as f32,
+        ];
         for (i, module) in self.module_gpu.iter_mut().enumerate() {
             let scene = scenes.get(i).and_then(|s| s.as_ref());
             module.sync(&self.device, &self.queue, scene);
@@ -1939,6 +2031,8 @@ impl GpuState {
                 lights,
                 sky_on,
                 self.origin_y,
+                self.wave_origin,
+                self.cloud_origin,
             )]),
         );
         self.queue.write_buffer(
@@ -2184,6 +2278,8 @@ impl GpuState {
                 lights,
                 sky_on,
                 self.origin_y,
+                self.wave_origin,
+                self.cloud_origin,
             )]),
         );
         self.queue.write_buffer(
@@ -4612,6 +4708,8 @@ struct App {
     redraw_reason: Option<String>,
     // When an idle editor next draws on its own.
     idle_wake: Option<std::time::Instant>,
+    // When the water's waves last moved on (see `advance_waves`).
+    wave_clock: Option<std::time::Instant>,
     // Where in the code the UI last asked to draw again straight away (from
     // egui's own record), for the overlay.
     egui_cause: Option<String>,
@@ -4902,6 +5000,7 @@ impl App {
             shadow_distance: shadow_distance(),
             sky: sky_enabled(),
             fog_amount: fog_amount(),
+            clouds: cloud_amount(),
             sun_time: sun::time_of_day_enabled(),
             time_of_day: sun::time_of_day_hours(),
         }
@@ -4932,6 +5031,7 @@ impl App {
         set_shadow_distance(prefs.shadow_distance);
         set_sky_enabled(prefs.sky);
         set_fog_amount(prefs.fog_amount);
+        set_cloud_amount(prefs.clouds);
         apply_sun_prefs(&prefs);
         self.persist_prefs_if_changed();
     }
@@ -5892,6 +5992,7 @@ impl App {
                 // A module (a day-night clock, say) may move the sun.
                 sun::set_module_sun(module_api::module_sun(&self.modules, world));
                 set_view_reach(module_api::module_view_distance(&self.modules, world));
+                set_tide(module_api::module_tide(&self.modules, world));
                 (instances, group_counts, build_lights(world, game_origin))
             }
             None => return,
@@ -7425,7 +7526,15 @@ impl ApplicationHandler for App {
                     self.draw_launcher(event_loop);
                     return;
                 }
-                self.perf.begin(std::time::Instant::now());
+                let now = std::time::Instant::now();
+                // Water moves while the world does.
+                if let Some(last) = self.wave_clock {
+                    if !self.paused || self.game_window.is_some() {
+                        advance_waves(now.saturating_duration_since(last).as_secs_f32());
+                    }
+                }
+                self.wave_clock = Some(now);
+                self.perf.begin(now);
                 // Window title: the project name, with " *" while there are
                 // unsaved changes.
                 if let (Some(name), Some(window)) =
@@ -7546,6 +7655,7 @@ impl ApplicationHandler for App {
                     &self.modules,
                     &self.world,
                 ));
+                set_tide(module_api::module_tide(&self.modules, &self.world));
                 let lights = build_lights(&self.world, view_origin);
                 // Features from editor modules. While a mouse button is held
                 // (dragging an Inspector slider, say) they keep showing what
@@ -8166,6 +8276,11 @@ impl ApplicationHandler for App {
                                             egui::Slider::new(&mut prefs_edit.fog_amount, 0.0..=sky::FOG_AMOUNT_MAX)
                                                 .text("Fog"),
                                         );
+                                        ui.add_enabled(
+                                            prefs_edit.sky,
+                                            egui::Slider::new(&mut prefs_edit.clouds, 0.0..=1.0)
+                                                .text("Clouds"),
+                                        );
                                         ui.weak("A sky behind the scene, lit by the first directional Light: lower the light toward the horizon for a sunset, below it for night. Distant ground fades into the horizon colour; 0 turns the fog off. With the sky off the viewport goes back to a plain background.");
                                         ui.add_space(4.0);
                                         outerface_checkbox(ui, &mut prefs_edit.sun_time, "Sun by time of day");
@@ -8737,6 +8852,8 @@ struct EditorPrefs {
     sky: bool,
     // How thick the fog is, as a multiplier on the default (0 is none).
     fog_amount: f32,
+    // How much of the sky clouds cover, 0 (none) to 1 (overcast).
+    clouds: f32,
     // Whether the sun is placed by the time of day instead of the Light.
     sun_time: bool,
     // The hour (0 to 24) the sun is placed for.
@@ -8759,6 +8876,7 @@ impl Default for EditorPrefs {
             shadow_distance: SHADOW_DISTANCE_DEFAULT,
             sky: true,
             fog_amount: sky::FOG_AMOUNT_DEFAULT,
+            clouds: sky::CLOUDS_DEFAULT,
             sun_time: false,
             time_of_day: sun::DEFAULT_HOUR,
         }
@@ -8785,6 +8903,7 @@ impl EditorPrefs {
             0.0,
             sky::FOG_AMOUNT_MAX,
         );
+        self.clouds = fix(self.clouds, sky::CLOUDS_DEFAULT, 0.0, 1.0);
         self.time_of_day = fix(self.time_of_day, sun::DEFAULT_HOUR, 0.0, 24.0);
         self.drag_hold_seconds = fix(
             self.drag_hold_seconds,
@@ -9739,6 +9858,7 @@ pub fn run_as(name: &str, app_id: &str, modules: Vec<Box<dyn EditorModule>>) {
     set_shadow_distance(prefs.shadow_distance);
     set_sky_enabled(prefs.sky);
     set_fog_amount(prefs.fog_amount);
+    set_cloud_amount(prefs.clouds);
     apply_sun_prefs(&prefs);
     let mut app = App {
         window: None,
@@ -9806,6 +9926,7 @@ pub fn run_as(name: &str, app_id: &str, modules: Vec<Box<dyn EditorModule>>) {
         perf: perf::FrameStats::new(std::time::Instant::now()),
         redraw_reason: None,
         idle_wake: None,
+        wave_clock: None,
         egui_cause: None,
         dirty: false,
         saved_scripts: std::collections::BTreeMap::new(),
@@ -9927,6 +10048,18 @@ mod prefs_tests {
         .sanitized();
         assert_eq!(p.fog_amount, sky::FOG_AMOUNT_DEFAULT);
         assert!(!p.sky);
+        let p = EditorPrefs {
+            clouds: 3.0,
+            ..EditorPrefs::default()
+        }
+        .sanitized();
+        assert_eq!(p.clouds, 1.0);
+        let p = EditorPrefs {
+            clouds: f32::NAN,
+            ..EditorPrefs::default()
+        }
+        .sanitized();
+        assert_eq!(p.clouds, sky::CLOUDS_DEFAULT);
     }
 
     #[test]
@@ -9984,6 +10117,43 @@ mod prefs_tests {
 #[cfg(test)]
 mod shader_tests {
     use wgpu::naga;
+
+    /// Bindings of the scene group that only the vertex stage can see (see
+    /// the scene bind group layout in `GpuState::new`).
+    const VERTEX_ONLY: [(u32, u32); 1] = [(0, 0)];
+
+    #[test]
+    fn fragment_shaders_only_read_bindings_the_fragment_stage_can_see() {
+        for source in [include_str!("shader.wgsl"), include_str!("shadow.wgsl")] {
+            let module = naga::front::wgsl::parse_str(source).unwrap();
+            let info = naga::valid::Validator::new(
+                naga::valid::ValidationFlags::all(),
+                naga::valid::Capabilities::all(),
+            )
+            .validate(&module)
+            .unwrap();
+            for (i, entry) in module.entry_points.iter().enumerate() {
+                if entry.stage != naga::ShaderStage::Fragment {
+                    continue;
+                }
+                let uses = info.get_entry_point(i);
+                for (handle, global) in module.global_variables.iter() {
+                    let Some(binding) = &global.binding else {
+                        continue;
+                    };
+                    let used = !uses[handle].is_empty();
+                    assert!(
+                        !(used && VERTEX_ONLY.contains(&(binding.group, binding.binding))),
+                        "{} reads {:?} (group {}, binding {}), which only the vertex stage sees",
+                        entry.name,
+                        global.name,
+                        binding.group,
+                        binding.binding
+                    );
+                }
+            }
+        }
+    }
 
     fn validate(source: &str) {
         let module = naga::front::wgsl::parse_str(source).expect("WGSL should parse");
@@ -10389,7 +10559,7 @@ mod ambient_tests {
     #[test]
     fn the_ambient_light_is_untouched_while_the_cycle_is_off() {
         let lights = [LightRaw::zeroed(); MAX_LIGHTS];
-        let uniform = sky_uniform_for_frame(Mat4::IDENTITY.to_cols_array_2d(), &lights, true, 0.0);
+        let uniform = sky_uniform_for_frame(Mat4::IDENTITY.to_cols_array_2d(), &lights, true, 0.0, [0.0; 2], [0.0; 2]);
         assert_eq!(uniform.ground[3], 1.0);
     }
 }

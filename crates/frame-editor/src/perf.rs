@@ -17,6 +17,13 @@ use std::time::{Duration, Instant};
 /// [`CountingAlloc`].
 static IN_USE: AtomicUsize = AtomicUsize::new(0);
 static PEAK: AtomicUsize = AtomicUsize::new(0);
+/// The most in use since the overlay last looked (see `take_recent_peak`).
+static RECENT: AtomicUsize = AtomicUsize::new(0);
+/// How far the memory in use has to climb above anything seen before to
+/// count as a jump worth a line in the Output panel.
+const JUMP: usize = 256 * 1024 * 1024;
+/// Half-second periods the overlay's recent peak covers (five seconds).
+const RECENT_PERIODS: usize = 10;
 
 /// The system allocator, counting what is in use so the performance overlay
 /// can tell memory the program holds from memory the system has kept for it
@@ -66,6 +73,13 @@ unsafe impl GlobalAlloc for CountingAlloc {
 fn added(size: usize) {
     let now = IN_USE.fetch_add(size, Ordering::Relaxed) + size;
     PEAK.fetch_max(now, Ordering::Relaxed);
+    RECENT.fetch_max(now, Ordering::Relaxed);
+}
+
+/// The most in use since the last call, then start again from what is in
+/// use now.
+fn take_recent_peak() -> usize {
+    RECENT.swap(IN_USE.load(Ordering::Relaxed), Ordering::Relaxed)
 }
 
 /// Heap bytes in use and the peak so far, or None when the binary does not
@@ -104,6 +118,12 @@ pub(crate) struct FrameStats {
     gap_worst: Duration,
     work_total: Duration,
     summary: Summary,
+    /// The peak of each of the last few periods, newest last.
+    recent_peaks: std::collections::VecDeque<usize>,
+    /// The highest peak seen so far, once counting has started.
+    highest: Option<usize>,
+    /// A line for the Output panel when memory jumped, not yet taken.
+    jump: Option<String>,
 }
 
 impl FrameStats {
@@ -116,7 +136,36 @@ impl FrameStats {
             gap_worst: Duration::ZERO,
             work_total: Duration::ZERO,
             summary: Summary::default(),
+            recent_peaks: std::collections::VecDeque::new(),
+            highest: None,
+            jump: None,
         }
+    }
+
+    /// Note the peak of the period just ended, and word a jump when it
+    /// climbed well above anything before.
+    fn note_peak(&mut self, peak: usize) {
+        self.recent_peaks.push_back(peak);
+        while self.recent_peaks.len() > RECENT_PERIODS {
+            self.recent_peaks.pop_front();
+        }
+        match self.highest {
+            Some(highest) if peak > highest + JUMP => {
+                self.jump = Some(format!(
+                    "Memory jumped to {} in use (the most before was {})",
+                    megabytes(peak as u64),
+                    megabytes(highest as u64)
+                ));
+                self.highest = Some(peak);
+            }
+            Some(highest) => self.highest = Some(highest.max(peak)),
+            None => self.highest = Some(peak),
+        }
+    }
+
+    /// The line about a memory jump, once, if there was one.
+    pub(crate) fn take_jump(&mut self) -> Option<String> {
+        self.jump.take()
     }
 
     /// A frame's work starts.
@@ -145,6 +194,9 @@ impl FrameStats {
                 work_ms: self.work_total.as_secs_f32() * 1000.0 / n,
                 resident: resident_bytes(),
             };
+            if heap().is_some() {
+                self.note_peak(take_recent_peak());
+            }
             self.period_start = now;
             self.frames = 0;
             self.gap_total = Duration::ZERO;
@@ -177,6 +229,11 @@ impl FrameStats {
                     "  {} in use by the program (peak {}), the rest freed but kept, the graphics driver and the program itself",
                     megabytes(in_use as u64),
                     megabytes(peak as u64)
+                ));
+                let recent = self.recent_peaks.iter().copied().max().unwrap_or(in_use);
+                out.push(format!(
+                    "  peak in the last 5 s {}",
+                    megabytes(recent as u64)
                 ));
             }
             (Some(resident), None) => out.push(format!("memory {}", megabytes(resident))),
@@ -250,6 +307,27 @@ mod tests {
         stats.begin(start);
         stats.end(start + Duration::from_millis(5));
         assert_eq!(stats.summary(), Summary::default());
+    }
+
+    #[test]
+    fn a_big_climb_in_memory_is_reported_once_and_small_ones_not_at_all() {
+        let mut stats = FrameStats::new(Instant::now());
+        let mb = 1024 * 1024;
+        stats.note_peak(100 * mb);
+        stats.note_peak(200 * mb);
+        assert_eq!(stats.take_jump(), None, "100 MB more is not a jump");
+        stats.note_peak(5000 * mb);
+        let line = stats.take_jump().expect("a jump");
+        assert!(line.contains("5242.9 MB"), "{line}");
+        assert_eq!(stats.take_jump(), None, "reported once");
+        // The same level again is not a new jump.
+        stats.note_peak(5000 * mb);
+        assert_eq!(stats.take_jump(), None);
+        // Only the last few periods count as recent.
+        for _ in 0..RECENT_PERIODS {
+            stats.note_peak(50 * mb);
+        }
+        assert_eq!(stats.recent_peaks.iter().max(), Some(&(50 * mb)));
     }
 
     #[test]

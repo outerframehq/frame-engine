@@ -104,6 +104,17 @@ pub trait EditorModule {
         None
     }
 
+    /// How far the sea stands above its still level right now (below if
+    /// negative), in world units, if this module keeps the tides. Called once
+    /// per frame for each window drawn, like `sun`. Water built with a tide
+    /// rule (see [`WaterFlow`]) follows it on the GPU: the sea rises and
+    /// falls, and water the tide can reach (a river's mouth) is lifted where
+    /// the tide stands higher. If several modules answer, the first wins.
+    /// The default is None: no tide.
+    fn tide(&mut self, _world: &World) -> Option<f32> {
+        None
+    }
+
     /// Whether this module is still working in the background (building
     /// something it will want to show). While any module is, the editor keeps
     /// drawing every frame so the results appear as they arrive; otherwise an
@@ -500,6 +511,58 @@ pub struct VertexMorph {
     pub uv: Option<[f32; 2]>,
 }
 
+/// How a vertex of a liquid surface moves: its flow, which carries the
+/// ripples along and breaks into white water when fast, and how it follows
+/// the tide (see [`EditorModule::tide`]). For [`WorldMesh::new_flowing`].
+#[derive(Copy, Clone, Debug, Default, PartialEq)]
+pub struct WaterFlow {
+    /// The water's velocity across the ground (x, z), in the mesh's own units
+    /// a second, up to `FLOW_RANGE` either way.
+    pub velocity: [f32; 2],
+    pub tide: Tide,
+}
+
+/// How a vertex of a liquid surface follows the tide.
+#[derive(Copy, Clone, Debug, Default, PartialEq)]
+pub enum Tide {
+    /// Not at all: a lake, or water that is not a liquid.
+    #[default]
+    Still,
+    /// The sea: rises and falls with the tide.
+    Sea,
+    /// Water the tide can reach, such as a river near its mouth: lifted to
+    /// the tide's level where that is higher than its own. `sea` is the
+    /// still sea level in the mesh's own units.
+    Floods { sea: f32 },
+}
+
+/// The fastest water a [`WaterFlow`] can carry, in the mesh's units a
+/// second. MUST match FLOW_RANGE in shader.wgsl.
+pub const FLOW_RANGE: f32 = 16.0;
+/// How far below the still sea a flooding vertex can sit and still be
+/// reached, in the mesh's units. MUST match TIDE_REACH in shader.wgsl.
+const TIDE_REACH: f32 = 512.0;
+
+/// A value from -1 to 1 as the renderer stores it.
+fn snorm(v: f32) -> i16 {
+    (v.clamp(-1.0, 1.0) * 32767.0).round() as i16
+}
+
+/// `flow` as the renderer stores it, for a vertex at height `y`.
+fn water_bits(flow: &WaterFlow, y: f32) -> [i16; 4] {
+    let (mode, below) = match flow.tide {
+        Tide::Still => (0.0, 0.0),
+        Tide::Sea => (1.0, 0.0),
+        Tide::Floods { sea } => (-1.0, (sea - y) / TIDE_REACH),
+    };
+    [
+        snorm(flow.velocity[0] / FLOW_RANGE),
+        snorm(flow.velocity[1] / FLOW_RANGE),
+        snorm(mode),
+        snorm(below),
+    ]
+}
+
 /// The vertices as the renderer stores them, each with its `morphs` entry
 /// (none past the end of `morphs`).
 fn morphing_vertices(vertices: &[MeshVertexData], morphs: &[VertexMorph]) -> Vec<MeshVertex> {
@@ -516,6 +579,20 @@ fn morphing_vertices(vertices: &[MeshVertexData], morphs: &[VertexMorph]) -> Vec
             out
         })
         .collect()
+}
+
+/// The vertices as the renderer stores them, with their `morphs` and `flows`
+/// entries (none past the end of either).
+fn flowing_vertices(
+    vertices: &[MeshVertexData],
+    morphs: &[VertexMorph],
+    flows: &[WaterFlow],
+) -> Vec<MeshVertex> {
+    let mut verts = morphing_vertices(vertices, morphs);
+    for (v, flow) in verts.iter_mut().zip(flows) {
+        v.water = water_bits(flow, v.position[1]);
+    }
+    verts
 }
 
 /// A triangle mesh on the GPU, in world units, for a module to draw.
@@ -557,6 +634,22 @@ impl WorldMesh {
             return None;
         }
         let verts = morphing_vertices(vertices, morphs);
+        Some(Self::upload(device, &verts))
+    }
+
+    /// Like `new_morphing`, for a liquid surface whose vertices move as their
+    /// `flows` entries say (see [`WaterFlow`]); a missing entry is still
+    /// water. Drawn with a liquid material, the ripples run with the flow.
+    pub fn new_flowing(
+        device: &wgpu::Device,
+        vertices: &[MeshVertexData],
+        morphs: &[VertexMorph],
+        flows: &[WaterFlow],
+    ) -> Option<Self> {
+        if vertices.is_empty() {
+            return None;
+        }
+        let verts = flowing_vertices(vertices, morphs, flows);
         Some(Self::upload(device, &verts))
     }
 
@@ -918,6 +1011,19 @@ pub(crate) fn module_view_distance(
         .reduce(f64::max)
 }
 
+/// The tide, from the first module that keeps one (see
+/// [`EditorModule::tide`]).
+pub(crate) fn module_tide(
+    modules: &std::cell::RefCell<Vec<Box<dyn EditorModule>>>,
+    world: &World,
+) -> Option<f32> {
+    modules
+        .borrow_mut()
+        .iter_mut()
+        .find_map(|module| module.tide(world))
+        .filter(|t| t.is_finite())
+}
+
 /// Let every module advance its own simulation by `dt`. Called once per
 /// simulation tick, before `sync_collision`.
 pub(crate) fn tick_modules(
@@ -1270,6 +1376,74 @@ mod tests {
         assert_eq!(out[1].morph_uv, [0.3, 0.4]);
         assert_eq!(out[2].morph_uv, [0.5, 0.6]);
         assert_eq!(out[2].morph, [0.0; 3]);
+    }
+
+    #[test]
+    fn flowing_vertices_carry_their_flow_and_tide_rule() {
+        let v = |y: f32| MeshVertexData {
+            position: [0.0, y, 0.0],
+            normal: [0.0, 1.0, 0.0],
+            uv: [0.5, 0.5],
+        };
+        let flows = [
+            WaterFlow {
+                velocity: [8.0, -4.0],
+                tide: Tide::Sea,
+            },
+            WaterFlow {
+                velocity: [0.0, 100.0],
+                tide: Tide::Floods { sea: 2.0 },
+            },
+        ];
+        let out = flowing_vertices(&[v(2.0), v(258.0), v(5.0)], &[], &flows);
+        let back = |b: i16| f32::from(b) / 32767.0;
+        // Velocity over FLOW_RANGE; the sea follows the tide.
+        assert!((back(out[0].water[0]) * FLOW_RANGE - 8.0).abs() < 0.01);
+        assert!((back(out[0].water[1]) * FLOW_RANGE + 4.0).abs() < 0.01);
+        assert_eq!(out[0].water[2], 32767);
+        assert_eq!(out[0].water[3], 0);
+        // Too fast is held to the range; flooding water knows how far the
+        // still sea is below it.
+        assert_eq!(out[1].water[1], 32767);
+        assert_eq!(out[1].water[2], -32767);
+        assert!((back(out[1].water[3]) * TIDE_REACH + 256.0).abs() < 0.05);
+        // No entry: still, and no flow.
+        assert_eq!(out[2].water, [0; 4]);
+        // Nothing else carries any.
+        assert_eq!(morphing_vertices(&[v(1.0)], &[])[0].water, [0; 4]);
+    }
+
+    /// A module that keeps a tide (or not).
+    struct Sea {
+        tide: Option<f32>,
+    }
+    impl EditorModule for Sea {
+        fn name(&self) -> &str {
+            "sea"
+        }
+        fn tide(&mut self, _world: &World) -> Option<f32> {
+            self.tide
+        }
+        fn new_gpu(&self, _gpu: &GpuContext) -> Box<dyn ModuleGpu> {
+            unreachable!("no GPU in tests")
+        }
+    }
+
+    #[test]
+    fn the_first_module_with_a_tide_sets_it() {
+        let (world, _) = world_with_entity();
+        let modules: std::cell::RefCell<Vec<Box<dyn EditorModule>>> =
+            std::cell::RefCell::new(vec![
+                Box::new(Sea { tide: None }),
+                Box::new(Sea { tide: Some(1.25) }),
+                Box::new(Sea { tide: Some(-3.0) }),
+            ]);
+        assert_eq!(module_tide(&modules, &world), Some(1.25));
+        let none: std::cell::RefCell<Vec<Box<dyn EditorModule>>> =
+            std::cell::RefCell::new(vec![Box::new(Sea {
+                tide: Some(f32::NAN),
+            })]);
+        assert_eq!(module_tide(&none, &world), None);
     }
 
     /// A module that draws out to a fixed distance (or not at all).
