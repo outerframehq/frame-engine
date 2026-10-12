@@ -24,7 +24,7 @@ use wgpu::util::DeviceExt;
 /// Samples per side a patch can have at most.
 pub const GRASS_GRID_MAX: u32 = 33;
 /// How many patches one field holds at most.
-pub const GRASS_PATCHES_MAX: usize = 256;
+pub const GRASS_PATCHES_MAX: usize = 512;
 /// Blades drawn per instance of the shared index pattern. MUST match
 /// GRASS_BATCH in shader.wgsl.
 const BATCH: u32 = 16_384;
