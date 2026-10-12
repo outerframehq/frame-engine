@@ -25,6 +25,13 @@
 use super::*;
 use std::collections::{BTreeMap, BTreeSet};
 
+/// The scene part of the editor's shader (WGSL): bind group 0 (the camera,
+/// lights, shadow map and sky) and the helpers that read it (`apply_fog`,
+/// `shadow_factor`, `morph_amount`, ...). A module drawing with its own shader
+/// (see [`ModuleGpu::draw_custom_in_view`]) puts this first in its source, so
+/// it is lit, shadowed and fogged exactly like everything else.
+pub const SCENE_WGSL: &str = include_str!("scene.wgsl");
+
 pub use crate::grass::{
     GRASS_GRID_MAX, GRASS_PATCHES_MAX, GrassFactory, GrassField, GrassPatch, GrassQuality,
     GrassSample,
@@ -154,6 +161,8 @@ pub struct GpuContext<'a> {
     pub(crate) material_layout: &'a wgpu::BindGroupLayout,
     pub(crate) material_sampler: &'a wgpu::Sampler,
     pub(crate) grass: &'a crate::grass::GrassFactory,
+    pub(crate) scene_layout: &'a wgpu::BindGroupLayout,
+    pub(crate) color_format: wgpu::TextureFormat,
 }
 
 impl GpuContext<'_> {
@@ -170,6 +179,43 @@ impl GpuContext<'_> {
     pub fn grass_factory(&self) -> GrassFactory {
         self.grass.clone()
     }
+
+    /// What a module needs to build its own render pipeline for
+    /// [`ModuleGpu::draw_custom_in_view`].
+    pub fn custom_targets(&self) -> CustomTargets {
+        CustomTargets {
+            scene_layout: self.scene_layout.clone(),
+            color_format: self.color_format,
+            depth_format: crate::DEPTH_FORMAT,
+            depth_compare: wgpu::CompareFunction::Greater,
+        }
+    }
+}
+
+/// How a module's own pipeline must be set up to draw into a window (see
+/// [`ModuleGpu::draw_custom_in_view`]): bind group 0 is always the scene
+/// (`scene_layout`, the bindings in [`SCENE_WGSL`]); the colour target's
+/// format; and the depth buffer's format and test. Depth is reversed (nearer
+/// is greater), so use `depth_compare` as given.
+#[derive(Clone, Debug)]
+pub struct CustomTargets {
+    pub scene_layout: wgpu::BindGroupLayout,
+    pub color_format: wgpu::TextureFormat,
+    pub depth_format: wgpu::TextureFormat,
+    pub depth_compare: wgpu::CompareFunction,
+}
+
+/// The Grass setting in Editor Settings, for a module that draws grass of
+/// its own (see [`GrassQuality`]).
+pub fn grass_setting() -> GrassQuality {
+    crate::grass_quality()
+}
+
+/// Seconds of moving water and wind: runs while the world moves (the editor
+/// playing or the Play window open), wrapped every hour. The same clock the
+/// editor's waves and grass use, for a module's own shader.
+pub fn motion_seconds() -> f32 {
+    crate::wave_seconds()
 }
 
 /// Makes [`WorldMaterial`]s for one window.
@@ -387,6 +433,19 @@ pub trait ModuleGpu {
     /// Meshes are not sorted: draw the farthest first if several overlap.
     fn draw_transparent(&self, _pass: &mut wgpu::RenderPass<'_>) {}
 
+    /// Whether there is anything to draw with `draw_custom_in_view`.
+    fn has_custom(&self) -> bool {
+        false
+    }
+
+    /// Draw with the module's own pipeline (built with
+    /// [`GpuContext::custom_targets`] and a shader that starts with
+    /// [`SCENE_WGSL`]). Called after every module's solid geometry and grass
+    /// and before anything see-through, in the colour pass and the Camera
+    /// preview, with the scene bound as group 0. Set your own pipeline and
+    /// any other groups; whoever draws next sets theirs.
+    fn draw_custom_in_view(&self, _pass: &mut wgpu::RenderPass<'_>, _view: &DrawView) {}
+
     /// This window's grass, if the module has any (see [`GrassField`]). The
     /// editor draws it after every module's solid geometry, as much of it as
     /// the Grass setting asks for. The default is none.
@@ -415,6 +474,9 @@ pub struct DrawView {
     planes: Option<[[f32; 4]; 6]>,
     /// True for the shadow pass, which draws depth only, seen from the sun.
     pub shadow: bool,
+    /// Where the camera is (relative to the render origin), for a camera's
+    /// view; None for the shadow pass and a view that sees everything.
+    eye: Option<[f32; 3]>,
 }
 
 impl DrawView {
@@ -430,7 +492,21 @@ impl DrawView {
             .iter()
             .all(|p| p.is_finite())
             .then(|| sides.map(|p| p.to_array()));
-        DrawView { planes, shadow }
+        let eye = (!shadow)
+            .then(|| crate::sky::eye_from_view_proj(&m))
+            .filter(|e| e.is_finite())
+            .map(|e| e.to_array());
+        DrawView {
+            planes,
+            shadow,
+            eye,
+        }
+    }
+
+    /// Where the camera is, relative to the render origin, for a camera's
+    /// view (None for the shadow pass): for drawing more detail near it.
+    pub fn eye(&self) -> Option<[f32; 3]> {
+        self.eye
     }
 
     /// A view that sees everything.
@@ -438,6 +514,7 @@ impl DrawView {
         DrawView {
             planes: None,
             shadow: false,
+            eye: None,
         }
     }
 
@@ -1514,6 +1591,46 @@ mod tests {
         // Past the last layer is the last layer; a missing entry the first.
         assert_eq!(out[2].water[3], 32767);
         assert_eq!(out[3].water[3], 0);
+    }
+
+    #[test]
+    fn a_camera_view_knows_where_the_eye_is_and_the_shadow_view_does_not() {
+        let eye = glam::Vec3::new(12.0, 34.0, -56.0);
+        let view = glam::Mat4::look_at_rh(eye, glam::Vec3::new(0.0, 30.0, 0.0), glam::Vec3::Y);
+        let proj = glam::Mat4::perspective_rh(1.0, 1.5, 0.1, 1000.0);
+        let vp = (proj * view).to_cols_array_2d();
+        let got = DrawView::from_view_proj(vp, false).eye().unwrap();
+        for a in 0..3 {
+            assert!((got[a] - eye[a]).abs() < 0.01, "{got:?}");
+        }
+        assert!(DrawView::from_view_proj(vp, true).eye().is_none());
+        assert!(DrawView::everything().eye().is_none());
+    }
+
+    #[test]
+    fn a_module_shader_built_on_the_scene_part_is_valid_wgsl() {
+        let source = format!(
+            "{SCENE_WGSL}
+@vertex
+fn vs_custom(@builtin(vertex_index) i: u32) -> @builtin(position) vec4<f32> {{
+    let p = vec3<f32>(f32(i), 0.0, 0.0);
+    let t = morph_amount(p, camera.eye.xyz, vec2<f32>(0.0, 1.0));
+    return camera.view_proj * vec4<f32>(p + vec3<f32>(0.0, t, 0.0), 1.0);
+}}
+@fragment
+fn fs_custom(@builtin(position) at: vec4<f32>) -> @location(0) vec4<f32> {{
+    let lit = vec3<f32>(0.5) * shadow_factor(at.xyz, vec3<f32>(0.0, 1.0, 0.0));
+    return vec4<f32>(apply_fog(lit, at.xyz), 1.0);
+}}
+"
+        );
+        let module = wgpu::naga::front::wgsl::parse_str(&source).expect("parses");
+        wgpu::naga::valid::Validator::new(
+            wgpu::naga::valid::ValidationFlags::all(),
+            wgpu::naga::valid::Capabilities::all(),
+        )
+        .validate(&module)
+        .expect("validates");
     }
 
     #[test]

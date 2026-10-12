@@ -415,7 +415,7 @@ mod tests {
 
     #[test]
     fn the_shader_uses_the_same_haze_numbers() {
-        let shader = include_str!("shader.wgsl");
+        let shader = crate::ENTITY_WGSL;
         for (name, value) in [
             ("FOG_HEIGHT_SCALE", FOG_HEIGHT_SCALE),
             ("AWAY_COOLING", AWAY_COOLING),

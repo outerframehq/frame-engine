@@ -22,6 +22,10 @@ use winit::event::{
 use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Icon, Window, WindowId};
+/// The editor's shader: the scene part every world pass shares, then the
+/// editor's own entry points.
+pub(crate) const ENTITY_WGSL: &str =
+    concat!(include_str!("scene.wgsl"), include_str!("shader.wgsl"));
 mod font;
 mod grass;
 mod origin;
@@ -873,7 +877,12 @@ fn create_material_bind_group(
         layout,
         sampler,
         texture_view,
-        [roughness, metalness, if has_texture { 1.0 } else { 0.0 }, 0.0],
+        [
+            roughness,
+            metalness,
+            if has_texture { 1.0 } else { 0.0 },
+            0.0,
+        ],
         [0.0; 4],
     )
 }
@@ -1598,7 +1607,10 @@ impl GpuState {
         // this buffer and draw the range for whichever primitive an entity uses.
         let (mesh_vertex_buffer, mesh_ranges) = build_mesh_buffer(&device, &[]);
         // --- Entity pipeline (world-space, camera-driven) ---
-        let entity_shader = device.create_shader_module(wgpu::include_wgsl!("shader.wgsl"));
+        let entity_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("entity shader"),
+            source: wgpu::ShaderSource::Wgsl(ENTITY_WGSL.into()),
+        });
         let entity_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("entity pipeline layout"),
@@ -1871,6 +1883,8 @@ impl GpuState {
                 material_layout: &material_bind_group_layout,
                 material_sampler: &material_sampler,
                 grass: &grass_factory,
+                scene_layout: &scene_bind_group_layout,
+                color_format: config.format,
             };
             modules.iter().map(|m| m.new_gpu(&context)).collect()
         };
@@ -2089,6 +2103,22 @@ impl GpuState {
             0,
             bytemuck::bytes_of(&settings),
         );
+    }
+
+    /// Let every module draw with its own pipeline (see
+    /// `ModuleGpu::draw_custom_in_view`), with the scene bound as `scene`.
+    fn draw_custom(
+        &self,
+        pass: &mut wgpu::RenderPass<'_>,
+        scene: &wgpu::BindGroup,
+        view: &module_api::DrawView,
+    ) {
+        for module in &self.module_gpu {
+            if module.has_custom() {
+                pass.set_bind_group(0, scene, &[]);
+                module.draw_custom_in_view(pass, view);
+            }
+        }
     }
 
     /// Draw every module's grass, seen through `view_proj` with the scene
@@ -2323,6 +2353,7 @@ impl GpuState {
                 }
             }
             self.draw_grass(&mut render_pass, &self.scene_bind_group, view_proj, &view);
+            self.draw_custom(&mut render_pass, &self.scene_bind_group, &view);
             if self.module_gpu.iter().any(|m| m.has_transparent()) {
                 render_pass.set_pipeline(&self.transparent_pipeline);
                 render_pass.set_bind_group(1, &self.material_bind_groups[0], &[]);
@@ -2507,6 +2538,7 @@ impl GpuState {
                 }
             }
             self.draw_grass(&mut render_pass, &self.preview_bind_group, view_proj, &view);
+            self.draw_custom(&mut render_pass, &self.preview_bind_group, &view);
             if self.module_gpu.iter().any(|m| m.has_transparent()) {
                 render_pass.set_pipeline(&self.transparent_pipeline);
                 render_pass.set_bind_group(1, &self.material_bind_groups[0], &[]);
@@ -7789,10 +7821,7 @@ impl ApplicationHandler for App {
                     view_origin,
                 );
                 sun::set_module_sun(module_api::module_sun(&self.modules, &self.world));
-                set_view_reach(module_api::module_view_distance(
-                    &self.modules,
-                    &self.world,
-                ));
+                set_view_reach(module_api::module_view_distance(&self.modules, &self.world));
                 set_tide(module_api::module_tide(&self.modules, &self.world));
                 let lights = build_lights(&self.world, view_origin);
                 // Features from editor modules. While a mouse button is held
@@ -10278,7 +10307,7 @@ mod shader_tests {
 
     #[test]
     fn fragment_shaders_only_read_bindings_the_fragment_stage_can_see() {
-        for source in [include_str!("shader.wgsl"), include_str!("shadow.wgsl")] {
+        for source in [super::ENTITY_WGSL, include_str!("shadow.wgsl")] {
             let module = naga::front::wgsl::parse_str(source).unwrap();
             let info = naga::valid::Validator::new(
                 naga::valid::ValidationFlags::all(),
@@ -10321,12 +10350,12 @@ mod shader_tests {
 
     #[test]
     fn entity_shader_is_valid() {
-        validate(include_str!("shader.wgsl"));
+        validate(super::ENTITY_WGSL);
     }
 
     #[test]
     fn entity_shader_has_the_entry_points_the_pipelines_name() {
-        let module = naga::front::wgsl::parse_str(include_str!("shader.wgsl")).unwrap();
+        let module = naga::front::wgsl::parse_str(super::ENTITY_WGSL).unwrap();
         for name in ["vs_main", "fs_main", "fs_transparent", "vs_sky", "fs_sky"] {
             assert!(
                 module.entry_points.iter().any(|e| e.name == name),
@@ -10355,7 +10384,7 @@ mod shader_tests {
 
     #[test]
     fn the_uniforms_are_the_same_size_on_both_sides() {
-        let main = include_str!("shader.wgsl");
+        let main = super::ENTITY_WGSL;
         let shadow = include_str!("shadow.wgsl");
         let camera = std::mem::size_of::<super::CameraUniform>() as u32;
         let shadow_uniform = std::mem::size_of::<super::ShadowUniform>() as u32;
@@ -10366,7 +10395,7 @@ mod shader_tests {
 
     #[test]
     fn the_vertex_layout_matches_the_shader_inputs() {
-        let module = naga::front::wgsl::parse_str(include_str!("shader.wgsl")).unwrap();
+        let module = naga::front::wgsl::parse_str(super::ENTITY_WGSL).unwrap();
         let entry = module
             .entry_points
             .iter()
@@ -10713,7 +10742,14 @@ mod ambient_tests {
     #[test]
     fn the_ambient_light_is_untouched_while_the_cycle_is_off() {
         let lights = [LightRaw::zeroed(); MAX_LIGHTS];
-        let uniform = sky_uniform_for_frame(Mat4::IDENTITY.to_cols_array_2d(), &lights, true, 0.0, [0.0; 2], [0.0; 2]);
+        let uniform = sky_uniform_for_frame(
+            Mat4::IDENTITY.to_cols_array_2d(),
+            &lights,
+            true,
+            0.0,
+            [0.0; 2],
+            [0.0; 2],
+        );
         assert_eq!(uniform.ground[3], 1.0);
     }
 }
