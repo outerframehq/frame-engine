@@ -743,3 +743,264 @@ fn with_clouds(colour: vec3<f32>, direction: vec3<f32>) -> vec3<f32> {
     let fade = exp(-t / 90000.0);
     return mix(colour, cloud, amount * fade * 0.95);
 }
+
+// ---------------------------------------------------------------------------
+// Grass (see grass.rs). Blades are made here from their vertex number: no
+// vertex buffer, only a shared index pattern of seven points a blade. A patch
+// of ground data gives the height, how thick and tall the grass is and its
+// colour; each blade's place comes from the R2 sequence (so the first blades
+// of a patch always cover it evenly) and its height, width, turn and lean
+// from a hash of its number.
+
+// One patch. MUST match PatchRaw in grass.rs.
+struct GrassPatch {
+    // The patch's corner, relative to the render origin, and its width.
+    origin: vec3<f32>,
+    size: f32,
+    // Where its samples start in the sample buffer, and samples per side.
+    base: u32,
+    grid: u32,
+    seed: u32,
+    flags: u32,
+    // The ground's slide to its coarser shape (see morph_amount).
+    band: vec2<f32>,
+    pad: vec2<f32>,
+};
+
+// Shared by every patch. MUST match SettingsRaw in grass.rs.
+struct GrassSettings {
+    // Blades a square metre close in, how far grass reaches, and the
+    // distance within which every blade is drawn.
+    density: f32,
+    range: f32,
+    near: f32,
+    // A blade's width at its root.
+    width: f32,
+    // The wind across the ground, direction times strength.
+    wind: vec2<f32>,
+    // Seconds of moving wind, wrapped.
+    time: f32,
+    pad: f32,
+    // The render origin's x and z, wrapped.
+    origin: vec2<f32>,
+    pad2: vec2<f32>,
+};
+
+// Two vec4s a sample: (height, coarse offset, density, blade height) and
+// (colour, unused).
+@group(1) @binding(3) var<storage, read> grass_samples: array<vec4<f32>>;
+@group(1) @binding(4) var<uniform> grass_patch: GrassPatch;
+@group(1) @binding(5) var<uniform> grass: GrassSettings;
+
+// Blades per instance of the index pattern. MUST match BATCH in grass.rs.
+const GRASS_BATCH: u32 = 16384u;
+
+struct GrassVarying {
+    @builtin(position) clip_position: vec4<f32>,
+    @location(0) world_position: vec3<f32>,
+    @location(1) normal: vec3<f32>,
+    @location(2) color: vec3<f32>,
+    // 0 at the root, 1 at the tip.
+    @location(3) along: f32,
+};
+
+// A well-mixed 32-bit hash (PCG).
+fn grass_hash(x: u32) -> u32 {
+    let state = x * 747796405u + 2891336453u;
+    let word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+
+// A number from 0 to 1 for `x`.
+fn grass_random(x: u32) -> f32 {
+    return f32(grass_hash(x) >> 8u) / 16777216.0;
+}
+
+// The patch's data at `p` (0 to 1 across it), blended between its samples.
+struct GrassPoint {
+    ground: vec4<f32>,
+    colour: vec4<f32>,
+};
+
+fn grass_point(p: vec2<f32>) -> GrassPoint {
+    let g = max(grass_patch.grid, 2u);
+    let f = clamp(p, vec2<f32>(0.0), vec2<f32>(1.0)) * f32(g - 1u);
+    let i = min(vec2<u32>(floor(f)), vec2<u32>(g - 2u));
+    let t = f - vec2<f32>(i);
+    let row0 = grass_patch.base + i.y * g + i.x;
+    let row1 = row0 + g;
+    let a00 = grass_samples[row0 * 2u];
+    let a10 = grass_samples[(row0 + 1u) * 2u];
+    let a01 = grass_samples[row1 * 2u];
+    let a11 = grass_samples[(row1 + 1u) * 2u];
+    let c00 = grass_samples[row0 * 2u + 1u];
+    let c10 = grass_samples[(row0 + 1u) * 2u + 1u];
+    let c01 = grass_samples[row1 * 2u + 1u];
+    let c11 = grass_samples[(row1 + 1u) * 2u + 1u];
+    var out: GrassPoint;
+    out.ground = mix(mix(a00, a10, t.x), mix(a01, a11, t.x), t.y);
+    out.colour = mix(mix(c00, c10, t.x), mix(c01, c11, t.x), t.y);
+    return out;
+}
+
+@vertex
+fn vs_grass(@builtin(vertex_index) vertex: u32, @builtin(instance_index) instance: u32) -> GrassVarying {
+    var out: GrassVarying;
+    // A blade left out folds to one point off screen: nothing is drawn.
+    out.clip_position = vec4<f32>(2.0, 2.0, 2.0, 1.0);
+    out.world_position = vec3<f32>(0.0);
+    out.normal = vec3<f32>(0.0, 1.0, 0.0);
+    out.color = vec3<f32>(0.0);
+    out.along = 0.0;
+
+    let blade = instance * GRASS_BATCH + vertex / 7u;
+    let point = vertex % 7u;
+    let seed = grass_patch.seed;
+    // Where it stands: the R2 sequence in 32-bit fixed point, shifted per
+    // patch so neighbours differ. MUST match `spot` in grass.rs's tests.
+    let sx = seed * 0x9e3779b9u;
+    let sz = (seed ^ 0x85ebca6bu) * 0x9e3779b9u;
+    let px = f32((blade * 3242174889u + sx) >> 8u) / 16777216.0;
+    let pz = f32((blade * 2447445413u + sz) >> 8u) / 16777216.0;
+    let here = grass_point(vec2<f32>(px, pz));
+    let density = here.ground.z;
+    let tall = here.ground.w;
+    let key = blade ^ (seed * 0x27d4eb2du);
+    if (tall <= 0.0 || grass_random(key) >= density) {
+        return out;
+    }
+    let size = grass_patch.size;
+    var root = grass_patch.origin + vec3<f32>(px * size, here.ground.x, pz * size);
+    // Fewer blades with distance, each a little wider, and none past the
+    // range: the first ones (by number) stay, so cover stays even.
+    let distance = length(root.xz - camera.eye.xz);
+    let keep = min(1.0, pow(grass.near / max(distance, grass.near), 2.0));
+    if (f32(blade) >= grass.density * size * size * keep) {
+        return out;
+    }
+    let fade = 1.0 - smoothstep(0.75 * grass.range, grass.range, distance);
+    if (fade <= 0.0) {
+        return out;
+    }
+    // On the ground as drawn, sliding with it between levels of detail.
+    root.y = root.y + here.ground.y * morph_amount(root, camera.eye.xyz, grass_patch.band);
+
+    let r1 = grass_random(key * 3u + 1u);
+    let r2 = grass_random(key * 3u + 2u);
+    let r3 = grass_random(key * 7u + 3u);
+    let r4 = grass_random(key * 11u + 5u);
+    let height = tall * (0.65 + 0.7 * r1) * fade;
+    let width = grass.width * (0.75 + 0.5 * r2) * clamp(inverseSqrt(keep), 1.0, 3.0);
+    let turn = r3 * TAU;
+    let side = vec3<f32>(cos(turn), 0.0, sin(turn));
+    // A lean of its own, and the wind in gusts that roll across the field.
+    let lean = vec2<f32>(cos(r4 * TAU), sin(r4 * TAU)) * (0.12 + 0.25 * r2);
+    let wind_strength = length(grass.wind);
+    let wind_dir = grass.wind / max(wind_strength, 1e-4);
+    let p = root.xz + grass.origin;
+    let phase = dot(p, wind_dir) * 0.07 - grass.time * 1.4 + r1 * 0.9;
+    let gust = (0.55 + 0.45 * sin(phase)) * (0.75 + 0.25 * sin(phase * 2.3 + dot(p, vec2<f32>(0.11, -0.07))));
+    let bend = lean + wind_dir * wind_strength * gust * 0.45;
+    let tip_dir = normalize(vec3<f32>(bend.x, 1.0, bend.y));
+    // A curve from the root, up, then over toward the tip.
+    let p0 = root;
+    let p1 = root + vec3<f32>(0.0, height * 0.6, 0.0);
+    let p2 = root + tip_dir * height;
+    var t = f32(point / 2u) / 3.0;
+    var across = select(-0.5, 0.5, (point % 2u) == 1u);
+    if (point == 6u) {
+        t = 1.0;
+        across = 0.0;
+    }
+    let on_curve = mix(mix(p0, p1, t), mix(p1, p2, t), t);
+    let tangent = normalize(mix(p1 - p0, p2 - p1, t));
+    let position = on_curve + side * (width * (1.0 - t) * across * 2.0) * 0.5;
+    // Rounded across its width, so a field does not look like flat cards.
+    let flat_normal = normalize(cross(side, tangent));
+    out.normal = normalize(flat_normal + side * across * 0.9);
+    out.clip_position = camera.view_proj * vec4<f32>(position, 1.0);
+    out.world_position = position;
+    out.along = t;
+    // Each blade a little different, and broad patches of fresher and drier
+    // grass across the field, so it does not read as one flat colour.
+    let patch_noise = sin(p.x * 0.045 + 1.3) * sin(p.y * 0.038 - 0.7) * 0.5 + 0.5;
+    let fresh = vec3<f32>(0.86, 1.08, 0.80);
+    let dry = vec3<f32>(1.22, 1.08, 0.62);
+    let shift = mix(fresh, dry, smoothstep(0.35, 0.95, patch_noise * 0.7 + r2 * 0.3));
+    // Far off the blades take the ground's own colour, so where they stop
+    // there is no line (see fs_grass).
+    let far = smoothstep(0.35 * grass.range, 0.9 * grass.range, distance);
+    out.color = here.colour.rgb * mix(shift * (0.8 + 0.4 * r3), vec3<f32>(1.0), far);
+    return out;
+}
+
+// Light on a blade: the scene's lights with a soft wrap, light through the
+// blade from behind, and the sky's ambient floor.
+fn grass_light(world_position: vec3<f32>, normal: vec3<f32>) -> f32 {
+    let ambient = 0.45 * select(sky.ground.w, 1.0, sky.ground.w <= 0.0);
+    var total = ambient;
+    for (var i: u32 = 0u; i < MAX_LIGHTS; i = i + 1u) {
+        let light = lights.lights[i];
+        let intensity = light.params.z;
+        if (intensity <= 0.0) {
+            continue;
+        }
+        var light_dir: vec3<f32>;
+        var attenuation: f32 = 1.0;
+        if (light.params.x < 0.5) {
+            light_dir = normalize(light.position_or_direction.xyz);
+        } else {
+            let to_light = light.position_or_direction.xyz - world_position;
+            let dist = length(to_light);
+            light_dir = to_light / max(dist, 0.0001);
+            attenuation = clamp(1.0 - dist / max(light.params.y, 0.0001), 0.0, 1.0);
+        }
+        let facing = dot(normal, light_dir);
+        var lit = clamp(facing * 0.6 + 0.4, 0.0, 1.0) + 0.35 * max(-facing, 0.0);
+        if (light.params.w > 0.5) {
+            lit = lit * shadow_factor(world_position, vec3<f32>(0.0, 1.0, 0.0));
+        }
+        total = total + lit * attenuation * intensity;
+    }
+    return min(total, 1.25);
+}
+
+// Light on flat ground as the solid shader gives it (rough, facing up), for
+// blades far off to match the ground they fade into.
+fn grass_ground_light(world_position: vec3<f32>) -> f32 {
+    var total = 0.4 * select(sky.ground.w, 1.0, sky.ground.w <= 0.0);
+    for (var i: u32 = 0u; i < MAX_LIGHTS; i = i + 1u) {
+        let light = lights.lights[i];
+        let intensity = light.params.z;
+        if (intensity <= 0.0 || light.params.x > 0.5) {
+            continue;
+        }
+        var lit = pow(max(normalize(light.position_or_direction.xyz).y, 0.0), 0.77);
+        if (light.params.w > 0.5) {
+            lit = lit * shadow_factor(world_position, vec3<f32>(0.0, 1.0, 0.0));
+        }
+        total = total + lit * intensity;
+    }
+    return min(total, 1.0);
+}
+
+@fragment
+fn fs_grass(in: GrassVarying) -> @location(0) vec4<f32> {
+    // Two-sided: light the side facing the camera.
+    var normal = normalize(in.normal);
+    if (dot(normal, sky.eye.xyz - in.world_position) < 0.0) {
+        normal = -normal;
+    }
+    // Darker at the root, where blades shade each other, lighter at the tip.
+    // Far off, lit and coloured like the ground under it.
+    let distance = length(in.world_position.xz - sky.eye.xz);
+    let far = smoothstep(0.35 * grass.range, 0.9 * grass.range, distance);
+    let gradient = mix(mix(0.32, 1.2, pow(in.along, 0.8)), 1.0, far);
+    let light = mix(grass_light(in.world_position, normal), grass_ground_light(in.world_position), far);
+    var colour = in.color * gradient * light;
+    // Looking toward the sun, the tips glow as light comes through them.
+    let to_eye = normalize(sky.eye.xyz - in.world_position);
+    let against = max(dot(-to_eye, sky.sun_direction.xyz), 0.0);
+    colour = colour + in.color * sky.sun_colour.rgb * pow(against, 6.0) * in.along * 0.9;
+    return vec4<f32>(apply_fog(colour, in.world_position), 1.0);
+}

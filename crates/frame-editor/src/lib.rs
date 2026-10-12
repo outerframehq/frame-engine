@@ -23,6 +23,7 @@ use winit::event_loop::{ActiveEventLoop, EventLoop};
 use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Icon, Window, WindowId};
 mod font;
+mod grass;
 mod origin;
 mod perf;
 pub use perf::CountingAlloc;
@@ -251,6 +252,16 @@ fn cloud_amount() -> f32 {
 }
 fn set_cloud_amount(amount: f32) {
     CLOUD_AMOUNT_BITS.store(amount.to_bits(), std::sync::atomic::Ordering::Relaxed);
+}
+/// How much grass to draw (see `grass::GrassQuality`), as its index. An
+/// editor preference, read by every window.
+static GRASS_QUALITY: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(grass::GrassQuality::High as u32);
+fn grass_quality() -> grass::GrassQuality {
+    grass::GrassQuality::from_index(GRASS_QUALITY.load(std::sync::atomic::Ordering::Relaxed))
+}
+fn set_grass_quality(quality: grass::GrassQuality) {
+    GRASS_QUALITY.store(quality.to_index(), std::sync::atomic::Ordering::Relaxed);
 }
 fn wave_seconds() -> f32 {
     f32::from_bits(WAVE_SECONDS_BITS.load(std::sync::atomic::Ordering::Relaxed))
@@ -1165,6 +1176,14 @@ struct GpuState {
     /// The same shader with alpha blending and no depth writes, for
     /// transparent module geometry drawn after everything opaque.
     transparent_pipeline: wgpu::RenderPipeline,
+    /// Draws modules' grass (see `grass.rs`): blades made in the vertex
+    /// shader, drawn after the solid geometry.
+    grass_pipeline: wgpu::RenderPipeline,
+    /// The grass bind group layout, settings and blade pattern every module's
+    /// fields in this window share.
+    grass_factory: grass::GrassFactory,
+    /// Blades the last main view drew, for the performance overlay.
+    grass_drawn: std::cell::Cell<u64>,
     text_pipeline: wgpu::RenderPipeline,
     // One vertex buffer holding every primitive's geometry back to back, plus
     // each primitive's vertex range within it, ordered Cube, Sphere, Plane
@@ -1661,6 +1680,51 @@ impl GpuState {
             multiview_mask: None,
             cache: None,
         });
+        // Grass: the same shader module's grass entry points, with the
+        // scene's bind group and the grass data in group 1. No vertex
+        // buffers: blades come from their vertex number. Both sides of a
+        // blade are drawn.
+        let grass_factory = grass::GrassFactory::new(&device);
+        let grass_pipeline_layout =
+            device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("grass pipeline layout"),
+                bind_group_layouts: &[Some(&scene_bind_group_layout), Some(&grass_factory.layout)],
+                immediate_size: 0,
+            });
+        let grass_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some("grass pipeline"),
+            layout: Some(&grass_pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &entity_shader,
+                entry_point: Some("vs_grass"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                buffers: &[],
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &entity_shader,
+                entry_point: Some("fs_grass"),
+                compilation_options: wgpu::PipelineCompilationOptions::default(),
+                targets: &[Some(wgpu::ColorTargetState {
+                    format: config.format,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                })],
+            }),
+            primitive: wgpu::PrimitiveState {
+                cull_mode: None,
+                ..wgpu::PrimitiveState::default()
+            },
+            depth_stencil: Some(wgpu::DepthStencilState {
+                format: DEPTH_FORMAT,
+                depth_write_enabled: Some(true),
+                depth_compare: Some(wgpu::CompareFunction::Greater),
+                stencil: wgpu::StencilState::default(),
+                bias: wgpu::DepthBiasState::default(),
+            }),
+            multisample: wgpu::MultisampleState::default(),
+            multiview_mask: None,
+            cache: None,
+        });
         // --- Shadow pipeline (depth only, from the light's point of view) ---
         let shadow_pass_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
@@ -1806,6 +1870,7 @@ impl GpuState {
                 queue: &queue,
                 material_layout: &material_bind_group_layout,
                 material_sampler: &material_sampler,
+                grass: &grass_factory,
             };
             modules.iter().map(|m| m.new_gpu(&context)).collect()
         };
@@ -1818,6 +1883,9 @@ impl GpuState {
                 present_modes,
                 render_pipeline,
                 transparent_pipeline,
+                grass_pipeline,
+                grass_factory,
+                grass_drawn: std::cell::Cell::new(0),
                 text_pipeline,
                 mesh_vertex_buffer,
                 mesh_ranges,
@@ -2002,6 +2070,63 @@ impl GpuState {
         }
     }
     // Draw one frame: entities (world-space cubes) then text (screen overlay).
+    /// The grass settings for this frame: the quality preference, the
+    /// breeze and the wind's clock.
+    fn write_grass_settings(&self) {
+        let (density, range) = grass_quality().density_and_range();
+        let settings = grass::SettingsRaw {
+            density,
+            range,
+            near: grass::GRASS_FULL_NEAR,
+            width: grass::BLADE_WIDTH,
+            wind: grass::DEFAULT_WIND,
+            time: wave_seconds(),
+            origin: self.wave_origin,
+            ..Default::default()
+        };
+        self.queue.write_buffer(
+            &self.grass_factory.settings,
+            0,
+            bytemuck::bytes_of(&settings),
+        );
+    }
+
+    /// Draw every module's grass, seen through `view_proj` with the scene
+    /// bound as `scene`. Sets the grass pipeline; whoever draws next sets
+    /// their own.
+    fn draw_grass(
+        &self,
+        pass: &mut wgpu::RenderPass<'_>,
+        scene: &wgpu::BindGroup,
+        view_proj: [[f32; 4]; 4],
+        view: &module_api::DrawView,
+    ) {
+        let quality = grass_quality();
+        if std::ptr::eq(scene, &self.scene_bind_group) {
+            self.grass_drawn.set(0);
+        }
+        if quality == grass::GrassQuality::Off
+            || !self
+                .module_gpu
+                .iter()
+                .any(|m| m.grass().is_some_and(|f| !f.is_empty()))
+        {
+            return;
+        }
+        let eye = sky::eye_from_view_proj(&Mat4::from_cols_array_2d(&view_proj));
+        pass.set_pipeline(&self.grass_pipeline);
+        pass.set_bind_group(0, scene, &[]);
+        let mut drawn = 0;
+        for module in &self.module_gpu {
+            if let Some(field) = module.grass() {
+                drawn += field.draw(pass, eye.to_array(), view, quality);
+            }
+        }
+        if std::ptr::eq(scene, &self.scene_bind_group) {
+            self.grass_drawn.set(drawn);
+        }
+    }
+
     fn render(
         &mut self,
         instances: &[InstanceRaw],
@@ -2040,6 +2165,7 @@ impl GpuState {
             0,
             bytemuck::cast_slice(&[LightsUniform { lights: *lights }]),
         );
+        self.write_grass_settings();
         // egui: upload any new/changed textures before we start encoding.
         for (id, image_delta) in &egui_textures_delta.set {
             self.egui_renderer
@@ -2196,6 +2322,7 @@ impl GpuState {
                     module.draw_in_view(&mut render_pass, &view);
                 }
             }
+            self.draw_grass(&mut render_pass, &self.scene_bind_group, view_proj, &view);
             if self.module_gpu.iter().any(|m| m.has_transparent()) {
                 render_pass.set_pipeline(&self.transparent_pipeline);
                 render_pass.set_bind_group(1, &self.material_bind_groups[0], &[]);
@@ -2379,6 +2506,7 @@ impl GpuState {
                     module.draw_in_view(&mut render_pass, &view);
                 }
             }
+            self.draw_grass(&mut render_pass, &self.preview_bind_group, view_proj, &view);
             if self.module_gpu.iter().any(|m| m.has_transparent()) {
                 render_pass.set_pipeline(&self.transparent_pipeline);
                 render_pass.set_bind_group(1, &self.material_bind_groups[0], &[]);
@@ -4976,7 +5104,15 @@ impl App {
             ("Play", self.game_gpu.as_ref()),
         ] {
             let Some(gpu) = gpu else { continue };
-            let gpu_lines: Vec<String> = gpu.module_gpu.iter().flat_map(|m| m.stats()).collect();
+            let mut gpu_lines: Vec<String> =
+                gpu.module_gpu.iter().flat_map(|m| m.stats()).collect();
+            let blades = gpu.grass_drawn.get();
+            if blades > 0 {
+                gpu_lines.push(format!(
+                    "grass: {blades} blades drawn ({})",
+                    grass_quality().label()
+                ));
+            }
             if !gpu_lines.is_empty() {
                 lines.push(format!("GPU, {label} window:"));
                 lines.extend(gpu_lines.into_iter().map(|l| format!("  {l}")));
@@ -5001,6 +5137,7 @@ impl App {
             sky: sky_enabled(),
             fog_amount: fog_amount(),
             clouds: cloud_amount(),
+            grass: grass_quality(),
             sun_time: sun::time_of_day_enabled(),
             time_of_day: sun::time_of_day_hours(),
         }
@@ -5032,6 +5169,7 @@ impl App {
         set_sky_enabled(prefs.sky);
         set_fog_amount(prefs.fog_amount);
         set_cloud_amount(prefs.clouds);
+        set_grass_quality(prefs.grass);
         apply_sun_prefs(&prefs);
         self.persist_prefs_if_changed();
     }
@@ -8283,6 +8421,18 @@ impl ApplicationHandler for App {
                                         );
                                         ui.weak("A sky behind the scene, lit by the first directional Light: lower the light toward the horizon for a sunset, below it for night. Distant ground fades into the horizon colour; 0 turns the fog off. With the sky off the viewport goes back to a plain background.");
                                         ui.add_space(4.0);
+                                        ui.horizontal(|ui| {
+                                            egui::ComboBox::from_id_salt("grass_quality_picker")
+                                                .selected_text(prefs_edit.grass.label())
+                                                .show_ui(ui, |ui| {
+                                                    for q in grass::GrassQuality::ALL {
+                                                        ui.selectable_value(&mut prefs_edit.grass, q, q.label());
+                                                    }
+                                                });
+                                            ui.label("Grass");
+                                        });
+                                        ui.weak("How much grass modules draw: blades close to the camera and how far grass reaches. Off draws none. High suits most graphics cards from the last few years.");
+                                        ui.add_space(4.0);
                                         outerface_checkbox(ui, &mut prefs_edit.sun_time, "Sun by time of day");
                                         ui.add_enabled(
                                             prefs_edit.sun_time,
@@ -8854,6 +9004,8 @@ struct EditorPrefs {
     fog_amount: f32,
     // How much of the sky clouds cover, 0 (none) to 1 (overcast).
     clouds: f32,
+    // How much grass modules draw: blades close in and how far it reaches.
+    grass: grass::GrassQuality,
     // Whether the sun is placed by the time of day instead of the Light.
     sun_time: bool,
     // The hour (0 to 24) the sun is placed for.
@@ -8877,6 +9029,7 @@ impl Default for EditorPrefs {
             sky: true,
             fog_amount: sky::FOG_AMOUNT_DEFAULT,
             clouds: sky::CLOUDS_DEFAULT,
+            grass: grass::GrassQuality::High,
             sun_time: false,
             time_of_day: sun::DEFAULT_HOUR,
         }
@@ -9859,6 +10012,7 @@ pub fn run_as(name: &str, app_id: &str, modules: Vec<Box<dyn EditorModule>>) {
     set_sky_enabled(prefs.sky);
     set_fog_amount(prefs.fog_amount);
     set_cloud_amount(prefs.clouds);
+    set_grass_quality(prefs.grass);
     apply_sun_prefs(&prefs);
     let mut app = App {
         window: None,

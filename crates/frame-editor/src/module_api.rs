@@ -25,6 +25,10 @@
 use super::*;
 use std::collections::{BTreeMap, BTreeSet};
 
+pub use crate::grass::{
+    GRASS_GRID_MAX, GRASS_PATCHES_MAX, GrassFactory, GrassField, GrassPatch, GrassQuality,
+    GrassSample,
+};
 /// Bytes as megabytes, worded the way the performance overlay shows them.
 pub use crate::perf::megabytes;
 pub use frame_engine::assets::MeshVertexData;
@@ -149,6 +153,7 @@ pub struct GpuContext<'a> {
     pub queue: &'a wgpu::Queue,
     pub(crate) material_layout: &'a wgpu::BindGroupLayout,
     pub(crate) material_sampler: &'a wgpu::Sampler,
+    pub(crate) grass: &'a crate::grass::GrassFactory,
 }
 
 impl GpuContext<'_> {
@@ -159,6 +164,11 @@ impl GpuContext<'_> {
             layout: self.material_layout.clone(),
             sampler: self.material_sampler.clone(),
         }
+    }
+
+    /// What a module needs to make [`GrassField`]s for this window.
+    pub fn grass_factory(&self) -> GrassFactory {
+        self.grass.clone()
     }
 }
 
@@ -224,7 +234,7 @@ impl MaterialFactory {
         look: MaterialLook,
     ) -> Option<WorldMaterial> {
         let layers = look.layers.max(1);
-        if !pixels_fit(width, height, rgba.len()) || height % layers != 0 {
+        if !pixels_fit(width, height, rgba.len()) || !height.is_multiple_of(layers) {
             return None;
         }
         let view = create_material_texture(device, queue, width, height, rgba);
@@ -376,6 +386,13 @@ pub trait ModuleGpu {
     /// it to 1 for an ordinary uniform mesh.
     /// Meshes are not sorted: draw the farthest first if several overlap.
     fn draw_transparent(&self, _pass: &mut wgpu::RenderPass<'_>) {}
+
+    /// This window's grass, if the module has any (see [`GrassField`]). The
+    /// editor draws it after every module's solid geometry, as much of it as
+    /// the Grass setting asks for. The default is none.
+    fn grass(&self) -> Option<&GrassField> {
+        None
+    }
 
     /// Lines for the performance overlay about this window's GPU copy (how
     /// many meshes, how much memory). Called once per frame only while the
