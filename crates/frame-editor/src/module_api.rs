@@ -207,12 +207,13 @@ impl MaterialFactory {
             MaterialLook {
                 roughness,
                 metalness,
-                detail: 0.0,
+                ..MaterialLook::default()
             },
         )
     }
 
-    /// Like `create`, with the whole [`MaterialLook`].
+    /// Like `create`, with the whole [`MaterialLook`]. With more than one
+    /// layer, `height` must divide into that many layers of equal height.
     pub fn create_with_look(
         &self,
         device: &wgpu::Device,
@@ -222,7 +223,8 @@ impl MaterialFactory {
         rgba: &[u8],
         look: MaterialLook,
     ) -> Option<WorldMaterial> {
-        if !pixels_fit(width, height, rgba.len()) {
+        let layers = look.layers.max(1);
+        if !pixels_fit(width, height, rgba.len()) || height % layers != 0 {
             return None;
         }
         let view = create_material_texture(device, queue, width, height, rgba);
@@ -237,7 +239,7 @@ impl MaterialFactory {
                 1.0,
                 0.0,
             ],
-            [look.detail.clamp(0.0, 1.0), 0.0, 0.0, 0.0],
+            [look.detail.clamp(0.0, 1.0), layers as f32, 0.0, 0.0],
         );
         Some(WorldMaterial { bind_group })
     }
@@ -280,6 +282,26 @@ pub struct MaterialLook {
     /// areas of one colour (ground seen up close) are not flat. Each size
     /// fades out with distance before it could shimmer. 0 is none.
     pub detail: f32,
+    /// How many images the texture holds, stacked top to bottom, each the
+    /// same size (1 for an ordinary texture). A mesh built with
+    /// [`WorldMesh::new_indexed_layered`] picks a point between them for
+    /// each vertex and the colour blends between the two nearest, so one
+    /// mesh can shade from one set of colours into another (lush ground into
+    /// dry, say). The vertex `uv` addresses one image, as if it were the
+    /// whole texture.
+    pub layers: u32,
+}
+
+impl Default for MaterialLook {
+    /// Fully rough, not metal, no detail, one layer.
+    fn default() -> Self {
+        MaterialLook {
+            roughness: 1.0,
+            metalness: 0.0,
+            detail: 0.0,
+            layers: 1,
+        }
+    }
 }
 
 /// A texture and surface look a module's meshes can be drawn with. The
@@ -581,6 +603,27 @@ fn morphing_vertices(vertices: &[MeshVertexData], morphs: &[VertexMorph]) -> Vec
         .collect()
 }
 
+/// A layer choice (0 to 1, see `MaterialLook::layers`) as the renderer stores
+/// it: in the last of the four values liquids use for their flow, which a
+/// solid surface leaves unused (its tide rule stays 0, so nothing moves).
+fn layer_bits(layer: f32) -> [i16; 4] {
+    [0, 0, 0, snorm(layer.clamp(0.0, 1.0))]
+}
+
+/// The vertices as the renderer stores them, with their `morphs` and
+/// `layers` entries (none past the end of either).
+fn layered_vertices(
+    vertices: &[MeshVertexData],
+    morphs: &[VertexMorph],
+    layers: &[f32],
+) -> Vec<MeshVertex> {
+    let mut verts = morphing_vertices(vertices, morphs);
+    for (v, &layer) in verts.iter_mut().zip(layers) {
+        v.water = layer_bits(layer);
+    }
+    verts
+}
+
 /// The vertices as the renderer stores them, with their `morphs` and `flows`
 /// entries (none past the end of either).
 fn flowing_vertices(
@@ -669,6 +712,32 @@ impl WorldMesh {
             return None;
         }
         let verts = morphing_vertices(vertices, morphs);
+        let mut mesh = Self::upload(device, &verts);
+        let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("module mesh indices"),
+            contents: bytemuck::cast_slice(indices),
+            usage: wgpu::BufferUsages::INDEX,
+        });
+        mesh.indices = Some((index_buffer, indices.len() as u32));
+        Some(mesh)
+    }
+
+    /// Like `new_indexed`, drawn with a layered material (see
+    /// [`MaterialLook::layers`]): `layers` gives each vertex a point from 0
+    /// (the first image) to 1 (the last), and the colour blends between the
+    /// two images nearest it. A missing entry is 0. For solid surfaces only:
+    /// liquids use the same slot for their flow.
+    pub fn new_indexed_layered(
+        device: &wgpu::Device,
+        vertices: &[MeshVertexData],
+        morphs: &[VertexMorph],
+        layers: &[f32],
+        indices: &[u32],
+    ) -> Option<Self> {
+        if !indices_fit(indices, vertices.len()) {
+            return None;
+        }
+        let verts = layered_vertices(vertices, morphs, layers);
         let mut mesh = Self::upload(device, &verts);
         let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("module mesh indices"),
@@ -1411,6 +1480,30 @@ mod tests {
         assert_eq!(out[2].water, [0; 4]);
         // Nothing else carries any.
         assert_eq!(morphing_vertices(&[v(1.0)], &[])[0].water, [0; 4]);
+    }
+
+    #[test]
+    fn layered_vertices_keep_their_layer_where_no_tide_rule_reads_it() {
+        let v = MeshVertexData {
+            position: [0.0, 3.0, 0.0],
+            normal: [0.0, 1.0, 0.0],
+            uv: [0.5, 0.5],
+        };
+        let out = layered_vertices(&[v, v, v, v], &[], &[0.0, 0.5, 2.0]);
+        // The tide rule stays 0, so the vertex shader moves nothing.
+        assert!(out.iter().all(|o| o.water[..3] == [0, 0, 0]));
+        assert_eq!(out[0].water[3], 0);
+        assert!((f32::from(out[1].water[3]) / 32767.0 - 0.5).abs() < 1e-4);
+        // Past the last layer is the last layer; a missing entry the first.
+        assert_eq!(out[2].water[3], 32767);
+        assert_eq!(out[3].water[3], 0);
+    }
+
+    #[test]
+    fn a_plain_material_look_has_one_layer() {
+        let look = MaterialLook::default();
+        assert_eq!(look.layers, 1);
+        assert_eq!(look.detail, 0.0);
     }
 
     /// A module that keeps a tide (or not).

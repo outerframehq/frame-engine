@@ -182,7 +182,9 @@ struct MaterialParams {
     // default (a textureless mesh samples pure white, a harmless no-op).
     // w: how choppy a liquid surface's waves are (0: not a liquid).
     params: vec4<f32>,
-    // x: ground detail, 0 to 1 (see MaterialLook). yzw unused.
+    // x: ground detail, 0 to 1 (see MaterialLook). y: how many layers the
+    // texture holds, stacked top to bottom (1 for an ordinary texture). zw
+    // unused.
     extra: vec4<f32>,
 };
 @group(1) @binding(0) var material_texture: texture_2d<f32>;
@@ -236,6 +238,9 @@ struct VertexOutput {
     // A liquid surface's velocity across the ground (x, z), world units a
     // second. Zero for everything else.
     @location(6) flow: vec2<f32>,
+    // For a layered material, where between its first (0) and last (1)
+    // layer this point's colour comes from.
+    @location(7) layer: f32,
 };
 
 // World size of a primitive at scale 1. Primitives are generated at ~unit size
@@ -319,7 +324,23 @@ fn vs_main(vertex: VertexInput, instance: InstanceInput) -> VertexOutput {
     out.uv = mix(vertex.uv, vertex.morph_uv, t);
     let velocity = vec3<f32>(vertex.water.x, 0.0, vertex.water.y) * FLOW_RANGE;
     out.flow = rotate_by(velocity * MESH_SIZE * instance.scale, instance.rotation).xz;
+    // A solid surface keeps its layer in the last value (its tide rule is 0).
+    out.layer = select(vertex.water.w, 0.0, abs(vertex.water.z) > 0.5);
     return out;
+}
+
+// The material's colour at `uv`. A layered material (extra.y layers stacked
+// top to bottom) blends between the two layers either side of `layer` (0 the
+// first, 1 the last), each read at `uv` as if it were the whole texture. Both
+// reads always happen, so the sampling stays in uniform control flow.
+fn layered_sample(uv: vec2<f32>, layer: f32) -> vec3<f32> {
+    let count = max(material.extra.y, 1.0);
+    let at = clamp(layer, 0.0, 1.0) * (count - 1.0);
+    let below = min(floor(at), count - 1.0);
+    let above = min(below + 1.0, count - 1.0);
+    let a = textureSample(material_texture, material_sampler, vec2<f32>(uv.x, (below + fract(uv.y)) / count));
+    let b = textureSample(material_texture, material_sampler, vec2<f32>(uv.x, (above + fract(uv.y)) / count));
+    return mix(a.rgb, b.rgb, at - below);
 }
 
 // The lit colour of one fragment, shared by the opaque and transparent entry
@@ -331,8 +352,7 @@ fn shade_fragment(in: VertexOutput) -> vec3<f32> {
     let has_texture = material.params.z;
     var base_color = in.color;
     if (has_texture > 0.5) {
-        let sampled = textureSample(material_texture, material_sampler, in.uv);
-        base_color = base_color * sampled.rgb;
+        base_color = base_color * layered_sample(in.uv, in.layer);
     }
     let detail = material.extra.x;
     if (detail > 0.0) {
