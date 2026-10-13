@@ -114,10 +114,20 @@ pub(crate) struct SkyUniform {
     /// ground detail). w: the near haze's density per world unit (see
     /// `AERIAL_RANGE`), 0 with the sky off.
     pub motion: [f32; 4],
-    /// The cloud layer: x is how much of the sky it covers (0 none, 1
-    /// overcast), y and z the render origin's x and z wrapped to the clouds'
-    /// period. w unused.
+    /// The clouds: x is how much of the sky they cover (0 none, 1 overcast),
+    /// y and z the render origin's x and z plus how far the wind has carried
+    /// them, wrapped to the clouds' period. w unused.
     pub clouds: [f32; 4],
+    /// xyz: unit direction toward the moon. w: how strongly to draw it (0
+    /// with no moon).
+    pub moon: [f32; 4],
+    /// x: the moon's phase (0 new, 0.5 full). y: its lit fraction. z: how
+    /// bright the stars are (0 by day). w: the moon's light, 0 to 1 (see
+    /// `moon_glow`), for its glow and its glint on water.
+    pub night: [f32; 4],
+    /// rgb: the colour of the light on everything lit: white by day, cool
+    /// blue at night. w unused.
+    pub tint: [f32; 4],
 }
 
 type Rgb = [f32; 3];
@@ -206,19 +216,108 @@ pub(crate) fn sun_light_scale(height: f32) -> f32 {
     smoothstep(-0.04, 0.12, height)
 }
 
-/// How much of its daytime strength the ambient (unlit) light keeps at night.
-/// Lower is darker. Only applies while the day-night cycle is on.
-pub(crate) const NIGHT_AMBIENT_SCALE: f32 = 0.6;
+/// How much of its daytime strength the ambient (unlit) light keeps on a
+/// moonless night. Lower is darker. Only applies while the day-night cycle
+/// is on. Dark but readable: shapes and the sky's outline, little more.
+pub(crate) const NIGHT_AMBIENT_SCALE: f32 = 0.22;
+
+/// How much more ambient light a full moon high in the sky adds at night, on
+/// top of `NIGHT_AMBIENT_SCALE`.
+pub(crate) const MOON_AMBIENT: f32 = 0.2;
+
+/// The moon's light at full and high in the sky, as a share of the sun's.
+/// Far brighter than the real ratio, so a moonlit night can be played; a new
+/// moon gives none.
+pub(crate) const MOONLIGHT: f32 = 0.15;
+
+/// The colour of the light at night: everything lit takes on a cool blue.
+pub(crate) const NIGHT_TINT: Rgb = [0.70, 0.80, 1.0];
+
+/// How much of the moon's face is lit at `phase` (0 new, 0.5 full).
+pub(crate) fn moon_lit_fraction(phase: f32) -> f32 {
+    if !phase.is_finite() {
+        return 1.0;
+    }
+    0.5 - 0.5 * (std::f32::consts::TAU * phase).cos()
+}
+
+/// How much of a moon's light reaches the ground, 0 to 1: its lit fraction,
+/// faded out as it sinks to the horizon (`height`, the y of the unit vector
+/// toward it), like the sun's.
+pub(crate) fn moon_glow(height: f32, phase: f32) -> f32 {
+    moon_lit_fraction(phase) * sun_light_scale(height).min(1.0) * f32::from(height.is_finite())
+}
+
+/// 0 by day, 1 at night, on the same curve as the sky's colours, for a sun
+/// at this height.
+pub(crate) fn night_amount(height: f32) -> f32 {
+    if !height.is_finite() {
+        return 0.0;
+    }
+    1.0 - smoothstep(-0.12, 0.28, height)
+}
 
 /// The scale on the ambient light for a sun at this height (the y component of
-/// the unit vector toward it): 1.0 by day, falling to `NIGHT_AMBIENT_SCALE` at
-/// night, on the same curve as the sky's own day and night colours.
-pub(crate) fn ambient_scale(height: f32) -> f32 {
+/// the unit vector toward it) and a moon giving `moon_glow` light: 1.0 by
+/// day, falling at night to `NIGHT_AMBIENT_SCALE`, plus up to `MOON_AMBIENT`
+/// more under a full moon, on the same curve as the sky's own day and night
+/// colours.
+pub(crate) fn ambient_scale(height: f32, moon_glow: f32) -> f32 {
     if !height.is_finite() {
         return 1.0;
     }
+    let moon = if moon_glow.is_finite() {
+        moon_glow.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    let night = NIGHT_AMBIENT_SCALE + MOON_AMBIENT * moon;
     let day = smoothstep(-0.12, 0.28, height);
-    NIGHT_AMBIENT_SCALE + (1.0 - NIGHT_AMBIENT_SCALE) * day
+    night + (1.0 - night) * day
+}
+
+/// The colour of the light for a sun at this height: white by day, toward
+/// `NIGHT_TINT` at night.
+pub(crate) fn light_tint(height: f32) -> Rgb {
+    mix([1.0, 1.0, 1.0], NIGHT_TINT, night_amount(height))
+}
+
+/// How bright the stars are for a sun at this height: none by day, coming
+/// out after sunset, all of them once the sun is well down.
+pub(crate) fn star_strength(height: f32) -> f32 {
+    if !height.is_finite() {
+        return 0.0;
+    }
+    1.0 - smoothstep(-0.22, 0.0, height)
+}
+
+/// The sky uniform's night fields for a sun at `sun_height` and a moon (its
+/// direction, phase and the light it gives), or None for no moon: the moon,
+/// the stars and the colour of the light.
+pub(crate) fn night_fields(
+    sun_height: f32,
+    moon: Option<([f32; 3], f32, f32)>,
+) -> ([f32; 4], [f32; 4], [f32; 4]) {
+    let tint = light_tint(sun_height);
+    let stars = star_strength(sun_height);
+    let (moon_field, phase, lit, glow) = match moon {
+        Some((d, phase, glow)) => {
+            // Faint by day, clear at night.
+            let show = 0.35 + 0.65 * night_amount(sun_height);
+            (
+                [d[0], d[1], d[2], show],
+                phase,
+                moon_lit_fraction(phase),
+                glow,
+            )
+        }
+        None => ([0.0, 1.0, 0.0, 0.0], 0.5, 0.0, 0.0),
+    };
+    (
+        moon_field,
+        [phase, lit, stars, glow * night_amount(sun_height)],
+        [tint[0], tint[1], tint[2], 0.0],
+    )
 }
 
 /// How thick the haze is, as a multiplier on the fog density, for a sun at
@@ -402,6 +501,9 @@ pub(crate) fn sky_uniform(
             },
         ],
         clouds: [0.0; 4],
+        moon: [0.0, 1.0, 0.0, 0.0],
+        night: [0.5, 0.0, 0.0, 0.0],
+        tint: [1.0, 1.0, 1.0, 0.0],
     }
 }
 
@@ -465,8 +567,8 @@ mod tests {
 
     #[test]
     fn the_uniform_has_a_layout_the_shader_can_read() {
-        // A mat4 and six vec4s, with no padding to go wrong.
-        assert_eq!(std::mem::size_of::<SkyUniform>(), 64 + 8 * 16);
+        // A mat4 and vec4s, with no padding to go wrong.
+        assert_eq!(std::mem::size_of::<SkyUniform>(), 64 + 11 * 16);
         assert_eq!(std::mem::size_of::<SkyUniform>() % 16, 0);
     }
 
@@ -711,24 +813,55 @@ mod ambient_tests {
 
     #[test]
     fn the_ambient_light_is_full_by_day_and_dimmed_at_night() {
-        assert_eq!(ambient_scale(1.0), 1.0);
-        assert_eq!(ambient_scale(0.28), 1.0);
-        assert_eq!(ambient_scale(-0.12), NIGHT_AMBIENT_SCALE);
-        assert_eq!(ambient_scale(-1.0), NIGHT_AMBIENT_SCALE);
+        assert_eq!(ambient_scale(1.0, 0.0), 1.0);
+        assert_eq!(ambient_scale(0.28, 0.0), 1.0);
+        assert_eq!(ambient_scale(-0.12, 0.0), NIGHT_AMBIENT_SCALE);
+        assert_eq!(ambient_scale(-1.0, 0.0), NIGHT_AMBIENT_SCALE);
+        // A full moon lifts the night, never the day.
+        assert!((ambient_scale(-1.0, 1.0) - (NIGHT_AMBIENT_SCALE + MOON_AMBIENT)).abs() < 1e-6);
+        assert_eq!(ambient_scale(1.0, 1.0), 1.0);
+        assert_eq!(ambient_scale(-1.0, f32::NAN), NIGHT_AMBIENT_SCALE);
+    }
+
+    #[test]
+    fn the_moon_waxes_to_full_and_wanes_and_gives_light_only_when_up() {
+        assert!(moon_lit_fraction(0.0).abs() < 1e-6);
+        assert!((moon_lit_fraction(0.5) - 1.0).abs() < 1e-6);
+        assert!((moon_lit_fraction(0.25) - 0.5).abs() < 1e-5);
+        assert!((moon_lit_fraction(0.75) - 0.5).abs() < 1e-5);
+        assert!((moon_glow(0.8, 0.5) - 1.0).abs() < 1e-6);
+        assert_eq!(moon_glow(-0.3, 0.5), 0.0);
+        assert_eq!(moon_glow(f32::NAN, 0.5), 0.0);
+    }
+
+    #[test]
+    fn night_is_tinted_blue_with_stars_and_day_is_plain() {
+        let (moon, night, tint) = night_fields(0.9, Some(([0.0, 1.0, 0.0], 0.5, 1.0)));
+        assert_eq!(&tint[..3], &[1.0, 1.0, 1.0]);
+        assert_eq!(night[2], 0.0, "no stars by day");
+        assert_eq!(night[3], 0.0, "no moon glow by day");
+        assert!(moon[3] > 0.3 && moon[3] < 0.4, "a faint moon by day");
+        let (moon, night, tint) = night_fields(-0.6, Some(([0.0, 1.0, 0.0], 0.5, 1.0)));
+        assert!(tint[2] > tint[0] && tint[0] < 0.8, "blue: {tint:?}");
+        assert_eq!(night[2], 1.0);
+        assert!((night[1] - 1.0).abs() < 1e-6 && (night[3] - 1.0).abs() < 1e-6);
+        assert_eq!(moon[3], 1.0);
+        let (moon, ..) = night_fields(-0.6, None);
+        assert_eq!(moon[3], 0.0);
     }
 
     #[test]
     fn the_ambient_light_changes_smoothly_and_never_goes_out() {
-        let mut last = ambient_scale(-1.0);
+        let mut last = ambient_scale(-1.0, 0.0);
         for i in 0..=200 {
             let h = -1.0 + 2.0 * (i as f32 / 200.0);
-            let s = ambient_scale(h);
+            let s = ambient_scale(h, 0.0);
             assert!(s >= NIGHT_AMBIENT_SCALE && s <= 1.0);
             assert!(s >= last - 1e-6, "never darker as the sun rises");
             assert!(s - last < 0.05, "no jump at {h}");
             last = s;
         }
-        assert_eq!(ambient_scale(f32::NAN), 1.0);
+        assert_eq!(ambient_scale(f32::NAN, 0.0), 1.0);
     }
 
     #[test]

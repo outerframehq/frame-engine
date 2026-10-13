@@ -34,7 +34,7 @@ pub use perf::CountingAlloc;
 mod script;
 mod sky;
 mod sun;
-const TICK_RATE: u32 = 30;
+use frame_engine::core::TICK_RATE;
 const MAX_CATCHUP_TICKS: u32 = 5;
 // Vertical field of view, shared by the projection and the pan maths.
 const FOV_DEGREES: f32 = 45.0;
@@ -67,6 +67,18 @@ pub use wgpu;
 const ORBIT_SENS: f32 = 0.005;
 // Mouselook sensitivity for the flythrough camera (radians per pixel of motion).
 const LOOK_SENS: f32 = 0.005;
+
+/// Hide and hold the mouse in `window` (for looking around), or give it back.
+fn grab_cursor(window: &Window, grab: bool) {
+    if grab {
+        let _ = window
+            .set_cursor_grab(winit::window::CursorGrabMode::Locked)
+            .or_else(|_| window.set_cursor_grab(winit::window::CursorGrabMode::Confined));
+    } else {
+        let _ = window.set_cursor_grab(winit::window::CursorGrabMode::None);
+    }
+    window.set_cursor_visible(!grab);
+}
 // Format of the depth buffer. 32-bit float depth, no stencil.
 const DEPTH_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Depth32Float;
 // Size of the Camera preview shown in the Inspector when a Camera entity is
@@ -336,11 +348,32 @@ fn sky_uniform_for_frame(
     uniform.motion[1] = wave_origin[0];
     uniform.motion[2] = wave_origin[1];
     let cover = if enabled { cloud_amount() } else { 0.0 };
-    uniform.clouds = [cover, cloud_origin[0], cloud_origin[1], 0.0];
-    uniform.ground[3] = match sun::current() {
-        Some(sun) => sky::ambient_scale(sun.direction[1]),
-        None => 1.0,
-    };
+    // The clouds sit as far downwind as the wind has carried them.
+    let drift = sun::cloud_drift(wave_seconds());
+    let cloud_at =
+        |origin: f32, drift: f64| (f64::from(origin) + drift).rem_euclid(CLOUD_PERIOD) as f32;
+    uniform.clouds = [
+        cover,
+        cloud_at(cloud_origin[0], drift[0]),
+        cloud_at(cloud_origin[1], drift[1]),
+        0.0,
+    ];
+    let moon = sun::current_moon();
+    match sun::current() {
+        Some(sun) => {
+            uniform.ground[3] = sky::ambient_scale(sun.direction[1], moon.map_or(0.0, |m| m.glow));
+            let (m, night, tint) = sky::night_fields(
+                sun.direction[1],
+                moon.map(|m| (m.direction, m.phase, m.glow)),
+            );
+            if enabled {
+                uniform.moon = m;
+                uniform.night = night;
+            }
+            uniform.tint = tint;
+        }
+        None => uniform.ground[3] = 1.0,
+    }
     uniform
 }
 /// Work out the shadow map's view for this frame: an orthographic box,
@@ -1040,9 +1073,19 @@ fn camera_entity_view_proj(
     origin: DVec3,
 ) -> Option<[[f32; 4]; 4]> {
     let pos = world.positions.get(id)?;
-    let rotation = world.rotations.get(id).copied().unwrap_or_default();
+    let mut rotation = world.rotations.get(id).copied().unwrap_or_default();
+    let mut at = DVec3::new(pos.x, pos.y, pos.z);
+    // A camera on a character sees from its eyes, where it looks.
+    if let Some((eye, look)) = frame_engine::systems::character_eyes(world, id) {
+        at = DVec3::from(eye);
+        rotation = frame_engine::world::Rotation {
+            yaw: look.yaw,
+            pitch: look.pitch,
+            roll: 0.0,
+        };
+    }
     // Relative to the render origin, like everything else that is drawn.
-    let eye = origin::relative(DVec3::new(pos.x, pos.y, pos.z), origin);
+    let eye = origin::relative(at, origin);
     // The camera looks along its entity's full orientation: yaw turns it,
     // pitch tips it, roll banks it (the "up" vector tilts with it).
     let forward = Vec3::from(rotation.forward());
@@ -2671,6 +2714,7 @@ struct EditedEntity {
     parent: Option<frame_engine::world::Parent>,
     ui_text: Option<frame_engine::world::UiText>,
     ui_image: Option<frame_engine::world::UiImage>,
+    character: Option<frame_engine::world::CharacterBody>,
     // The entity's extension components, for editor modules' Inspector sections.
     ext: ExtEdit,
 }
@@ -3529,6 +3573,7 @@ fn inspector_tab_ui(
             parent,
             ui_text,
             ui_image,
+            character,
             ext,
         }) => {
             ui.heading(format!("Entity {id}"));
@@ -3678,6 +3723,54 @@ fn inspector_tab_ui(
                         ui.weak("(camera preview unavailable)");
                     }
                 }
+            }
+            ui.add_space(8.0);
+            section_label(ui, "Character");
+            let mut has_body = character.is_some();
+            if outerface_checkbox(ui, &mut has_body, "Character body")
+                .on_hover_text(
+                    "A person-shaped capsule (turning it on also turns on \
+                     Controlled, Gravity and Physics): \
+                     it walks where it looks at its own speeds, runs (Shift), \
+                     crouches (C), steps up small ledges and jumps. In the Play \
+                     window the mouse turns it. A Camera on it, or attached \
+                     to it, sees from its eyes. Its drawn size follows the capsule.",
+                )
+                .changed()
+            {
+                *character = if has_body {
+                    // A body only moves as a Controlled physics character
+                    // that falls, so those come with it.
+                    *controlled = true;
+                    *is_rigid_body = true;
+                    *has_gravity = true;
+                    *is_static = false;
+                    Some(frame_engine::world::CharacterBody::default())
+                } else {
+                    None
+                };
+            }
+            if let Some(body) = character {
+                let row =
+                    |ui: &mut egui::Ui, label: &str, value: &mut f32, speed: f64, unit: &str| {
+                        ui.horizontal(|ui| {
+                            ui.label(label);
+                            ui.add(egui::DragValue::new(value).speed(speed).suffix(unit));
+                        });
+                    };
+                row(ui, "Height", &mut body.height, 0.01, " m");
+                row(ui, "Radius", &mut body.radius, 0.01, " m");
+                row(ui, "Eye height", &mut body.eye_height, 0.01, " m");
+                row(ui, "Crouch height", &mut body.crouch_height, 0.01, " m");
+                row(ui, "Walk speed", &mut body.walk_speed, 0.05, " m/s");
+                row(ui, "Run speed", &mut body.run_speed, 0.05, " m/s");
+                row(ui, "Crouch speed", &mut body.crouch_speed, 0.05, " m/s");
+                row(ui, "Jump height", &mut body.jump_height, 0.01, " m");
+                row(ui, "Step height", &mut body.step_height, 0.01, " m");
+                row(ui, "Steepest slope", &mut body.max_slope, 0.5, "°");
+                row(ui, "Mass", &mut body.mass, 0.5, " kg");
+                row(ui, "Air control", &mut body.air_control, 0.01, "");
+                *body = body.sanitized();
             }
             ui.add_space(8.0);
             section_label(ui, "Light");
@@ -4945,6 +5038,9 @@ struct App {
     // about_to_wait, outside event dispatch, so dropping the wgpu surface on
     // Wayland doesn't segfault mid-event.
     game_closing: bool,
+    // Whether the Play window holds the mouse (after a click in it), so the
+    // mouse turns the view. Esc lets it go.
+    game_mouse_held: bool,
     // Dock tabs currently popped out into their own window (see
     // PoppedOutWindow, App::pop_out_tab). The Viewport tab is never a key
     // here -- it's the live 3D scene, not an egui panel, so popping it out
@@ -6041,6 +6137,9 @@ impl App {
         // Cleared rather than just left from a previous session: an image
         // name can mean a different file in a different project.
         self.game_ui_textures.clear();
+        // The mouse is only taken when the window is clicked: grabbing it
+        // before the window has focus can leave it stuck and hidden.
+        self.game_mouse_held = false;
         self.game_window = Some(window);
         self.log(format!("Playing '{name}'"));
     }
@@ -6055,6 +6154,7 @@ impl App {
         self.game_egui_state = None;
         self.game_ui_textures.clear();
         self.game_window = None;
+        self.game_mouse_held = false;
         self.game_input = InputState::new();
     }
 
@@ -6161,6 +6261,8 @@ impl App {
                 );
                 // A module (a day-night clock, say) may move the sun.
                 sun::set_module_sun(module_api::module_sun(&self.modules, world));
+                sun::set_module_moon(module_api::module_moon(&self.modules, world));
+                sun::set_module_wind(module_api::module_wind(&self.modules, world));
                 set_view_reach(module_api::module_view_distance(&self.modules, world));
                 set_tide(module_api::module_tide(&self.modules, world));
                 (instances, group_counts, build_lights(world, game_origin))
@@ -6285,8 +6387,38 @@ impl App {
         let images: Vec<frame_engine::world::UiImage> =
             world.ui_images.iter().flatten().cloned().collect();
         let textures = &self.game_ui_textures;
+        // What to tell the player while the mouse is free: how to start, and
+        // why nothing moves when nothing in the scene is Controlled.
+        let hint = (!self.game_mouse_held).then(|| {
+            if world.controlled.iter().flatten().next().is_none() {
+                "Nothing in this scene is Controlled: tick Controlled on your \
+                 character in the editor and save (Ctrl+S). Esc closes."
+            } else {
+                "Click to play: the mouse looks around, WASD moves, Shift runs, \
+                 C crouches, Space jumps. Esc frees the mouse, Esc again closes."
+            }
+        });
         let full_output = ctx.run_ui(raw_input, |ui| {
             let screen = ui.max_rect();
+            if let Some(hint) = hint {
+                egui::Area::new(egui::Id::new("play-hint"))
+                    .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -24.0))
+                    .order(egui::Order::Foreground)
+                    .interactable(false)
+                    .show(ui.ctx(), |ui| {
+                        egui::Frame::new()
+                            .fill(egui::Color32::from_black_alpha(160))
+                            .inner_margin(egui::Margin::symmetric(12, 8))
+                            .corner_radius(6.0)
+                            .show(ui, |ui| {
+                                ui.label(
+                                    egui::RichText::new(hint)
+                                        .size(15.0)
+                                        .color(egui::Color32::WHITE),
+                                );
+                            });
+                    });
+            }
             for text in &texts {
                 if text.text.is_empty() {
                     continue;
@@ -6346,6 +6478,15 @@ impl App {
         (jobs, full_output.textures_delta, ppp)
     }
 
+    /// Give the mouse back from the game window.
+    fn release_game_mouse(&mut self) {
+        if let Some(window) = &self.game_window {
+            grab_cursor(window, false);
+            window.request_redraw();
+        }
+        self.game_mouse_held = false;
+    }
+
     /// Handle an event addressed to the game window.
     fn game_window_event(&mut self, event: WindowEvent) {
         // Forwarded first, same as popped_out_window_event: the egui overlay
@@ -6357,6 +6498,28 @@ impl App {
         }
         match event {
             WindowEvent::CloseRequested => self.game_closing = true,
+            WindowEvent::Focused(focused) => {
+                // Losing focus lets the mouse go and drops held keys. Getting
+                // it back takes nothing: a click takes the mouse again.
+                if !focused {
+                    self.release_game_mouse();
+                    self.game_input = InputState::new();
+                }
+            }
+            WindowEvent::MouseInput {
+                state: ElementState::Pressed,
+                button: MouseButton::Left,
+                ..
+            } => {
+                // A click in the window takes the mouse for looking around.
+                if !self.game_mouse_held
+                    && let Some(window) = &self.game_window
+                {
+                    grab_cursor(window, true);
+                    self.game_mouse_held = true;
+                    window.request_redraw();
+                }
+            }
             WindowEvent::Resized(size) => {
                 if let Some(gpu) = self.game_gpu.as_mut() {
                     gpu.resize(size.width, size.height);
@@ -6367,12 +6530,25 @@ impl App {
                 let pressed = event.state == ElementState::Pressed;
                 if let PhysicalKey::Code(code) = event.physical_key {
                     match code {
-                        KeyCode::Escape => self.game_closing = true,
+                        // Esc lets the mouse go; pressed again, it closes.
+                        KeyCode::Escape if pressed => {
+                            if self.game_mouse_held {
+                                self.release_game_mouse();
+                            } else {
+                                self.game_closing = true;
+                            }
+                        }
                         KeyCode::KeyW => self.game_input.set(Button::Up, pressed),
                         KeyCode::KeyA => self.game_input.set(Button::Left, pressed),
                         KeyCode::KeyS => self.game_input.set(Button::Down, pressed),
                         KeyCode::KeyD => self.game_input.set(Button::Right, pressed),
                         KeyCode::Space => self.game_input.set(Button::Jump, pressed),
+                        KeyCode::ShiftLeft | KeyCode::ShiftRight => {
+                            self.game_input.set(Button::Run, pressed)
+                        }
+                        KeyCode::ControlLeft | KeyCode::KeyC => {
+                            self.game_input.set(Button::Crouch, pressed)
+                        }
                         _ => {}
                     }
                 }
@@ -7371,6 +7547,20 @@ impl ApplicationHandler for App {
         // Raw mouse motion drives mouselook while flying. Raw motion (rather than
         // cursor position) keeps looking smooth with the cursor grabbed in place.
         if let DeviceEvent::MouseMotion { delta: (dx, dy) } = event {
+            // In the Play window the mouse turns the characters' view: right
+            // turns right, and up looks up unless inverted.
+            if self.game_mouse_held
+                && let Some(world) = self.game_world.as_mut()
+            {
+                let look_x =
+                    LOOK_SENS * self.look_sensitivity * if self.invert_look_x { -1.0 } else { 1.0 };
+                let look_y =
+                    LOOK_SENS * self.look_sensitivity * if self.invert_look_y { -1.0 } else { 1.0 };
+                systems::turn_view(world, dx as f32 * look_x, -(dy as f32) * look_y);
+                if let Some(window) = &self.game_window {
+                    window.request_redraw();
+                }
+            }
             if self.fly_mode {
                 // view_forward points toward -sin(yaw), so a larger yaw looks
                 // left. Subtract so moving the mouse right looks right.
@@ -7609,6 +7799,10 @@ impl ApplicationHandler for App {
                         }
                         KeyCode::KeyD => self.input.set(Button::Right, pressed),
                         KeyCode::Space => self.input.set(Button::Jump, pressed),
+                        KeyCode::ShiftLeft | KeyCode::ShiftRight => {
+                            self.input.set(Button::Run, pressed)
+                        }
+                        KeyCode::KeyC => self.input.set(Button::Crouch, pressed),
                         _ => {}
                     }
                 }
@@ -7821,6 +8015,8 @@ impl ApplicationHandler for App {
                     view_origin,
                 );
                 sun::set_module_sun(module_api::module_sun(&self.modules, &self.world));
+                sun::set_module_moon(module_api::module_moon(&self.modules, &self.world));
+                sun::set_module_wind(module_api::module_wind(&self.modules, &self.world));
                 set_view_reach(module_api::module_view_distance(&self.modules, &self.world));
                 set_tide(module_api::module_tide(&self.modules, &self.world));
                 let lights = build_lights(&self.world, view_origin);
@@ -8005,6 +8201,7 @@ impl ApplicationHandler for App {
                         parent: self.world.parents.get(id).copied(),
                         ui_text: self.world.ui_texts.get(id).cloned(),
                         ui_image: self.world.ui_images.get(id).cloned(),
+                        character: self.world.characters.get(id).copied(),
                         ext: ExtEdit::from_world(&self.world, id),
                     })
                 });
@@ -8737,6 +8934,7 @@ impl ApplicationHandler for App {
                     parent,
                     ui_text,
                     ui_image,
+                    character,
                     ext,
                 }) = edited
                 {
@@ -8824,6 +9022,14 @@ impl ApplicationHandler for App {
                             self.world.ui_images.remove(id);
                         }
                     }
+                    match character {
+                        Some(body) => {
+                            self.world.characters.insert(id, body);
+                        }
+                        None => {
+                            self.world.characters.remove(id);
+                        }
+                    }
                     ext.apply(&mut self.world, id);
                 }
                 // Drag-and-drop reparenting, applied *after* the Inspector's
@@ -8853,6 +9059,13 @@ impl ApplicationHandler for App {
                 for field in &custom_fields {
                     self.world
                         .insert_dynamic::<f64>(&field.name, field.entity, field.value);
+                }
+                // A module's own change to the world, asked for from its
+                // Inspector section (a button that spawns entities, say),
+                // after an undo step.
+                if module_api::modules_want_world_edit(&self.modules) {
+                    self.push_undo();
+                    module_api::edit_world_modules(&self.modules, &mut self.world);
                 }
                 // A menu item clicked this frame runs the same action method the
                 // keyboard uses — one command, two triggers. This sits at
@@ -9723,7 +9936,7 @@ fn build_lights(world: &World, origin: DVec3) -> [LightRaw; MAX_LIGHTS] {
         count += 1;
     }
     // With a time-of-day (or module) sun, it turns the scene's sun light.
-    sun::apply_to_lights(&mut out, sun::current());
+    sun::apply_to_lights(&mut out, sun::current(), sun::current_moon());
     out
 }
 
@@ -10150,6 +10363,7 @@ pub fn run_as(name: &str, app_id: &str, modules: Vec<Box<dyn EditorModule>>) {
         game_input: InputState::new(),
         game_clock: Clock::new(TICK_RATE, MAX_CATCHUP_TICKS),
         game_closing: false,
+        game_mouse_held: false,
         popped_out: std::collections::HashMap::new(),
         popped_out_closing: Vec::new(),
         new_script_name: String::new(),

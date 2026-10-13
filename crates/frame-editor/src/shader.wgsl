@@ -77,10 +77,10 @@ struct VertexOutput {
     @location(7) layer: f32,
 };
 
-// World size of a primitive at scale 1. Primitives are generated at ~unit size
-// in main.rs and scaled up by this, so a default entity is exactly the size the
-// cube always was. NOTE: must match MESH_SIZE in main.rs (render and pick agree).
-const MESH_SIZE: f32 = 8.0;
+// World size of a primitive at scale 1, in metres: a cube at scale 1 is a metre
+// across. NOTE: must match ENTITY_SIZE in the engine (QUAD_SIZE in lib.rs) and
+// MESH_SIZE in shadow.wgsl, so render, pick and collision agree.
+const MESH_SIZE: f32 = 1.0;
 
 // Rotate a vector from the entity's own space into world space by yaw, pitch
 // and roll: roll first (around the forward axis), then pitch (around the
@@ -243,7 +243,7 @@ fn shade_fragment(in: VertexOutput) -> vec3<f32> {
     // blends between normal shading and full unlit brightness, so a high
     // emissive value makes an entity glow, ignoring every light. The
     // selected entity is then brightened toward white so it stands out.
-    let shaded = base_color * shade_metal_adjusted;
+    let shaded = base_color * shade_metal_adjusted * light_tint();
 
     let lit = mix(shaded, base_color, in.emissive);
     let highlighted = mix(lit, vec3<f32>(1.0, 1.0, 1.0), 0.3 * in.selected);
@@ -395,12 +395,16 @@ fn liquid(in: VertexOutput, thin: f32, alpha: f32, ripples: f32) -> vec4<f32> {
     let sharpness = mix(1200.0, 60.0, far);
     let glint = pow(max(dot(r, sky.sun_direction.xyz), 0.0), sharpness)
         * mix(4.0, 0.8, far) * sky.sun_direction.w;
-    var colour = mix(lit, mirrored, fresnel) + sky.sun_colour.rgb * glint;
+    // The moon's glint, the same way, silver and far fainter.
+    let moon_glint = pow(max(dot(r, sky.moon.xyz), 0.0), sharpness)
+        * mix(1.6, 0.4, far) * sky.night.w;
+    var colour = mix(lit, mirrored, fresnel) + sky.sun_colour.rgb * glint
+        + MOON_COLOUR * moon_glint;
     // The mirror fades out with the surface itself: where a mesh fades its
     // edge out (uv.x near 0) and at the very waterline, so a low view does
     // not show the edge's triangles as a hard, bright line.
     let present = smoothstep(0.0, 0.25, in.uv.x) * (1.0 - smoothstep(0.75, 1.0, thin));
-    var opacity = clamp(max(alpha, fresnel * present) + glint * present, 0.0, 1.0);
+    var opacity = clamp(max(alpha, fresnel * present) + (glint + moon_glint) * present, 0.0, 1.0);
     if (white > 0.0) {
         let daylight = clamp(sky.sun_direction.y * 4.0 + 0.4, 0.0, 1.0);
         let foam = mix(vec3<f32>(0.93, 0.96, 0.98), sky.sun_colour.rgb, 0.25)
@@ -470,18 +474,27 @@ fn fs_sky(in: SkyVarying) -> @location(0) vec4<f32> {
     let toward = max(cos_angle, 0.0);
     let glow = (pow(toward, 48.0) * 0.45 + pow(toward, 6.0) * SUN_HAZE) * strength;
     colour = mix(colour, sky.sun_colour.rgb * 1.4, disc) + sky.sun_colour.rgb * glow;
+    colour = with_moon(colour, direction);
+    colour = with_stars(colour, direction);
     colour = with_clouds(colour, direction);
     return vec4<f32>(min(colour, vec3<f32>(1.0, 1.0, 1.0)), 1.0);
 }
 
-// The cloud layer: a flat sheet at CLOUD_HEIGHT (world height), its pattern
+// The clouds: puffy, billowing cumulus at CLOUD_HEIGHT and thin, wispy
+// cirrus high above at CIRRUS_HEIGHT (world heights). Their patterns come
 // from noise that repeats exactly every CLOUD_PERIOD units, so the render
-// origin can be handed in wrapped to it. It drifts on the wind while the
-// world moves (the same clock as the waves). MUST match CLOUD_PERIOD in
-// lib.rs.
+// origin and the wind's drift can be handed in wrapped to it (`sky.clouds.yz`).
+// Both layers ride the same wind; the higher one seems slower, as real high
+// cloud does. MUST match CLOUD_PERIOD in lib.rs.
 const CLOUD_HEIGHT: f32 = 2500.0;
+const CIRRUS_HEIGHT: f32 = 7000.0;
 const CLOUD_PERIOD: f32 = 262144.0;
-const CLOUD_WIND: vec2<f32> = vec2<f32>(6.0, 2.0);
+
+// The moon's colour: a cool silver white.
+const MOON_COLOUR: vec3<f32> = vec3<f32>(0.86, 0.89, 0.97);
+// The moon's radius in the sky, in radians: about 1.3 degrees across, bigger
+// than the real one on purpose, like the sun's.
+const MOON_RADIUS: f32 = 0.0115;
 
 // A random number from 0 to 1 for a lattice point.
 fn lattice_hash(x: i32, z: i32) -> f32 {
@@ -528,43 +541,174 @@ fn ground_detail(world: vec3<f32>, detail: f32) -> f32 {
     return 1.0 + detail * (0.45 * a + 0.4 * b + 0.3 * c + 0.25 * e);
 }
 
-// How much cloud there is at `p` on the sheet, 0 to 1: big billows with
-// smaller ones on their edges.
-fn cloud_density(p: vec2<f32>) -> f32 {
-    return 0.5 * cloud_noise(p, 8192.0)
-        + 0.25 * cloud_noise(p, 4096.0)
-        + 0.15 * cloud_noise(p, 2048.0)
-        + 0.1 * cloud_noise(p, 512.0);
+// How much cloud there is at `p` on the cumulus layer for a sky `cover`
+// clouded, 0 (clear) to 1 (thick). Broad noise picks where clouds gather,
+// warped so they curl into each other instead of lining up; small noise
+// then eats into their edges, so each cloud is a heap of rounded billows
+// with a clear outline.
+fn cloud_spread(p: vec2<f32>, cover: f32) -> f32 {
+    let warp = vec2<f32>(
+        cloud_noise(p, 4096.0),
+        cloud_noise(p + vec2<f32>(5120.0, 1536.0), 4096.0),
+    ) - vec2<f32>(0.5, 0.5);
+    let q = p + warp * 2200.0;
+    let base = 0.55 * cloud_noise(q, 6144.0)
+        + 0.3 * cloud_noise(q, 3072.0)
+        + 0.15 * cloud_noise(q, 1536.0);
+    let gather = clamp((base - (0.68 - 0.42 * cover)) / 0.16, 0.0, 1.0);
+    let billows = 0.55 * cloud_noise(q, 640.0) + 0.3 * cloud_noise(q, 256.0) + 0.15 * cloud_noise(q, 96.0);
+    return clamp(gather - (1.0 - billows) * 0.55, 0.0, 1.0) / 0.45;
 }
 
-// `colour`, the sky looking in `direction`, with the cloud layer over it.
-// Clouds are lit by the sun's colour on top and take the sky's colour in
-// their thick middles, so they glow warm at dawn and dusk and go dark at
-// night. Far off they fade into the horizon.
+// Stars: points fixed in the sky, one at most in each small cell of
+// directions, coming out after sunset (`sky.night.z`), fading near the
+// horizon and under a bright moon, and twinkling a little.
+fn star_hash(c: vec3<f32>) -> u32 {
+    var h = (u32(i32(c.x)) * 73856093u) ^ (u32(i32(c.y)) * 19349663u) ^ (u32(i32(c.z)) * 83492791u);
+    h = (h ^ (h >> 13u)) * 1274126177u;
+    return h ^ (h >> 16u);
+}
+
+fn with_stars(colour: vec3<f32>, direction: vec3<f32>) -> vec3<f32> {
+    // A star is at least a pixel or so wide, so none falls between pixels.
+    let pixel = length(fwidth(direction));
+    let size = max(pixel * 0.9, 0.0006);
+    var strength = sky.night.z * smoothstep(0.0, 0.2, direction.y) * (1.0 - 0.6 * sky.night.w);
+    // None show through the moon, lit or not.
+    if (sky.moon.w > 0.0 && dot(direction, normalize(sky.moon.xyz)) > cos(MOON_RADIUS)) {
+        strength = 0.0;
+    }
+    if (strength <= 0.0) {
+        return colour;
+    }
+    let p = direction * 140.0;
+    let cell = floor(p);
+    let h = star_hash(cell);
+    if ((h & 1023u) > 56u) {
+        return colour;
+    }
+    // Kept to the middle of its cell, so a star never sits on a cell edge.
+    let jitter = vec3<f32>(f32((h >> 10u) & 255u), f32((h >> 18u) & 255u), f32((h >> 24u) & 255u)) / 255.0;
+    let star = normalize(cell + vec3<f32>(0.25, 0.25, 0.25) + 0.5 * jitter);
+    let core = 1.0 - smoothstep(0.0, size, length(direction - star));
+    if (core <= 0.0) {
+        return colour;
+    }
+    let bright = 0.15 + 0.85 * pow(f32((h >> 4u) & 63u) / 63.0, 3.0);
+    let twinkle = 0.8 + 0.2 * sin(sky.motion.x * 3.0 + f32(h & 255u));
+    let tint = mix(vec3<f32>(0.75, 0.85, 1.0), vec3<f32>(1.0, 0.9, 0.75), f32((h >> 12u) & 1u));
+    return colour + tint * core * bright * twinkle * strength;
+}
+
+// The moon: a disc lit on one side by its phase (`sky.night.x`), with a faint
+// glow around it at night. Its unlit part is a little darker than the sky
+// around it. By day only its lit part shows, faintly (`sky.moon.w`).
+fn with_moon(colour: vec3<f32>, direction: vec3<f32>) -> vec3<f32> {
+    let show = sky.moon.w * smoothstep(-0.01, 0.02, direction.y);
+    if (show <= 0.0) {
+        return colour;
+    }
+    let d = normalize(sky.moon.xyz);
+    let c = dot(direction, d);
+    // The glow, only at night.
+    let toward = max(c, 0.0);
+    var out = colour + MOON_COLOUR * (pow(toward, 900.0) * 0.22 + pow(toward, 40.0) * 0.035) * sky.night.w;
+    let sin_r = sin(MOON_RADIUS);
+    if (c < cos(MOON_RADIUS * 1.1)) {
+        return out;
+    }
+    // A point on the disc, as a point on a ball facing the viewer.
+    var right = cross(d, vec3<f32>(0.0, 1.0, 0.0));
+    if (length(right) < 1e-3) {
+        right = cross(d, vec3<f32>(1.0, 0.0, 0.0));
+    }
+    right = normalize(right);
+    let up = cross(right, d);
+    let o = direction - d * c;
+    let x = dot(o, right) / sin_r;
+    let y = dot(o, up) / sin_r;
+    let r2 = x * x + y * y;
+    let edge = 1.0 - smoothstep(0.86, 1.0, r2);
+    if (edge <= 0.0) {
+        return out;
+    }
+    let toward_viewer = -d;
+    let n = x * right + y * up + sqrt(max(1.0 - r2, 0.0)) * toward_viewer;
+    // The sunlight on it: from behind at new moon, from the viewer's side at
+    // full, from the right while it waxes.
+    let a = 6.2831853 * sky.night.x;
+    let light = -cos(a) * toward_viewer + sin(a) * right;
+    let lit = smoothstep(-0.06, 0.1, dot(n, light));
+    // Darker seas on its face.
+    let seas = 0.8 + 0.2 * lattice_noise(vec2<f32>(x, y) * 1.6 + vec2<f32>(20.0, 20.0), 0.5, 64.0);
+    out = mix(out, out * 0.8 + MOON_COLOUR * 0.015, edge * sky.night.z * (1.0 - lit));
+    let face = MOON_COLOUR * seas * (0.9 + 0.3 * (1.0 - show));
+    return mix(out, face, edge * lit * show);
+}
+
+// `colour`, the sky looking in `direction`, with the clouds over it. Cumulus
+// is lit from the sun's side: bright, sometimes glowing edges facing it,
+// darker bellies where more cloud lies between it and the sun. It takes the
+// sun's colour (warm at dawn and dusk), goes dark at night with a silver
+// edge near the moon, and fades into the horizon far off. Cirrus lies thin
+// and high behind it.
 fn with_clouds(colour: vec3<f32>, direction: vec3<f32>) -> vec3<f32> {
     let cover = sky.clouds.x;
     let eye_height = sky.eye.y + sky.eye.w;
-    if (cover <= 0.0 || direction.y <= 0.0 || eye_height >= CLOUD_HEIGHT) {
+    if (cover <= 0.0 || direction.y <= 0.0) {
         return colour;
     }
-    let t = (CLOUD_HEIGHT - eye_height) / direction.y;
-    let p = sky.eye.xz + direction.xz * t + sky.clouds.yz + CLOUD_WIND * sky.motion.x;
-    // Stretch the noise's spread so the cover setting really ranges from
-    // a few puffs to overcast.
-    let d = clamp((cloud_density(p) - 0.5) * 2.2 + 0.5, 0.0, 1.0);
-    let edge = 1.0 - cover;
-    let amount = smoothstep(edge - 0.05, edge + 0.12, d);
-    if (amount <= 0.0) {
-        return colour;
-    }
-    let core = smoothstep(edge + 0.1, edge + 0.5, d);
     let daylight = clamp(sky.sun_direction.y * 4.0 + 0.4, 0.0, 1.0);
     let toward = max(dot(direction, sky.sun_direction.xyz), 0.0);
-    let sunlit = sky.sun_colour.rgb * (0.85 + 0.6 * pow(toward, 4.0)) * daylight;
-    let shaded = mix(sky.zenith.rgb, horizon_colour(direction), 0.5) * 0.85;
-    let cloud = mix(max(sunlit, shaded), shaded, core * 0.65);
+    let toward_moon = max(dot(direction, sky.moon.xyz), 0.0);
+    let sky_light = mix(sky.zenith.rgb, horizon_colour(direction), 0.5);
+    let moonlight = MOON_COLOUR * sky.night.w;
+    var out = colour;
+
+    // Cirrus: thin streaks, lit right through.
+    if (eye_height < CIRRUS_HEIGHT) {
+        let t = (CIRRUS_HEIGHT - eye_height) / direction.y;
+        let p = sky.eye.xz + direction.xz * t + sky.clouds.yz;
+        let n = 0.65 * cloud_noise(p + vec2<f32>(91136.0, 47104.0), 6144.0)
+            + 0.35 * cloud_noise(p, 768.0);
+        let wisp = smoothstep(0.56, 0.86, n) * (0.25 + 0.35 * cover);
+        let lit = sky.sun_colour.rgb * daylight * (0.9 + 0.6 * pow(toward, 6.0))
+            + sky_light * 0.35 + moonlight * 0.15;
+        out = mix(out, lit, wisp * exp(-t / 150000.0));
+    }
+
+    if (eye_height >= CLOUD_HEIGHT) {
+        return out;
+    }
+    let t = (CLOUD_HEIGHT - eye_height) / direction.y;
+    let p = sky.eye.xz + direction.xz * t + sky.clouds.yz;
+    let d = cloud_spread(p, cover);
+    let amount = smoothstep(0.0, 0.12, d);
+    if (amount <= 0.0) {
+        return out;
+    }
+    // How thick it is here, and toward the sun: more cloud between this
+    // point and the sun shades it.
+    let thick = smoothstep(0.0, 0.8, d);
+    var to_sun = sky.sun_direction.xz;
+    if (length(to_sun) > 1e-4) {
+        to_sun = normalize(to_sun);
+    }
+    let thick_sun = 0.6 * cloud_spread(p + to_sun * 250.0, cover)
+        + 0.4 * cloud_spread(p + to_sun * 700.0, cover);
+    let open = exp(-2.4 * thick_sun);
+    // Lumps on its face, fading out far off before they get small enough to
+    // shimmer.
+    let lumps = mix(0.5, 0.65 * cloud_noise(p, 256.0) + 0.35 * cloud_noise(p, 96.0), exp(-t / 12000.0));
+    let shade = clamp(open * 0.75 + lumps * 0.5, 0.0, 1.0);
+    let sunlit = sky.sun_colour.rgb * daylight * (0.45 + 0.75 * shade) * (1.0 + 0.5 * pow(toward, 6.0));
+    let belly = sky_light * 0.75 + sky.sun_colour.rgb * daylight * 0.1;
+    var cloud = mix(sunlit + moonlight * (0.1 + 0.25 * shade), belly + moonlight * 0.08, thick * (1.0 - shade) * 0.8);
+    // Thin edges glow with the light behind them: silver linings.
+    cloud = cloud + sky.sun_colour.rgb * daylight * pow(toward, 12.0) * (1.0 - thick) * 0.8
+        + moonlight * pow(toward_moon, 20.0) * (1.0 - thick) * 0.4;
     let fade = exp(-t / 90000.0);
-    return mix(colour, cloud, amount * fade * 0.95);
+    return mix(out, cloud, amount * fade * 0.96);
 }
 
 // ---------------------------------------------------------------------------
@@ -820,7 +964,7 @@ fn fs_grass(in: GrassVarying) -> @location(0) vec4<f32> {
     let far = smoothstep(0.35 * grass.range, 0.9 * grass.range, distance);
     let gradient = mix(mix(0.32, 1.2, pow(in.along, 0.8)), 1.0, far);
     let light = mix(grass_light(in.world_position, normal), grass_ground_light(in.world_position), far);
-    var colour = in.color * gradient * light;
+    var colour = in.color * gradient * light * light_tint();
     // Looking toward the sun, the tips glow as light comes through them.
     let to_eye = normalize(sky.eye.xyz - in.world_position);
     let against = max(dot(-to_eye, sky.sun_direction.xyz), 0.0);

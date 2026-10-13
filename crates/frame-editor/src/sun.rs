@@ -2,7 +2,8 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-//! Where the sun is, when something other than the scene's Light decides.
+//! Where the sun and the moon are, and how the wind blows, when something
+//! other than the scene's Light decides.
 //!
 //! Two things can: the editor's own "Sun by time of day" setting, which puts
 //! the sun where it would be at a chosen hour, and an editor module (see
@@ -14,11 +15,23 @@
 //! tells the sky where the sun is. Turn it off and the scene's own light is
 //! back, untouched.
 //!
+//! The moon comes with it: a module may place it and say how full it is
+//! ([`crate::module_api::EditorModule::moon`]); otherwise a full moon stands
+//! opposite the sun. At night, when the moon gives more light than the sun,
+//! the same light points at the moon instead, much dimmer.
+//!
+//! The wind moves the clouds: a module's wind if one keeps the weather
+//! ([`crate::module_api::EditorModule::wind`]), otherwise a light breeze.
+//!
 //! The state is process-wide, for the same reason the sky and shadow
 //! preferences are: the editor viewport and the Play window each have their
 //! own GPU state, and both must show the same sun.
 
-use super::{LightRaw, MAX_LIGHTS, module_api::SunOverride, sky};
+use super::{
+    LightRaw, MAX_LIGHTS,
+    module_api::{MoonOverride, SunOverride, Wind},
+    sky,
+};
 use std::sync::{LazyLock, Mutex, MutexGuard};
 
 /// The hour the time-of-day sun starts at: mid-morning, so the first time it
@@ -75,11 +88,45 @@ pub(crate) fn direction_for_hour(hour: f32) -> [f32; 3] {
     ]
 }
 
+/// Where the moon is, how full, and how much light it gives.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub(crate) struct Moon {
+    /// Unit vector toward the moon (X east, Y up, Z south).
+    pub direction: [f32; 3],
+    /// 0 new, 0.5 full, back to new at 1 (see `MoonOverride::phase`).
+    pub phase: f32,
+    /// How much of the moon's light reaches the ground, 0 to 1: its lit
+    /// fraction, faded out as it sets (`sky::moon_glow`).
+    pub glow: f32,
+}
+
+impl Moon {
+    fn new(direction: [f32; 3], phase: f32) -> Option<Self> {
+        let sun = Sun::from_direction(direction)?;
+        let phase = if phase.is_finite() {
+            phase.rem_euclid(1.0)
+        } else {
+            0.5
+        };
+        Some(Moon {
+            direction: sun.direction,
+            phase,
+            glow: sky::moon_glow(sun.direction[1], phase),
+        })
+    }
+}
+
+/// A light breeze toward the east-south-east, in metres a second, when no
+/// module keeps the weather. It moves the clouds while the world moves.
+pub(crate) const BREEZE: [f32; 2] = [6.0, 2.0];
+
 #[derive(Default)]
 struct State {
     time_enabled: bool,
     hour: f32,
     module: Option<SunOverride>,
+    module_moon: Option<MoonOverride>,
+    module_wind: Option<Wind>,
 }
 
 static STATE: LazyLock<Mutex<State>> = LazyLock::new(|| {
@@ -87,6 +134,8 @@ static STATE: LazyLock<Mutex<State>> = LazyLock::new(|| {
         time_enabled: false,
         hour: DEFAULT_HOUR,
         module: None,
+        module_moon: None,
+        module_wind: None,
     })
 });
 
@@ -119,6 +168,40 @@ pub(crate) fn set_module_sun(sun: Option<SunOverride>) {
     state().module = sun;
 }
 
+/// Record the moon a module asked for this frame (None for none).
+pub(crate) fn set_module_moon(moon: Option<MoonOverride>) {
+    state().module_moon = moon;
+}
+
+/// Record the wind a module keeps this frame (None for none).
+pub(crate) fn set_module_wind(wind: Option<Wind>) {
+    state().module_wind = wind;
+}
+
+/// The moon for this frame: a module's if it gave one, else a full moon
+/// opposite the sun when there is a sun, else None.
+pub(crate) fn current_moon() -> Option<Moon> {
+    let module = state().module_moon;
+    if let Some(m) = module {
+        return Moon::new(m.direction, m.phase);
+    }
+    let sun = current()?;
+    Moon::new(sun.direction.map(|v| -v), 0.5)
+}
+
+/// How far the clouds have drifted downwind, in metres (x and z): the
+/// module's wind if one keeps it, else the breeze over `seconds` of moving
+/// world.
+pub(crate) fn cloud_drift(seconds: f32) -> [f64; 2] {
+    match state().module_wind {
+        Some(w) => w.drift,
+        None => [
+            f64::from(BREEZE[0] * seconds),
+            f64::from(BREEZE[1] * seconds),
+        ],
+    }
+}
+
 /// The sun for this frame: a module's if it gave one, else the time of day's
 /// if that is on, else None (the scene's own Light decides).
 pub(crate) fn current() -> Option<Sun> {
@@ -134,14 +217,25 @@ pub(crate) fn current() -> Option<Sun> {
     None
 }
 
-/// Point the scene's sun light at `sun`. The shadow-casting directional light
-/// is the sun, or the first directional light if none casts shadows. Its
-/// direction is replaced and its strength faded with the sun's height. Other
-/// lights are left alone. Does nothing without a sun or without a directional
-/// light.
-pub(crate) fn apply_to_lights(lights: &mut [LightRaw; MAX_LIGHTS], sun: Option<Sun>) {
+/// Point the scene's sun light at `sun`, or at `moon` when the moon gives
+/// more light. The shadow-casting directional light is the sun, or the first
+/// directional light if none casts shadows. Its direction is replaced and its
+/// strength faded with the sun's height, or set to the moon's much dimmer
+/// light (`sky::MOONLIGHT` at most). Other lights are left alone. Does nothing
+/// without a sun or without a directional light.
+pub(crate) fn apply_to_lights(
+    lights: &mut [LightRaw; MAX_LIGHTS],
+    sun: Option<Sun>,
+    moon: Option<Moon>,
+) {
     let Some(sun) = sun else {
         return;
+    };
+    // Whichever gives more light is the light this frame.
+    let moonlight = moon.map_or(0.0, |m| sky::MOONLIGHT * m.glow);
+    let (direction, scale) = match moon {
+        Some(m) if moonlight > sun.light_scale => (m.direction, moonlight),
+        _ => (sun.direction, sun.light_scale),
     };
     let directional = |l: &LightRaw| l.params[0] < 0.5 && l.params[2] > 0.0;
     let index = lights
@@ -153,12 +247,12 @@ pub(crate) fn apply_to_lights(lights: &mut [LightRaw; MAX_LIGHTS], sun: Option<S
     };
     let light = &mut lights[index];
     light.position_or_direction = [
-        sun.direction[0],
-        sun.direction[1],
-        sun.direction[2],
+        direction[0],
+        direction[1],
+        direction[2],
         light.position_or_direction[3],
     ];
-    light.params[2] *= sun.light_scale;
+    light.params[2] *= scale;
 }
 
 #[cfg(test)]
@@ -253,7 +347,7 @@ mod tests {
             direction: [0.0, 0.6, 0.8],
             light_scale: 0.5,
         };
-        apply_to_lights(&mut lights, Some(sun));
+        apply_to_lights(&mut lights, Some(sun), None);
         assert_eq!(
             lights[0],
             point([0.0, 5.0, 0.0], 1.0),
@@ -278,7 +372,7 @@ mod tests {
             direction: [1.0, 0.0, 0.0],
             light_scale: 1.0,
         };
-        apply_to_lights(&mut lights, Some(sun));
+        apply_to_lights(&mut lights, Some(sun), None);
         assert_eq!(lights[1].position_or_direction[..3], [1.0, 0.0, 0.0]);
     }
 
@@ -290,7 +384,7 @@ mod tests {
             direction: [0.0, -0.5, 0.8],
             light_scale: 0.0,
         };
-        apply_to_lights(&mut lights, Some(sun));
+        apply_to_lights(&mut lights, Some(sun), None);
         assert_eq!(lights[0].params[2], 0.0);
     }
 
@@ -299,7 +393,7 @@ mod tests {
         let mut lights = empty();
         lights[0] = directional([0.0, 1.0, 0.0], 1.0, true);
         let original = lights;
-        apply_to_lights(&mut lights, None);
+        apply_to_lights(&mut lights, None, None);
         assert_eq!(lights, original);
 
         let mut only_points = empty();
@@ -309,7 +403,44 @@ mod tests {
             direction: [0.0, 1.0, 0.0],
             light_scale: 1.0,
         };
-        apply_to_lights(&mut only_points, Some(sun));
+        apply_to_lights(&mut only_points, Some(sun), None);
         assert_eq!(only_points, original);
+    }
+
+    #[test]
+    fn at_night_the_light_turns_to_the_moon_and_is_much_dimmer() {
+        let mut lights = empty();
+        lights[0] = directional([0.0, 1.0, 0.0], 1.0, true);
+        let sun = Sun::from_direction(direction_for_hour(0.0)).unwrap();
+        let full = Moon::new([0.2, 0.9, 0.3], 0.5).unwrap();
+        apply_to_lights(&mut lights, Some(sun), Some(full));
+        let d = lights[0].position_or_direction;
+        assert!(
+            (d[1] - full.direction[1]).abs() < 1e-6,
+            "points at the moon"
+        );
+        assert!((lights[0].params[2] - sky::MOONLIGHT).abs() < 1e-3);
+        // A new moon gives no light, so the sun (down, dark) stays.
+        let mut dark = empty();
+        dark[0] = directional([0.0, 1.0, 0.0], 1.0, true);
+        let new = Moon::new([0.2, 0.9, 0.3], 0.0).unwrap();
+        apply_to_lights(&mut dark, Some(sun), Some(new));
+        assert_eq!(dark[0].params[2], 0.0);
+        // By day the sun wins whatever the moon does.
+        let mut day = empty();
+        day[0] = directional([0.0, 1.0, 0.0], 1.0, true);
+        let noon = Sun::from_direction(direction_for_hour(12.0)).unwrap();
+        apply_to_lights(&mut day, Some(noon), Some(full));
+        assert_eq!(day[0].params[2], 1.0);
+    }
+
+    #[test]
+    fn a_moon_below_the_horizon_gives_no_light_and_its_phase_wraps() {
+        let set = Moon::new([0.0, -0.5, 0.8], 0.5).unwrap();
+        assert_eq!(set.glow, 0.0);
+        let wrapped = Moon::new([0.0, 1.0, 0.0], 1.5).unwrap();
+        assert!((wrapped.phase - 0.5).abs() < 1e-6);
+        assert!((wrapped.glow - 1.0).abs() < 1e-6);
+        assert_eq!(Moon::new([0.0; 3], 0.5), None);
     }
 }

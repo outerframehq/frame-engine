@@ -88,6 +88,19 @@ pub trait EditorModule {
         Vec::new()
     }
 
+    /// Whether this module has a change to make to the world from the editor
+    /// (a button pressed in its Inspector section that spawns entities,
+    /// say). Asked once per editor frame, after the Inspector; when it says
+    /// yes the editor saves an undo step and then calls `edit_world`. The
+    /// default is never.
+    fn wants_world_edit(&self) -> bool {
+        false
+    }
+
+    /// Make the change `wants_world_edit` asked for, with write access to the
+    /// world. Called in the editor only, paused or running, never in Play.
+    fn edit_world(&mut self, _world: &mut World) {}
+
     /// Advance whatever this module simulates by `dt` seconds, with write
     /// access to the world (including `world.resources`). Called once per
     /// simulation tick, before collision is synced, in the editor viewport
@@ -126,6 +139,24 @@ pub trait EditorModule {
         None
     }
 
+    /// Where this module wants the moon and how full it is, if it keeps one.
+    /// Called once per frame for each window drawn, after `sun`. The sky
+    /// draws the moon with its lit part, and at night it lights the scene in
+    /// place of the sun: a dim, cool light that still casts shadows, brighter
+    /// the fuller and higher it is. The default is None: with a day-night sun
+    /// the editor puts a full moon opposite the sun. If several modules
+    /// answer, the first wins.
+    fn moon(&mut self, _world: &World) -> Option<MoonOverride> {
+        None
+    }
+
+    /// The wind, if this module keeps the weather. Called once per frame for
+    /// each window drawn, after `sun`. The clouds drift with it. The default
+    /// is None: a light breeze that moves while the world moves.
+    fn wind(&mut self, _world: &World) -> Option<Wind> {
+        None
+    }
+
     /// Whether this module is still working in the background (building
     /// something it will want to show). While any module is, the editor keeps
     /// drawing every frame so the results appear as they arrive; otherwise an
@@ -152,6 +183,29 @@ pub struct SunOverride {
     /// Unit vector pointing toward the sun: X east, Y up, Z south. A negative
     /// Y puts the sun below the horizon, which is night.
     pub direction: [f32; 3],
+}
+
+/// A moon supplied by a module (see [`EditorModule::moon`]).
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct MoonOverride {
+    /// Unit vector pointing toward the moon: X east, Y up, Z south. Below the
+    /// horizon when Y is negative.
+    pub direction: [f32; 3],
+    /// Where it is in its month: 0 new (dark), 0.25 first quarter (lit on
+    /// the right), 0.5 full, 0.75 last quarter, back to new at 1.
+    pub phase: f32,
+}
+
+/// The wind a module supplies (see [`EditorModule::wind`]).
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct Wind {
+    /// Where the air is going and how fast, in metres a second: x east, y
+    /// south (the world's x and z).
+    pub velocity: [f32; 2],
+    /// How far the air has moved so far, in metres (x and z). The clouds sit
+    /// this far downwind of where they started, so a module with its own
+    /// clock (a sped-up day) moves them at its own pace.
+    pub drift: [f64; 2],
 }
 
 /// What a module gets when it makes its per-window GPU state.
@@ -540,6 +594,7 @@ impl DrawView {
 /// editor, and only for names that were actually changed.
 #[derive(Clone, PartialEq, Default)]
 pub struct ExtEdit {
+    id: usize,
     values: BTreeMap<String, ron::Value>,
     touched: BTreeSet<String>,
 }
@@ -553,6 +608,7 @@ impl ExtEdit {
             }
         }
         ExtEdit {
+            id,
             values,
             touched: BTreeSet::new(),
         }
@@ -571,6 +627,12 @@ impl ExtEdit {
                 None => world.ext_remove(name, id),
             }
         }
+    }
+
+    /// The entity's id, for a module that wants to act on it from
+    /// [`EditorModule::edit_world`].
+    pub fn id(&self) -> usize {
+        self.id
     }
 
     /// Whether the entity has a component named `name`.
@@ -1187,8 +1249,55 @@ pub(crate) fn module_tide(
         .filter(|t| t.is_finite())
 }
 
+/// The first module's moon (see [`EditorModule::moon`]), if any gives one
+/// that makes sense.
+pub(crate) fn module_moon(
+    modules: &std::cell::RefCell<Vec<Box<dyn EditorModule>>>,
+    world: &World,
+) -> Option<MoonOverride> {
+    modules
+        .borrow_mut()
+        .iter_mut()
+        .find_map(|module| module.moon(world))
+        .filter(|m| m.direction.iter().all(|v| v.is_finite()) && m.phase.is_finite())
+}
+
+/// The first module's wind (see [`EditorModule::wind`]), if any.
+pub(crate) fn module_wind(
+    modules: &std::cell::RefCell<Vec<Box<dyn EditorModule>>>,
+    world: &World,
+) -> Option<Wind> {
+    modules
+        .borrow_mut()
+        .iter_mut()
+        .find_map(|module| module.wind(world))
+        .filter(|w| {
+            w.velocity.iter().all(|v| v.is_finite()) && w.drift.iter().all(|v| v.is_finite())
+        })
+}
+
 /// Let every module advance its own simulation by `dt`. Called once per
 /// simulation tick, before `sync_collision`.
+/// Whether any module has a change to make to the world (see
+/// [`EditorModule::wants_world_edit`]).
+pub(crate) fn modules_want_world_edit(
+    modules: &std::cell::RefCell<Vec<Box<dyn EditorModule>>>,
+) -> bool {
+    modules.borrow().iter().any(|m| m.wants_world_edit())
+}
+
+/// Let every module that asked make its change to the world.
+pub(crate) fn edit_world_modules(
+    modules: &std::cell::RefCell<Vec<Box<dyn EditorModule>>>,
+    world: &mut World,
+) {
+    for module in modules.borrow_mut().iter_mut() {
+        if module.wants_world_edit() {
+            module.edit_world(world);
+        }
+    }
+}
+
 pub(crate) fn tick_modules(
     modules: &std::cell::RefCell<Vec<Box<dyn EditorModule>>>,
     world: &mut World,
@@ -1407,7 +1516,7 @@ mod tests {
         }
         let y = world.positions.get(id).unwrap().y;
         assert!(
-            y > 1.0 && y < 12.0,
+            y > 0.4 && y < 12.0,
             "it should rest on the module's floor: {y}"
         );
         assert_eq!(physics.static_mesh_collider_count(), 1);
@@ -1446,6 +1555,49 @@ mod tests {
         tick_modules(&modules, &mut world, 0.5);
         tick_modules(&modules, &mut world, 0.5);
         assert_eq!(world.resources.get::<f32>("t").copied(), Some(1.0));
+    }
+
+    #[test]
+    fn a_module_edits_the_world_only_when_it_asks() {
+        struct Spawner {
+            asked: bool,
+        }
+        impl EditorModule for Spawner {
+            fn name(&self) -> &str {
+                "spawner"
+            }
+            fn wants_world_edit(&self) -> bool {
+                self.asked
+            }
+            fn edit_world(&mut self, world: &mut World) {
+                world.spawn(
+                    Position {
+                        x: 0.0,
+                        y: 0.0,
+                        z: 0.0,
+                    },
+                    Velocity {
+                        dx: 0.0,
+                        dy: 0.0,
+                        dz: 0.0,
+                    },
+                );
+                self.asked = false;
+            }
+            fn new_gpu(&self, _gpu: &GpuContext) -> Box<dyn ModuleGpu> {
+                unreachable!()
+            }
+        }
+        let modules = RefCell::new(vec![
+            Box::new(Spawner { asked: false }) as Box<dyn EditorModule>
+        ]);
+        let mut world = World::new();
+        assert!(!modules_want_world_edit(&modules));
+        modules.borrow_mut()[0] = Box::new(Spawner { asked: true });
+        assert!(modules_want_world_edit(&modules));
+        edit_world_modules(&modules, &mut world);
+        assert_eq!(world.positions.iter().flatten().count(), 1);
+        assert!(!modules_want_world_edit(&modules));
     }
 
     struct Anchor;
@@ -1511,7 +1663,19 @@ mod tests {
         // Module meshes are in world units; the shader multiplies by the
         // entity size, so the instance scale must be its inverse.
         assert_eq!(QUAD_SIZE * (1.0 / QUAD_SIZE), 1.0);
-        assert_eq!(QUAD_SIZE, 8.0, "shader.wgsl's MESH_SIZE must match");
+        for source in [crate::ENTITY_WGSL, include_str!("shadow.wgsl")] {
+            let line = source
+                .lines()
+                .find(|l| l.starts_with("const MESH_SIZE"))
+                .expect("a MESH_SIZE in each shader");
+            let value: f32 = line
+                .trim_start_matches("const MESH_SIZE: f32 =")
+                .trim()
+                .trim_end_matches(';')
+                .parse()
+                .unwrap();
+            assert_eq!(value, QUAD_SIZE, "MESH_SIZE must match ENTITY_SIZE: {line}");
+        }
     }
 
     #[test]

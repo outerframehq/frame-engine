@@ -80,9 +80,18 @@ struct Sky {
     // For liquid surfaces: x is seconds of moving water, y and z the render
     // origin's x and z wrapped to WAVE_PERIOD. w unused.
     motion: vec4<f32>,
-    // The cloud layer: x how much of the sky it covers (0 none, 1 overcast),
-    // y and z the render origin's x and z wrapped to CLOUD_PERIOD. w unused.
+    // The clouds: x how much of the sky they cover (0 none, 1 overcast), y
+    // and z the render origin's x and z plus how far the wind has carried
+    // them, wrapped to CLOUD_PERIOD. w unused.
     clouds: vec4<f32>,
+    // xyz: unit direction toward the moon. w: how strongly to draw it (0
+    // with no moon).
+    moon: vec4<f32>,
+    // x: the moon's phase (0 new, 0.5 full). y: its lit fraction. z: how
+    // bright the stars are. w: the moon's light at night, 0 to 1.
+    night: vec4<f32>,
+    // rgb: the colour of the light: white by day, cool blue at night.
+    tint: vec4<f32>,
 };
 @group(0) @binding(5) var<uniform> sky: Sky;
 
@@ -171,6 +180,13 @@ fn shadow_factor(world_position: vec3<f32>, normal: vec3<f32>) -> f32 {
         }
     }
     return sum / 9.0;
+}
+
+// The colour of the light on everything lit this frame (see `tint` in Sky):
+// multiply a lit colour by it. White when the sky has not set it.
+fn light_tint() -> vec3<f32> {
+    let t = sky.tint.rgb;
+    return select(t, vec3<f32>(1.0, 1.0, 1.0), t.r + t.g + t.b <= 0.0);
 }
 
 struct Lights {
