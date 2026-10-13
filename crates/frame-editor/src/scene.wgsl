@@ -82,7 +82,8 @@ struct Sky {
     motion: vec4<f32>,
     // The clouds: x how much of the sky they cover (0 none, 1 overcast), y
     // and z the render origin's x and z plus how far the wind has carried
-    // them, wrapped to CLOUD_PERIOD. w unused.
+    // them, wrapped to CLOUD_PERIOD (262144). w: 1 when a module draws the
+    // clouds itself and the sky leaves its own out.
     clouds: vec4<f32>,
     // xyz: unit direction toward the moon. w: how strongly to draw it (0
     // with no moon).
@@ -93,6 +94,9 @@ struct Sky {
     // rgb: the colour of the light: white by day, cool blue at night.
     tint: vec4<f32>,
 };
+// Seen by both stages. The camera (binding 0) is seen only by vertex
+// shaders, and the lights, shadow map and its sampler (1 to 4) only by
+// fragment shaders.
 @group(0) @binding(5) var<uniform> sky: Sky;
 
 // How quickly fog thins with altitude, in world units per factor of e.

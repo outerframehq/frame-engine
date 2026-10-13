@@ -29,7 +29,9 @@ use std::collections::{BTreeMap, BTreeSet};
 /// lights, shadow map and sky) and the helpers that read it (`apply_fog`,
 /// `shadow_factor`, `morph_amount`, ...). A module drawing with its own shader
 /// (see [`ModuleGpu::draw_custom_in_view`]) puts this first in its source, so
-/// it is lit, shadowed and fogged exactly like everything else.
+/// it is lit, shadowed and fogged exactly like everything else. The camera
+/// can be read only in vertex shaders, the lights and shadow map only in
+/// fragment shaders, and the sky in both.
 pub const SCENE_WGSL: &str = include_str!("scene.wgsl");
 
 pub use crate::grass::{
@@ -489,6 +491,16 @@ pub trait ModuleGpu {
 
     /// Whether there is anything to draw with `draw_custom_in_view`.
     fn has_custom(&self) -> bool {
+        false
+    }
+
+    /// Whether this module draws the clouds itself (with
+    /// `draw_custom_in_view`). If any module in a window does, the sky
+    /// leaves out its own clouds there and `clouds.w` in the sky uniform is
+    /// 1. The cover and the wind's drift still ride in `clouds.xyz` for the
+    /// module's shader. Liquids still reflect the sky's own clouds. The
+    /// default is false.
+    fn draws_clouds(&self) -> bool {
         false
     }
 

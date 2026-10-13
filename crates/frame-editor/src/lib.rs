@@ -1446,8 +1446,10 @@ impl GpuState {
                     },
                     wgpu::BindGroupLayoutEntry {
                         binding: 5,
-                        // The sky and fog, read per fragment.
-                        visibility: wgpu::ShaderStages::FRAGMENT,
+                        // The sky and fog, read per fragment. Vertex shaders
+                        // may read it too (a module placing clouds by the
+                        // wind's drift, say).
+                        visibility: wgpu::ShaderStages::VERTEX_FRAGMENT,
                         ty: wgpu::BindingType::Buffer {
                             ty: wgpu::BufferBindingType::Uniform,
                             has_dynamic_offset: false,
@@ -2148,6 +2150,17 @@ impl GpuState {
         );
     }
 
+    /// `uniform` with `clouds.w` set to 1 when a module draws this window's
+    /// clouds (see `ModuleGpu::draws_clouds`), so the sky leaves out its own.
+    fn with_module_clouds(&self, mut uniform: sky::SkyUniform) -> sky::SkyUniform {
+        uniform.clouds[3] = if self.module_gpu.iter().any(|m| m.draws_clouds()) {
+            1.0
+        } else {
+            0.0
+        };
+        uniform
+    }
+
     /// Let every module draw with its own pipeline (see
     /// `ModuleGpu::draw_custom_in_view`), with the scene bound as `scene`.
     fn draw_custom(
@@ -2224,14 +2237,14 @@ impl GpuState {
         self.queue.write_buffer(
             &self.sky_buffer,
             0,
-            bytemuck::cast_slice(&[sky_uniform_for_frame(
+            bytemuck::cast_slice(&[self.with_module_clouds(sky_uniform_for_frame(
                 view_proj,
                 lights,
                 sky_on,
                 self.origin_y,
                 self.wave_origin,
                 self.cloud_origin,
-            )]),
+            ))]),
         );
         self.queue.write_buffer(
             &self.lights_buffer,
@@ -2474,14 +2487,14 @@ impl GpuState {
         self.queue.write_buffer(
             &self.preview_sky_buffer,
             0,
-            bytemuck::cast_slice(&[sky_uniform_for_frame(
+            bytemuck::cast_slice(&[self.with_module_clouds(sky_uniform_for_frame(
                 view_proj,
                 lights,
                 sky_on,
                 self.origin_y,
                 self.wave_origin,
                 self.cloud_origin,
-            )]),
+            ))]),
         );
         self.queue.write_buffer(
             &self.lights_buffer,
@@ -10518,6 +10531,41 @@ mod shader_tests {
     /// Bindings of the scene group that only the vertex stage can see (see
     /// the scene bind group layout in `GpuState::new`).
     const VERTEX_ONLY: [(u32, u32); 1] = [(0, 0)];
+    /// And those only the fragment stage can see.
+    const FRAGMENT_ONLY: [(u32, u32); 4] = [(0, 1), (0, 2), (0, 3), (0, 4)];
+
+    #[test]
+    fn vertex_shaders_only_read_bindings_the_vertex_stage_can_see() {
+        for source in [super::ENTITY_WGSL, include_str!("shadow.wgsl")] {
+            let module = naga::front::wgsl::parse_str(source).unwrap();
+            let info = naga::valid::Validator::new(
+                naga::valid::ValidationFlags::all(),
+                naga::valid::Capabilities::all(),
+            )
+            .validate(&module)
+            .unwrap();
+            for (i, entry) in module.entry_points.iter().enumerate() {
+                if entry.stage != naga::ShaderStage::Vertex {
+                    continue;
+                }
+                let uses = info.get_entry_point(i);
+                for (handle, global) in module.global_variables.iter() {
+                    let Some(binding) = &global.binding else {
+                        continue;
+                    };
+                    let used = !uses[handle].is_empty();
+                    assert!(
+                        !(used && FRAGMENT_ONLY.contains(&(binding.group, binding.binding))),
+                        "{} reads {:?} (group {}, binding {}), which only the fragment stage sees",
+                        entry.name,
+                        global.name,
+                        binding.group,
+                        binding.binding
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn fragment_shaders_only_read_bindings_the_fragment_stage_can_see() {
