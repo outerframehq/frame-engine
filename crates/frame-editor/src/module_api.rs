@@ -890,6 +890,50 @@ impl WorldMesh {
         Some(mesh)
     }
 
+    /// Like `new_indexed`, for a liquid surface whose vertices move as their
+    /// `flows` entries say (see `new_flowing`). A surface that changes every
+    /// frame (water that flows and rises) is made once with this and then
+    /// rewritten in place with [`WorldMesh::update_flowing`].
+    pub fn new_indexed_flowing(
+        device: &wgpu::Device,
+        vertices: &[MeshVertexData],
+        morphs: &[VertexMorph],
+        flows: &[WaterFlow],
+        indices: &[u32],
+    ) -> Option<Self> {
+        if !indices_fit(indices, vertices.len()) {
+            return None;
+        }
+        let verts = flowing_vertices(vertices, morphs, flows);
+        let mut mesh = Self::upload(device, &verts);
+        let index_buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("module mesh indices"),
+            contents: bytemuck::cast_slice(indices),
+            usage: wgpu::BufferUsages::INDEX,
+        });
+        mesh.indices = Some((index_buffer, indices.len() as u32));
+        Some(mesh)
+    }
+
+    /// Rewrite every vertex of a flowing mesh in place, keeping its indices:
+    /// `vertices` must be exactly as many as it was made with. Far cheaper
+    /// than a new mesh for a surface that changes every frame. Returns false,
+    /// changing nothing, when the count differs.
+    pub fn update_flowing(
+        &self,
+        queue: &wgpu::Queue,
+        vertices: &[MeshVertexData],
+        morphs: &[VertexMorph],
+        flows: &[WaterFlow],
+    ) -> bool {
+        if vertices.len() as u32 != self.count {
+            return false;
+        }
+        let verts = flowing_vertices(vertices, morphs, flows);
+        queue.write_buffer(&self.buffer, 0, bytemuck::cast_slice(&verts));
+        true
+    }
+
     /// Like `new_indexed`, drawn with a layered material (see
     /// [`MaterialLook::layers`]): `layers` gives each vertex a point from 0
     /// (the first image) to 1 (the last), and the colour blends between the
@@ -920,7 +964,8 @@ impl WorldMesh {
         let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("module mesh buffer"),
             contents: bytemuck::cast_slice(verts),
-            usage: wgpu::BufferUsages::VERTEX,
+            // Written to again by `update_flowing`.
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
         });
         WorldMesh {
             buffer,
