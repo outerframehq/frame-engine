@@ -54,11 +54,15 @@ These are set for you every tick. Read them, write them, or both.
 | `grounded` | Touching the ground | read-only | `true` if this entity is a physics character and was on the ground as of the last physics step. Always `false` otherwise. One tick behind, since physics runs after scripts each tick. |
 | `input_up` / `input_down` / `input_left` / `input_right` | Movement keys held | read-only | `true` while that key is held. Same for every entity's script this tick, not specific to one. |
 | `input_jump` | Jump key held | read-only | `true` while Jump is held. Same shared-per-tick caveat as the movement keys above. |
+| `input_run` / `input_crouch` | Run or Crouch key held | read-only | `true` while Shift (run) or C (crouch) is held. Same shared-per-tick caveat. |
+| `crouched` | Crouched | read-only | `true` if this entity is a character with a `CharacterBody` and was crouched as of the last physics step. It stays crouched while there is no room to stand. |
 | `spawn_at` | Where a new entity appears | read/write | `spawn_at.x/.y/.z`. Defaults to this entity's own position. |
 | `spawn`   | Request a new entity        | read/write | Set `true` to spawn one at `spawn_at`, at the end of this tick. Resets to `false` at the start of every script run, so it has to be set again each time you want another one. |
 | `despawn_id` | Request an entity removed | read/write | An entity id, or `-1.0` for no request. Can be this entity's own `id`, or any other, `hit_id` included. |
 | `move_dx` / `move_dz` | Requested movement | read/write | World-space movement this tick, same units `Controlled` input uses. Only acted on for a `Controlled` + `RigidBody` entity (a physics character); harmless on anything else. Seeded with whatever `Controlled` input already asked for this tick, so leaving it alone doesn't cancel keyboard movement. |
 | `move_jump` | Requested jump | read/write | Same physics-character-only rule as `move_dx`/`move_dz`. Needs a fresh `true` (not held) to actually jump, same as the Jump key. |
+| `move_run` / `move_crouch` | Requested run or crouch | read/write | For a character with a `CharacterBody`: run at its run speed, or crouch. Seeded from the keys, like `move_dx`. |
+| `look_yaw` / `look_pitch` | Where a character looks | read/write | In radians, for an entity with a `CharacterBody`. Yaw 0 faces -Z and turns the whole body; pitch tips the view, up positive, kept just short of straight up or down. Changing them turns the character. |
 | `pos`     | Position                  | read/write | `pos.x`, `pos.y`, `pos.z`. Where the entity is.    |
 | `vel`     | Velocity (per tick)       | read/write | `vel.x`, `vel.y`, `vel.z`. Added to position each tick. |
 | `scale`   | Scale (per axis)          | read/write | `scale.x`, `scale.y`, `scale.z`. `1.0` is normal size. |
