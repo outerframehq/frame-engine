@@ -14,6 +14,15 @@ pub enum Button {
     Left,
     Right,
     Jump,
+    /// Run instead of walk, while held.
+    Run,
+    /// Crouch, while held.
+    Crouch,
+    /// The main action, while held: use what is in the hand (dig with a
+    /// spade, say). The game decides what it does.
+    Use,
+    /// The second action, while held (pile ground with a spade, say).
+    UseAlt,
 }
 
 /// Which logical buttons are currently held. Plain runtime state, refreshed by
@@ -22,12 +31,17 @@ pub enum Button {
 #[derive(Default)]
 pub struct InputState {
     held: HashSet<Button>,
+    /// Where the player wants to look (yaw, pitch), when the host sends it
+    /// with the buttons: a multiplayer client's view, say. None leaves the
+    /// view as it is.
+    look: Option<(f32, f32)>,
 }
 
 impl InputState {
     pub fn new() -> Self {
         InputState {
             held: HashSet::new(),
+            look: None,
         }
     }
 
@@ -43,5 +57,15 @@ impl InputState {
     /// Is this button currently held?
     pub fn is_held(&self, button: Button) -> bool {
         self.held.contains(&button)
+    }
+
+    /// Ask to look this way (yaw and pitch in radians, see `world::Look`).
+    pub fn set_look(&mut self, yaw: f32, pitch: f32) {
+        self.look = Some((yaw, pitch));
+    }
+
+    /// The view asked for with `set_look`, if any.
+    pub fn look(&self) -> Option<(f32, f32)> {
+        self.look
     }
 }

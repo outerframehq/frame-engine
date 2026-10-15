@@ -64,17 +64,143 @@ impl Clone for DynamicEntry {
     }
 }
 
-/// The world-space size of an entity at scale 1, in world units. This is a
-/// simulation fact (it's what collision boxes are built from), so it lives in
-/// the engine. The editor's rendering and picking must use the same value:
+/// The world-space size of an entity at scale 1, in world units. A world unit
+/// is a metre, so a cube at scale 1 is a metre across. This is a simulation
+/// fact (it's what collision boxes are built from), so it lives in the
+/// engine. The editor's rendering and picking must use the same value:
 /// `QUAD_SIZE` in the editor references this, and `MESH_SIZE` in shader.wgsl
-/// (which can't import Rust) must be kept equal to it by hand.
-pub const ENTITY_SIZE: f32 = 8.0;
+/// and shadow.wgsl (which can't import Rust) must be kept equal to it by hand.
+pub const ENTITY_SIZE: f32 = 1.0;
 
-/// Downward (−Y) acceleration added to a falling entity's velocity each tick.
-/// A tunable knob: larger falls faster. Only entities with the `Gravity` marker
-/// are affected.
-pub const GRAVITY: f32 = 0.3;
+/// What `ENTITY_SIZE` was before world units became metres. A scene or
+/// prefab saved then has its scales multiplied by this on load, so it looks
+/// the same as before (see `SCENE_UNITS`).
+pub const OLD_ENTITY_SIZE: f32 = 8.0;
+
+/// The unit version written with every scene and prefab. 0 (or missing) is
+/// a file from before world units were metres, when an entity at scale 1
+/// was `OLD_ENTITY_SIZE` across; 1 is metres.
+pub const SCENE_UNITS: u32 = 1;
+
+/// Downward (-Y) speed added to a falling entity's velocity each tick, in
+/// metres per tick (velocities on the hand-rolled path are per tick). Real
+/// gravity, 9.81 m/s^2, at the engine's tick rate. Only entities with the
+/// `Gravity` marker are affected.
+pub const GRAVITY: f32 = 9.81 / (crate::core::TICK_RATE as f32 * crate::core::TICK_RATE as f32);
+
+/// How a character's body is built, in metres, kilograms and metres per
+/// second. The character controller (`physics`) reads it every tick to size
+/// the capsule it moves and to decide how fast it walks, runs and jumps. It is
+/// plain data that anything can write: the Inspector, a script, or a game's
+/// own systems (one that grows its characters over a lifetime, say). An
+/// entity needs `Controlled` and `RigidBody` too for it to move. Its drawn
+/// `Scale` is kept matching the capsule (see `physics`).
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Debug)]
+#[serde(default)]
+pub struct CharacterBody {
+    /// Standing height, feet to the top of the head.
+    pub height: f32,
+    /// Radius of the capsule the body moves as.
+    pub radius: f32,
+    /// Height of the eyes above the feet when standing.
+    pub eye_height: f32,
+    /// Height when crouching.
+    pub crouch_height: f32,
+    /// Speed walking, running and crouching.
+    pub walk_speed: f32,
+    pub run_speed: f32,
+    pub crouch_speed: f32,
+    /// How high a standing jump lifts the feet.
+    pub jump_height: f32,
+    /// The highest step walked straight up without jumping.
+    pub step_height: f32,
+    /// The steepest ground that can be walked up, in degrees from flat.
+    pub max_slope: f32,
+    /// Body mass.
+    pub mass: f32,
+    /// How much the character can still steer in the air: 0 keeps the
+    /// speed it jumped with, 1 steers as freely as on the ground.
+    pub air_control: f32,
+}
+
+impl Default for CharacterBody {
+    /// An adult of average size.
+    fn default() -> Self {
+        CharacterBody {
+            height: 1.8,
+            radius: 0.3,
+            eye_height: 1.66,
+            crouch_height: 1.2,
+            walk_speed: 1.4,
+            run_speed: 5.0,
+            crouch_speed: 0.8,
+            jump_height: 0.5,
+            step_height: 0.35,
+            max_slope: 45.0,
+            mass: 70.0,
+            air_control: 0.2,
+        }
+    }
+}
+
+impl CharacterBody {
+    /// The same body with every value in a range the controller can use: a
+    /// height from 0.3 to 4 m, a capsule that fits inside it, eyes inside the
+    /// head, speeds and heights never negative, a slope under 89 degrees.
+    pub fn sanitized(&self) -> CharacterBody {
+        let finite = |v: f32, fallback: f32| if v.is_finite() { v } else { fallback };
+        let d = CharacterBody::default();
+        let height = finite(self.height, d.height).clamp(0.3, 4.0);
+        let radius = finite(self.radius, d.radius).clamp(0.05, height * 0.45);
+        let crouch_height =
+            finite(self.crouch_height, d.crouch_height).clamp(2.0 * radius + 0.02, height);
+        CharacterBody {
+            height,
+            radius,
+            eye_height: finite(self.eye_height, d.eye_height).clamp(0.0, height),
+            crouch_height,
+            walk_speed: finite(self.walk_speed, d.walk_speed).max(0.0),
+            run_speed: finite(self.run_speed, d.run_speed).max(0.0),
+            crouch_speed: finite(self.crouch_speed, d.crouch_speed).max(0.0),
+            jump_height: finite(self.jump_height, d.jump_height).clamp(0.0, 10.0),
+            step_height: finite(self.step_height, d.step_height).clamp(0.0, height * 0.5),
+            max_slope: finite(self.max_slope, d.max_slope).clamp(0.0, 89.0),
+            mass: finite(self.mass, d.mass).max(0.1),
+            air_control: finite(self.air_control, d.air_control).clamp(0.0, 1.0),
+        }
+    }
+
+    /// How tall the body stands now: `crouch_height` while crouched.
+    pub fn height_now(&self, crouched: bool) -> f32 {
+        if crouched {
+            self.crouch_height
+        } else {
+            self.height
+        }
+    }
+
+    /// How high the eyes are above the feet now. Crouching lowers them in
+    /// step with the body.
+    pub fn eye_height_now(&self, crouched: bool) -> f32 {
+        self.eye_height * self.height_now(crouched) / self.height.max(1e-3)
+    }
+}
+
+/// Where a character is looking. `yaw` turns the whole body (0 faces -Z,
+/// like `Rotation`); `pitch` tips only the view, up positive, within
+/// `LOOK_PITCH_LIMIT` either way. A `Camera` attached to a character with a
+/// `CharacterBody` looks this way from its eyes (see
+/// `systems::apply_parenting`).
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Debug, Default)]
+pub struct Look {
+    pub yaw: f32,
+    #[serde(default)]
+    pub pitch: f32,
+}
+
+/// The furthest a `Look` tips up or down, in radians (just under 90 degrees,
+/// so the view never flips over).
+pub const LOOK_PITCH_LIMIT: f32 = 1.55;
 
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Script {
@@ -837,11 +963,31 @@ impl Default for UiImage {
 /// What a physics-controlled entity asked to do this tick: move (dx, dz) in
 /// world units, and whether Jump is held. Whether it can actually move or
 /// jump is decided by the physics step, not here.
-#[derive(Clone, Copy, Default, PartialEq)]
+/// For a character with a `CharacterBody`, `run` and `crouch` are what
+/// those buttons ask for too; other entities ignore them.
+#[derive(Clone, Copy, Default, PartialEq, Debug)]
 pub struct MoveIntent {
     pub dx: f32,
     pub dz: f32,
     pub jump: bool,
+    pub run: bool,
+    pub crouch: bool,
+}
+
+/// The actions an entity is holding: the main one (`Button::Use`) and the
+/// second (`Button::UseAlt`). What they do is the game's to decide; the
+/// engine only carries them from the input to the world (`World.actions`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Actions {
+    pub primary: bool,
+    pub secondary: bool,
+}
+
+impl Actions {
+    /// Whether either action is held.
+    pub fn any(&self) -> bool {
+        self.primary || self.secondary
+    }
 }
 
 /// A reusable snapshot of one entity's "shape": everything that decides what
@@ -895,6 +1041,12 @@ pub struct Prefab {
     /// no children, exactly how it already behaved.
     #[serde(default)]
     pub children: Vec<PrefabChild>,
+    #[serde(default)]
+    pub character: Option<CharacterBody>,
+    /// See `SCENE_UNITS`. Missing in a prefab saved before metres, which is
+    /// scaled up when it is spawned.
+    #[serde(default)]
+    pub units: u32,
 }
 
 /// One child in a `Prefab`'s subtree: the offset it carried on its own live
@@ -955,6 +1107,12 @@ pub struct World {
     /// Optional per-entity screen-space UI image, `ui_texts`'s sibling.
     #[serde(default)]
     pub ui_images: ComponentStorage<UiImage>,
+    /// How each character's body is built. See `CharacterBody`.
+    #[serde(default)]
+    pub characters: ComponentStorage<CharacterBody>,
+    /// Where each character is looking. See `Look`.
+    #[serde(default)]
+    pub looks: ComponentStorage<Look>,
     /// Components that belong to crates outside the engine, keyed by name.
     /// A crate that adds its own component (a game-specific feature, say) never
     /// needs a field here: it stores each entity's value under its own name
@@ -1029,6 +1187,12 @@ pub struct World {
     /// saved with the scene.
     #[serde(skip)]
     pub move_intents: std::collections::BTreeMap<usize, MoveIntent>,
+    /// The actions each controlled entity is holding this tick (see
+    /// `Actions`), keyed by entity id: only those holding one. Written by the
+    /// input systems, read by whatever acts on them (a game's tools, in a
+    /// module's tick). Transient like `move_intents`, never saved.
+    #[serde(skip)]
+    pub actions: std::collections::BTreeMap<usize, Actions>,
     /// Whether each physics character was touching the ground as of the last
     /// time `physics::Physics::move_characters` ran, keyed by entity id.
     /// Rebuilt fresh every physics step (see there), so an id only appears
@@ -1041,6 +1205,16 @@ pub struct World {
     /// never saved with the scene.
     #[serde(skip)]
     pub grounded: std::collections::BTreeMap<usize, bool>,
+    /// Which characters are crouched as of the last physics step, keyed by
+    /// entity id. Rebuilt every step like `grounded`; read by
+    /// `systems::apply_parenting` to lower a character's eyes, and by
+    /// scripts. Transient, never saved.
+    #[serde(skip)]
+    pub crouched: std::collections::BTreeMap<usize, bool>,
+    /// See `SCENE_UNITS`. Written as `SCENE_UNITS` on save; a scene loaded
+    /// with an older value is upgraded by `load_from_file`.
+    #[serde(default)]
+    units: u32,
     /// Runtime-registered component storage, keyed by name, for a component
     /// type the engine was never compiled knowing about. This is the seam a
     /// host (a private game layer, an editor plugin) uses to attach its own
@@ -1197,6 +1371,8 @@ impl World {
             self.sounds.remove(id);
             self.ui_texts.remove(id);
             self.ui_images.remove(id);
+            self.characters.remove(id);
+            self.looks.remove(id);
             for storage in self.extensions.values_mut() {
                 storage.remove(id);
             }
@@ -1297,6 +1473,8 @@ impl World {
             light: self.lights.get(id).cloned(),
             sound: self.sounds.get(id).cloned(),
             children,
+            character: self.characters.get(id).copied(),
+            units: SCENE_UNITS,
         })
     }
 
@@ -1357,6 +1535,17 @@ impl World {
         }
         if let Some(sound) = &prefab.sound {
             self.sounds.insert(id, sound.clone());
+        }
+        if let Some(character) = prefab.character {
+            self.characters.insert(id, character);
+        }
+        if prefab.units < SCENE_UNITS {
+            // A prefab saved before metres: scale it as it was drawn then.
+            if let Some(scale) = self.scales.get_mut(id) {
+                scale.x *= OLD_ENTITY_SIZE;
+                scale.y *= OLD_ENTITY_SIZE;
+                scale.z *= OLD_ENTITY_SIZE;
+            }
         }
     }
 
@@ -1518,7 +1707,13 @@ impl World {
         &self,
         path: impl AsRef<std::path::Path>,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let ron = ron::ser::to_string_pretty(self, ron::ser::PrettyConfig::default())?;
+        let ron = if self.units == SCENE_UNITS {
+            ron::ser::to_string_pretty(self, ron::ser::PrettyConfig::default())?
+        } else {
+            let mut current = self.clone();
+            current.units = SCENE_UNITS;
+            ron::ser::to_string_pretty(&current, ron::ser::PrettyConfig::default())?
+        };
         std::fs::write(path, ron)?;
         Ok(())
     }
@@ -1529,6 +1724,7 @@ impl World {
     ) -> Result<World, Box<dyn std::error::Error>> {
         let text = std::fs::read_to_string(path)?;
         let mut world: World = ron::from_str(&text)?;
+        world.upgrade_units();
         // `dynamic` itself never serializes (see its own doc comment);
         // rebuild the f64 half of it from `dynamic_f64`, which does, so
         // `get_dynamic::<f64>` reads correctly straight after a load without
@@ -1547,6 +1743,25 @@ impl World {
     }
 }
 
+impl World {
+    /// Bring a world read from a file up to `SCENE_UNITS`. A scene saved
+    /// before world units were metres drew an entity at scale 1 as
+    /// `OLD_ENTITY_SIZE` across, so its scales are multiplied by that and it
+    /// looks the same as before. Positions, offsets and light ranges were
+    /// already in world units and are left alone.
+    pub fn upgrade_units(&mut self) {
+        if self.units >= SCENE_UNITS {
+            return;
+        }
+        for scale in self.scales.iter_mut().flatten() {
+            scale.x *= OLD_ENTITY_SIZE;
+            scale.y *= OLD_ENTITY_SIZE;
+            scale.z *= OLD_ENTITY_SIZE;
+        }
+        self.units = SCENE_UNITS;
+    }
+}
+
 pub trait ScriptRuntime {
     /// Called once per tick, before any entity's script runs. Lets a runtime
     /// advance shared per-tick state (such as a clock exposed to scripts), and
@@ -1559,6 +1774,108 @@ pub trait ScriptRuntime {
 
     /// Run one entity's script for this tick, applying its effects to `world`.
     fn run(&mut self, world: &mut World, entity: usize);
+}
+
+#[cfg(test)]
+mod unit_tests {
+    use super::*;
+
+    #[test]
+    fn a_scene_from_before_metres_keeps_its_size_and_saves_as_metres() {
+        let mut world = World::new();
+        let id = world.spawn(
+            Position {
+                x: 1.0,
+                y: 2.0,
+                z: 3.0,
+            },
+            Velocity {
+                dx: 0.0,
+                dy: 0.0,
+                dz: 0.0,
+            },
+        );
+        world.scales.insert(
+            id,
+            Scale {
+                x: 1.0,
+                y: 2.0,
+                z: 0.5,
+            },
+        );
+        // Written the way an older editor wrote it: no `units`.
+        let text = ron::to_string(&world).unwrap();
+        let older = text.replacen(",units:0", "", 1);
+        assert_ne!(older, text);
+        let dir = std::env::temp_dir().join(format!("frame-units-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("old.ron");
+        std::fs::write(&path, older).unwrap();
+        let loaded = World::load_from_file(&path).unwrap();
+        let s = loaded.scales.get(id).unwrap();
+        assert_eq!((s.x, s.y, s.z), (8.0, 16.0, 4.0));
+        let p = loaded.positions.get(id).unwrap();
+        assert_eq!((p.x, p.y, p.z), (1.0, 2.0, 3.0));
+        // Saved again and loaded, it is not scaled twice.
+        loaded.save_to_file(&path).unwrap();
+        let again = World::load_from_file(&path).unwrap();
+        assert_eq!(again.scales.get(id).unwrap().x, 8.0);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_prefab_from_before_metres_spawns_its_old_size() {
+        let mut world = World::new();
+        let prefab = Prefab {
+            scale: Scale {
+                x: 1.0,
+                y: 1.0,
+                z: 2.0,
+            },
+            ..Prefab::default()
+        };
+        let pos = Position {
+            x: 0.0,
+            y: 0.0,
+            z: 0.0,
+        };
+        let old = world.spawn_from_prefab(&prefab, pos);
+        assert_eq!(world.scales.get(old).unwrap().z, 16.0);
+        let current = Prefab {
+            units: SCENE_UNITS,
+            ..prefab
+        };
+        let new = world.spawn_from_prefab(&current, pos);
+        assert_eq!(world.scales.get(new).unwrap().z, 2.0);
+        // A captured prefab is current.
+        assert_eq!(world.capture_prefab(new).unwrap().units, SCENE_UNITS);
+    }
+
+    #[test]
+    fn a_character_body_is_kept_in_a_usable_range() {
+        let wild = CharacterBody {
+            height: 9.0,
+            radius: 5.0,
+            eye_height: -1.0,
+            crouch_height: 0.0,
+            walk_speed: -2.0,
+            jump_height: f32::NAN,
+            max_slope: 120.0,
+            ..CharacterBody::default()
+        }
+        .sanitized();
+        assert_eq!(wild.height, 4.0);
+        assert!(wild.radius < wild.height * 0.5);
+        assert_eq!(wild.eye_height, 0.0);
+        assert!(wild.crouch_height > 2.0 * wild.radius);
+        assert_eq!(wild.walk_speed, 0.0);
+        assert_eq!(wild.jump_height, CharacterBody::default().jump_height);
+        assert_eq!(wild.max_slope, 89.0);
+        assert_eq!(
+            CharacterBody::default().sanitized(),
+            CharacterBody::default()
+        );
+    }
 }
 
 #[cfg(test)]

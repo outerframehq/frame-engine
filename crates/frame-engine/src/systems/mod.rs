@@ -4,7 +4,7 @@
 
 use crate::input::{Button, InputState};
 use crate::world::World;
-use crate::world::{MoveIntent, QueryFilter, ScriptRuntime};
+use crate::world::{Actions, MoveIntent, QueryFilter, ScriptRuntime};
 
 /// Expand an axis-aligned box's half-extents to bound the same box after it's
 /// rotated (yaw, pitch and roll). This is a conservative over-approximation,
@@ -234,6 +234,24 @@ pub fn resolve_collisions(world: &mut World) {
     }
 }
 
+/// Where character `id`'s eyes are (world position) and where they look,
+/// for an entity with a `CharacterBody`: at its eye height above its feet,
+/// lower while crouched, looking along its `Look` (or its `Rotation`'s yaw
+/// when it has no `Look` yet). None for any other entity. A `Camera` on the
+/// character itself, or attached to it, sees from here.
+pub fn character_eyes(world: &World, id: usize) -> Option<([f64; 3], crate::world::Look)> {
+    let body = world.characters.get(id)?.sanitized();
+    let pos = world.positions.get(id)?;
+    let crouched = world.crouched.get(&id).copied().unwrap_or(false);
+    // The character's position is the middle of its capsule.
+    let eye = body.eye_height_now(crouched) - 0.5 * body.height_now(crouched);
+    let look = world.looks.get(id).copied().unwrap_or(crate::world::Look {
+        yaw: world.rotations.get(id).map_or(0.0, |r| r.yaw),
+        pitch: 0.0,
+    });
+    Some(([pos.x, pos.y + f64::from(eye), pos.z], look))
+}
+
 /// Move and turn every `Parent`-attached entity to match its parent, plus its
 /// own local offset. Meant to run last each tick, after every other system
 /// that might move the parent (hand-rolled movement, scripts, physics), so a
@@ -247,6 +265,12 @@ pub fn resolve_collisions(world: &mut World) {
 /// parent's own vertical axis (`Rotation::with_extra_yaw`). For a parent with
 /// only a yaw this is exactly the old behaviour: yaw 0 faces -Z, a purely
 /// forward local offset points where the parent faces.
+///
+/// A `Camera` attached to a character (a parent with a `CharacterBody`) is
+/// its eyes instead: it sits at the character's eye height (lower while
+/// crouched), with the offset added on top in the character's own space,
+/// and looks along the character's `Look`, pitch included. Set the offset to
+/// zero for a first-person view.
 ///
 /// An entity with no `Parent`, or whose named parent has since despawned, is
 /// left untouched, the same tolerance a stale `Script` reference gets.
@@ -266,6 +290,26 @@ pub fn apply_parenting(world: &mut World) {
             .get(parent.entity)
             .copied()
             .unwrap_or_default();
+        if world.cameras.get(id).is_some()
+            && let Some((eye, look)) = character_eyes(world, parent.entity)
+        {
+            let turn = crate::world::Rotation::from_yaw(look.yaw);
+            let [dx, dy, dz] = turn.apply([parent.offset_x, parent.offset_y, parent.offset_z]);
+            if let Some(p) = world.positions.get_mut(id) {
+                p.x = eye[0] + f64::from(dx);
+                p.y = eye[1] + f64::from(dy);
+                p.z = eye[2] + f64::from(dz);
+            }
+            world.rotations.insert(
+                id,
+                crate::world::Rotation {
+                    yaw: look.yaw + parent.offset_yaw,
+                    pitch: look.pitch,
+                    roll: 0.0,
+                },
+            );
+            continue;
+        }
         let [world_dx, world_dy, world_dz] =
             parent_rotation.apply([parent.offset_x, parent.offset_y, parent.offset_z]);
         if let Some(p) = world.positions.get_mut(id) {
@@ -332,8 +376,9 @@ pub fn movement(world: &mut World) {
     }
 }
 
-// How far a controlled entity moves per tick while a direction is held.
-const INPUT_SPEED: f32 = 1.0;
+// How far a controlled entity without a `CharacterBody` moves per tick while
+// a direction is held: 4 m/s.
+const INPUT_SPEED: f32 = 4.0 / crate::core::TICK_RATE as f32;
 
 /// What the held buttons ask for this tick. Up is forward, which is -Z: the
 /// direction the editor camera faces at yaw 0.
@@ -356,15 +401,70 @@ fn held_intent(input: &InputState) -> MoveIntent {
         dx,
         dz,
         jump: input.is_held(Button::Jump),
+        run: input.is_held(Button::Run),
+        crouch: input.is_held(Button::Crouch),
+    }
+}
+
+/// The yaw a character faces: its `Look`, or its `Rotation` when it has no
+/// `Look` yet.
+fn facing(world: &World, id: usize) -> f32 {
+    world
+        .looks
+        .get(id)
+        .map(|l| l.yaw)
+        .or_else(|| world.rotations.get(id).map(|r| r.yaw))
+        .unwrap_or(0.0)
+}
+
+/// A held-button intent turned into a character's own move for one tick:
+/// the direction turned to the way it faces (Up walks where it looks), never
+/// faster on a diagonal, at its walking, running or crouching speed.
+fn character_move(intent: MoveIntent, yaw: f32, body: &crate::world::CharacterBody) -> MoveIntent {
+    let body = body.sanitized();
+    let sign = |v: f32| -> f32 {
+        if v > 0.0 {
+            1.0
+        } else if v < 0.0 {
+            -1.0
+        } else {
+            0.0
+        }
+    };
+    let (right, back) = (sign(intent.dx), sign(intent.dz));
+    let length = (right * right + back * back).sqrt();
+    let speed = if intent.crouch {
+        body.crouch_speed
+    } else if intent.run {
+        body.run_speed
+    } else {
+        body.walk_speed
+    };
+    let step = if length > 0.0 {
+        speed / crate::core::TICK_RATE as f32 / length
+    } else {
+        0.0
+    };
+    // Right is (cos, sin) and back is (-sin, cos) on (x, z) at this yaw.
+    let (sin, cos) = yaw.sin_cos();
+    MoveIntent {
+        dx: (right * cos - back * sin) * step,
+        dz: (right * sin + back * cos) * step,
+        ..intent
     }
 }
 
 /// Apply one entity's intent. A `RigidBody` entity only records it:
 /// `physics::Physics::step` checks it against the world and decides how far
-/// it really goes and whether it can jump. Anything else moves straight away
-/// and ignores Jump, since the hand-rolled path has no idea of standing on
-/// the ground.
+/// it really goes and whether it can jump. A character (one with a
+/// `CharacterBody`) moves the way it faces at its own speeds. Anything else
+/// moves straight away, along the world's axes, and ignores Jump, since the
+/// hand-rolled path has no idea of standing on the ground.
 fn apply_move(world: &mut World, id: usize, intent: MoveIntent) {
+    let intent = match world.characters.get(id) {
+        Some(body) => character_move(intent, facing(world, id), body),
+        None => intent,
+    };
     if world.rigid_bodies.get(id).is_some() {
         world.move_intents.insert(id, intent);
     } else if let Some(position) = world.positions.get_mut(id) {
@@ -391,13 +491,52 @@ pub fn input_movement(world: &mut World, input: &InputState) {
     }
 }
 
+/// The actions held in `input` (`Button::Use`, `Button::UseAlt`).
+fn held_actions(input: &InputState) -> Actions {
+    Actions {
+        primary: input.is_held(Button::Use),
+        secondary: input.is_held(Button::UseAlt),
+    }
+}
+
+/// Record the actions held in `input` for every `Controlled` entity in
+/// `World.actions`, replacing last tick's: an entity is there only while it
+/// holds one. Run each tick before anything that acts on them (a module's
+/// tick, say), like `input_movement`.
+pub fn input_actions(world: &mut World, input: &InputState) {
+    world.actions.clear();
+    let held = held_actions(input);
+    if !held.any() {
+        return;
+    }
+    let ids: Vec<usize> = world.controlled.entities().collect();
+    for id in ids {
+        world.actions.insert(id, held);
+    }
+}
+
+/// Like `input_actions`, for exactly one entity from its own input: what a
+/// multiplayer server needs (see `input_movement_for`).
+pub fn input_actions_for(world: &mut World, entity: usize, input: &InputState) {
+    let held = held_actions(input);
+    if held.any() {
+        world.actions.insert(entity, held);
+    } else {
+        world.actions.remove(&entity);
+    }
+}
+
 /// Like `input_movement`, but drives exactly one entity rather than every
 /// `Controlled` entity at once, from that entity's own input specifically.
 /// What a multiplayer server needs: each client's input can only ever move
 /// the one entity the server assigned that connection, never anyone else's,
 /// since there's nothing in the message a client sends that could name a
-/// different one.
+/// different one. A view sent with the input (`InputState::set_look`) turns
+/// that entity first.
 pub fn input_movement_for(world: &mut World, entity: usize, input: &InputState) {
+    if let Some((yaw, pitch)) = input.look() {
+        set_view(world, entity, yaw, pitch);
+    }
     let intent = held_intent(input);
     if intent == MoveIntent::default() {
         return;
@@ -405,11 +544,52 @@ pub fn input_movement_for(world: &mut World, entity: usize, input: &InputState) 
     apply_move(world, entity, intent);
 }
 
+/// Turn the view of every `Controlled` character (an entity with a
+/// `CharacterBody`) by `yaw` and `pitch` radians: the mouse, say. Yaw turns
+/// the whole body; pitch stays within `LOOK_PITCH_LIMIT`. Meant to be called
+/// whenever the host reads the mouse, every frame, not once a tick, so the
+/// view follows the hand without waiting for the next tick.
+pub fn turn_view(world: &mut World, yaw: f32, pitch: f32) {
+    let ids: Vec<usize> = world
+        .controlled
+        .join(&world.characters)
+        .map(|(id, _, _)| id)
+        .collect();
+    for id in ids {
+        let look = world.looks.get(id).copied().unwrap_or(crate::world::Look {
+            yaw: facing(world, id),
+            pitch: 0.0,
+        });
+        set_view(world, id, look.yaw + yaw, look.pitch + pitch);
+    }
+}
+
+/// Set where one character looks: its `Look`, and its body's yaw to match.
+/// The yaw is kept between -pi and pi and the pitch within
+/// `LOOK_PITCH_LIMIT`. Ignored for an entity with no `CharacterBody`, or for
+/// values that are not finite.
+pub fn set_view(world: &mut World, id: usize, yaw: f32, pitch: f32) {
+    use std::f32::consts::{PI, TAU};
+    if world.characters.get(id).is_none() || !yaw.is_finite() || !pitch.is_finite() {
+        return;
+    }
+    let yaw = (yaw + PI).rem_euclid(TAU) - PI;
+    let pitch = pitch.clamp(
+        -crate::world::LOOK_PITCH_LIMIT,
+        crate::world::LOOK_PITCH_LIMIT,
+    );
+    world.looks.insert(id, crate::world::Look { yaw, pitch });
+    let mut rotation = world.rotations.get(id).copied().unwrap_or_default();
+    rotation.yaw = yaw;
+    world.rotations.insert(id, rotation);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::world::{
-        Controlled, GRAVITY, Gravity, Parent, Position, RigidBody, Static, Velocity, World,
+        CharacterBody, Controlled, GRAVITY, Gravity, Parent, Position, RigidBody, Static, Velocity,
+        World,
     };
 
     fn at(world: &mut World, x: f32, y: f32, z: f32) -> usize {
@@ -495,10 +675,152 @@ mod tests {
         let mut input = InputState::new();
         input.set(Button::Right, true);
         input_movement(&mut world, &input);
-        assert_eq!(world.positions.get(walker).unwrap().x, 1.0);
+        let step = f64::from(INPUT_SPEED);
+        assert_eq!(world.positions.get(walker).unwrap().x, step);
         assert_eq!(world.positions.get(bystander).unwrap().x, 0.0);
         assert_eq!(world.positions.get(rigid).unwrap().x, 0.0);
-        assert_eq!(world.move_intents.get(&rigid).unwrap().dx, 1.0);
+        assert_eq!(world.move_intents.get(&rigid).unwrap().dx, INPUT_SPEED);
+    }
+
+    fn character(world: &mut World) -> usize {
+        let id = at(world, 0.0, 0.0, 0.0);
+        world.controlled.insert(id, Controlled);
+        world.rigid_bodies.insert(id, RigidBody);
+        world.characters.insert(id, CharacterBody::default());
+        id
+    }
+
+    fn close(a: f32, b: f32) -> bool {
+        (a - b).abs() < 1e-5
+    }
+
+    #[test]
+    fn a_character_walks_the_way_it_looks_at_its_own_speeds() {
+        let mut world = World::new();
+        let id = character(&mut world);
+        let tick = crate::core::TICK_RATE as f32;
+        let body = CharacterBody::default();
+        let mut input = InputState::new();
+        input.set(Button::Up, true);
+        // Facing -Z: forward is -Z, at walking speed.
+        input_movement(&mut world, &input);
+        let m = world.move_intents[&id];
+        assert!(
+            close(m.dx, 0.0) && close(m.dz, -body.walk_speed / tick),
+            "{m:?}"
+        );
+        // Turned a quarter to the right: forward is +X.
+        set_view(&mut world, id, std::f32::consts::FRAC_PI_2, 0.0);
+        input.set(Button::Run, true);
+        input_movement(&mut world, &input);
+        let m = world.move_intents[&id];
+        assert!(
+            close(m.dx, body.run_speed / tick) && close(m.dz, 0.0),
+            "{m:?}"
+        );
+        assert!(m.run);
+        // Up and right together are no faster than one direction.
+        input.set(Button::Right, true);
+        input.set(Button::Run, false);
+        input_movement(&mut world, &input);
+        let m = world.move_intents[&id];
+        assert!(close(m.dx.hypot(m.dz), body.walk_speed / tick), "{m:?}");
+        // Crouching wins over running.
+        input.set(Button::Run, true);
+        input.set(Button::Crouch, true);
+        input_movement(&mut world, &input);
+        let m = world.move_intents[&id];
+        assert!(close(m.dx.hypot(m.dz), body.crouch_speed / tick), "{m:?}");
+        assert!(m.crouch);
+    }
+
+    #[test]
+    fn held_actions_reach_the_controlled_entities_and_clear_when_let_go() {
+        let mut world = World::new();
+        let id = character(&mut world);
+        let other = at(&mut world, 0.0, 0.0, 0.0);
+        let mut input = InputState::new();
+        input.set(Button::Use, true);
+        input_actions(&mut world, &input);
+        assert_eq!(
+            world.actions.get(&id),
+            Some(&Actions {
+                primary: true,
+                secondary: false
+            })
+        );
+        assert!(!world.actions.contains_key(&other), "not controlled");
+        input.set(Button::Use, false);
+        input.set(Button::UseAlt, true);
+        input_actions(&mut world, &input);
+        assert_eq!(
+            world.actions[&id],
+            Actions {
+                primary: false,
+                secondary: true
+            }
+        );
+        input.set(Button::UseAlt, false);
+        input_actions(&mut world, &input);
+        assert!(world.actions.is_empty());
+        // One entity's own input, as a server applies it.
+        input.set(Button::Use, true);
+        input_actions_for(&mut world, other, &input);
+        assert!(world.actions[&other].primary && !world.actions.contains_key(&id));
+        input.set(Button::Use, false);
+        input_actions_for(&mut world, other, &input);
+        assert!(world.actions.is_empty());
+    }
+
+    #[test]
+    fn turning_the_view_turns_the_body_and_keeps_the_pitch_in_range() {
+        let mut world = World::new();
+        let id = character(&mut world);
+        let plain = at(&mut world, 0.0, 0.0, 0.0);
+        world.controlled.insert(plain, Controlled);
+        turn_view(&mut world, 0.5, 3.0);
+        let look = world.looks.get(id).copied().unwrap();
+        assert!(close(look.yaw, 0.5));
+        assert!(close(look.pitch, crate::world::LOOK_PITCH_LIMIT));
+        assert!(close(world.rotations.get(id).unwrap().yaw, 0.5));
+        assert!(close(world.rotations.get(id).unwrap().pitch, 0.0));
+        // A controlled entity with no body has no view to turn.
+        assert!(world.looks.get(plain).is_none());
+        // Yaw wraps round.
+        turn_view(&mut world, 7.0, -6.0);
+        let look = world.looks.get(id).copied().unwrap();
+        assert!(close(look.yaw, 7.5 - std::f32::consts::TAU));
+        assert!(close(look.pitch, -crate::world::LOOK_PITCH_LIMIT));
+    }
+
+    #[test]
+    fn a_camera_on_a_character_sits_at_its_eyes_and_looks_its_way() {
+        let mut world = World::new();
+        let id = character(&mut world);
+        world.positions.get_mut(id).unwrap().y = 10.0;
+        let eye = at(&mut world, 0.0, 0.0, 0.0);
+        world.cameras.insert(eye, crate::world::Camera);
+        world.parents.insert(
+            eye,
+            Parent {
+                entity: id,
+                ..Parent::default()
+            },
+        );
+        set_view(&mut world, id, 1.0, 0.3);
+        apply_parenting(&mut world);
+        let body = CharacterBody::default();
+        let p = world.positions.get(eye).unwrap();
+        let expect = 10.0 + f64::from(body.eye_height - 0.5 * body.height);
+        assert!((p.y - expect).abs() < 1e-5 && p.x == 0.0 && p.z == 0.0);
+        let r = world.rotations.get(eye).unwrap();
+        assert!(close(r.yaw, 1.0) && close(r.pitch, 0.3));
+        // Crouched, the eyes drop with the body.
+        world.crouched.insert(id, true);
+        apply_parenting(&mut world);
+        let low = world.positions.get(eye).unwrap().y;
+        let expect = 10.0 + f64::from(body.eye_height_now(true) - 0.5 * body.height_now(true));
+        assert!((low - expect).abs() < 1e-5, "{low} vs {expect}");
     }
 
     #[test]
@@ -538,9 +860,9 @@ mod tests {
     fn collision_reports_overlaps_and_skips_physics_owned() {
         let mut world = World::new();
         let a = at(&mut world, 0.0, 0.0, 0.0);
-        let b = at(&mut world, 4.0, 0.0, 0.0); // overlaps a (boxes are 8 wide)
+        let b = at(&mut world, 0.5, 0.0, 0.0); // overlaps a (boxes are 1 wide)
         let far = at(&mut world, 100.0, 0.0, 0.0);
-        let rigid = at(&mut world, 2.0, 0.0, 0.0); // overlaps both, but rapier's
+        let rigid = at(&mut world, 0.25, 0.0, 0.0); // overlaps both, but rapier's
         world.rigid_bodies.insert(rigid, RigidBody);
         collision(&mut world);
         assert_eq!(world.collisions.len(), 1);
@@ -558,14 +880,14 @@ mod tests {
     fn resolve_pushes_dynamic_out_of_static_only() {
         let mut world = World::new();
         let floor = at(&mut world, 0.0, 0.0, 0.0);
-        let ball = at(&mut world, 0.0, 6.0, 0.0); // 2 units into the floor
-        let other_static = at(&mut world, 0.0, 6.0, 0.0);
+        let ball = at(&mut world, 0.0, 0.75, 0.0); // a quarter into the floor
+        let other_static = at(&mut world, 0.0, 0.75, 0.0);
         world.statics.insert(floor, Static);
         world.statics.insert(other_static, Static);
         resolve_collisions(&mut world);
         assert_eq!(world.positions.get(floor).unwrap().y, 0.0);
-        assert_eq!(world.positions.get(other_static).unwrap().y, 6.0);
-        assert_eq!(world.positions.get(ball).unwrap().y, 8.0);
+        assert_eq!(world.positions.get(other_static).unwrap().y, 0.75);
+        assert_eq!(world.positions.get(ball).unwrap().y, 1.0);
     }
 
     #[test]
@@ -669,5 +991,42 @@ mod tests {
         assert!(
             (world.rotations.get(child).unwrap().pitch - std::f32::consts::FRAC_PI_2).abs() < 1e-5
         );
+    }
+
+    #[test]
+    fn a_characters_eyes_are_at_its_eye_height_looking_where_it_looks() {
+        let mut world = World::new();
+        let id = world.spawn(
+            Position {
+                x: 3.0,
+                y: 10.0,
+                z: -2.0,
+            },
+            Velocity {
+                dx: 0.0,
+                dy: 0.0,
+                dz: 0.0,
+            },
+        );
+        assert!(character_eyes(&world, id).is_none());
+        let body = crate::world::CharacterBody::default();
+        world.characters.insert(id, body);
+        world.looks.insert(
+            id,
+            crate::world::Look {
+                yaw: 0.5,
+                pitch: -0.2,
+            },
+        );
+        let (eye, look) = character_eyes(&world, id).unwrap();
+        // The position is the middle of the capsule, so the eyes are the eye
+        // height above the feet.
+        let feet = 10.0 - 0.5 * f64::from(body.height);
+        assert!((eye[1] - (feet + f64::from(body.eye_height))).abs() < 1e-5);
+        assert_eq!((eye[0], eye[2]), (3.0, -2.0));
+        assert_eq!((look.yaw, look.pitch), (0.5, -0.2));
+        // Crouched, they are lower.
+        world.crouched.insert(id, true);
+        assert!(character_eyes(&world, id).unwrap().0[1] < eye[1]);
     }
 }

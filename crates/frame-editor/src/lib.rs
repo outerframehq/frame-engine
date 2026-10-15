@@ -1219,6 +1219,10 @@ struct SharedGpu {
 // All the long-lived GPU objects, bundled so they travel together.
 struct GpuState {
     surface: wgpu::Surface<'static>,
+    /// The window the surface draws to, told just before each present so
+    /// that on Wayland the next redraw waits for the compositor's frame
+    /// callback (see `render`).
+    window: Arc<Window>,
     device: wgpu::Device,
     queue: wgpu::Queue,
     config: wgpu::SurfaceConfiguration,
@@ -1935,6 +1939,7 @@ impl GpuState {
         };
         (
             GpuState {
+                window: window.clone(),
                 surface,
                 device,
                 queue,
@@ -2269,6 +2274,11 @@ impl GpuState {
         let frame = match self.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame)
             | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
+            // Hidden or slow to give a frame: skip this one and try on the
+            // next redraw. Reconfiguring would not help and costs a stall.
+            wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
+                return;
+            }
             _ => {
                 self.surface.configure(&self.device, &self.config);
                 return;
@@ -2459,6 +2469,16 @@ impl GpuState {
                 .into_iter()
                 .chain(std::iter::once(encoder.finish())),
         );
+        // On Wayland this asks the compositor for a frame callback, and
+        // winit holds the window's next RedrawRequested until it comes. A
+        // window the compositor is not showing (covered by a fullscreen
+        // Play window, on another workspace) gets none, so it stops drawing
+        // instead of blocking in `get_current_texture` for a second each
+        // frame with vsync on, which stalled every window on this thread.
+        // Only called here, right before a present that commits it: asked
+        // for and never committed, the window would wait for ever. Does
+        // nothing on other platforms.
+        self.window.pre_present_notify();
         frame.present();
     }
     /// Render the scene from a Camera entity's own point of view into the
@@ -6199,6 +6219,7 @@ impl App {
                 // rather than the keyboard unconditionally overwriting
                 // whatever the script just set.
                 systems::input_movement(world, &self.game_input);
+                systems::input_actions(world, &self.game_input);
                 systems::run_scripts(world, &mut self.script_runtime, &self.game_input);
                 module_api::tick_modules(&self.modules, world, 1.0 / TICK_RATE as f32);
                 systems::gravity(world);
@@ -6436,12 +6457,24 @@ impl App {
                  character in the editor and save (Ctrl+S). Esc closes."
             } else {
                 "Click to play: the mouse looks around, WASD moves, Shift runs, \
-                 C crouches, Space jumps, F3 shows the numbers. Esc frees the \
-                 mouse, Esc again closes."
+                 C crouches, Space jumps, the mouse buttons use what you hold, \
+                 F3 shows the numbers. Esc frees the mouse, Esc again closes."
             }
         });
+        let aiming = self.game_mouse_held;
         let full_output = ctx.run_ui(raw_input, |ui| {
             let screen = ui.max_rect();
+            if aiming {
+                // A small dot in the middle while the mouse looks around:
+                // where the view, and a held tool, points.
+                let painter = ui.ctx().layer_painter(egui::LayerId::new(
+                    egui::Order::Foreground,
+                    egui::Id::new("play-crosshair"),
+                ));
+                let centre = screen.center();
+                painter.circle_filled(centre, 3.0, egui::Color32::from_black_alpha(140));
+                painter.circle_filled(centre, 1.8, egui::Color32::from_white_alpha(230));
+            }
             if let Some(stats) = &stats {
                 egui::Area::new(egui::Id::new("play-stats"))
                     .anchor(egui::Align2::LEFT_TOP, egui::vec2(8.0, 8.0))
@@ -6549,6 +6582,9 @@ impl App {
             window.request_redraw();
         }
         self.game_mouse_held = false;
+        // A freed mouse holds no action.
+        self.game_input.set(Button::Use, false);
+        self.game_input.set(Button::UseAlt, false);
     }
 
     /// Handle an event addressed to the game window.
@@ -6570,18 +6606,27 @@ impl App {
                     self.game_input = InputState::new();
                 }
             }
-            WindowEvent::MouseInput {
-                state: ElementState::Pressed,
-                button: MouseButton::Left,
-                ..
-            } => {
-                // A click in the window takes the mouse for looking around.
-                if !self.game_mouse_held
-                    && let Some(window) = &self.game_window
-                {
-                    grab_cursor(window, true);
-                    self.game_mouse_held = true;
-                    window.request_redraw();
+            WindowEvent::MouseInput { state, button, .. } => {
+                let pressed = state == ElementState::Pressed;
+                if !self.game_mouse_held {
+                    // A click in the window takes the mouse for looking
+                    // around; that click does nothing else.
+                    if pressed
+                        && button == MouseButton::Left
+                        && let Some(window) = &self.game_window
+                    {
+                        grab_cursor(window, true);
+                        self.game_mouse_held = true;
+                        window.request_redraw();
+                    }
+                } else {
+                    // With the mouse held, its buttons are the actions: left
+                    // the main one, right the second.
+                    match button {
+                        MouseButton::Left => self.game_input.set(Button::Use, pressed),
+                        MouseButton::Right => self.game_input.set(Button::UseAlt, pressed),
+                        _ => {}
+                    }
                 }
             }
             WindowEvent::Resized(size) => {

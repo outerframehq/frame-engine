@@ -4,3 +4,7 @@
 
 pub mod clock;
 pub use clock::Clock;
+
+/// Simulation ticks per second. Every host runs the world at this rate, so a
+/// tick is always `1.0 / TICK_RATE as f32` seconds.
+pub const TICK_RATE: u32 = 30;

@@ -10,8 +10,8 @@
 //! Light shipped in:
 //!
 //! - `Static` maps to a fixed rapier body, `Gravity`-without-`Static` to a
-//!   dynamic one, and `Controlled` to a kinematic character (see
-//!   `move_characters`). Plain `movement` (a `Velocity` with none of those
+//!   dynamic one, and `Controlled` (or a `CharacterBody` that is not
+//!   `Static`) to a kinematic character (see `move_characters`). Plain `movement` (a `Velocity` with none of those
 //!   markers) has no rapier equivalent yet.
 //! - A `Controlled` character is a kinematic body moved by rapier's
 //!   `KinematicCharacterController`, not by forces. Input leaves an intent in
@@ -63,17 +63,16 @@
 //! turns the opposite way to the engine's own yaw, so every rotation passes
 //! through `rapier_rotation`, which negates it.
 
-use rapier3d::control::{CharacterLength, KinematicCharacterController};
+use rapier3d::control::{CharacterAutostep, CharacterLength, KinematicCharacterController};
 use rapier3d::prelude::*;
 
 use crate::systems::half_extents;
 use crate::world::{Position, World};
 
-/// Downward acceleration for every physics body, in world units per second
-/// squared. Scaled to this engine's size: treating an 8-unit entity as about
-/// 1.8 m tall makes 1 unit about 0.22 m, so real gravity (9.81 m/s^2) is
-/// about 43.6 units/s^2. Make it less negative for floatier falls and jumps.
-pub const GRAVITY_Y: f32 = -43.6;
+/// Downward acceleration for every physics body, in metres per second
+/// squared (a world unit is a metre): real gravity. Make it less negative for
+/// floatier falls and jumps.
+pub const GRAVITY_Y: f32 = -9.81;
 
 /// How fast a character turns to face the way it's moving, in radians per
 /// second. 10.0 is a snappy half turn in about a third of a second. Lower
@@ -81,9 +80,15 @@ pub const GRAVITY_Y: f32 = -43.6;
 pub const TURN_SPEED: f32 = 10.0;
 
 /// Roughly how high a character's jump peaks above where it left the
-/// ground, in world units. 8.0 is one default entity height. The launch speed is worked
-/// out from this and the gravity, so changing gravity keeps the same height.
-pub const JUMP_HEIGHT: f32 = 8.0;
+/// ground, in metres, for a character with no `CharacterBody` (one with a
+/// body uses its own `jump_height`). The launch speed is worked out from this
+/// and the gravity, so changing gravity keeps the same height.
+pub const JUMP_HEIGHT: f32 = 1.0;
+
+/// The gap the character controller keeps between a character and what it
+/// touches, in metres. Small, but never zero (see rapier's
+/// `KinematicCharacterController::offset`).
+const SKIN: f64 = 0.02;
 
 /// Frame Engine's yaw as a rapier rotation. The engine's yaw turns clockwise
 /// seen from above (towards +X), the way the shader draws it, so yaw 0 faces
@@ -174,9 +179,6 @@ pub struct Physics {
     /// Kept so characters can fall at the same rate as dynamic bodies.
     /// Rapier's own gravity only acts on dynamic bodies, never kinematic ones.
     gravity_y: f32,
-    /// One controller drives every character. It holds settings only, no
-    /// per-entity state.
-    controller: KinematicCharacterController,
     /// Per-character runtime state, keyed by entity id. An entity is in here
     /// exactly when it has a kinematic body driven by `controller`.
     characters: std::collections::BTreeMap<usize, Character>,
@@ -191,12 +193,63 @@ pub struct Physics {
 struct Character {
     /// Vertical speed in world units per second. Negative means falling.
     fall_speed: f32,
+    /// Speed across the ground (x, z) in metres per second, kept through the
+    /// air so a jump carries on the way it started.
+    velocity: [f32; 2],
     /// Whether the last move ended touching the ground. While grounded, the
     /// character doesn't build up falling speed, and it can jump.
     grounded: bool,
     /// Whether Jump was held last tick. A jump needs a fresh press, so
     /// holding Jump down doesn't jump again on landing.
     jump_held: bool,
+    /// Whether it is crouched. It stays crouched while there is no room to
+    /// stand.
+    crouched: bool,
+    /// The capsule its collider has now (half the height of the straight
+    /// part, radius), when it has a `CharacterBody`. Rebuilt when the body
+    /// or the crouch changes it.
+    capsule: Option<(f32, f32)>,
+}
+
+/// Whether physics moves entity `id` as a character (kinematic, upright,
+/// moved by the controller): `Controlled`, or with a `CharacterBody` and not
+/// `Static`. A character that is not `Controlled` gets no input; it stands,
+/// falls and is moved only by what a script or system asks of it.
+fn is_character(world: &World, id: usize) -> bool {
+    world.controlled.get(id).is_some()
+        || (world.characters.get(id).is_some() && world.statics.get(id).is_none())
+}
+
+/// The capsule for a body standing or crouched: half the height of its
+/// straight part, and its radius.
+fn capsule_for(body: &crate::world::CharacterBody, crouched: bool) -> (f32, f32) {
+    let height = body.height_now(crouched);
+    ((0.5 * height - body.radius).max(0.0), body.radius)
+}
+
+/// The controller settings for one character: its body's step height and
+/// steepest slope, or the defaults for a character with no body.
+fn controller_for(body: Option<&crate::world::CharacterBody>) -> KinematicCharacterController {
+    let mut controller = KinematicCharacterController {
+        offset: CharacterLength::Absolute(SKIN),
+        ..KinematicCharacterController::default()
+    };
+    if let Some(body) = body {
+        let slope = f64::from(body.max_slope.to_radians());
+        controller.max_slope_climb_angle = slope;
+        controller.min_slope_slide_angle = slope;
+        controller.snap_to_ground = Some(CharacterLength::Absolute(f64::from(
+            body.step_height.max(0.1),
+        )));
+        if body.step_height > 0.0 {
+            controller.autostep = Some(CharacterAutostep {
+                max_height: CharacterLength::Absolute(f64::from(body.step_height)),
+                min_width: CharacterLength::Absolute(f64::from(body.radius * 0.5)),
+                include_dynamic_bodies: true,
+            });
+        }
+    }
+    controller
 }
 
 impl Physics {
@@ -213,10 +266,6 @@ impl Physics {
             rapier,
             handles: std::collections::BTreeMap::new(),
             gravity_y,
-            controller: KinematicCharacterController {
-                offset: CharacterLength::Absolute(0.05),
-                ..KinematicCharacterController::default()
-            },
             characters: std::collections::BTreeMap::new(),
             mesh_sets: std::collections::BTreeMap::new(),
         }
@@ -346,7 +395,11 @@ impl Physics {
                 // is removed later.
                 continue;
             }
-            if !is_controlled && !is_static && world.gravities.get(id).is_none() {
+            // A character: moved by the controller, upright. Anything with a
+            // `CharacterBody` is one (a person stands on their feet whether
+            // a player drives them or not), unless it is fixed in place.
+            let is_character = is_character(world, id);
+            if !is_character && !is_static && world.gravities.get(id).is_none() {
                 // Neither mapping in the module doc comment applies; nothing
                 // safe to build yet. Same "retry every tick" reasoning as
                 // the `Controlled` case above.
@@ -363,7 +416,7 @@ impl Physics {
             let [hx, hy, hz] = half_extents(&mesh, scale, &world.mesh_meta);
             let engine_rot = world.rotations.get(id).copied().unwrap_or_default();
 
-            let builder = if is_controlled {
+            let builder = if is_character {
                 // Moved by `move_characters`, not by forces.
                 RigidBodyBuilder::kinematic_position_based()
             } else if is_static {
@@ -374,7 +427,7 @@ impl Physics {
             // A character stays upright: yaw only, and locked to the Y axis.
             // Everything else uses its full orientation and, if dynamic, may
             // tumble freely.
-            let body = if is_controlled {
+            let body = if is_character {
                 builder
                     .rotation(rapier_rotation(engine_rot.yaw).to_scaled_axis())
                     .enabled_rotations(false, true, false)
@@ -384,16 +437,35 @@ impl Physics {
             .translation(Vector::new(position.x, position.y, position.z))
             .build();
             let body_handle = self.rapier.bodies.insert(body);
-            let collider =
-                ColliderBuilder::cuboid(f64::from(hx), f64::from(hy), f64::from(hz)).build();
+            // A character with a body is the capsule its body describes;
+            // anything else is the box it is drawn as.
+            let capsule = world
+                .characters
+                .get(id)
+                .filter(|_| is_character)
+                .map(|b| capsule_for(&b.sanitized(), false));
+            let collider = match capsule {
+                Some((half, radius)) => {
+                    ColliderBuilder::capsule_y(f64::from(half), f64::from(radius)).build()
+                }
+                None => {
+                    ColliderBuilder::cuboid(f64::from(hx), f64::from(hy), f64::from(hz)).build()
+                }
+            };
             let collider_handle = self.rapier.colliders.insert_with_parent(
                 collider,
                 body_handle,
                 &mut self.rapier.bodies,
             );
             self.handles.insert(id, (body_handle, collider_handle));
-            if is_controlled {
-                self.characters.insert(id, Character::default());
+            if is_character {
+                self.characters.insert(
+                    id,
+                    Character {
+                        capsule,
+                        ..Character::default()
+                    },
+                );
             }
         }
 
@@ -401,13 +473,18 @@ impl Physics {
             .handles
             .keys()
             .copied()
-            // Also rebuild an entity whose `Controlled` marker changed since
-            // its body was made: a kinematic body can't turn into a dynamic
-            // one in place, so remove it and let the next tick build the
-            // right kind.
+            // Also rebuild an entity that became or stopped being a character
+            // since its body was made: a kinematic body can't turn into a
+            // dynamic one in place, so remove it and let the next tick build
+            // the right kind.
             .filter(|id| {
                 world.rigid_bodies.get(*id).is_none()
-                    || self.characters.contains_key(id) != world.controlled.get(*id).is_some()
+                    || self.characters.contains_key(id) != is_character(world, *id)
+                    // Gaining or losing a `CharacterBody` swaps box for
+                    // capsule or back.
+                    || self.characters.get(id).is_some_and(|c| {
+                        c.capsule.is_some() != world.characters.get(*id).is_some()
+                    })
             })
             .collect();
         for id in gone {
@@ -442,10 +519,12 @@ impl Physics {
         // rather than left to accumulate stale entries for a despawned or
         // un-Controlled entity.
         world.grounded.clear();
+        world.crouched.clear();
         let intents = std::mem::take(&mut world.move_intents);
         // The query pipeline borrows all of `self.rapier`, so a body can't be
         // changed while it's alive. Work out every move first, then apply.
         let mut moves: Vec<(RigidBodyHandle, Vector, f32)> = Vec::new();
+        let mut reshapes: Vec<(ColliderHandle, (f32, f32))> = Vec::new();
         for (&id, character) in self.characters.iter_mut() {
             let Some(&(body_handle, collider_handle)) = self.handles.get(&id) else {
                 continue;
@@ -453,10 +532,48 @@ impl Physics {
             let Some(collider) = self.rapier.colliders.get(collider_handle) else {
                 continue;
             };
+            let body = world.characters.get(id).map(|b| b.sanitized());
             let intent = intents.get(&id).copied().unwrap_or_default();
             let jump_pressed = intent.jump && !character.jump_held;
             character.jump_held = intent.jump;
             let falls = world.gravities.get(id).is_some();
+            let filter = QueryFilter::default().exclude_rigid_body(body_handle);
+            let queries = self.rapier.query_pipeline_with_filter(filter);
+
+            // Crouching shrinks the capsule toward the feet; standing back
+            // up needs room overhead. `shift` moves the capsule's middle so
+            // its feet stay where they are.
+            let mut shift = 0.0f32;
+            let mut shape: Option<SharedShape> = None;
+            if let Some(body) = &body {
+                let mut crouched = intent.crouch;
+                let mut capsule = capsule_for(body, crouched);
+                let old = character.capsule.unwrap_or(capsule);
+                if !crouched && character.crouched {
+                    // Room to stand? Test the standing capsule where it
+                    // would be.
+                    let lift = (capsule.0 + capsule.1) - (old.0 + old.1);
+                    let mut pose = *collider.position();
+                    pose.translation += Vector::new(0.0, f64::from(lift), 0.0);
+                    let standing =
+                        SharedShape::capsule_y(f64::from(capsule.0), f64::from(capsule.1));
+                    if queries.intersect_shape(pose, &*standing).next().is_some() {
+                        crouched = true;
+                        capsule = capsule_for(body, true);
+                    }
+                }
+                character.crouched = crouched;
+                if capsule != old {
+                    shift = (capsule.0 + capsule.1) - (old.0 + old.1);
+                    shape = Some(SharedShape::capsule_y(
+                        f64::from(capsule.0),
+                        f64::from(capsule.1),
+                    ));
+                    character.capsule = Some(capsule);
+                    reshapes.push((collider_handle, capsule));
+                }
+                world.crouched.insert(id, crouched);
+            }
 
             if falls && !character.grounded {
                 // Only build up falling speed in the air. Pushing down into
@@ -468,26 +585,41 @@ impl Physics {
                 character.fall_speed = 0.0;
             }
             if falls && character.grounded && jump_pressed {
-                // Launch speed that peaks at about JUMP_HEIGHT under this
+                // Launch speed that peaks at the jump height under this
                 // gravity, from v^2 = 2 * g * h. Moving in whole ticks
-                // overshoots a little (about 0.4 units at 30 ticks/s).
-                character.fall_speed = (2.0 * -self.gravity_y * JUMP_HEIGHT).sqrt();
+                // overshoots a little.
+                let height = body.as_ref().map_or(JUMP_HEIGHT, |b| b.jump_height);
+                character.fall_speed = (2.0 * -self.gravity_y * height).sqrt();
+            }
+
+            // Across the ground: on the ground (or with no body) the
+            // character goes where it asks; in the air it keeps its speed,
+            // steering only as much as its body's `air_control` allows.
+            let wanted = [intent.dx / dt, intent.dz / dt];
+            let airborne = falls && !character.grounded;
+            match &body {
+                Some(body) if airborne => {
+                    let steer = (body.air_control * 10.0 * dt).min(1.0);
+                    for (v, w) in character.velocity.iter_mut().zip(wanted) {
+                        *v += (w - *v) * steer;
+                    }
+                }
+                _ => character.velocity = wanted,
             }
             let desired = Vector::new(
-                f64::from(intent.dx),
+                f64::from(character.velocity[0] * dt),
                 f64::from(character.fall_speed * dt),
-                f64::from(intent.dz),
+                f64::from(character.velocity[1] * dt),
             );
 
-            // Leave the character's own collider out of the obstacles it
-            // checks against, or it would collide with itself.
-            let filter = QueryFilter::default().exclude_rigid_body(body_handle);
-            let queries = self.rapier.query_pipeline_with_filter(filter);
-            let movement = self.controller.move_shape(
+            let mut pose = *collider.position();
+            pose.translation += Vector::new(0.0, f64::from(shift), 0.0);
+            let controller = controller_for(body.as_ref());
+            let movement = controller.move_shape(
                 f64::from(dt),
                 &queries,
-                collider.shape(),
-                collider.position(),
+                shape.as_deref().unwrap_or(collider.shape()),
+                &pose,
                 desired,
                 |_| {},
             );
@@ -498,20 +630,30 @@ impl Physics {
                 // Landed: stop building up speed while standing still.
                 character.fall_speed = 0.0;
             }
+            if movement.grounded || !falls {
+                // What the ground let it do is what it carries into a jump.
+                character.velocity = [
+                    movement.translation.x as f32 / dt,
+                    movement.translation.z as f32 / dt,
+                ];
+            }
 
-            // Turn to face the way the character is trying to move. Starts
-            // from the entity's own yaw, not the body's, so a yaw set by a
-            // script or the Inspector is kept rather than overwritten. With
-            // no move this tick the yaw is left as it is.
+            // A character with a body faces where it looks (its `Rotation`
+            // follows its `Look`, see `systems::set_view`). One without
+            // turns to face the way it is trying to move. Starts from the
+            // entity's own yaw, not the body's, so a yaw set by a script or
+            // the Inspector is kept rather than overwritten. With no move
+            // this tick the yaw is left as it is.
             let mut yaw = world.rotations.get(id).map(|r| r.yaw).unwrap_or(0.0);
-            if intent.dx != 0.0 || intent.dz != 0.0 {
+            if body.is_none() && (intent.dx != 0.0 || intent.dz != 0.0) {
                 yaw = turn_towards(yaw, yaw_facing(intent.dx, intent.dz), TURN_SPEED * dt);
             }
-            moves.push((
-                body_handle,
-                collider.position().translation + movement.translation,
-                yaw,
-            ));
+            moves.push((body_handle, pose.translation + movement.translation, yaw));
+        }
+        for (collider_handle, (half, radius)) in reshapes {
+            if let Some(collider) = self.rapier.colliders.get_mut(collider_handle) {
+                collider.set_shape(SharedShape::capsule_y(f64::from(half), f64::from(radius)));
+            }
         }
         for (body_handle, target, yaw) in moves {
             if let Some(body) = self.rapier.bodies.get_mut(body_handle) {
@@ -527,6 +669,20 @@ impl Physics {
     /// costs nothing to run unconditionally, the same "just recompute it"
     /// choice `systems::movement` already makes for everything else.
     fn write_back(&mut self, world: &mut World) {
+        // A character with a body is drawn the size of its capsule.
+        for (&id, character) in &self.characters {
+            if let Some((half, radius)) = character.capsule {
+                let size = crate::world::ENTITY_SIZE;
+                world.scales.insert(
+                    id,
+                    crate::world::Scale {
+                        x: 2.0 * radius / size,
+                        y: 2.0 * (half + radius) / size,
+                        z: 2.0 * radius / size,
+                    },
+                );
+            }
+        }
         for (&id, (body_handle, _)) in self.handles.iter() {
             let Some(body) = self.rapier.bodies.get(*body_handle) else {
                 continue;
@@ -567,7 +723,7 @@ impl Physics {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::world::{Gravity, Rotation as EngineRotation, Static, Velocity};
+    use crate::world::{Gravity, MoveIntent, Rotation as EngineRotation, Static, Velocity};
 
     fn quat_of(r: &Rotation) -> (f32, f32, f32, f32) {
         (r.x as f32, r.y as f32, r.z as f32, r.w as f32)
@@ -772,7 +928,7 @@ mod tests {
             physics.step(&mut world, 1.0 / 30.0);
         }
         let y = world.positions.get(id).unwrap().y;
-        assert!(y > 1.0 && y < 12.0, "it should rest on the floor: {y}");
+        assert!(y > 0.4 && y < 12.0, "it should rest on the floor: {y}");
     }
 
     #[test]
@@ -786,7 +942,7 @@ mod tests {
         }
         let y = world.positions.get(id).unwrap().y;
         assert!(
-            y > 51.0 && y < 62.0,
+            y > 50.4 && y < 62.0,
             "it should rest on the raised floor: {y}"
         );
     }
@@ -802,7 +958,7 @@ mod tests {
             physics.step(&mut world, 1.0 / 30.0);
         }
         let y = world.positions.get(id).unwrap().y;
-        assert!(y > 1.0 && y < 10.0, "the character should stand on it: {y}");
+        assert!(y > 0.4 && y < 10.0, "the character should stand on it: {y}");
     }
 
     /// Drop a body 10 units above a floor at `origin` and let it settle;
@@ -867,9 +1023,10 @@ mod tests {
     #[test]
     fn a_body_far_from_the_origin_really_rests_on_the_floor() {
         // Not just "the same as near the origin": it has landed on the floor
-        // (a half-extent above it), not fallen through or floated off.
+        // (a half-extent, half a metre, above it), not fallen through or
+        // floated off.
         let rest = settle_at([2.0e7, 0.0, 2.0e7], false);
-        assert!(rest[1] > 3.0 && rest[1] < 5.0, "{rest:?}");
+        assert!(rest[1] > 0.4 && rest[1] < 0.6, "{rest:?}");
         assert!(
             (rest[0] - 3.3).abs() < 0.5 && (rest[2] - 1.7).abs() < 0.5,
             "it stayed where it was dropped: {rest:?}"
@@ -928,5 +1085,186 @@ mod tests {
         physics.sync_static_meshes(&[("odd".to_string(), set)]);
         // Nothing usable, but the set is still tracked and nothing panicked.
         assert!(physics.static_mesh_collider_count() <= 1);
+    }
+
+    /// A fixed box `size` across with its top centre at `top`.
+    fn block(world: &mut World, top: [f64; 3], size: [f32; 3]) -> usize {
+        let id = world.spawn(
+            Position {
+                x: top[0],
+                y: top[1] - f64::from(size[1]) * 0.5,
+                z: top[2],
+            },
+            Velocity {
+                dx: 0.0,
+                dy: 0.0,
+                dz: 0.0,
+            },
+        );
+        world.scales.insert(
+            id,
+            crate::world::Scale {
+                x: size[0],
+                y: size[1],
+                z: size[2],
+            },
+        );
+        world.statics.insert(id, Static);
+        world.rigid_bodies.insert(id, crate::world::RigidBody);
+        id
+    }
+
+    /// A character with the default body standing on a wide floor at y = 0.
+    fn walker(world: &mut World) -> usize {
+        block(world, [0.0; 3], [40.0, 1.0, 40.0]);
+        let id = world.spawn(
+            Position {
+                x: 0.0,
+                y: 1.0,
+                z: 0.0,
+            },
+            Velocity {
+                dx: 0.0,
+                dy: 0.0,
+                dz: 0.0,
+            },
+        );
+        world.gravities.insert(id, Gravity);
+        world.rigid_bodies.insert(id, crate::world::RigidBody);
+        world.controlled.insert(id, crate::world::Controlled);
+        world
+            .characters
+            .insert(id, crate::world::CharacterBody::default());
+        id
+    }
+
+    /// Run `ticks` ticks, asking `id` to do `intent` every tick.
+    fn run(physics: &mut Physics, world: &mut World, id: usize, intent: MoveIntent, ticks: usize) {
+        for _ in 0..ticks {
+            world.move_intents.insert(id, intent);
+            physics.step(world, 1.0 / 30.0);
+        }
+    }
+
+    /// Walk along x at `speed` metres a second.
+    fn walk(speed: f32) -> MoveIntent {
+        MoveIntent {
+            dx: speed / 30.0,
+            ..Default::default()
+        }
+    }
+
+    fn feet(world: &World, id: usize, crouched: bool) -> f64 {
+        let body = crate::world::CharacterBody::default();
+        world.positions.get(id).unwrap().y - f64::from(body.height_now(crouched)) * 0.5
+    }
+
+    #[test]
+    fn a_character_stands_on_its_feet_and_is_drawn_its_own_size() {
+        let mut world = World::new();
+        let id = walker(&mut world);
+        let mut physics = Physics::new(GRAVITY_Y);
+        run(&mut physics, &mut world, id, walk(0.0), 60);
+        let f = feet(&world, id, false);
+        assert!(f.abs() < 0.05, "feet at {f}");
+        assert_eq!(world.grounded.get(&id), Some(&true));
+        let scale = world.scales.get(id).unwrap();
+        assert!((scale.y - 1.8).abs() < 1e-4 && (scale.x - 0.6).abs() < 1e-4);
+    }
+
+    #[test]
+    fn a_character_walks_up_a_step_but_not_a_wall() {
+        let mut world = World::new();
+        let id = walker(&mut world);
+        block(&mut world, [2.0, 0.3, 0.0], [1.0, 0.3, 4.0]);
+        let mut physics = Physics::new(GRAVITY_Y);
+        run(&mut physics, &mut world, id, walk(0.0), 30);
+        run(&mut physics, &mut world, id, walk(1.4), 60);
+        let p = *world.positions.get(id).unwrap();
+        assert!(p.x > 1.8, "it should be on the step: {}", p.x);
+        assert!((feet(&world, id, false) - 0.3).abs() < 0.06);
+
+        let mut world = World::new();
+        let id = walker(&mut world);
+        block(&mut world, [2.0, 0.8, 0.0], [1.0, 0.8, 4.0]);
+        let mut physics = Physics::new(GRAVITY_Y);
+        run(&mut physics, &mut world, id, walk(0.0), 30);
+        run(&mut physics, &mut world, id, walk(1.4), 60);
+        let p = *world.positions.get(id).unwrap();
+        assert!(p.x < 1.5 - 0.29, "it should stop at the wall: {}", p.x);
+    }
+
+    #[test]
+    fn a_character_jumps_its_bodys_height() {
+        let mut world = World::new();
+        let id = walker(&mut world);
+        let mut physics = Physics::new(GRAVITY_Y);
+        run(&mut physics, &mut world, id, walk(0.0), 30);
+        let jump = MoveIntent {
+            jump: true,
+            ..Default::default()
+        };
+        run(&mut physics, &mut world, id, jump, 1);
+        let mut highest = 0.0f64;
+        for _ in 0..30 {
+            run(&mut physics, &mut world, id, jump, 1);
+            highest = highest.max(feet(&world, id, false));
+        }
+        let wanted = f64::from(crate::world::CharacterBody::default().jump_height);
+        assert!((highest - wanted).abs() < 0.1, "peaked at {highest}");
+    }
+
+    #[test]
+    fn a_crouched_character_stays_down_under_a_low_roof() {
+        let mut world = World::new();
+        let id = walker(&mut world);
+        // A roof 1.5 m up, from x = 1 onwards.
+        block(&mut world, [3.0, 1.8, 0.0], [4.0, 0.3, 4.0]);
+        let mut physics = Physics::new(GRAVITY_Y);
+        run(&mut physics, &mut world, id, walk(0.0), 30);
+        let crouch = |speed: f32| MoveIntent {
+            dx: speed / 30.0,
+            crouch: true,
+            ..Default::default()
+        };
+        run(&mut physics, &mut world, id, crouch(0.0), 5);
+        assert_eq!(world.crouched.get(&id), Some(&true));
+        assert!(feet(&world, id, true).abs() < 0.05);
+        let scale = world.scales.get(id).unwrap();
+        assert!((scale.y - 1.2).abs() < 1e-4);
+        // Under the roof, letting go of Crouch keeps it crouched.
+        run(&mut physics, &mut world, id, crouch(0.8), 75);
+        assert!(world.positions.get(id).unwrap().x > 2.0);
+        run(&mut physics, &mut world, id, walk(0.0), 10);
+        assert_eq!(world.crouched.get(&id), Some(&true));
+        // Back out in the open it stands up again.
+        run(&mut physics, &mut world, id, crouch(-0.8), 120);
+        run(&mut physics, &mut world, id, walk(0.0), 10);
+        assert_eq!(world.crouched.get(&id), Some(&false));
+        assert!(feet(&world, id, false).abs() < 0.05);
+    }
+
+    #[test]
+    fn a_body_with_no_player_still_stands_upright_on_its_feet() {
+        let mut world = World::new();
+        let id = walker(&mut world);
+        world.controlled.remove(id);
+        world.positions.get_mut(id).unwrap().y = 3.0;
+        let mut physics = Physics::new(GRAVITY_Y);
+        for _ in 0..90 {
+            physics.step(&mut world, 1.0 / 30.0);
+        }
+        // Landed as a capsule, its middle half its height above the floor,
+        // not a tumbled box.
+        let y = world.positions.get(id).unwrap().y;
+        let half = 0.5 * f64::from(crate::world::CharacterBody::default().height);
+        assert!((y - half).abs() < 0.1, "{y}");
+        let r = world.rotations.get(id).copied().unwrap_or_default();
+        assert_eq!((r.pitch, r.roll), (0.0, 0.0));
+        // Fixed in place, it is a fixed box again.
+        world.statics.insert(id, Static);
+        physics.step(&mut world, 1.0 / 30.0);
+        physics.step(&mut world, 1.0 / 30.0);
+        assert!(!physics.characters.contains_key(&id));
     }
 }

@@ -2,14 +2,13 @@
 // License, v. 2.0. If a copy of the MPL was not distributed with this
 // file, You can obtain one at https://mozilla.org/MPL/2.0/.
 
-use frame_engine::core::Clock;
+use frame_engine::core::{Clock, TICK_RATE};
 use frame_engine::input::{Button, InputState};
 use frame_engine::net::{Client, Server};
 use frame_engine::physics::{GRAVITY_Y, Physics};
 use frame_engine::world::{Gravity, Position, RigidBody, Static, Velocity, World};
 use frame_engine::{render, systems};
 
-const TICK_RATE: u32 = 30;
 const MAX_CATCHUP_TICKS: u32 = 5;
 
 /// `cargo run -p frame-engine` with no arguments keeps the original,

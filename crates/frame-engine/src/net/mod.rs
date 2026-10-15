@@ -104,8 +104,9 @@ enum ServerMessage {
 }
 
 /// One input message, sent client to server: which of the movement
-/// buttons (and Jump) this client currently holds. Nothing else, deliberately; a
-/// client reports intent, never its own position or velocity directly.
+/// buttons (and Jump, Run and Crouch) this client currently holds, and where
+/// it is looking. Nothing else, deliberately; a client reports intent, never
+/// its own position or velocity directly.
 #[derive(Serialize, Deserialize)]
 struct InputUpload {
     up: bool,
@@ -116,6 +117,20 @@ struct InputUpload {
     /// field still reads.
     #[serde(default)]
     jump: bool,
+    /// Run and Crouch, and where the client is looking (yaw, pitch), if it
+    /// says. All default, so a message from an older client still reads.
+    #[serde(default)]
+    run: bool,
+    #[serde(default)]
+    crouch: bool,
+    #[serde(default)]
+    look: Option<(f32, f32)>,
+    /// The actions held (`Button::Use`, `Button::UseAlt`). Default, so a
+    /// message from an older client still reads.
+    #[serde(default)]
+    primary: bool,
+    #[serde(default)]
+    secondary: bool,
 }
 
 /// Write one length-prefixed message: a 4-byte big-endian length, then the
@@ -333,7 +348,15 @@ impl Server {
                 input.set(Button::Left, upload.left);
                 input.set(Button::Right, upload.right);
                 input.set(Button::Jump, upload.jump);
+                input.set(Button::Run, upload.run);
+                input.set(Button::Crouch, upload.crouch);
+                input.set(Button::Use, upload.primary);
+                input.set(Button::UseAlt, upload.secondary);
+                if let Some((yaw, pitch)) = upload.look {
+                    input.set_look(yaw, pitch);
+                }
                 systems::input_movement_for(world, entity, &input);
+                systems::input_actions_for(world, entity, &input);
             });
         }
         // Removed back to front, so an earlier index is never invalidated by
@@ -389,7 +412,7 @@ impl Client {
     }
 
     /// Send this tick's held input to the server. The client only ever
-    /// reports intent, which of the four buttons are held, never a
+    /// reports intent, which buttons are held and where it looks, never a
     /// position or velocity of its own; the server decides what effect, if
     /// any, that has, and which entity it applies to. Does nothing if the
     /// input can't be serialized, the same silent-skip already used
@@ -401,6 +424,11 @@ impl Client {
             left: input.is_held(Button::Left),
             right: input.is_held(Button::Right),
             jump: input.is_held(Button::Jump),
+            run: input.is_held(Button::Run),
+            crouch: input.is_held(Button::Crouch),
+            look: input.look(),
+            primary: input.is_held(Button::Use),
+            secondary: input.is_held(Button::UseAlt),
         };
         let Ok(payload) = ron::ser::to_string_pretty(&upload, ron::ser::PrettyConfig::default())
         else {
@@ -451,5 +479,20 @@ impl Client {
                 }
             }
         });
+    }
+}
+
+#[cfg(test)]
+mod action_tests {
+    use super::*;
+
+    #[test]
+    fn an_older_clients_input_without_actions_still_reads() {
+        let old = "(up: true, down: false, left: false, right: false, jump: false, run: true)";
+        let upload: InputUpload = ron::from_str(old).unwrap();
+        assert!(upload.up && upload.run && !upload.primary && !upload.secondary);
+        let new = "(up: false, down: false, left: false, right: false, primary: true)";
+        let upload: InputUpload = ron::from_str(new).unwrap();
+        assert!(upload.primary && !upload.secondary);
     }
 }
