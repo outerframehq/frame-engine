@@ -220,6 +220,10 @@ fn run_client(addr: &str) {
 
     loop {
         client.poll(&mut world);
+        if let Some(why) = client.refused() {
+            eprintln!("{why}");
+            return;
+        }
         client.send_input(&input);
         let owed = clock.advance(true);
         for _ in 0..owed {

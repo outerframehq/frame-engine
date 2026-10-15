@@ -4,6 +4,17 @@ members = ["crates/frame-editor",
     "crates/frame-engine",
 ]
 
+# One version for the engine and the editor, so they can't drift apart and a
+# release bumps one line. `rust-version` is the oldest Rust compiler that can
+# build Frame Engine; it is set by the newest of our libraries (egui 0.35
+# needs 1.92). An older compiler stops with one clear message instead of
+# hundreds of errors. Raise it when a library update needs a newer one.
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+rust-version = "1.92"
+license = "MPL-2.0"
+
 # `cargo run` builds in debug mode. Our own crates stay fast to rebuild, but
 # the libraries underneath (wgpu, egui, rapier, image, rhai, kira) run many
 # times slower unoptimised, which shows in every frame, in loading textures

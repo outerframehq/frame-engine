@@ -4692,8 +4692,8 @@ fn credits_ui(ui: &mut egui::Ui) {
 
     ui.label("Frame Engine and Frame Editor");
     ui.weak(format!(
-        "Version {} (pre-release), MIT licence",
-        env!("CARGO_PKG_VERSION")
+        "Version {} (pre-release), MPL-2.0 licence",
+        frame_engine::version::ENGINE
     ));
     ui.add_space(6.0);
 
@@ -5012,6 +5012,10 @@ struct App {
     saved_scripts: std::collections::BTreeMap<String, String>,
     // An action waiting on the unsaved-changes prompt.
     pending_unsaved: Option<GuardedAction>,
+    // A warning about versions to show in a window until dismissed: a
+    // scene, prefab or project from a newer Frame Editor. See
+    // `version_notice_ui`.
+    version_notice: Option<String>,
     // The title last given to the window, so it's only set when it changes.
     window_title: String,
     // The preferences as last written to editor.ron.
@@ -5579,10 +5583,40 @@ impl App {
                 Ok(()) => {
                     self.mark_saved();
                     self.log(format!("Saved scene to {}", path.display()));
+                    stamp_project(&path);
                 }
-                Err(e) => self.log(format!("Save failed: {e}")),
+                Err(e) => {
+                    if self.world.newer_format().is_some() {
+                        self.version_notice = Some(format!("Not saved: {e}."));
+                    }
+                    self.log(format!("Save failed: {e}"));
+                }
             },
             None => self.save_scene_as(),
+        }
+    }
+
+    /// After a scene loads (or fails to), say so if it came from a newer
+    /// Frame Editor: it opened but can't be saved over, or it can't be
+    /// read here at all.
+    fn check_scene_version(&mut self, result: Result<(), String>) {
+        match result {
+            Ok(()) => {
+                if let Some(found) = self.world.newer_format() {
+                    let text = format!(
+                        "This scene was saved by a newer Frame Editor (save format {found}; this is {}, which writes format {}). It opened, but anything this editor doesn't know about isn't shown, so Save is turned off for it. Use Save As to keep a copy, or update Frame Editor.",
+                        frame_engine::version::ENGINE,
+                        frame_engine::world::SCENE_FORMAT
+                    );
+                    self.log(text.clone());
+                    self.version_notice = Some(text);
+                }
+            }
+            Err(e) => {
+                if e.contains("newer Frame Editor") {
+                    self.version_notice = Some(format!("Could not open: {e}."));
+                }
+            }
         }
     }
 
@@ -5595,10 +5629,14 @@ impl App {
             .set_title("Save scene as")
             .save_file();
         if let Some(path) = picked {
+            // Choosing a file on purpose is the way to keep a scene from a
+            // newer editor; the copy is in this editor's format.
+            self.world.clear_newer_format();
             match self.world.save_to_file(&path) {
                 Ok(()) => {
                     self.mark_saved();
                     self.log(format!("Saved scene to {}", path.display()));
+                    stamp_project(&path);
                     self.current_scene_path = Some(path);
                 }
                 Err(e) => self.log(format!("Save failed: {e}")),
@@ -5621,8 +5659,12 @@ impl App {
                     self.mark_saved();
                     self.log(format!("Opened scene from {}", path.display()));
                     self.current_scene_path = Some(path);
+                    self.check_scene_version(Ok(()));
                 }
-                Err(e) => self.log(format!("Open failed: {e}")),
+                Err(e) => {
+                    self.log(format!("Open failed: {e}"));
+                    self.check_scene_version(Err(e.to_string()));
+                }
             }
         }
     }
@@ -5639,8 +5681,12 @@ impl App {
                 self.selected = None;
                 self.mark_saved();
                 self.log(format!("Reloaded scene from {}", path.display()));
+                self.check_scene_version(Ok(()));
             }
-            Err(e) => self.log(format!("Reload failed: {e}")),
+            Err(e) => {
+                self.log(format!("Reload failed: {e}"));
+                self.check_scene_version(Err(e.to_string()));
+            }
         }
     }
 
@@ -5658,6 +5704,8 @@ impl App {
         let mut s_name = std::mem::take(&mut self.settings_name);
         let mut s_desc = std::mem::take(&mut self.settings_description);
         let mut s_version = std::mem::take(&mut self.settings_version);
+        let notice = self.version_notice.clone();
+        let mut dismiss_notice = false;
         let (jobs, tex_delta, ppp) = if let (Some(state), Some(window)) =
             (self.egui_state.as_mut(), self.window.as_ref())
         {
@@ -5808,6 +5856,9 @@ impl App {
                             });
                     }
                 });
+                if let Some(text) = &notice {
+                    dismiss_notice |= version_notice_ui(ui.ctx(), text);
+                }
                 // Project-settings window, floating above the launcher. Closing
                 // it (its X or Save) flips `settings_open`, which triggers a save.
                 if settings_open {
@@ -5874,6 +5925,9 @@ impl App {
             self.settings_description = s_desc;
             self.settings_version = s_version;
         }
+        if dismiss_notice {
+            self.version_notice = None;
+        }
         match action {
             Some(LauncherAction::NewProject) => self.new_project(),
             Some(LauncherAction::OpenProject) => self.open_project(),
@@ -5918,6 +5972,7 @@ impl App {
                     &ProjectManifest {
                         description: String::new(),
                         version: "0.1.0".to_string(),
+                        editor: String::new(),
                     },
                 );
                 self.world = world;
@@ -5952,13 +6007,38 @@ impl App {
             .and_then(|s| s.to_str())
             .unwrap_or("Project")
             .to_string();
+        // The project's own stamp first: it names the editor version,
+        // which reads better than a save format number.
+        let manifest = read_manifest(&root);
+        let newer_project = frame_engine::version::is_newer_than_this(&manifest.editor);
         match World::load_from_file(&scene_path) {
             Ok(world) => {
                 self.world = world;
                 self.add_recent_project(&root);
                 self.enter_editor(name, scene_path);
+                self.check_scene_version(Ok(()));
+                if newer_project && self.version_notice.is_none() {
+                    let text = format!(
+                        "This project was last saved with Frame Editor {}, and this is {}. It opened fine, but a newer editor may have used features this one doesn't have. Updating Frame Editor is the safe choice.",
+                        manifest.editor,
+                        frame_engine::version::ENGINE
+                    );
+                    self.log(text.clone());
+                    self.version_notice = Some(text);
+                }
             }
-            Err(e) => self.log(format!("Could not open project: {e}")),
+            Err(e) => {
+                self.log(format!("Could not open project: {e}"));
+                if newer_project {
+                    self.version_notice = Some(format!(
+                        "Could not open this project. It was last saved with Frame Editor {}, and this is {}. Update Frame Editor to open it. ({e})",
+                        manifest.editor,
+                        frame_engine::version::ENGINE
+                    ));
+                } else {
+                    self.check_scene_version(Err(e.to_string()));
+                }
+            }
         }
     }
 
@@ -6039,6 +6119,7 @@ impl App {
             &ProjectManifest {
                 description,
                 version,
+                editor: String::new(),
             },
         );
         self.settings_open = false;
@@ -6102,7 +6183,7 @@ impl App {
         // Enabled/disabled choices already saved in the scene are kept.
         let (manifests, scripts, errors) = load_project_plugins(&root);
         for e in errors {
-            self.log(format!("Plugin load failed: {e}"));
+            self.log(format!("Plugins: {e}"));
         }
         merge_plugins_into_world(&mut world, manifests, scripts);
         let name = scene
@@ -7202,7 +7283,7 @@ impl App {
 
             let (manifests, scripts, errors) = load_project_plugins(&root);
             for e in errors {
-                self.log(format!("Plugin load failed: {e}"));
+                self.log(format!("Plugins: {e}"));
             }
             if !manifests.is_empty() {
                 self.log(format!("Found {} plugin(s)", manifests.len()));
@@ -7211,7 +7292,7 @@ impl App {
 
             let (prefabs, errors) = load_project_prefabs(&root);
             for e in errors {
-                self.log(format!("Prefab load failed: {e}"));
+                self.log(format!("Prefabs: {e}"));
             }
             if !prefabs.is_empty() {
                 self.log(format!("Found {} prefab(s)", prefabs.len()));
@@ -7267,7 +7348,7 @@ impl App {
             {
                 let (_, scripts, errors) = load_project_plugins(&root);
                 for e in errors {
-                    self.log(format!("Plugin load failed: {e}"));
+                    self.log(format!("Plugins: {e}"));
                 }
                 for (name, source) in scripts {
                     if name.starts_with(&prefix) {
@@ -8367,6 +8448,8 @@ impl ApplicationHandler for App {
                 let mut editor_settings_open = self.editor_settings_open;
                 let mut prefs_edit = self.current_prefs();
                 let pending_unsaved = self.pending_unsaved;
+                let notice = self.version_notice.clone();
+                let mut dismiss_notice = false;
                 let project_label = self
                     .project_name
                     .clone()
@@ -8654,6 +8737,9 @@ impl ApplicationHandler for App {
                                             });
                                         }
                                     });
+                            }
+                            if let Some(text) = &notice {
+                                dismiss_notice |= version_notice_ui(ui.ctx(), text);
                             }
                             // Unsaved-changes prompt, shown when quitting, closing
                             // the project or reloading would throw edits away.
@@ -9188,6 +9274,9 @@ impl ApplicationHandler for App {
                 // The unsaved-changes prompt's answer, applied here so Save sees
                 // this frame's Inspector and Script Editor edits already written
                 // back to the world above.
+                if dismiss_notice {
+                    self.version_notice = None;
+                }
                 if let Some(choice) = unsaved_choice {
                     if let Some(action) = self.pending_unsaved.take() {
                         match choice {
@@ -9492,6 +9581,27 @@ struct ProjectManifest {
     description: String,
     #[serde(default)]
     version: String,
+    /// The Frame Editor version that last saved this project, written by
+    /// `write_manifest`. Not the game's own `version` above. An older editor
+    /// opening the project compares it with its own and warns if it is
+    /// newer. Empty in a project from before this existed.
+    #[serde(default)]
+    editor: String,
+}
+
+/// A warning if a plugin says it needs a newer engine than this one (its
+/// `engine` field). The plugin still loads; it may use script variables or
+/// features this editor doesn't have.
+fn plugin_engine_warning(manifest: &frame_engine::world::PluginManifest) -> Option<String> {
+    if !frame_engine::version::is_newer_than_this(&manifest.engine) {
+        return None;
+    }
+    Some(format!(
+        "plugin '{}' needs Frame Engine {} or newer, and this is {}. It is loaded, but parts of it may not work",
+        manifest.name,
+        manifest.engine,
+        frame_engine::version::ENGINE
+    ))
 }
 
 /// Load every .obj in a project's assets folder into a name -> mesh map.
@@ -9546,6 +9656,9 @@ fn load_project_plugins(
                 continue;
             }
         };
+        if let Some(warning) = plugin_engine_warning(&manifest) {
+            errors.push(warning);
+        }
         if let Ok(script_entries) = std::fs::read_dir(plugin_dir.join("scripts")) {
             for script_entry in script_entries.flatten() {
                 let script_path = script_entry.path();
@@ -9602,9 +9715,28 @@ fn load_project_prefabs(
         match std::fs::read_to_string(&path) {
             Ok(text) => match ron::from_str::<frame_engine::world::Prefab>(&text) {
                 Ok(prefab) => {
+                    if prefab.format > frame_engine::world::SCENE_FORMAT {
+                        errors.push(format!(
+                            "{}: saved by a newer Frame Editor (save format {}, this editor reads up to {}), so parts of it may be missing here",
+                            path.display(),
+                            prefab.format,
+                            frame_engine::world::SCENE_FORMAT
+                        ));
+                    }
                     prefabs.insert(stem.to_string(), prefab);
                 }
-                Err(e) => errors.push(format!("{}: invalid prefab: {e}", path.display())),
+                Err(e) => {
+                    if frame_engine::world::scene_format_of(&text)
+                        > frame_engine::world::SCENE_FORMAT
+                    {
+                        errors.push(format!(
+                            "{}: saved by a newer Frame Editor and can't be read here; update Frame Editor to use it",
+                            path.display()
+                        ));
+                    } else {
+                        errors.push(format!("{}: invalid prefab: {e}", path.display()));
+                    }
+                }
             },
             Err(e) => errors.push(format!("{}: {e}", path.display())),
         }
@@ -9803,11 +9935,59 @@ fn read_manifest(root: &std::path::Path) -> ProjectManifest {
         .unwrap_or_default()
 }
 
-/// Write a project's manifest.
+/// Write a project's manifest, stamped with this editor's version in
+/// `editor`. A stamp from a newer editor already on disk is kept, so opening
+/// a project in an older editor never hides that a newer one saved it.
 fn write_manifest(root: &std::path::Path, manifest: &ProjectManifest) {
-    if let Ok(text) = ron::ser::to_string_pretty(manifest, ron::ser::PrettyConfig::default()) {
+    let mut manifest = manifest.clone();
+    manifest.editor = newest_editor(&read_manifest(root).editor);
+    if let Ok(text) = ron::ser::to_string_pretty(&manifest, ron::ser::PrettyConfig::default()) {
         let _ = std::fs::write(root.join("project.ron"), text);
     }
+}
+
+/// The editor version to stamp: this one, unless `existing` is newer.
+fn newest_editor(existing: &str) -> String {
+    if frame_engine::version::is_newer_than_this(existing) {
+        existing.to_string()
+    } else {
+        frame_engine::version::ENGINE.to_string()
+    }
+}
+
+/// After saving a scene, stamp the project it belongs to (the folder it is
+/// in, if that folder has a `project.ron`) with this editor's version.
+fn stamp_project(scene_path: &std::path::Path) {
+    let Some(root) = scene_path.parent() else {
+        return;
+    };
+    if !root.join("project.ron").exists() {
+        return;
+    }
+    let manifest = read_manifest(root);
+    if manifest.editor == newest_editor(&manifest.editor) {
+        return; // already stamped
+    }
+    write_manifest(root, &manifest);
+}
+
+/// A window with a version warning and an OK button. True when OK is
+/// clicked. Shared by the launcher and the editor.
+fn version_notice_ui(ctx: &egui::Context, text: &str) -> bool {
+    let mut ok = false;
+    egui::Window::new("Newer version")
+        .collapsible(false)
+        .resizable(false)
+        .default_width(420.0)
+        .anchor(egui::Align2::CENTER_CENTER, egui::vec2(0.0, 0.0))
+        .show(ctx, |ui| {
+            ui.label(text);
+            ui.add_space(8.0);
+            if ui.button("OK").clicked() {
+                ok = true;
+            }
+        });
+    ok
 }
 
 /// A remembered project, resolved for display on the launcher: its folder, the
@@ -10443,6 +10623,7 @@ pub fn run_as(name: &str, app_id: &str, modules: Vec<Box<dyn EditorModule>>) {
         dirty: false,
         saved_scripts: std::collections::BTreeMap::new(),
         pending_unsaved: None,
+        version_notice: None,
         window_title: String::new(),
         saved_prefs: prefs,
         egui_ctx: egui::Context::default(),
@@ -11116,5 +11297,85 @@ mod ambient_tests {
             [0.0; 2],
         );
         assert_eq!(uniform.ground[3], 1.0);
+    }
+}
+
+#[cfg(test)]
+mod version_tests {
+    use super::*;
+
+    fn temp_project(tag: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("frame-stamp-{tag}-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn a_project_is_stamped_with_this_editor() {
+        let root = temp_project("this");
+        write_manifest(
+            &root,
+            &ProjectManifest {
+                description: "A game".to_string(),
+                version: "2.3.0".to_string(),
+                editor: String::new(),
+            },
+        );
+        let back = read_manifest(&root);
+        assert_eq!(back.editor, frame_engine::version::ENGINE);
+        // The game's own version is left alone.
+        assert_eq!(back.version, "2.3.0");
+        // A project from before the stamp reads with it empty.
+        std::fs::write(
+            root.join("project.ron"),
+            "(description: \"old\", version: \"0.1.0\")",
+        )
+        .unwrap();
+        assert_eq!(read_manifest(&root).editor, "");
+        // Saving a scene in the project stamps it.
+        stamp_project(&root.join("game.ron"));
+        assert_eq!(read_manifest(&root).editor, frame_engine::version::ENGINE);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_newer_editors_stamp_is_kept() {
+        let root = temp_project("newer");
+        std::fs::write(
+            root.join("project.ron"),
+            "(description: \"\", version: \"0.1.0\", editor: \"99.0.0\")",
+        )
+        .unwrap();
+        stamp_project(&root.join("game.ron"));
+        write_manifest(&root, &read_manifest(&root));
+        let back = read_manifest(&root);
+        assert_eq!(back.editor, "99.0.0");
+        assert!(frame_engine::version::is_newer_than_this(&back.editor));
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_folder_without_a_project_is_not_stamped() {
+        let root = temp_project("bare");
+        stamp_project(&root.join("scene.ron"));
+        assert!(!root.join("project.ron").exists());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn a_plugin_needing_a_newer_engine_warns() {
+        let mut manifest: frame_engine::world::PluginManifest =
+            ron::from_str("(name: \"weather\", version: \"1.0.0\", author: \"me\")").unwrap();
+        assert_eq!(manifest.engine, "");
+        assert!(plugin_engine_warning(&manifest).is_none());
+        manifest.engine = frame_engine::version::ENGINE.to_string();
+        assert!(plugin_engine_warning(&manifest).is_none());
+        manifest.engine = "99.0".to_string();
+        let warning = plugin_engine_warning(&manifest).unwrap();
+        assert!(
+            warning.contains("weather") && warning.contains("99.0"),
+            "{warning}"
+        );
     }
 }

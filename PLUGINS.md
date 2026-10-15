@@ -45,11 +45,18 @@ isn't treated as a plugin.
     version: "0.1.0",
     author: "your name",
     description: "A couple of simple wander behaviours.",
+    engine: "0.1.0",
 )
 ```
 
 `name`, `version`, and `author` are required. `description` is optional and
 defaults to an empty string if left out.
+
+`engine` is optional too: the oldest Frame Engine version the plugin works
+with. If someone opens your plugin in an older editor, it still loads, but
+the editor's log warns that it needs a newer engine and parts of it may not
+work. Set it to the version you wrote the plugin against, so a script that
+uses a newer variable fails with a clear reason instead of a confusing one.
 
 `name` matters beyond the manifest itself: it's also the prefix every one of
 the plugin's scripts gets, covered next.

@@ -42,6 +42,7 @@ cargo test
 
 - Add tests for new behaviour. Most of the engine is tested without a GPU, so logic should be testable without one.
 - Keep changes documented: add a line under `[Unreleased]` in `CHANGELOG.md`, and update `DESIGN.md` if you change how something is built or why.
+- If you change what a scene or prefab saves (a new component or field, a renamed one, or a changed meaning), raise `SCENE_FORMAT` in `crates/frame-engine/src/world/mod.rs` by one. If you change a multiplayer message in a way the other side could misread, raise `PROTOCOL` in `crates/frame-engine/src/net/mod.rs`. These numbers are how an older editor or client knows it is looking at something newer. Don't change the shape of `Hello`, `Welcome` or `Refused`; only add fields with defaults.
 - Don't add new dependencies without discussing it in the issue first.
 
 ## Names and logos

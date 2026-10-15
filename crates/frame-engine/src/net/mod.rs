@@ -58,6 +58,14 @@
 //!   with a 4-byte big-endian length prefix ahead of it. Even a slice this
 //!   small can't skip that and still be correct; it isn't an optional nicety.
 //!
+//! - Versions are checked on connect. A client's first message is a
+//!   `Hello` naming its `PROTOCOL`; the server answers `Welcome` (and only
+//!   then spawns an entity for it) or `Refused`, naming its own version, so a
+//!   mismatched pair stops with a clear reason instead of silently dropping
+//!   every message neither side can read. `Hello`, `Welcome` and `Refused`
+//!   keep their shape across versions (fields may only be added, with
+//!   defaults), because an older build has to read them from a newer one.
+//!
 //! Neither `Server` nor `Client` is wired into any running process's real
 //! game logic yet, only the engine binary's own debug loop; see its
 //! `server`/`client` modes.
@@ -67,7 +75,26 @@ use crate::systems;
 use crate::world::{Controlled, Position, Velocity, World};
 use serde::{Deserialize, Serialize};
 use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{SocketAddr, TcpListener, TcpStream};
+
+/// The network protocol version. A client and server only talk if theirs
+/// match. Raise it by one whenever a message changes in a way the other side
+/// could misread or lose: a renamed or removed field, a changed meaning, or a
+/// new field the other side must act on. A new field the other side can
+/// safely ignore (with `#[serde(default)]`) does not need a raise.
+///
+/// 1 is the first release, `0.1.0`.
+pub const PROTOCOL: u32 = 1;
+
+/// A client's first message, before anything else: which protocol it
+/// speaks, and its engine version for the error message if they differ.
+/// Keeps this shape in every version (see the module notes).
+#[derive(Serialize, Deserialize)]
+struct Hello {
+    protocol: u32,
+    #[serde(default)]
+    engine: String,
+}
 
 /// One entity's position, as sent over the wire. A plain, flat shape kept
 /// deliberately separate from `Position` itself, so the wire format can
@@ -99,8 +126,18 @@ enum ServerMessage {
     /// here, rather than leaving it to infer from a snapshot alone.
     Welcome {
         entity: usize,
+        #[serde(default)]
+        protocol: u32,
     },
     Snapshot(Snapshot),
+    /// The server will not take this client: its protocol differs, or its
+    /// first message was not a `Hello` (a build from before the check).
+    /// Names the server's own versions so the client can say what to do.
+    Refused {
+        protocol: u32,
+        #[serde(default)]
+        engine: String,
+    },
 }
 
 /// One input message, sent client to server: which of the movement
@@ -131,6 +168,43 @@ struct InputUpload {
     primary: bool,
     #[serde(default)]
     secondary: bool,
+}
+
+/// Serialize `message` and write it framed. False if either step fails.
+fn send<T: Serialize>(stream: &mut TcpStream, message: &T) -> bool {
+    ron::ser::to_string_pretty(message, ron::ser::PrettyConfig::default())
+        .ok()
+        .and_then(|payload| write_framed(stream, payload.as_bytes()).ok())
+        .is_some()
+}
+
+/// Take the first complete framed message off the front of `buffer`, if one
+/// has fully arrived, leaving anything after it in place.
+fn take_frame(buffer: &mut Vec<u8>) -> Option<Vec<u8>> {
+    if buffer.len() < 4 {
+        return None;
+    }
+    let len = u32::from_be_bytes([buffer[0], buffer[1], buffer[2], buffer[3]]) as usize;
+    if buffer.len() < 4 + len {
+        return None;
+    }
+    let payload = buffer[4..4 + len].to_vec();
+    buffer.drain(0..4 + len);
+    Some(payload)
+}
+
+/// Read everything available on a non-blocking socket into `buffer`. True if
+/// the connection has closed.
+fn read_available(stream: &mut TcpStream, buffer: &mut Vec<u8>) -> bool {
+    let mut chunk = [0u8; 4096];
+    loop {
+        match stream.read(&mut chunk) {
+            Ok(0) => return true,
+            Ok(n) => buffer.extend_from_slice(&chunk[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => return false,
+            Err(_) => return true,
+        }
+    }
 }
 
 /// Write one length-prefixed message: a 4-byte big-endian length, then the
@@ -172,12 +246,20 @@ struct ConnectedClient {
     buffer: Vec<u8>,
 }
 
+/// A connection the server has accepted but not yet welcomed: it is waiting
+/// for the client's `Hello`. No entity exists for it yet.
+struct PendingClient {
+    stream: TcpStream,
+    buffer: Vec<u8>,
+}
+
 /// The authoritative side: accepts client connections, broadcasts position
 /// snapshots, and applies whatever input each client uploads to that
 /// client's own entity. Owns the real simulation; a `Client` never tells it
 /// what state to be in, only what buttons are held.
 pub struct Server {
     listener: TcpListener,
+    pending: Vec<PendingClient>,
     clients: Vec<ConnectedClient>,
 }
 
@@ -190,16 +272,23 @@ impl Server {
         listener.set_nonblocking(true)?;
         Ok(Server {
             listener,
+            pending: Vec::new(),
             clients: Vec::new(),
         })
     }
 
-    /// Accept every client that has connected since the last call. Meant to
-    /// be called once per tick; never blocks, since the listener is
-    /// non-blocking, an absence of new connections is not an error, just
-    /// nothing to do this tick. Each accepted client gets a fresh
-    /// `Controlled` entity spawned for it right here, on the server: a
-    /// client has no way to claim or request an id of its own.
+    /// The address actually bound, useful after binding port 0.
+    pub fn local_addr(&self) -> std::io::Result<SocketAddr> {
+        self.listener.local_addr()
+    }
+
+    /// Accept every client that has connected since the last call, and
+    /// answer any waiting client whose `Hello` has arrived. Meant to be
+    /// called once per tick; never blocks. A client with the same
+    /// `PROTOCOL` gets a fresh `Controlled` entity spawned for it right here,
+    /// on the server (a client has no way to claim or request an id of its
+    /// own), and a `Welcome` naming it. Any other client gets `Refused` with
+    /// this server's versions and is dropped, without an entity.
     pub fn accept_new_clients(&mut self, world: &mut World) {
         loop {
             match self.listener.accept() {
@@ -209,49 +298,69 @@ impl Server {
                     // server; better to lose one bad connection than risk
                     // the whole broadcast loop hanging on it.
                     if stream.set_nonblocking(true).is_ok() {
-                        let entity = world.spawn(
-                            Position {
-                                x: 0.0,
-                                y: 0.0,
-                                z: 0.0,
-                            },
-                            Velocity {
-                                dx: 0.0,
-                                dy: 0.0,
-                                dz: 0.0,
-                            },
-                        );
-                        world.controlled.insert(entity, Controlled);
-                        let mut stream = stream;
-                        // Sent once, immediately, so the client knows which
-                        // entity is its own from the start rather than
-                        // guessing from a snapshot. If this write fails the
-                        // client is dropped here too; a connection that
-                        // can't even receive its own welcome isn't one worth
-                        // keeping around for the regular broadcast to fail
-                        // on later.
-                        let welcome = ServerMessage::Welcome { entity };
-                        let sent =
-                            ron::ser::to_string_pretty(&welcome, ron::ser::PrettyConfig::default())
-                                .ok()
-                                .and_then(|payload| {
-                                    write_framed(&mut stream, payload.as_bytes()).ok()
-                                });
-                        if sent.is_some() {
-                            self.clients.push(ConnectedClient {
-                                stream,
-                                entity,
-                                buffer: Vec::new(),
-                            });
-                        } else {
-                            world.despawn(entity);
-                        }
+                        self.pending.push(PendingClient {
+                            stream,
+                            buffer: Vec::new(),
+                        });
                     }
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                 Err(_) => break,
             }
         }
+        let mut still_waiting = Vec::new();
+        for mut pending in std::mem::take(&mut self.pending) {
+            let closed = read_available(&mut pending.stream, &mut pending.buffer);
+            let Some(first) = take_frame(&mut pending.buffer) else {
+                if !closed {
+                    still_waiting.push(pending);
+                }
+                continue;
+            };
+            let hello = std::str::from_utf8(&first)
+                .ok()
+                .and_then(|text| ron::from_str::<Hello>(text).ok());
+            let mut stream = pending.stream;
+            if hello.is_none_or(|h| h.protocol != PROTOCOL) {
+                let refused = ServerMessage::Refused {
+                    protocol: PROTOCOL,
+                    engine: crate::version::ENGINE.to_string(),
+                };
+                let _ = send(&mut stream, &refused);
+                continue; // dropped, which closes the connection
+            }
+            let entity = world.spawn(
+                Position {
+                    x: 0.0,
+                    y: 0.0,
+                    z: 0.0,
+                },
+                Velocity {
+                    dx: 0.0,
+                    dy: 0.0,
+                    dz: 0.0,
+                },
+            );
+            world.controlled.insert(entity, Controlled);
+            // Sent once, so the client knows which entity is its own from
+            // the start rather than guessing from a snapshot. If this write
+            // fails the client is dropped here too.
+            let welcome = ServerMessage::Welcome {
+                entity,
+                protocol: PROTOCOL,
+            };
+            if send(&mut stream, &welcome) {
+                // Input the client sent straight after its Hello is kept.
+                self.clients.push(ConnectedClient {
+                    stream,
+                    entity,
+                    buffer: pending.buffer,
+                });
+            } else {
+                world.despawn(entity);
+            }
+        }
+        self.pending = still_waiting;
     }
 
     /// Send every live entity's current position to every connected client,
@@ -389,19 +498,38 @@ pub struct Client {
     // one-time Welcome message. None until that message has actually
     // arrived, which may take a poll or two after connecting.
     own_entity: Option<usize>,
+    // Why the server would not take this client, if it refused.
+    refused: Option<String>,
 }
 
 impl Client {
     /// Connect to a server at `addr`. Non-blocking, so `poll` can be called
     /// every tick without ever stalling on the network.
+    /// Sends a `Hello` with this build's `PROTOCOL` first; the server
+    /// answers on a later `poll`.
     pub fn connect(addr: &str) -> std::io::Result<Self> {
-        let stream = TcpStream::connect(addr)?;
+        let mut stream = TcpStream::connect(addr)?;
+        let hello = Hello {
+            protocol: PROTOCOL,
+            engine: crate::version::ENGINE.to_string(),
+        };
+        if !send(&mut stream, &hello) {
+            return Err(std::io::Error::other("could not send hello"));
+        }
         stream.set_nonblocking(true)?;
         Ok(Client {
             stream,
             buffer: Vec::new(),
             own_entity: None,
+            refused: None,
         })
+    }
+
+    /// Why the server would not take this client, once it has said so: a
+    /// message naming both versions, ready to show. A refused client sends
+    /// nothing more.
+    pub fn refused(&self) -> Option<&str> {
+        self.refused.as_deref()
     }
 
     /// Which entity the server said is this client's own, once its Welcome
@@ -418,6 +546,9 @@ impl Client {
     /// input can't be serialized, the same silent-skip already used
     /// elsewhere in this module rather than a new error path.
     pub fn send_input(&mut self, input: &InputState) {
+        if self.refused.is_some() {
+            return;
+        }
         let upload = InputUpload {
             up: input.is_held(Button::Up),
             down: input.is_held(Button::Down),
@@ -456,6 +587,7 @@ impl Client {
         // A burst of several snapshots arriving in one read is applied in
         // order, oldest first, same as if each had arrived on its own tick.
         let own_entity = &mut self.own_entity;
+        let refused = &mut self.refused;
         drain_framed(&mut self.buffer, |payload| {
             let Ok(text) = std::str::from_utf8(payload) else {
                 return;
@@ -464,7 +596,16 @@ impl Client {
                 return;
             };
             match message {
-                ServerMessage::Welcome { entity } => *own_entity = Some(entity),
+                ServerMessage::Welcome { entity, protocol } => {
+                    if protocol == PROTOCOL {
+                        *own_entity = Some(entity);
+                    } else {
+                        *refused = Some(mismatch(protocol, "unknown"));
+                    }
+                }
+                ServerMessage::Refused { protocol, engine } => {
+                    *refused = Some(mismatch(protocol, &engine));
+                }
                 ServerMessage::Snapshot(snapshot) => {
                     for update in snapshot.positions {
                         world.positions.insert(
@@ -479,6 +620,165 @@ impl Client {
                 }
             }
         });
+    }
+}
+
+/// The message for a client and server that can't talk.
+fn mismatch(server_protocol: u32, server_engine: &str) -> String {
+    let server_engine = if server_engine.is_empty() {
+        "unknown"
+    } else {
+        server_engine
+    };
+    format!(
+        "The server runs a different version of Frame Engine (server {server_engine}, network protocol {server_protocol}; this is {}, protocol {PROTOCOL}). Use the same version on both.",
+        crate::version::ENGINE
+    )
+}
+
+#[cfg(test)]
+mod handshake_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    fn server() -> (Server, String) {
+        let server = Server::bind("127.0.0.1:0").unwrap();
+        let addr = server.local_addr().unwrap().to_string();
+        (server, addr)
+    }
+
+    /// Read one framed message from a blocking stream.
+    fn read_one(stream: &mut TcpStream) -> String {
+        stream
+            .set_read_timeout(Some(Duration::from_secs(5)))
+            .unwrap();
+        let mut len = [0u8; 4];
+        stream.read_exact(&mut len).unwrap();
+        let mut payload = vec![0u8; u32::from_be_bytes(len) as usize];
+        stream.read_exact(&mut payload).unwrap();
+        String::from_utf8(payload).unwrap()
+    }
+
+    #[test]
+    fn a_matching_client_is_welcomed_and_gets_an_entity() {
+        let (mut server, addr) = server();
+        let mut world = World::new();
+        let mut client = Client::connect(&addr).unwrap();
+        let mut client_world = World::new();
+        let start = Instant::now();
+        while client.own_entity().is_none() && start.elapsed() < Duration::from_secs(5) {
+            server.accept_new_clients(&mut world);
+            client.poll(&mut client_world);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let own = client.own_entity().expect("welcomed");
+        assert!(client.refused().is_none());
+        assert_eq!(server.client_count(), 1);
+        assert!(world.controlled.get(own).is_some());
+    }
+
+    #[test]
+    fn a_client_with_another_protocol_is_refused_without_an_entity() {
+        let (mut server, addr) = server();
+        let mut world = World::new();
+        let mut raw = TcpStream::connect(&addr).unwrap();
+        let hello = Hello {
+            protocol: PROTOCOL + 1,
+            engine: "9.9.9".to_string(),
+        };
+        assert!(send(&mut raw, &hello));
+        let start = Instant::now();
+        let mut reply = None;
+        raw.set_nonblocking(true).unwrap();
+        let mut buffer = Vec::new();
+        while reply.is_none() && start.elapsed() < Duration::from_secs(5) {
+            server.accept_new_clients(&mut world);
+            read_available(&mut raw, &mut buffer);
+            reply = take_frame(&mut buffer);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let reply = String::from_utf8(reply.expect("answered")).unwrap();
+        let message: ServerMessage = ron::from_str(&reply).unwrap();
+        assert!(matches!(message, ServerMessage::Refused { protocol, .. } if protocol == PROTOCOL));
+        assert_eq!(server.client_count(), 0);
+        assert_eq!(world.positions.iter().flatten().count(), 0);
+    }
+
+    #[test]
+    fn a_client_that_skips_the_hello_is_refused() {
+        // A build from before the check sends input straight away.
+        let (mut server, addr) = server();
+        let mut world = World::new();
+        let mut raw = TcpStream::connect(&addr).unwrap();
+        write_framed(
+            &mut raw,
+            b"(up: true, down: false, left: false, right: false)",
+        )
+        .unwrap();
+        raw.set_nonblocking(true).unwrap();
+        let mut buffer = Vec::new();
+        let mut reply = None;
+        let start = Instant::now();
+        while reply.is_none() && start.elapsed() < Duration::from_secs(5) {
+            server.accept_new_clients(&mut world);
+            read_available(&mut raw, &mut buffer);
+            reply = take_frame(&mut buffer);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let reply = String::from_utf8(reply.expect("answered")).unwrap();
+        let message: ServerMessage = ron::from_str(&reply).unwrap();
+        assert!(matches!(message, ServerMessage::Refused { .. }));
+        assert_eq!(server.client_count(), 0);
+    }
+
+    #[test]
+    fn a_refused_client_says_why() {
+        // A newer server, faked: it refuses whatever connects.
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap().to_string();
+        let mut client = Client::connect(&addr).unwrap();
+        let (mut stream, _) = listener.accept().unwrap();
+        let hello: Hello = ron::from_str(&read_one(&mut stream)).unwrap();
+        assert_eq!(hello.protocol, PROTOCOL);
+        assert_eq!(hello.engine, crate::version::ENGINE);
+        let refused = ServerMessage::Refused {
+            protocol: PROTOCOL + 1,
+            engine: "9.9.9".to_string(),
+        };
+        assert!(send(&mut stream, &refused));
+        let mut world = World::new();
+        let start = Instant::now();
+        while client.refused().is_none() && start.elapsed() < Duration::from_secs(5) {
+            client.poll(&mut world);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let why = client.refused().expect("refused");
+        assert!(why.contains("server 9.9.9"), "{why}");
+        assert!(why.contains("Use the same version"), "{why}");
+        assert!(client.own_entity().is_none());
+    }
+
+    #[test]
+    fn handshake_messages_keep_reading_with_fields_added_later() {
+        // What a newer build might send: the same messages with more in them.
+        let hello: Hello =
+            ron::from_str("(protocol: 7, engine: \"2.0.0\", region: \"eu\")").unwrap();
+        assert_eq!(hello.protocol, 7);
+        let refused: ServerMessage =
+            ron::from_str("Refused(protocol: 7, engine: \"2.0.0\", motd: \"hi\")").unwrap();
+        assert!(matches!(
+            refused,
+            ServerMessage::Refused { protocol: 7, .. }
+        ));
+        let welcome: ServerMessage =
+            ron::from_str("Welcome(entity: 3, protocol: 1, spawn_hint: 2)").unwrap();
+        assert!(matches!(
+            welcome,
+            ServerMessage::Welcome {
+                entity: 3,
+                protocol: 1
+            }
+        ));
     }
 }
 

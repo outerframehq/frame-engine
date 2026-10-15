@@ -9,4 +9,5 @@ pub mod net;
 pub mod physics;
 pub mod render;
 pub mod systems;
+pub mod version;
 pub mod world;

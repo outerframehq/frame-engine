@@ -82,6 +82,45 @@ pub const OLD_ENTITY_SIZE: f32 = 8.0;
 /// was `OLD_ENTITY_SIZE` across; 1 is metres.
 pub const SCENE_UNITS: u32 = 1;
 
+/// The save format written with every scene and prefab. Raise it by one
+/// whenever a change means an older editor would lose or misread something
+/// in a newer file: a new saved component or field (an older editor would
+/// drop it on save), a renamed field, or a field whose meaning changed. An
+/// older value is fine to read (every field has a default, and an upgrade
+/// step can run in `load_from_file`, as `upgrade_units` does). A newer one is
+/// what this guards against: such a scene still opens if it can be read, but
+/// `save_to_file` refuses to write over it (see `newer_format`), and if it
+/// can't be read the error says to update the editor rather than giving a
+/// parse error.
+///
+/// 1 is the first release, `0.1.0`. 0 (or missing) is anything older.
+pub const SCENE_FORMAT: u32 = 1;
+
+/// Only the `format` field of a scene or prefab file, read on its own so
+/// the version is known even when the rest of a newer file can't be read.
+/// Unknown fields are skipped, which is serde's default.
+#[derive(Deserialize)]
+struct FormatProbe {
+    #[serde(default)]
+    format: u32,
+}
+
+/// The save format a scene or prefab file says it was written with, 0 if it
+/// says nothing (or isn't readable at all).
+pub fn scene_format_of(text: &str) -> u32 {
+    ron::from_str::<FormatProbe>(text)
+        .map(|p| p.format)
+        .unwrap_or(0)
+}
+
+/// The error for a file written by a newer editor that this one can't read.
+fn newer_scene_error(found: u32) -> String {
+    format!(
+        "this file was saved by a newer Frame Editor (save format {found}, this editor reads up to {SCENE_FORMAT}). Update Frame Editor ({}) to open it",
+        crate::version::ENGINE
+    )
+}
+
 /// Downward (-Y) speed added to a falling entity's velocity each tick, in
 /// metres per tick (velocities on the hand-rolled path are per tick). Real
 /// gravity, 9.81 m/s^2, at the engine's tick rate. Only entities with the
@@ -394,6 +433,11 @@ pub struct PluginManifest {
     pub author: String,
     #[serde(default)]
     pub description: String,
+    /// The oldest Frame Engine version this plugin works with, for example
+    /// `"0.1.0"`. Optional; empty means it doesn't say. An older editor
+    /// still loads the plugin but warns that parts of it may not work.
+    #[serde(default)]
+    pub engine: String,
     /// Custom Inspector fields this plugin declares. Each names a dynamic
     /// component (the same key `insert_dynamic`/`get_dynamic` use) and a
     /// label to show next to it. `#[serde(default)]` so a plugin.ron written
@@ -1047,6 +1091,11 @@ pub struct Prefab {
     /// scaled up when it is spawned.
     #[serde(default)]
     pub units: u32,
+    /// See `SCENE_FORMAT`. Written as `SCENE_FORMAT` when captured; a value
+    /// above it means a newer editor saved this prefab and parts of it may
+    /// be missing here.
+    #[serde(default)]
+    pub format: u32,
 }
 
 /// One child in a `Prefab`'s subtree: the offset it carried on its own live
@@ -1215,6 +1264,15 @@ pub struct World {
     /// with an older value is upgraded by `load_from_file`.
     #[serde(default)]
     units: u32,
+    /// See `SCENE_FORMAT`. Written as `SCENE_FORMAT` on save.
+    #[serde(default)]
+    format: u32,
+    /// Set by `load_from_file` when the scene came from a newer editor
+    /// (its format is above `SCENE_FORMAT`). While set, `save_to_file`
+    /// refuses, so this editor can't quietly drop what it doesn't know.
+    /// Never saved.
+    #[serde(skip)]
+    newer_format: Option<u32>,
     /// Runtime-registered component storage, keyed by name, for a component
     /// type the engine was never compiled knowing about. This is the seam a
     /// host (a private game layer, an editor plugin) uses to attach its own
@@ -1475,6 +1533,7 @@ impl World {
             children,
             character: self.characters.get(id).copied(),
             units: SCENE_UNITS,
+            format: SCENE_FORMAT,
         })
     }
 
@@ -1702,16 +1761,26 @@ impl World {
         self.dynamic.keys().cloned().collect()
     }
 
-    /// Serialize the whole world to a RON file.
+    /// Serialize the whole world to a RON file, stamped with this editor's
+    /// `SCENE_FORMAT`. Refuses while the world came from a newer editor
+    /// (see `newer_format`); `clear_newer_format` lifts that once the user
+    /// has chosen to save a copy anyway.
     pub fn save_to_file(
         &self,
         path: impl AsRef<std::path::Path>,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        let ron = if self.units == SCENE_UNITS {
+        if let Some(found) = self.newer_format {
+            return Err(format!(
+                "this scene came from a newer Frame Editor (save format {found}, this editor writes {SCENE_FORMAT}). Saving over it here could lose what this editor doesn't know about. Use Save As to keep a copy, or update Frame Editor"
+            )
+            .into());
+        }
+        let ron = if self.units == SCENE_UNITS && self.format == SCENE_FORMAT {
             ron::ser::to_string_pretty(self, ron::ser::PrettyConfig::default())?
         } else {
             let mut current = self.clone();
             current.units = SCENE_UNITS;
+            current.format = SCENE_FORMAT;
             ron::ser::to_string_pretty(&current, ron::ser::PrettyConfig::default())?
         };
         std::fs::write(path, ron)?;
@@ -1723,7 +1792,19 @@ impl World {
         path: impl AsRef<std::path::Path>,
     ) -> Result<World, Box<dyn std::error::Error>> {
         let text = std::fs::read_to_string(path)?;
-        let mut world: World = ron::from_str(&text)?;
+        let mut world: World = match ron::from_str(&text) {
+            Ok(world) => world,
+            Err(e) => {
+                let found = scene_format_of(&text);
+                if found > SCENE_FORMAT {
+                    return Err(newer_scene_error(found).into());
+                }
+                return Err(e.into());
+            }
+        };
+        if world.format > SCENE_FORMAT {
+            world.newer_format = Some(world.format);
+        }
         world.upgrade_units();
         // `dynamic` itself never serializes (see its own doc comment);
         // rebuild the f64 half of it from `dynamic_f64`, which does, so
@@ -1744,6 +1825,20 @@ impl World {
 }
 
 impl World {
+    /// The save format of the newer editor this scene came from, if it did
+    /// (see `SCENE_FORMAT`). `None` for a scene this editor wrote or can
+    /// write safely. While `Some`, `save_to_file` refuses.
+    pub fn newer_format(&self) -> Option<u32> {
+        self.newer_format
+    }
+
+    /// Allow saving a scene that came from a newer editor. For a Save As,
+    /// where the user picks a new file on purpose; whatever this editor
+    /// didn't understand is not in the copy.
+    pub fn clear_newer_format(&mut self) {
+        self.newer_format = None;
+    }
+
     /// Bring a world read from a file up to `SCENE_UNITS`. A scene saved
     /// before world units were metres drew an entity at scale 1 as
     /// `OLD_ENTITY_SIZE` across, so its scales are multiplied by that and it
@@ -1849,6 +1944,117 @@ mod unit_tests {
         assert_eq!(world.scales.get(new).unwrap().z, 2.0);
         // A captured prefab is current.
         assert_eq!(world.capture_prefab(new).unwrap().units, SCENE_UNITS);
+    }
+
+    #[test]
+    fn a_scene_is_saved_with_the_current_format() {
+        let world = World::new();
+        let dir = std::env::temp_dir().join(format!("frame-format-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("now.ron");
+        world.save_to_file(&path).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(scene_format_of(&text), SCENE_FORMAT);
+        let loaded = World::load_from_file(&path).unwrap();
+        assert_eq!(loaded.newer_format(), None);
+        // A scene from before the format existed reads as 0 and opens.
+        let older = ron::to_string(&World::new())
+            .unwrap()
+            .replacen(&format!(",format:{SCENE_FORMAT}"), "", 1)
+            .replacen(",format:0", "", 1);
+        assert_eq!(scene_format_of(&older), 0);
+        std::fs::write(&path, older).unwrap();
+        assert!(
+            World::load_from_file(&path)
+                .unwrap()
+                .newer_format()
+                .is_none()
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_scene_from_a_newer_editor_opens_but_is_not_saved_over() {
+        let mut world = World::new();
+        let id = world.spawn(
+            Position {
+                x: 1.0,
+                y: 2.0,
+                z: 3.0,
+            },
+            Velocity {
+                dx: 0.0,
+                dy: 0.0,
+                dz: 0.0,
+            },
+        );
+        let future = SCENE_FORMAT + 1;
+        let text = ron::to_string(&world).unwrap().replacen(
+            "format:0",
+            // A newer editor's file: a higher format and a field this one
+            // has never heard of.
+            &format!("format:{future},weather_fronts:[(id:4)]"),
+            1,
+        );
+        assert_eq!(scene_format_of(&text), future);
+        let dir = std::env::temp_dir().join(format!("frame-newer-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("future.ron");
+        std::fs::write(&path, &text).unwrap();
+        let mut loaded = World::load_from_file(&path).unwrap();
+        assert_eq!(loaded.newer_format(), Some(future));
+        assert_eq!(loaded.positions.get(id).unwrap().y, 2.0);
+        // Saving over it is refused and the file is untouched.
+        let err = loaded.save_to_file(&path).unwrap_err().to_string();
+        assert!(err.contains("newer Frame Editor"), "{err}");
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), text);
+        // Save As: the user chose to keep a copy, which is then current.
+        loaded.clear_newer_format();
+        let copy = dir.join("copy.ron");
+        loaded.save_to_file(&copy).unwrap();
+        let copy_text = std::fs::read_to_string(&copy).unwrap();
+        assert_eq!(scene_format_of(&copy_text), SCENE_FORMAT);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_newer_scene_that_cannot_be_read_says_to_update() {
+        let future = SCENE_FORMAT + 1;
+        // A newer editor changed the shape of something this one knows.
+        let text = format!("(format:{future},positions:\"a new shape\")");
+        let dir = std::env::temp_dir().join(format!("frame-unreadable-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("future.ron");
+        std::fs::write(&path, &text).unwrap();
+        let err = World::load_from_file(&path).err().unwrap().to_string();
+        assert!(err.contains("newer Frame Editor"), "{err}");
+        assert!(err.contains("Update Frame Editor"), "{err}");
+        // A broken file of this format still gives the real parse error.
+        std::fs::write(&path, "(positions: oops").unwrap();
+        let err = World::load_from_file(&path).err().unwrap().to_string();
+        assert!(!err.contains("newer Frame Editor"), "{err}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_captured_prefab_carries_the_format() {
+        let mut world = World::new();
+        let id = world.spawn(
+            Position {
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+            },
+            Velocity {
+                dx: 0.0,
+                dy: 0.0,
+                dz: 0.0,
+            },
+        );
+        let prefab = world.capture_prefab(id).unwrap();
+        assert_eq!(prefab.format, SCENE_FORMAT);
+        let text = ron::to_string(&prefab).unwrap();
+        assert_eq!(scene_format_of(&text), SCENE_FORMAT);
     }
 
     #[test]
