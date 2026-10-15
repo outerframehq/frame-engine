@@ -29,7 +29,9 @@ Frame Engine is a learning project as much as a tool: I am still growing my own 
 
 **For a stable build, download a tagged release rather than cloning `main`.** Releases are cut at points where the project is known to build and run, so a release is your dependable copy. Tagged releases are on the project's Releases page.
 
-This repo restarted fresh with no tagged releases yet (see [SECURITY.md](SECURITY.md) for why). `Cargo.toml` currently sits at `0.0.0`, a placeholder for this pre-release baseline. The first tagged release will be `0.1.0`. The capabilities listed below reflect current `main`.
+This repo restarted fresh with no tagged releases yet (see [SECURITY.md](SECURITY.md) for why). `Cargo.toml` currently sits at `0.0.0`, a placeholder for this pre-release baseline. The first tagged release will be `0.1.0`, planned for **Friday 30 October 2026 at 10pm UK time**. It will be a source release (a tag, release notes and build instructions), so you build it yourself with Cargo. The capabilities listed below reflect current `main`.
+
+Releases come at most once a week. A crash, data loss or security bug gets a patch release (`0.1.1` and so on) as soon as it is fixed, without waiting. What has been tested, the known bugs and how to report a security issue are in [SECURITY.md](SECURITY.md).
 
 ## Status
 
