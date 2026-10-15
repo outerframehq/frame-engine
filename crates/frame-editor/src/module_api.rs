@@ -175,6 +175,16 @@ pub trait EditorModule {
         Vec::new()
     }
 
+    /// Lines for the Play window's overlay (F3 in Play): the few numbers a
+    /// player or a tester would want about this module's part of `world`,
+    /// short enough to read over the game. Called once per frame only while
+    /// that overlay is shown. The default shows nothing; the editor's
+    /// overlay is the place for the full account (`stats`).
+    fn play_stats(&self, world: &World) -> Vec<String> {
+        let _ = world;
+        Vec::new()
+    }
+
     /// Make this module's GPU state for one window.
     fn new_gpu(&self, gpu: &GpuContext) -> Box<dyn ModuleGpu>;
 }
@@ -1253,6 +1263,23 @@ pub(crate) fn busy_module(
         .map(|m| m.name().to_string())
 }
 
+/// Every module's lines for the Play overlay, each headed by the module's
+/// name.
+pub(crate) fn module_play_stats(
+    modules: &std::cell::RefCell<Vec<Box<dyn EditorModule>>>,
+    world: &World,
+) -> Vec<String> {
+    let mut out = Vec::new();
+    for m in modules.borrow().iter() {
+        let lines = m.play_stats(world);
+        if !lines.is_empty() {
+            out.push(format!("{}:", m.name()));
+            out.extend(lines.into_iter().map(|l| format!("  {l}")));
+        }
+    }
+    out
+}
+
 /// Every module's overlay lines, each headed by the module's name.
 pub(crate) fn module_stats(
     modules: &std::cell::RefCell<Vec<Box<dyn EditorModule>>>,
@@ -1507,6 +1534,9 @@ mod tests {
         fn stats(&self) -> Vec<String> {
             vec!["jobs 3".to_string()]
         }
+        fn play_stats(&self, world: &World) -> Vec<String> {
+            vec![format!("{} things", world.positions.len())]
+        }
         fn new_gpu(&self, _gpu: &GpuContext) -> Box<dyn ModuleGpu> {
             unreachable!("no GPU in tests")
         }
@@ -1523,6 +1553,12 @@ mod tests {
         assert_eq!(busy_module(&modules), None);
         // Only modules with something to say get lines, under their name.
         assert_eq!(module_stats(&modules), vec!["worker:", "  jobs 3"]);
+        // The Play overlay has its own, shorter lines, from the world.
+        let world = World::default();
+        assert_eq!(
+            module_play_stats(&modules, &world),
+            vec!["worker:", "  0 things"]
+        );
         modules.borrow_mut()[1] = Box::new(Worker { busy: true });
         assert_eq!(busy_module(&modules), Some("worker".to_string()));
     }

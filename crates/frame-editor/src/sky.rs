@@ -116,7 +116,9 @@ pub(crate) struct SkyUniform {
     pub motion: [f32; 4],
     /// The clouds: x is how much of the sky they cover (0 none, 1 overcast),
     /// y and z the render origin's x and z plus how far the wind has carried
-    /// them, wrapped to the clouds' period. w unused.
+    /// them, wrapped to the clouds' period. w: 1 when a module draws the
+    /// clouds itself (`ModuleGpu::draws_clouds`), so the sky leaves its own
+    /// out.
     pub clouds: [f32; 4],
     /// xyz: unit direction toward the moon. w: how strongly to draw it (0
     /// with no moon).

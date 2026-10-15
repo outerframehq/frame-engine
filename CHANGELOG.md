@@ -31,6 +31,7 @@ Engine:
 
 Editor:
 
+- A performance overlay in Play. F3 in the Play window shows the game's numbers over the game: frame rate, average and worst frame gap and the game's own work a frame (the Play window has its own frame timing now), memory, the tick rate, the entity count and where the player is, then each module's lines from the new `EditorModule::play_stats(world)`, which defaults to none. The hint names the key. It starts hidden each time Play starts and is not saved. The editor's overlay is unchanged.
 - A Character section in the Inspector: turn a body on for an entity and edit its numbers. Turning it on also turns on Controlled, Gravity and Physics, since a body only moves as a physics character.
 - In the Play window the mouse turns a character's view. A click in the window takes the mouse; Esc gives it back, and Esc again closes the window (it used to close at once). Losing focus gives it back too. While the mouse is free a line at the bottom says how to play, or that nothing in the scene is Controlled (Play runs the saved scene, so tick Controlled and save). Shift runs and C or Ctrl crouches. In the main viewport Shift runs and C crouches.
 - Scripts can read `input_run`, `input_crouch` and `crouched`, ask for `move_run` and `move_crouch`, and read or set `look_yaw` and `look_pitch` to turn a character.

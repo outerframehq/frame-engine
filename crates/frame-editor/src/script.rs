@@ -49,6 +49,9 @@ const API_VARS: &[&str] = &[
     "input_left",
     "input_right",
     "input_jump",
+    "input_run",
+    "input_crouch",
+    "crouched",
     "hit",
     "hit_id",
     "hit_point", // Actions — a script requests these, Rust performs them.
@@ -63,7 +66,13 @@ const API_VARS: &[&str] = &[
     // a script that never touches them changes nothing.
     "move_dx",
     "move_dz",
-    "move_jump", // Structured values (preferred).
+    "move_jump",
+    "move_run",
+    "move_crouch",
+    // A character's view (an entity with a CharacterBody): read it, or set it
+    // to turn the character.
+    "look_yaw",
+    "look_pitch", // Structured values (preferred).
     "pos",
     "vel",
     "scale",
@@ -162,6 +171,8 @@ pub struct RhaiRuntime {
     input_left: bool,
     input_right: bool,
     input_jump: bool,
+    input_run: bool,
+    input_crouch: bool,
 }
 
 impl RhaiRuntime {
@@ -177,6 +188,8 @@ impl RhaiRuntime {
             input_left: false,
             input_right: false,
             input_jump: false,
+            input_run: false,
+            input_crouch: false,
         }
     }
 
@@ -283,6 +296,8 @@ impl ScriptRuntime for RhaiRuntime {
         self.input_left = input.is_held(Button::Left);
         self.input_right = input.is_held(Button::Right);
         self.input_jump = input.is_held(Button::Jump);
+        self.input_run = input.is_held(Button::Run);
+        self.input_crouch = input.is_held(Button::Crouch);
     }
 
     fn run(&mut self, world: &mut World, entity: usize) {
@@ -412,6 +427,12 @@ impl ScriptRuntime for RhaiRuntime {
         // Read-only: whether this character was on the ground as of the last
         // physics step. Always false for a non-physics entity.
         scope.push("grounded", grounded);
+        // Read-only: whether this character was crouched as of the last
+        // physics step.
+        scope.push(
+            "crouched",
+            world.crouched.get(&entity).copied().unwrap_or(false),
+        );
         // Read-only: which movement buttons are currently held, snapshotted
         // once per tick in begin_tick. Shared context, not per-entity data.
         scope.push("input_up", self.input_up);
@@ -419,6 +440,8 @@ impl ScriptRuntime for RhaiRuntime {
         scope.push("input_left", self.input_left);
         scope.push("input_right", self.input_right);
         scope.push("input_jump", self.input_jump);
+        scope.push("input_run", self.input_run);
+        scope.push("input_crouch", self.input_crouch);
         scope.push("hit", hit); // read-only: colliding with anything this tick
         scope.push("hit_id", hit_id); // read-only: the other entity's id, or -1.0
         scope.push("hit_point", hit_point); // read-only: where the collision happened
@@ -456,6 +479,11 @@ impl ScriptRuntime for RhaiRuntime {
         scope.push("move_dx", current_intent.dx as f64);
         scope.push("move_dz", current_intent.dz as f64);
         scope.push("move_jump", current_intent.jump);
+        scope.push("move_run", current_intent.run);
+        scope.push("move_crouch", current_intent.crouch);
+        let look = world.looks.get(entity).copied().unwrap_or_default();
+        scope.push("look_yaw", look.yaw as f64);
+        scope.push("look_pitch", look.pitch as f64);
 
         // Structured values — the preferred spelling.
         scope.push(
@@ -609,8 +637,25 @@ impl ScriptRuntime for RhaiRuntime {
                 dx: move_dx as f32,
                 dz: move_dz as f32,
                 jump: move_jump,
+                run: scope
+                    .get_value::<bool>("move_run")
+                    .unwrap_or(current_intent.run),
+                crouch: scope
+                    .get_value::<bool>("move_crouch")
+                    .unwrap_or(current_intent.crouch),
             },
         );
+        // A view the script changed turns the character (and only then, so
+        // a script that leaves it alone never fights the mouse).
+        let look_yaw = scope
+            .get_value::<f64>("look_yaw")
+            .unwrap_or(look.yaw as f64) as f32;
+        let look_pitch = scope
+            .get_value::<f64>("look_pitch")
+            .unwrap_or(look.pitch as f64) as f32;
+        if look_yaw != look.yaw || look_pitch != look.pitch {
+            frame_engine::systems::set_view(world, entity, look_yaw, look_pitch);
+        }
 
         // Dynamic component write-back: same unconditional re-insert as every
         // other single value above, no change-detection needed.

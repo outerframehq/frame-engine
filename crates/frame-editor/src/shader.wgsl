@@ -476,7 +476,10 @@ fn fs_sky(in: SkyVarying) -> @location(0) vec4<f32> {
     colour = mix(colour, sky.sun_colour.rgb * 1.4, disc) + sky.sun_colour.rgb * glow;
     colour = with_moon(colour, direction);
     colour = with_stars(colour, direction);
-    colour = with_clouds(colour, direction);
+    // A module may draw the clouds itself (`clouds.w` is 1 then).
+    if (sky.clouds.w < 0.5) {
+        colour = with_clouds(colour, direction);
+    }
     return vec4<f32>(min(colour, vec3<f32>(1.0, 1.0, 1.0)), 1.0);
 }
 

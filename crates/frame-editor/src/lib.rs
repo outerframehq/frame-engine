@@ -4969,6 +4969,10 @@ struct App {
     show_stats: bool,
     // Frame timing for the performance overlay.
     perf: perf::FrameStats,
+    // Whether the Play window shows its own overlay (F3 in Play), and the
+    // Play window's frame timing. Off each time Play starts.
+    show_play_stats: bool,
+    play_perf: perf::FrameStats,
     // Why the editor is drawing every frame right now, or None when it only
     // draws on change (shown in the performance overlay).
     redraw_reason: Option<String>,
@@ -6145,6 +6149,8 @@ impl App {
         self.game_physics = Some(Physics::new(GRAVITY_Y));
         self.game_input = InputState::new();
         self.game_clock = Clock::new(TICK_RATE, MAX_CATCHUP_TICKS);
+        self.show_play_stats = false;
+        self.play_perf = perf::FrameStats::frames_only(std::time::Instant::now());
         self.game_egui_ctx = Some(game_egui_ctx);
         self.game_egui_state = Some(game_egui_state);
         // Cleared rather than just left from a previous session: an image
@@ -6174,6 +6180,7 @@ impl App {
     /// Advance and render the game window: tick the game world on its own clock
     /// (always running), draw it with the shared 3D pipeline, and no egui/overlay.
     fn render_game(&mut self) {
+        self.play_perf.begin(std::time::Instant::now());
         let owed = self.game_clock.advance(true);
         // Same project the editor has open, so sound files resolve under its
         // assets/ folder the same way build_instances' custom meshes do.
@@ -6331,9 +6338,29 @@ impl App {
                 egui_ppp,
             );
         }
+        self.play_perf.end(std::time::Instant::now());
         if let Some(window) = &self.game_window {
             window.request_redraw();
         }
+    }
+
+    /// The Play overlay's lines (F3 in Play): the frame rate and times,
+    /// memory, the simulation's tick rate, how many entities there are and
+    /// where the player is, then each module's own lines
+    /// (`EditorModule::play_stats`). Short, for reading over the game.
+    fn play_stats_lines(&self) -> Vec<String> {
+        let mut lines = self.play_perf.frame_lines("game");
+        lines.extend(perf::memory_line());
+        lines.push(format!("{TICK_RATE} ticks a second"));
+        if let Some(world) = self.game_world.as_ref() {
+            let entities = world.positions.iter().filter(|p| p.is_some()).count();
+            lines.push(format!("entities {entities}"));
+            if let Some(p) = find_camera_entity(world).and_then(|id| world.positions.get(id)) {
+                lines.push(format!("at {:.1}, {:.1}, {:.1}", p.x, p.y, p.z));
+            }
+            lines.extend(module_api::module_play_stats(&self.modules, world));
+        }
+        lines
     }
 
     /// Build this frame's egui overlay for the Play window: every UiText and
@@ -6350,6 +6377,7 @@ impl App {
         else {
             return (Vec::new(), egui::TexturesDelta::default(), 1.0);
         };
+        let stats = self.show_play_stats.then(|| self.play_stats_lines());
         let Some(state) = self.game_egui_state.as_mut() else {
             return (Vec::new(), egui::TexturesDelta::default(), 1.0);
         };
@@ -6408,11 +6436,34 @@ impl App {
                  character in the editor and save (Ctrl+S). Esc closes."
             } else {
                 "Click to play: the mouse looks around, WASD moves, Shift runs, \
-                 C crouches, Space jumps. Esc frees the mouse, Esc again closes."
+                 C crouches, Space jumps, F3 shows the numbers. Esc frees the \
+                 mouse, Esc again closes."
             }
         });
         let full_output = ctx.run_ui(raw_input, |ui| {
             let screen = ui.max_rect();
+            if let Some(stats) = &stats {
+                egui::Area::new(egui::Id::new("play-stats"))
+                    .anchor(egui::Align2::LEFT_TOP, egui::vec2(8.0, 8.0))
+                    .order(egui::Order::Foreground)
+                    .interactable(false)
+                    .show(ui.ctx(), |ui| {
+                        egui::Frame::new()
+                            .fill(egui::Color32::from_black_alpha(160))
+                            .inner_margin(egui::Margin::symmetric(10, 6))
+                            .corner_radius(4.0)
+                            .show(ui, |ui| {
+                                for line in stats {
+                                    ui.label(
+                                        egui::RichText::new(line)
+                                            .monospace()
+                                            .size(13.0)
+                                            .color(egui::Color32::WHITE),
+                                    );
+                                }
+                            });
+                    });
+            }
             if let Some(hint) = hint {
                 egui::Area::new(egui::Id::new("play-hint"))
                     .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -24.0))
@@ -6543,6 +6594,11 @@ impl App {
                 let pressed = event.state == ElementState::Pressed;
                 if let PhysicalKey::Code(code) = event.physical_key {
                     match code {
+                        // F3: the Play overlay (frame rate, memory, where
+                        // the player is, each module's numbers).
+                        KeyCode::F3 if pressed && !event.repeat => {
+                            self.show_play_stats = !self.show_play_stats;
+                        }
                         // Esc lets the mouse go; pressed again, it closes.
                         KeyCode::Escape if pressed => {
                             if self.game_mouse_held {
@@ -10333,6 +10389,8 @@ pub fn run_as(name: &str, app_id: &str, modules: Vec<Box<dyn EditorModule>>) {
         show_help: prefs.show_help,
         show_stats: prefs.show_stats,
         perf: perf::FrameStats::new(std::time::Instant::now()),
+        show_play_stats: false,
+        play_perf: perf::FrameStats::frames_only(std::time::Instant::now()),
         redraw_reason: None,
         idle_wake: None,
         wave_clock: None,

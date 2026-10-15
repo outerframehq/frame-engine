@@ -124,11 +124,24 @@ pub(crate) struct FrameStats {
     highest: Option<usize>,
     /// A line for the Output panel when memory jumped, not yet taken.
     jump: Option<String>,
+    /// Whether this one watches the memory peaks (one per program: taking
+    /// the recent peak resets it).
+    watches_memory: bool,
 }
 
 impl FrameStats {
     pub(crate) fn new(now: Instant) -> Self {
         FrameStats {
+            watches_memory: true,
+            ..Self::frames_only(now)
+        }
+    }
+
+    /// Frame times only: for a second window (Play), which leaves the
+    /// memory peaks to the editor's.
+    pub(crate) fn frames_only(now: Instant) -> Self {
+        FrameStats {
+            watches_memory: false,
             period_start: now,
             last_begin: None,
             frames: 0,
@@ -194,7 +207,7 @@ impl FrameStats {
                 work_ms: self.work_total.as_secs_f32() * 1000.0 / n,
                 resident: resident_bytes(),
             };
-            if heap().is_some() {
+            if self.watches_memory && heap().is_some() {
                 self.note_peak(take_recent_peak());
             }
             self.period_start = now;
@@ -209,16 +222,22 @@ impl FrameStats {
         self.summary
     }
 
-    /// The overlay's own lines.
-    pub(crate) fn lines(&self) -> Vec<String> {
+    /// The frame lines: the rate, the gaps, and `who`'s work a frame.
+    pub(crate) fn frame_lines(&self, who: &str) -> Vec<String> {
         let s = self.summary();
-        let mut out = vec![
+        vec![
             format!(
                 "{:.0} fps   frame {:.1} ms   worst {:.1} ms",
                 s.fps, s.frame_ms, s.worst_ms
             ),
-            format!("editor work {:.1} ms a frame", s.work_ms),
-        ];
+            format!("{who} work {:.1} ms a frame", s.work_ms),
+        ]
+    }
+
+    /// The overlay's own lines: the frame lines, then memory.
+    pub(crate) fn lines(&self) -> Vec<String> {
+        let s = self.summary();
+        let mut out = self.frame_lines("editor");
         match (s.resident, heap()) {
             (Some(resident), Some((in_use, peak))) => {
                 out.push(format!(
@@ -245,6 +264,21 @@ impl FrameStats {
             (None, None) => {}
         }
         out
+    }
+}
+
+/// One short line about memory for a plain overlay: what the program has
+/// in use (where the binary counts) or what the process holds, or None
+/// where neither is known.
+pub(crate) fn memory_line() -> Option<String> {
+    match (heap(), resident_bytes()) {
+        (Some((in_use, peak)), _) => Some(format!(
+            "memory {} in use (peak {})",
+            megabytes(in_use as u64),
+            megabytes(peak as u64)
+        )),
+        (None, Some(resident)) => Some(format!("memory {}", megabytes(resident))),
+        (None, None) => None,
     }
 }
 
@@ -285,6 +319,28 @@ mod tests {
         assert!((s.fps - 60.0).abs() < 2.0, "{s:?}");
         assert!((s.frame_ms - 16.7).abs() < 0.2, "{s:?}");
         assert!((s.work_ms - 4.0).abs() < 0.2, "{s:?}");
+    }
+
+    #[test]
+    fn the_play_window_keeps_its_own_frame_lines_and_leaves_memory_alone() {
+        let start = Instant::now();
+        let mut play = FrameStats::frames_only(start);
+        for i in 0..=30u32 {
+            let t = start + Duration::from_micros(33_333 * u64::from(i));
+            play.begin(t);
+            play.end(t + Duration::from_millis(2));
+        }
+        let lines = play.frame_lines("game");
+        assert_eq!(lines.len(), 2);
+        assert!(lines[0].starts_with("30 fps"), "{lines:?}");
+        assert!(lines[1].starts_with("game work 2."), "{lines:?}");
+        // The editor's lines say editor.
+        assert!(FrameStats::new(start).lines()[1].starts_with("editor work"));
+        assert!(!play.watches_memory && play.recent_peaks.is_empty());
+        // The memory line reads whatever is known without taking the peak.
+        if let Some(line) = memory_line() {
+            assert!(line.starts_with("memory "), "{line}");
+        }
     }
 
     #[test]
