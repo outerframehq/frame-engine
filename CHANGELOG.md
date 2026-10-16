@@ -103,6 +103,9 @@ Engine:
 
 Editor (frame-editor):
 
+- Every build from File > Build Game includes `THIRD-PARTY-LICENSES.txt`: each library the program links (from `cargo tree` for that platform) with its licence files, the fonts' OFL texts, and standard texts for libraries that ship none.
+- Windows builds from Linux in File > Build Game: tick Windows (and Linux) to build both. Uses the `x86_64-pc-windows-gnu` target and mingw-w64; Build checks this one-time setup first and says what to run if it's missing.
+- A game started with `run_player` writes `crash-log.txt` beside itself when it crashes and tells the player where it is, and start-up errors show in a message box on Windows (`report_player_error`).
 - File > Build Game: compiles the game program with cargo, packs the project (encrypted if the game has a cipher), adds the engine licence, and writes a `<Name>-<version>-<platform>` folder and a zip of it. Release or debug, encryption on or off and the output folder are saved per project. Shown when the editor's program registers a game with `set_game_builder`.
 - Pack files for game builds (`frame_engine::pack`): `write_pack` puts a project's scene, `assets/`, `plugins/` and `prefabs/` into one compressed file. `run_player` takes a pack or a project folder, and Play reads everything through `ProjectFiles`, so a game runs the same from either. A game can encrypt its pack by passing its own `PackCipher`; the engine has no encryption built in. New dependency: `flate2` (already built for PNG decoding).
 - Play from the launcher now plays sounds and shows on-screen images; they were looked up through the editor's open scene, which is empty at the launcher.

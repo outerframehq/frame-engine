@@ -12,13 +12,19 @@
 //! where builds are made. The steps run on a background thread and report
 //! progress to the Build window:
 //!
+//! For each platform chosen (see `PLATFORMS`):
+//!
 //! 1. `cargo build --bin <program>` (with `--release` unless debug was
-//!    chosen) in the game's workspace.
-//! 2. A fresh `<Name>-<version>-linux` folder in the output folder. An
+//!    chosen) in the game's workspace, with `--target` for a platform other
+//!    than the one the editor runs on. Building for Windows from Linux needs
+//!    a one-time setup, which is checked first (`check_cross_setup`).
+//! 2. A fresh `<Name>-<version>-<platform>` folder in the output folder. An
 //!    existing one is replaced only if Build made it (it holds a
 //!    `.frame-build` marker), so Build never deletes a folder it didn't make.
 //! 3. The program, `game.pack` (`frame_engine::pack::write_pack`, sealed
-//!    with the game's cipher if encryption is on) and the engine's licence.
+//!    with the game's cipher if encryption is on), the engine's licence, and
+//!    `THIRD-PARTY-LICENSES.txt` with every library and font in that
+//!    platform's program (`licences.rs`).
 //! 4. A zip of that folder next to it, for sending.
 //!
 //! Which program to compile, where its workspace is and how to encrypt are
@@ -70,6 +76,9 @@ pub(crate) struct BuildSettings {
     pub release: bool,
     /// Seal `game.pack` with the game's cipher.
     pub encrypt: bool,
+    /// Which platforms to build for, by `Platform::id`. The editor's own
+    /// platform when not set.
+    pub platforms: Vec<String>,
 }
 
 impl Default for BuildSettings {
@@ -78,6 +87,7 @@ impl Default for BuildSettings {
             output: String::new(),
             release: true,
             encrypt: true,
+            platforms: vec![host_platform().id.to_string()],
         }
     }
 }
@@ -120,8 +130,8 @@ pub(crate) enum BuildEvent {
 
 #[derive(Clone, Debug)]
 pub(crate) struct BuildOutput {
-    pub folder: PathBuf,
-    pub zip: PathBuf,
+    /// One zip per platform built.
+    pub zips: Vec<PathBuf>,
     pub seconds: f32,
 }
 
@@ -151,9 +161,8 @@ impl BuildJob {
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
             let started = std::time::Instant::now();
-            let result = run_build(&request, &tx).map(|(folder, zip)| BuildOutput {
-                folder,
-                zip,
+            let result = run_build(&request, &tx).map(|zips| BuildOutput {
+                zips,
                 seconds: started.elapsed().as_secs_f32(),
             });
             let _ = tx.send(BuildEvent::Done(result));
@@ -189,16 +198,55 @@ impl BuildJob {
     }
 }
 
-/// The platform name used in build folder names. Only the platform the
-/// editor runs on, for now.
-fn platform() -> &'static str {
-    if cfg!(target_os = "windows") {
+/// A platform a game can be built for.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Platform {
+    /// Saved in project.ron and used in folder names (`linux`).
+    pub id: &'static str,
+    /// Shown in the Build window.
+    pub label: &'static str,
+    /// The Rust target that builds for it.
+    pub target: &'static str,
+    /// The program's file name ending (`.exe` on Windows).
+    pub exe_suffix: &'static str,
+}
+
+/// The platforms Build knows. Windows uses the GNU toolchain (mingw-w64),
+/// which can be installed on Linux from the package manager and needs no
+/// Microsoft SDK. 64-bit only.
+pub(crate) const PLATFORMS: &[Platform] = &[
+    Platform {
+        id: "linux",
+        label: "Linux",
+        target: "x86_64-unknown-linux-gnu",
+        exe_suffix: "",
+    },
+    Platform {
+        id: "windows",
+        label: "Windows",
+        target: "x86_64-pc-windows-gnu",
+        exe_suffix: ".exe",
+    },
+];
+
+/// The platform this editor is running on: built for without `--target`.
+pub(crate) fn host_platform() -> &'static Platform {
+    let id = if cfg!(target_os = "windows") {
         "windows"
-    } else if cfg!(target_os = "macos") {
-        "macos"
     } else {
         "linux"
-    }
+    };
+    platform_by_id(id).unwrap_or(&PLATFORMS[0])
+}
+
+pub(crate) fn platform_by_id(id: &str) -> Option<&'static Platform> {
+    PLATFORMS.iter().find(|p| p.id == id)
+}
+
+/// Whether this editor can build for a platform: its own, or Windows from
+/// Linux. (Building for Linux from Windows isn't set up.)
+pub(crate) fn can_build_for(platform: &Platform) -> bool {
+    platform == host_platform() || (platform.id == "windows" && host_platform().id == "linux")
 }
 
 /// Keep a name usable as a file name on every system.
@@ -222,16 +270,19 @@ fn file_safe(name: &str) -> String {
 }
 
 /// The folder name a build gets: `<Name>-<version>-<platform>`.
-pub(crate) fn build_name(name: &str, version: &str) -> String {
+pub(crate) fn build_name(name: &str, version: &str, platform: &Platform) -> String {
     let version = version.trim();
     if version.is_empty() {
-        format!("{}-{}", file_safe(name), platform())
+        format!("{}-{}", file_safe(name), platform.id)
     } else {
-        format!("{}-{}-{}", file_safe(name), file_safe(version), platform())
+        format!("{}-{}-{}", file_safe(name), file_safe(version), platform.id)
     }
 }
 
 const MARKER: &str = ".frame-build";
+
+/// Every library and font in the program, with its licence (`licences.rs`).
+const THIRD_PARTY: &str = "THIRD-PARTY-LICENSES.txt";
 
 const ENGINE_LICENSE: &str = include_str!("../../../LICENSE");
 
@@ -268,10 +319,7 @@ fn cargo_command() -> std::process::Command {
 fn run_build(
     request: &BuildRequest,
     tx: &mpsc::Sender<BuildEvent>,
-) -> Result<(PathBuf, PathBuf), BuildError> {
-    let say = |text: String| {
-        let _ = tx.send(BuildEvent::Progress(text));
-    };
+) -> Result<Vec<PathBuf>, BuildError> {
     let builder = &request.builder;
     let settings = &request.settings;
     if settings.encrypt && builder.cipher.is_none() {
@@ -285,17 +333,119 @@ fn run_build(
             builder.workspace.display()
         )));
     }
+    let platforms: Vec<&Platform> = PLATFORMS
+        .iter()
+        .filter(|p| settings.platforms.iter().any(|id| id == p.id))
+        .collect();
+    if platforms.is_empty() {
+        return Err(BuildError::new("choose at least one platform"));
+    }
+    // Check every platform's setup before compiling anything, so a missing
+    // Windows setup is reported at once, not after a long Linux build.
+    for platform in &platforms {
+        if !can_build_for(platform) {
+            return Err(BuildError::new(format!(
+                "this editor can't build for {}",
+                platform.label
+            )));
+        }
+        if *platform != host_platform() {
+            check_cross_setup(platform)?;
+        }
+    }
+    let mut zips = Vec::new();
+    for platform in platforms {
+        let label = platform.label;
+        let say = |text: String| {
+            let _ = tx.send(BuildEvent::Progress(format!("{label}: {text}")));
+        };
+        zips.push(build_platform(request, platform, &say)?);
+    }
+    Ok(zips)
+}
+
+/// What to run once to build for `platform` from here.
+pub(crate) fn cross_setup_commands(platform: &Platform) -> Vec<String> {
+    match platform.id {
+        "windows" => vec![
+            format!("rustup target add {}", platform.target),
+            "sudo apt install mingw-w64".to_string(),
+        ],
+        _ => Vec::new(),
+    }
+}
+
+/// Make sure the one-time setup for building `platform` from here is done:
+/// its Rust target is installed, and, for Windows, the mingw-w64 linker.
+fn check_cross_setup(platform: &Platform) -> Result<(), BuildError> {
+    let missing = |what: &str| BuildError {
+        message: format!(
+            "building for {} needs a one-time setup: {what} is missing. Run these once, then build again:",
+            platform.label
+        ),
+        details: cross_setup_commands(platform),
+    };
+    // Rust targets: asked of rustup when there is one. Without rustup the
+    // compile itself will say if the target is missing.
+    let rustup = std::process::Command::new(rustup_program())
+        .args(["target", "list", "--installed"])
+        .output();
+    if let Ok(out) = rustup
+        && out.status.success()
+        && !String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .any(|l| l.trim() == platform.target)
+    {
+        return Err(missing(&format!("the Rust target {}", platform.target)));
+    }
+    if platform.id == "windows" {
+        let linker = std::process::Command::new("x86_64-w64-mingw32-gcc")
+            .arg("--version")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status();
+        if !linker.is_ok_and(|s| s.success()) {
+            return Err(missing("the mingw-w64 linker (x86_64-w64-mingw32-gcc)"));
+        }
+    }
+    Ok(())
+}
+
+/// rustup, found the same way as cargo.
+fn rustup_program() -> PathBuf {
+    if let Some(home) = dirs::home_dir() {
+        let installed = home.join(".cargo").join("bin").join(if cfg!(windows) {
+            "rustup.exe"
+        } else {
+            "rustup"
+        });
+        if installed.is_file() {
+            return installed;
+        }
+    }
+    PathBuf::from("rustup")
+}
+
+/// Build for one platform: compile, folder, pack, licence, zip. Returns the
+/// zip.
+fn build_platform(
+    request: &BuildRequest,
+    platform: &Platform,
+    say: &dyn Fn(String),
+) -> Result<PathBuf, BuildError> {
+    let builder = &request.builder;
+    let settings = &request.settings;
 
     // 1. Compile the game program.
     let profile = if settings.release { "release" } else { "debug" };
-    say(format!("Compiling {} ({profile})…", builder.program));
-    let program = compile(builder, settings.release, &say)?;
+    say(format!("compiling {} ({profile})…", builder.program));
+    let program = compile(builder, platform, settings.release, say)?;
 
     // 2. A fresh build folder.
     let output = settings.output_folder(&request.project);
-    let name = build_name(&request.name, &request.version);
+    let name = build_name(&request.name, &request.version, platform);
     let folder = output.join(&name);
-    say(format!("Making {}…", folder.display()));
+    say(format!("making {name}…"));
     std::fs::create_dir_all(&output)
         .map_err(|e| BuildError::new(format!("couldn't make {}: {e}", output.display())))?;
     if folder.exists() {
@@ -321,19 +471,16 @@ fn run_build(
     .map_err(|e| BuildError::new(format!("couldn't write in {}: {e}", folder.display())))?;
 
     // 3. The program, the pack and the licence.
-    let program_name = program
-        .file_name()
-        .map(|n| n.to_owned())
-        .unwrap_or_else(|| builder.program.clone().into());
+    let program_name = format!("{}{}", builder.program, platform.exe_suffix);
     let program_dest = folder.join(&program_name);
-    say("Copying the game program…".to_string());
+    say("copying the game program…".to_string());
     std::fs::copy(&program, &program_dest)
         .map_err(|e| BuildError::new(format!("couldn't copy {}: {e}", program.display())))?;
 
     say(if settings.encrypt {
-        "Packing and encrypting the project…".to_string()
+        "packing and encrypting the project…".to_string()
     } else {
-        "Packing the project…".to_string()
+        "packing the project…".to_string()
     });
     let cipher = if settings.encrypt {
         builder.cipher.as_deref()
@@ -343,38 +490,51 @@ fn run_build(
     let summary =
         frame_engine::pack::write_pack(&request.project, folder.join("game.pack"), cipher)
             .map_err(|e| BuildError::new(format!("couldn't pack the project: {e}")))?;
-    say(format!("Packed {} files.", summary.files));
+    say(format!("packed {} files.", summary.files));
 
     std::fs::write(folder.join("LICENSE-Frame-Engine.txt"), licence_notice())
         .map_err(|e| BuildError::new(format!("couldn't write the licence: {e}")))?;
 
+    // Every library and font in this platform's program, with its licence.
+    say("collecting library licences…".to_string());
+    let libraries =
+        crate::licences::program_libraries(cargo_command(), &builder.workspace, platform.target)
+            .map_err(|e| BuildError::new(format!("couldn't list the game's libraries: {e}")))?;
+    let notices = crate::licences::notices_text(
+        &request.name,
+        &libraries,
+        &crate::licences::registry_sources(),
+    );
+    std::fs::write(folder.join(THIRD_PARTY), notices)
+        .map_err(|e| BuildError::new(format!("couldn't write {THIRD_PARTY}: {e}")))?;
+    say(format!("credited {} libraries.", libraries.len()));
+
     // 4. Zip it.
-    say("Zipping…".to_string());
+    say("zipping…".to_string());
     let zip = output.join(format!("{name}.zip"));
     let files = [
-        (
-            program_name.to_string_lossy().to_string(),
-            program_dest,
-            true,
-        ),
+        (program_name, program_dest, true),
         ("game.pack".to_string(), folder.join("game.pack"), false),
         (
             "LICENSE-Frame-Engine.txt".to_string(),
             folder.join("LICENSE-Frame-Engine.txt"),
             false,
         ),
+        (THIRD_PARTY.to_string(), folder.join(THIRD_PARTY), false),
     ];
     write_zip(&zip, &name, &files)
         .map_err(|e| BuildError::new(format!("couldn't write {}: {e}", zip.display())))?;
-    Ok((folder, zip))
+    Ok(zip)
 }
 
 /// Run cargo, passing its progress on, and return the built program's path.
 fn compile(
     builder: &GameBuilder,
+    platform: &Platform,
     release: bool,
     say: &dyn Fn(String),
 ) -> Result<PathBuf, BuildError> {
+    let cross = platform != host_platform();
     let mut command = cargo_command();
     command
         .current_dir(&builder.workspace)
@@ -387,6 +547,9 @@ fn compile(
         .stderr(std::process::Stdio::piped());
     if release {
         command.arg("--release");
+    }
+    if cross {
+        command.arg("--target").arg(platform.target);
     }
     let mut child = command
         .spawn()
@@ -415,7 +578,10 @@ fn compile(
         .map_err(|e| BuildError::new(format!("cargo didn't finish: {e}")))?;
     if !status.success() {
         return Err(BuildError {
-            message: format!("compiling {} failed", builder.program),
+            message: format!(
+                "compiling {} for {} failed",
+                builder.program, platform.label
+            ),
             details: last_lines,
         });
     }
@@ -429,14 +595,15 @@ fn compile(
             }
         })
         .unwrap_or_else(|| builder.workspace.join("target"));
-    let file = if cfg!(windows) {
-        format!("{}.exe", builder.program)
+    // A --target build lands in its own folder under target/.
+    let target = if cross {
+        target.join(platform.target)
     } else {
-        builder.program.clone()
+        target
     };
     let program = target
         .join(if release { "release" } else { "debug" })
-        .join(file);
+        .join(format!("{}{}", builder.program, platform.exe_suffix));
     if !program.is_file() {
         return Err(BuildError::new(format!(
             "cargo finished but {} isn't there",
@@ -667,12 +834,33 @@ pub(crate) fn build_window_ui(
                     ui.weak("Name and version come from the project. Change the version in the launcher's project Settings.");
                     ui.end_row();
 
-                    ui.label("Platform");
+                    ui.label("Platforms");
                     ui.horizontal(|ui| {
-                        let _ = ui.add_enabled(false, egui::RadioButton::new(true, platform_label()));
-                        ui.weak("(more platforms later)");
+                        for platform in PLATFORMS {
+                            let possible = can_build_for(platform);
+                            let mut on = settings.platforms.iter().any(|id| id == platform.id);
+                            let changed = ui
+                                .add_enabled(
+                                    !view.running && possible,
+                                    egui::Checkbox::new(&mut on, platform.label),
+                                )
+                                .changed();
+                            if changed {
+                                settings.platforms.retain(|id| id != platform.id);
+                                if on {
+                                    settings.platforms.push(platform.id.to_string());
+                                }
+                            }
+                        }
                     });
                     ui.end_row();
+                    if settings.platforms.iter().any(|id| id == "windows")
+                        && host_platform().id != "windows"
+                    {
+                        ui.label("");
+                        ui.weak("Windows builds need a one-time setup on this PC. Build checks it first and says what to run if anything is missing.");
+                        ui.end_row();
+                    }
 
                     ui.label("Build");
                     ui.horizontal(|ui| {
@@ -719,12 +907,24 @@ pub(crate) fn build_window_ui(
                 });
 
             ui.add_space(6.0);
-            ui.weak(format!(
-                "Makes {}/{} with {}, game.pack and the licence, and a zip of it to send.",
-                short_path(&view.output_folder),
-                build_name(&view.name, &view.version),
-                view.program
-            ));
+            let chosen: Vec<&Platform> = PLATFORMS
+                .iter()
+                .filter(|p| settings.platforms.iter().any(|id| id == p.id))
+                .collect();
+            if let Some(first) = chosen.first() {
+                ui.weak(format!(
+                    "Makes {}/{} with {}{}, game.pack and the licences, and a zip of it to send{}.",
+                    short_path(&view.output_folder),
+                    build_name(&view.name, &view.version, first),
+                    view.program,
+                    first.exe_suffix,
+                    if chosen.len() > 1 {
+                        ", for each platform"
+                    } else {
+                        ""
+                    }
+                ));
+            }
             if view.unsaved {
                 ui.add_space(4.0);
                 ui.horizontal(|ui| {
@@ -740,7 +940,10 @@ pub(crate) fn build_window_ui(
             ui.add_space(8.0);
             ui.horizontal(|ui| {
                 if ui
-                    .add_enabled(!view.running, egui::Button::new("Build"))
+                    .add_enabled(
+                        !view.running && !settings.platforms.is_empty(),
+                        egui::Button::new("Build"),
+                    )
                     .clicked()
                 {
                     action = Some(BuildUiAction::Start);
@@ -757,11 +960,15 @@ pub(crate) fn build_window_ui(
                     ui.add_space(6.0);
                     ui.colored_label(
                         egui::Color32::from_rgb(0x7F, 0xC0, 0x7A),
-                        format!("Built in {:.0} s: {}", output.seconds, short_path(&output.zip)),
+                        format!("Built in {:.0} s:", output.seconds),
                     );
-                    if ui.button("Open output folder").clicked() {
-                        let folder = output.zip.parent().unwrap_or(&output.folder).to_path_buf();
-                        action = Some(BuildUiAction::OpenFolder(folder));
+                    for zip in &output.zips {
+                        ui.label(short_path(zip));
+                    }
+                    if let Some(folder) = output.zips.first().and_then(|z| z.parent())
+                        && ui.button("Open output folder").clicked()
+                    {
+                        action = Some(BuildUiAction::OpenFolder(folder.to_path_buf()));
                     }
                 }
                 Some(Err(error)) if !view.running => {
@@ -797,14 +1004,6 @@ fn short_path(path: &Path) -> String {
         return format!("~/{}", rest.display());
     }
     path.display().to_string()
-}
-
-fn platform_label() -> &'static str {
-    match platform() {
-        "windows" => "Windows",
-        "macos" => "macOS",
-        _ => "Linux",
-    }
 }
 
 /// Read a whole zip's file list back, for tests: (name, mode, contents).
@@ -917,6 +1116,7 @@ mod tests {
                 output: String::new(),
                 release: false,
                 encrypt: false,
+                ..Default::default()
             },
             builder: GameBuilder {
                 program: "tiny".to_string(),
@@ -925,18 +1125,22 @@ mod tests {
             },
         };
         let (tx, rx) = mpsc::channel();
-        let (folder, zip) = run_build(&request(), &tx).unwrap_or_else(|e| {
+        let zips = run_build(&request(), &tx).unwrap_or_else(|e| {
             panic!("{}: {}", e.message, e.details.join("\n"));
         });
-        let name = build_name("Tiny", "0.1.0");
-        assert_eq!(folder, base.join("Tiny-builds").join(&name));
+        let name = build_name("Tiny", "0.1.0", host_platform());
+        let folder = base.join("Tiny-builds").join(&name);
+        assert_eq!(zips, [base.join("Tiny-builds").join(format!("{name}.zip"))]);
+        let zip = &zips[0];
         assert!(folder.join("tiny").is_file());
         assert!(folder.join(MARKER).is_file());
         let pack = frame_engine::pack::ProjectFiles::open(folder.join("game.pack"), None).unwrap();
         assert_eq!(pack.read("assets/a.txt").unwrap(), b"asset");
         let notice = std::fs::read_to_string(folder.join("LICENSE-Frame-Engine.txt")).unwrap();
         assert!(notice.contains("Mozilla Public License"));
-        let names: Vec<String> = read_zip(&zip).into_iter().map(|e| e.0).collect();
+        let third = std::fs::read_to_string(folder.join(THIRD_PARTY)).unwrap();
+        assert!(third.contains("Libraries (0)") && third.contains("Font: Manrope"));
+        let names: Vec<String> = read_zip(zip).into_iter().map(|e| e.0).collect();
         assert_eq!(
             names,
             [
@@ -944,6 +1148,7 @@ mod tests {
                 format!("{name}/tiny"),
                 format!("{name}/game.pack"),
                 format!("{name}/LICENSE-Frame-Engine.txt"),
+                format!("{name}/THIRD-PARTY-LICENSES.txt"),
             ]
         );
         let said: Vec<String> = rx
@@ -954,7 +1159,7 @@ mod tests {
             })
             .collect();
         assert!(
-            said.iter().any(|l| l.starts_with("Compiling tiny")),
+            said.iter().any(|l| l.contains("compiling tiny")),
             "{said:?}"
         );
 
@@ -973,6 +1178,11 @@ mod tests {
             err.message
         );
         assert!(folder.join("mine.txt").exists());
+
+        // No platform chosen.
+        let mut none = request();
+        none.settings.platforms.clear();
+        assert!(run_build(&none, &tx).is_err());
 
         // Encryption asked for with no cipher.
         let mut sealed = request();
@@ -999,12 +1209,32 @@ mod tests {
     }
 
     #[test]
+    fn windows_is_built_from_linux_with_the_gnu_target_and_named_exe() {
+        let windows = platform_by_id("windows").unwrap();
+        assert_eq!(windows.target, "x86_64-pc-windows-gnu");
+        assert_eq!(windows.exe_suffix, ".exe");
+        if host_platform().id == "linux" {
+            assert!(can_build_for(windows));
+            assert_eq!(
+                cross_setup_commands(windows),
+                [
+                    "rustup target add x86_64-pc-windows-gnu",
+                    "sudo apt install mingw-w64"
+                ]
+            );
+        }
+    }
+
+    #[test]
     fn build_names_are_safe_and_settings_default_to_release_and_encrypted() {
-        let platform = platform();
-        assert_eq!(build_name("Ichor", "0.1"), format!("Ichor-0.1-{platform}"));
-        assert_eq!(build_name("My/Game?", ""), format!("My-Game--{platform}"));
+        let windows = platform_by_id("windows").unwrap();
+        assert_eq!(build_name("Ichor", "0.1", windows), "Ichor-0.1-windows");
+        assert_eq!(build_name("My/Game?", "", windows), "My-Game--windows");
         let old: BuildSettings = ron::from_str("()").unwrap();
         assert!(old.release && old.encrypt && old.output.is_empty());
+        // A project from before platforms existed builds for this computer.
+        assert_eq!(old.platforms, [host_platform().id]);
+        assert!(can_build_for(host_platform()));
         let project = Path::new("/home/me/Dev/Ichor");
         assert_eq!(
             old.output_folder(project),

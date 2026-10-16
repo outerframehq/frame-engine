@@ -30,6 +30,7 @@ pub(crate) const ENTITY_WGSL: &str =
 mod build;
 mod font;
 mod grass;
+mod licences;
 mod origin;
 mod perf;
 pub use perf::CountingAlloc;
@@ -5438,7 +5439,11 @@ impl App {
         if let Some(result) = finished {
             self.build_job = None;
             match &result {
-                Ok(output) => self.log(format!("Built {}", output.zip.display())),
+                Ok(output) => {
+                    for zip in &output.zips {
+                        self.log(format!("Built {}", zip.display()));
+                    }
+                }
                 Err(error) => self.log(format!("Build failed: {}", error.message)),
             }
             self.build_result = Some(result);
@@ -7850,7 +7855,20 @@ impl ApplicationHandler for App {
                     self.start_play(event_loop, files);
                 }
                 if self.game_window.is_none() {
-                    eprintln!("{} could not start. See the messages above.", app_name());
+                    // What went wrong was logged; a player on Windows has no
+                    // console to see it in, so it goes in the message too.
+                    let reasons: Vec<&str> = self
+                        .log_lines
+                        .iter()
+                        .rev()
+                        .take(3)
+                        .rev()
+                        .map(String::as_str)
+                        .collect();
+                    report_player_error(
+                        app_name(),
+                        &format!("{} could not start.\n\n{}", app_name(), reasons.join("\n")),
+                    );
                     self.player_failed = true;
                     event_loop.exit();
                 }
@@ -10732,6 +10750,8 @@ fn app_name() -> &'static str {
 
 /// The Linux application id, which the desktop uses to group windows and find
 /// the launcher entry and icon.
+// Only Linux uses an application id (Wayland groups windows by it).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn app_id() -> &'static str {
     APP_IDENTITY
         .get()
@@ -10768,14 +10788,88 @@ pub fn run_player(
     let files = match ProjectFiles::open(&project, cipher) {
         Ok(files) => files,
         Err(e) => {
-            eprintln!(
-                "{name} could not open its game files ({}): {e}",
-                project.display()
+            report_player_error(
+                name,
+                &format!(
+                    "{name} could not open its game files ({}): {e}",
+                    project.display()
+                ),
             );
             std::process::exit(1);
         }
     };
+    install_crash_log(name);
     run_app(name, app_id, modules, Some(files));
+}
+
+/// Tell a player their game couldn't start: on standard error, and in a
+/// message box on Windows, where a game has no console to print to (release
+/// builds hide it).
+pub fn report_player_error(name: &str, message: &str) {
+    eprintln!("{message}");
+    #[cfg(target_os = "windows")]
+    {
+        let _ = rfd::MessageDialog::new()
+            .set_level(rfd::MessageLevel::Error)
+            .set_title(name)
+            .set_description(message)
+            .set_buttons(rfd::MessageButtons::Ok)
+            .show();
+    }
+    #[cfg(not(target_os = "windows"))]
+    let _ = name;
+}
+
+/// Where a game writes `crash-log.txt`: next to the program, so a tester
+/// finds it beside the game, or the temporary folder if that can't be
+/// written to.
+fn crash_log_path() -> std::path::PathBuf {
+    let beside = std::env::current_exe()
+        .ok()
+        .and_then(|exe| exe.parent().map(|dir| dir.join("crash-log.txt")));
+    match beside {
+        Some(path)
+            if std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(&path)
+                .is_ok() =>
+        {
+            path
+        }
+        _ => std::env::temp_dir().join("crash-log.txt"),
+    }
+}
+
+/// On a crash (a panic, on any thread), still print it as usual, but also
+/// write what happened to `crash-log.txt` and tell the player where it is.
+/// Only the first crash is reported: one fault can set off others.
+fn install_crash_log(name: &str) {
+    static REPORTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    let name = name.to_string();
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        previous(info);
+        if REPORTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
+        let text = format!(
+            "{name} crashed.\n\n{info}\n\nFrame Engine {}, {} {}\n\n{}\n",
+            frame_engine::version::ENGINE,
+            std::env::consts::OS,
+            std::env::consts::ARCH,
+            std::backtrace::Backtrace::force_capture()
+        );
+        let path = crash_log_path();
+        let message = match std::fs::write(&path, text) {
+            Ok(()) => format!(
+                "{name} crashed. What happened was saved to:\n{}\n\nPlease send that file to the developer.",
+                path.display()
+            ),
+            Err(_) => format!("{name} crashed.\n\n{info}"),
+        };
+        report_player_error(&name, &message);
+    }));
 }
 
 /// The editor, or with `player` set, a game on its own (see `run_player`).
