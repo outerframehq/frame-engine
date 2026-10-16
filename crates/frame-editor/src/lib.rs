@@ -2658,6 +2658,9 @@ enum ConsoleTab {
 enum AppMode {
     Launcher,
     Editor,
+    /// A game on its own: no launcher and no editor window, only the game
+    /// window, and closing it quits. Started by `run_player`.
+    Player,
 }
 
 /// A choice made on the launcher screen this frame, applied after the egui pass
@@ -5016,6 +5019,11 @@ struct App {
     // scene, prefab or project from a newer Frame Editor. See
     // `version_notice_ui`.
     version_notice: Option<String>,
+    // The project a `run_player` build plays. `None` in the editor.
+    player_root: Option<std::path::PathBuf>,
+    // Set when a `run_player` build could not open its game, so the program
+    // ends with an error code.
+    player_failed: bool,
     // The title last given to the window, so it's only set when it changes.
     window_title: String,
     // The preferences as last written to editor.ron.
@@ -6191,7 +6199,21 @@ impl App {
             .and_then(|s| s.to_str())
             .unwrap_or("Game")
             .to_string();
-        let attributes = Window::default_attributes().with_title(format!("{name} — Play"));
+        // A game on its own is titled with its own name and grouped under its
+        // own app id; the editor's Play window says what it is playing.
+        let player = matches!(self.mode, AppMode::Player);
+        let title = if player {
+            app_name().to_string()
+        } else {
+            format!("{name} — Play")
+        };
+        #[allow(unused_mut)]
+        let mut attributes = Window::default_attributes().with_title(title);
+        #[cfg(target_os = "linux")]
+        if player {
+            use winit::platform::wayland::WindowAttributesExtWayland;
+            attributes = attributes.with_name(app_id(), app_id());
+        }
         let window = match event_loop.create_window(attributes) {
             Ok(w) => Arc::new(w),
             Err(e) => {
@@ -6199,11 +6221,16 @@ impl App {
                 return;
             }
         };
-        let (mut gpu, _shared) = GpuState::new(
+        let (mut gpu, shared) = GpuState::new(
             window.clone(),
             self.gpu_shared.as_ref(),
             &self.modules.borrow(),
         );
+        // A game on its own has no editor window, so the game window is the
+        // first and makes the shared device.
+        if self.gpu_shared.is_none() {
+            self.gpu_shared = Some(shared);
+        }
         // The game window has its own GpuState (pipelines, buffers,
         // egui_renderer), so the project's models get parsed and uploaded
         // for it separately, even though it shares the same underlying
@@ -7669,6 +7696,20 @@ fn load_window_icon() -> Option<Icon> {
 }
 impl ApplicationHandler for App {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        // A game on its own opens only the game window.
+        if matches!(self.mode, AppMode::Player) {
+            if self.game_window.is_none() {
+                if let Some(root) = self.player_root.clone() {
+                    self.start_play(event_loop, root);
+                }
+                if self.game_window.is_none() {
+                    eprintln!("{} could not start. See the messages above.", app_name());
+                    self.player_failed = true;
+                    event_loop.exit();
+                }
+            }
+            return;
+        }
         apply_editor_theme(&self.egui_ctx);
         #[allow(unused_mut)]
         let mut attributes = Window::default_attributes()
@@ -7725,6 +7766,10 @@ impl ApplicationHandler for App {
         if self.game_closing {
             self.close_game();
             self.game_closing = false;
+            // A game on its own ends with its window.
+            if matches!(self.mode, AppMode::Player) {
+                event_loop.exit();
+            }
         }
         // Same reasoning, same deferred-teardown pattern, for any popped-out
         // tab window that asked to close this cycle (its own X button, or its
@@ -10536,6 +10581,30 @@ pub fn run(modules: Vec<Box<dyn EditorModule>>) {
 /// application id, so a build with extra features can be told apart from the
 /// plain editor in the window switcher.
 pub fn run_as(name: &str, app_id: &str, modules: Vec<Box<dyn EditorModule>>) {
+    run_app(name, app_id, modules, None);
+}
+
+/// Start straight into a game, with no editor: the project in `project` (a
+/// folder holding its scene) opens in one window, the same way the editor's
+/// Play button runs it, and closing that window quits. `name` is the window
+/// title and `app_id` the Linux application id. This is what a game build
+/// runs.
+pub fn run_player(
+    name: &str,
+    app_id: &str,
+    project: std::path::PathBuf,
+    modules: Vec<Box<dyn EditorModule>>,
+) {
+    run_app(name, app_id, modules, Some(project));
+}
+
+/// The editor, or with `player` set, a game on its own (see `run_player`).
+fn run_app(
+    name: &str,
+    app_id: &str,
+    modules: Vec<Box<dyn EditorModule>>,
+    player: Option<std::path::PathBuf>,
+) {
     let _ = APP_IDENTITY.set((name.to_string(), app_id.to_string()));
     let event_loop = EventLoop::new().unwrap();
     // The editor opens on the launcher screen with no project loaded, so it
@@ -10624,6 +10693,8 @@ pub fn run_as(name: &str, app_id: &str, modules: Vec<Box<dyn EditorModule>>) {
         saved_scripts: std::collections::BTreeMap::new(),
         pending_unsaved: None,
         version_notice: None,
+        player_root: None,
+        player_failed: false,
         window_title: String::new(),
         saved_prefs: prefs,
         egui_ctx: egui::Context::default(),
@@ -10682,8 +10753,21 @@ pub fn run_as(name: &str, app_id: &str, modules: Vec<Box<dyn EditorModule>>) {
         .ok(),
         sound_cache: std::collections::HashMap::new(),
     };
-    println!("Frame Editor started at the launcher.");
+    match player {
+        Some(root) => {
+            app.mode = AppMode::Player;
+            // Sounds and on-screen images are found under the project's
+            // assets/ folder, which Play finds from the scene's path.
+            app.current_scene_path = find_scene(&root);
+            app.player_root = Some(root);
+            println!("{name} starting.");
+        }
+        None => println!("Frame Editor started at the launcher."),
+    }
     event_loop.run_app(&mut app).unwrap();
+    if app.player_failed {
+        std::process::exit(1);
+    }
 }
 
 #[cfg(test)]

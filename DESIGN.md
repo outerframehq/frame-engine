@@ -214,6 +214,8 @@ Project launcher. The editor opens on a launcher rather than a fixed scene. It i
 
 Play. Play opens the project in a separate, clean game window: its own winit window and wgpu surface running a copy of the world, the 3D scene only with no editor chrome, driven from the world's `Camera` entity. Events are routed by window id, and closing it (or Esc) tears the window down deferred in `about_to_wait` so dropping the wgpu surface does not crash on Wayland.
 
+A game on its own (`run_player`). The same Play path can start without the editor: `run_player(name, app_id, project, modules)` opens only the game window on a project folder, titled with the game's name, and quits when it closes. It is a third `AppMode`, `Player`, so the editor's launcher and main window are never created; the game window makes the shared GPU device itself. A crate with extra modules builds its game program by calling it with the same modules its editor uses, so the game runs the same world. This is the first piece of turning a project into something a player can download.
+
 Dockable panel UI via `egui` and `egui_dock`. The tool panels are dockable tabs, not fixed regions: they can be dragged, tabbed together, and split apart at runtime, and any tab can be popped out into its own window. Popped-out windows share the editor's single GPU instance rather than each creating their own.
 
 - A top toolbar with the editor's logo and File, Edit, View, and Help menus. Each menu item runs the same action as its keyboard shortcut: the menu and the key are two triggers for one command, so they cannot drift apart.

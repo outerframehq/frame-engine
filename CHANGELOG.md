@@ -103,6 +103,7 @@ Engine:
 
 Editor (frame-editor):
 
+- `run_player`: start straight into a project's game, with no launcher or editor window. Only the game window opens, titled with the game's name, and closing it quits. Used by game programs built on the editor library, with the same modules as their editor.
 - A "Newer version" window when a scene, prefab or project came from a newer Frame Editor. A project's `project.ron` now records which editor version last saved it (`editor`), keeping a newer one's stamp. Save is turned off for a scene from a newer editor (Save As still works), and a plugin that needs a newer engine is warned about in the log.
 - `frame-editor` is now a library as well as a binary, with a module interface (`module_api`). A crate can add an Inspector section, build and draw its own geometry (shadows included) and hide anchor entities from the ordinary shape pass, without editing the editor. `frame_editor::run` takes the modules to load; the public editor passes none.
 - Editor modules can draw see-through geometry. `ModuleGpu::has_transparent` and `draw_transparent` run after everything opaque, in the colour pass only (so nothing casts a shadow), through a second pipeline that alpha blends by each vertex's `uv.x`, tests depth and does not write it. `uv.y` is a 0 to 1 thickness: thin geometry lightens and fades out (water uses it for depth, so shallows go pale and clear and the shoreline dissolves). The entity shader's lighting moved into one function shared by the opaque and transparent entry points. Meshes are not sorted.
