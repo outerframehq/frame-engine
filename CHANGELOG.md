@@ -103,6 +103,7 @@ Engine:
 
 Editor (frame-editor):
 
+- File > Build Game: compiles the game program with cargo, packs the project (encrypted if the game has a cipher), adds the engine licence, and writes a `<Name>-<version>-<platform>` folder and a zip of it. Release or debug, encryption on or off and the output folder are saved per project. Shown when the editor's program registers a game with `set_game_builder`.
 - Pack files for game builds (`frame_engine::pack`): `write_pack` puts a project's scene, `assets/`, `plugins/` and `prefabs/` into one compressed file. `run_player` takes a pack or a project folder, and Play reads everything through `ProjectFiles`, so a game runs the same from either. A game can encrypt its pack by passing its own `PackCipher`; the engine has no encryption built in. New dependency: `flate2` (already built for PNG decoding).
 - Play from the launcher now plays sounds and shows on-screen images; they were looked up through the editor's open scene, which is empty at the launcher.
 - `World::load_from_str`, for a scene that isn't a file on its own.

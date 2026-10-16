@@ -27,6 +27,7 @@ use winit::window::{Icon, Window, WindowId};
 /// editor's own entry points.
 pub(crate) const ENTITY_WGSL: &str =
     concat!(include_str!("scene.wgsl"), include_str!("shader.wgsl"));
+mod build;
 mod font;
 mod grass;
 mod origin;
@@ -63,6 +64,8 @@ pub use egui;
 // For game programs built on this library: the cipher a game can seal its
 // pack with, and the writer that makes a pack from a project.
 pub use frame_engine::pack::{PackCipher, write_pack};
+// For a game program's editor: say which program File > Build Game compiles.
+pub use build::{GameBuilder, set_game_builder};
 use module_api::{EditorModule, ExtEdit, ModuleGpu, ModuleScene};
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -2700,6 +2703,7 @@ enum MenuAction {
     ToggleHelp,
     ToggleStats,
     OpenEditorSettings,
+    BuildGame,
     About,
     Quit,
 }
@@ -5124,6 +5128,14 @@ struct App {
     // Whether the Editor Settings window is currently open, toggled from
     // Edit > Editor settings….
     editor_settings_open: bool,
+    // File > Build Game: whether its window is open, the open project's
+    // build choices (saved in project.ron when a build starts), the build
+    // running now, its latest progress lines, and how the last one ended.
+    build_window_open: bool,
+    build_settings: build::BuildSettings,
+    build_job: Option<build::BuildJob>,
+    build_progress: Vec<String>,
+    build_result: Option<Result<build::BuildOutput, build::BuildError>>,
     // GPU texture for the toolbar logo, uploaded once on the first frame.
     logo_texture: Option<egui::TextureHandle>,
     // The kira audio backend. None if the host's audio device couldn't be
@@ -5359,6 +5371,129 @@ impl App {
         apply_sun_prefs(&prefs);
         self.persist_prefs_if_changed();
     }
+    /// The open project's folder.
+    fn project_root(&self) -> Option<std::path::PathBuf> {
+        self.current_scene_path
+            .as_ref()
+            .and_then(|p| p.parent())
+            .map(|p| p.to_path_buf())
+    }
+
+    /// Open File > Build Game with this project's saved build choices.
+    fn open_build_window(&mut self) {
+        let Some(root) = self.project_root() else {
+            self.log("Open a project to build it".to_string());
+            return;
+        };
+        if self.build_job.is_none() {
+            self.build_settings = read_manifest(&root).build;
+            self.build_result = None;
+            self.build_progress.clear();
+        }
+        self.build_window_open = true;
+    }
+
+    /// What the Build window shows this frame, or `None` with no project or
+    /// no game to build.
+    fn build_view(&self) -> Option<build::BuildView> {
+        let builder = build::game_builder()?;
+        let root = self.project_root()?;
+        let name = self
+            .current_scene_path
+            .as_ref()
+            .and_then(|p| p.file_stem())
+            .and_then(|s| s.to_str())
+            .unwrap_or("Game")
+            .to_string();
+        Some(build::BuildView {
+            name,
+            version: read_manifest(&root).version,
+            program: builder.program.clone(),
+            can_encrypt: builder.cipher.is_some(),
+            unsaved: self.is_dirty(),
+            output_folder: self.build_settings.output_folder(&root),
+            running: self.build_job.is_some(),
+            progress: self.build_progress.clone(),
+            result: self.build_result.clone(),
+        })
+    }
+
+    /// Take in what a running build has reported.
+    fn poll_build(&mut self) {
+        let Some(job) = &self.build_job else {
+            return;
+        };
+        let mut finished = None;
+        for event in job.poll() {
+            match event {
+                build::BuildEvent::Progress(line) => {
+                    self.build_progress.push(line);
+                    if self.build_progress.len() > 20 {
+                        self.build_progress.remove(0);
+                    }
+                }
+                build::BuildEvent::Done(result) => finished = Some(result),
+            }
+        }
+        if let Some(result) = finished {
+            self.build_job = None;
+            match &result {
+                Ok(output) => self.log(format!("Built {}", output.zip.display())),
+                Err(error) => self.log(format!("Build failed: {}", error.message)),
+            }
+            self.build_result = Some(result);
+        }
+    }
+
+    fn handle_build_action(&mut self, action: build::BuildUiAction) {
+        match action {
+            build::BuildUiAction::Start => self.start_build(),
+            build::BuildUiAction::SaveScene => self.save_scene(),
+            build::BuildUiAction::OpenFolder(folder) => build::open_folder(&folder),
+            build::BuildUiAction::ChooseFolder => {
+                let start = self
+                    .project_root()
+                    .map(|root| self.build_settings.output_folder(&root));
+                let mut dialog = rfd::FileDialog::new().set_title("Where builds go");
+                if let Some(start) = start.filter(|p| p.is_dir()).or_else(|| self.project_root()) {
+                    dialog = dialog.set_directory(start);
+                }
+                if let Some(folder) = dialog.pick_folder() {
+                    self.build_settings.output = folder.display().to_string();
+                }
+            }
+        }
+    }
+
+    /// Save this project's build choices and start a build on its own thread.
+    fn start_build(&mut self) {
+        if self.build_job.is_some() {
+            return;
+        }
+        let (Some(builder), Some(root)) = (build::game_builder(), self.project_root()) else {
+            return;
+        };
+        let mut manifest = read_manifest(&root);
+        manifest.build = self.build_settings.clone();
+        write_manifest(&root, &manifest);
+        let name = self
+            .current_scene_path
+            .as_ref()
+            .and_then(|p| p.file_stem())
+            .and_then(|s| s.to_str())
+            .unwrap_or("Game")
+            .to_string();
+        self.build_progress = vec!["Starting…".to_string()];
+        self.build_result = None;
+        self.build_job = Some(build::BuildJob::start(build::BuildRequest {
+            project: root,
+            name,
+            version: manifest.version,
+            settings: self.build_settings.clone(),
+            builder: builder.clone(),
+        }));
+    }
+
     /// True if the open scene has changes that haven't been saved.
     fn is_dirty(&self) -> bool {
         self.dirty || self.world.script_library != self.saved_scripts
@@ -5989,9 +6124,8 @@ impl App {
                 write_manifest(
                     &folder,
                     &ProjectManifest {
-                        description: String::new(),
                         version: "0.1.0".to_string(),
-                        editor: String::new(),
+                        ..Default::default()
                     },
                 );
                 self.world = world;
@@ -6138,7 +6272,8 @@ impl App {
             &ProjectManifest {
                 description,
                 version,
-                editor: String::new(),
+                // Kept as they are; File > Build Game edits these.
+                ..read_manifest(&root)
             },
         );
         self.settings_open = false;
@@ -8503,6 +8638,12 @@ impl ApplicationHandler for App {
                 let paused = self.paused;
                 let mut plugins_panel_open = self.plugins_panel_open;
                 let mut editor_settings_open = self.editor_settings_open;
+                self.poll_build();
+                let mut build_open = self.build_window_open;
+                let mut build_settings_edit = self.build_settings.clone();
+                // Only worked out while the window is open: it reads project.ron.
+                let build_view = if build_open { self.build_view() } else { None };
+                let mut build_action: Option<build::BuildUiAction> = None;
                 let mut prefs_edit = self.current_prefs();
                 let pending_unsaved = self.pending_unsaved;
                 let notice = self.version_notice.clone();
@@ -8623,6 +8764,12 @@ impl ApplicationHandler for App {
                                         }
                                         if ui.button("Import texture…").clicked() {
                                             menu_action = Some(MenuAction::ImportTexture);
+                                        }
+                                        if build::game_builder().is_some() {
+                                            ui.separator();
+                                            if ui.button("Build Game…").clicked() {
+                                                menu_action = Some(MenuAction::BuildGame);
+                                            }
                                         }
                                         ui.separator();
                                         if ui.button("Save scene").clicked() {
@@ -8833,6 +8980,16 @@ impl ApplicationHandler for App {
                                             }
                                         });
                                     });
+                            }
+                            if build_open {
+                                if let Some(view) = &build_view {
+                                    build_action = build::build_window_ui(
+                                        ui.ctx(),
+                                        &mut build_open,
+                                        &mut build_settings_edit,
+                                        view,
+                                    );
+                                }
                             }
                             // Editor Settings: a floating window, opened from
                             // Edit > Editor settings…. Just plugin toggles for
@@ -9089,6 +9246,11 @@ impl ApplicationHandler for App {
                 self.console_tab = console_tab;
                 self.plugins_panel_open = plugins_panel_open;
                 self.editor_settings_open = editor_settings_open;
+                self.build_window_open = build_open;
+                self.build_settings = build_settings_edit;
+                if let Some(action) = build_action {
+                    self.handle_build_action(action);
+                }
                 if prefs_edit != self.current_prefs() {
                     self.apply_prefs(prefs_edit);
                 }
@@ -9375,6 +9537,7 @@ impl ApplicationHandler for App {
                     Some(MenuAction::ToggleHelp) => self.toggle_help(),
                     Some(MenuAction::ToggleStats) => self.toggle_stats(),
                     Some(MenuAction::OpenEditorSettings) => self.editor_settings_open = true,
+                    Some(MenuAction::BuildGame) => self.open_build_window(),
                     Some(MenuAction::About) => {
                         self.log("Frame Editor — a hand-rolled Rust simulation engine and editor.");
                     }
@@ -9644,6 +9807,9 @@ struct ProjectManifest {
     /// newer. Empty in a project from before this existed.
     #[serde(default)]
     editor: String,
+    /// File > Build Game's choices for this project.
+    #[serde(default)]
+    build: build::BuildSettings,
 }
 
 /// A warning if a plugin says it needs a newer engine than this one (its
@@ -10755,6 +10921,11 @@ fn run_app(
         renaming: None,
         plugins_panel_open: false,
         editor_settings_open: false,
+        build_window_open: false,
+        build_settings: build::BuildSettings::default(),
+        build_job: None,
+        build_progress: Vec::new(),
+        build_result: None,
         script_runtime: script::RhaiRuntime::new(),
         logo_texture: None,
         // A missing/unusable audio device (headless, no default output) is a
@@ -11408,6 +11579,34 @@ mod version_tests {
     }
 
     #[test]
+    fn build_choices_survive_saving_project_settings() {
+        let root = temp_project("build");
+        // An older project.ron with no build section gets the defaults.
+        std::fs::write(root.join("project.ron"), "(version: \"0.1.0\")").unwrap();
+        let build = read_manifest(&root).build;
+        assert!(build.release && build.encrypt);
+        let mut manifest = read_manifest(&root);
+        manifest.build.release = false;
+        manifest.build.output = "/tmp/builds".to_string();
+        write_manifest(&root, &manifest);
+        // What Project Settings does when saved: new description and
+        // version, everything else kept.
+        write_manifest(
+            &root,
+            &ProjectManifest {
+                description: "New".to_string(),
+                version: "0.2.0".to_string(),
+                ..read_manifest(&root)
+            },
+        );
+        let back = read_manifest(&root);
+        assert_eq!(back.version, "0.2.0");
+        assert!(!back.build.release);
+        assert_eq!(back.build.output, "/tmp/builds");
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
     fn a_project_is_stamped_with_this_editor() {
         let root = temp_project("this");
         write_manifest(
@@ -11415,7 +11614,7 @@ mod version_tests {
             &ProjectManifest {
                 description: "A game".to_string(),
                 version: "2.3.0".to_string(),
-                editor: String::new(),
+                ..Default::default()
             },
         );
         let back = read_manifest(&root);

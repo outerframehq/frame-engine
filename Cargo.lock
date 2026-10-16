@@ -1023,6 +1023,7 @@ dependencies = [
  "egui-wgpu",
  "egui-winit",
  "egui_dock",
+ "flate2",
  "frame-engine",
  "git2",
  "glam 0.30.10",
