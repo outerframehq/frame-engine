@@ -103,6 +103,9 @@ Engine:
 
 Editor (frame-editor):
 
+- Pack files for game builds (`frame_engine::pack`): `write_pack` puts a project's scene, `assets/`, `plugins/` and `prefabs/` into one compressed file. `run_player` takes a pack or a project folder, and Play reads everything through `ProjectFiles`, so a game runs the same from either. A game can encrypt its pack by passing its own `PackCipher`; the engine has no encryption built in. New dependency: `flate2` (already built for PNG decoding).
+- Play from the launcher now plays sounds and shows on-screen images; they were looked up through the editor's open scene, which is empty at the launcher.
+- `World::load_from_str`, for a scene that isn't a file on its own.
 - `run_player`: start straight into a project's game, with no launcher or editor window. Only the game window opens, titled with the game's name, and closing it quits. Used by game programs built on the editor library, with the same modules as their editor.
 - A "Newer version" window when a scene, prefab or project came from a newer Frame Editor. A project's `project.ron` now records which editor version last saved it (`editor`), keeping a newer one's stamp. Save is turned off for a scene from a newer editor (Save As still works), and a plugin that needs a newer engine is warned about in the log.
 - `frame-editor` is now a library as well as a binary, with a module interface (`module_api`). A crate can add an Inspector section, build and draw its own geometry (shadows included) and hide anchor entities from the ordinary shape pass, without editing the editor. `frame_editor::run` takes the modules to load; the public editor passes none.

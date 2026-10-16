@@ -1792,10 +1792,17 @@ impl World {
         path: impl AsRef<std::path::Path>,
     ) -> Result<World, Box<dyn std::error::Error>> {
         let text = std::fs::read_to_string(path)?;
-        let mut world: World = match ron::from_str(&text) {
+        World::load_from_str(&text)
+    }
+
+    /// Load a world from a scene's text, as `load_from_file` does once it has
+    /// read the file. For a scene that isn't a file on its own, such as one
+    /// inside a game's pack.
+    pub fn load_from_str(text: &str) -> Result<World, Box<dyn std::error::Error>> {
+        let mut world: World = match ron::from_str(text) {
             Ok(world) => world,
             Err(e) => {
-                let found = scene_format_of(&text);
+                let found = scene_format_of(text);
                 if found > SCENE_FORMAT {
                     return Err(newer_scene_error(found).into());
                 }

@@ -8,6 +8,11 @@ license.workspace = true
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 ron = "0.12"
+# Game builds pack a project into one file (`pack.rs`), deflated through
+# flate2's pure-Rust backend, which PNG decoding already builds, so Windows
+# builds cross-compile with no C toolchain. Encryption is not here: a game
+# that wants it brings its own cipher (`PackCipher`).
+flate2 = "1"
 # Rigid-body/collider physics, the named exception to the zero-new-deps rule
 # for the same "buy, don't hand-roll" reasoning as wgpu and rhai (see
 # DESIGN.md and Roadmap and Decisions). Pinned to a minor version rather than

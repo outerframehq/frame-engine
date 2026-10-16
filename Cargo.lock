@@ -1042,6 +1042,7 @@ dependencies = [
 name = "frame-engine"
 version = "0.0.0"
 dependencies = [
+ "flate2",
  "rapier3d-f64",
  "ron",
  "serde",

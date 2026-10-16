@@ -6,6 +6,7 @@ const LOGO_PNG: &[u8] = include_bytes!("../assets/frame-editor.png");
 use bytemuck::Zeroable;
 use frame_engine::core::Clock;
 use frame_engine::input::{Button, InputState};
+use frame_engine::pack::ProjectFiles;
 use frame_engine::physics::{GRAVITY_Y, Physics};
 use frame_engine::systems;
 use frame_engine::world::{
@@ -59,6 +60,9 @@ pub mod module_api;
 // Re-exported so a crate that adds a module uses exactly the egui and wgpu
 // this editor was built with.
 pub use egui;
+// For game programs built on this library: the cipher a game can seal its
+// pack with, and the writer that makes a pack from a project.
+pub use frame_engine::pack::{PackCipher, write_pack};
 use module_api::{EditorModule, ExtEdit, ModuleGpu, ModuleScene};
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -5019,8 +5023,9 @@ struct App {
     // scene, prefab or project from a newer Frame Editor. See
     // `version_notice_ui`.
     version_notice: Option<String>,
-    // The project a `run_player` build plays. `None` in the editor.
-    player_root: Option<std::path::PathBuf>,
+    // The project a `run_player` build plays: its folder or its pack.
+    // `None` in the editor.
+    player_files: Option<ProjectFiles>,
     // Set when a `run_player` build could not open its game, so the program
     // ends with an error code.
     player_failed: bool,
@@ -5058,6 +5063,10 @@ struct App {
     // running a copy of the project's world with no editor chrome. None when not
     // playing. game_input drives Controlled entities; game_clock ticks the sim.
     game_window: Option<Arc<Window>>,
+    // Where the game being played reads its files: the project folder, or
+    // a game build's pack. Sounds and on-screen images are found here while
+    // playing, so Play works the same with or without a project open.
+    game_files: Option<ProjectFiles>,
     game_gpu: Option<GpuState>,
     // Features added by other crates (see `module_api`).
     modules: Rc<RefCell<Vec<Box<dyn EditorModule>>>>,
@@ -5940,7 +5949,9 @@ impl App {
             Some(LauncherAction::NewProject) => self.new_project(),
             Some(LauncherAction::OpenProject) => self.open_project(),
             Some(LauncherAction::OpenRecent(root)) => self.open_project_at(root),
-            Some(LauncherAction::PlayRecent(root)) => self.start_play(event_loop, root),
+            Some(LauncherAction::PlayRecent(root)) => {
+                self.start_play(event_loop, ProjectFiles::Folder(root))
+            }
             Some(LauncherAction::OpenSettings(root)) => self.open_settings(root),
             Some(LauncherAction::ConfirmDelete(root)) => self.pending_delete = Some(root),
             Some(LauncherAction::CancelDelete) => self.pending_delete = None,
@@ -6168,16 +6179,22 @@ impl App {
 
     /// Play a project: open a separate, clean game window (its own GPU surface),
     /// load the project's scene into it, and run the simulation there with no
-    /// editor chrome. Closing the window returns to the launcher.
-    fn start_play(&mut self, event_loop: &ActiveEventLoop, root: std::path::PathBuf) {
+    /// editor chrome. Closing the window returns to the launcher. `files` is
+    /// the project folder, or a game build's pack; everything Play reads
+    /// comes through it.
+    fn start_play(&mut self, event_loop: &ActiveEventLoop, files: ProjectFiles) {
         if self.game_window.is_some() {
             return; // already playing
         }
-        let Some(scene) = find_scene(&root) else {
+        let Some(scene) = files.scene() else {
             self.log("That project has no scene to play".to_string());
             return;
         };
-        let mut world = match World::load_from_file(&scene) {
+        let loaded = files
+            .read_to_string(&scene)
+            .map_err(|e| e.to_string())
+            .and_then(|text| World::load_from_str(&text).map_err(|e| e.to_string()));
+        let mut world = match loaded {
             Ok(world) => world,
             Err(e) => {
                 self.log(format!("Could not play project: {e}"));
@@ -6189,14 +6206,14 @@ impl App {
         // the last save, and Play should reflect what's really on disk now
         // (a plugin edited or dropped in since), not a stale snapshot.
         // Enabled/disabled choices already saved in the scene are kept.
-        let (manifests, scripts, errors) = load_project_plugins(&root);
+        let (manifests, scripts, errors) = load_plugins_from(&files);
         for e in errors {
             self.log(format!("Plugins: {e}"));
         }
         merge_plugins_into_world(&mut world, manifests, scripts);
         let name = scene
-            .file_stem()
-            .and_then(|s| s.to_str())
+            .strip_suffix(".ron")
+            .filter(|s| !s.is_empty())
             .unwrap_or("Game")
             .to_string();
         // A game on its own is titled with its own name and grouped under its
@@ -6235,8 +6252,8 @@ impl App {
         // egui_renderer), so the project's models get parsed and uploaded
         // for it separately, even though it shares the same underlying
         // device as the main window now. Play can start from the launcher
-        // with no project open in the editor, so load from the root.
-        let (models, errors) = load_project_models(&root);
+        // with no project open in the editor, so load from `files`.
+        let (models, errors) = load_models_from(&files);
         for e in errors {
             self.log(format!("Model load failed: {e}"));
         }
@@ -6249,7 +6266,7 @@ impl App {
         let materials = build_material_gpu_data(
             &self.game_custom_names,
             &world.mesh_meta,
-            &root.join("assets"),
+            Some(&files),
             &mut game_texture_cache,
         );
         let pairs: Vec<(&frame_engine::assets::MeshData, &MaterialGpuData)> =
@@ -6288,6 +6305,7 @@ impl App {
         // before the window has focus can leave it stuck and hidden.
         self.game_mouse_held = false;
         self.game_window = Some(window);
+        self.game_files = Some(files);
         self.log(format!("Playing '{name}'"));
     }
 
@@ -6301,6 +6319,7 @@ impl App {
         self.game_egui_state = None;
         self.game_ui_textures.clear();
         self.game_window = None;
+        self.game_files = None;
         self.game_mouse_held = false;
         self.game_input = InputState::new();
     }
@@ -6310,13 +6329,9 @@ impl App {
     fn render_game(&mut self) {
         self.play_perf.begin(std::time::Instant::now());
         let owed = self.game_clock.advance(true);
-        // Same project the editor has open, so sound files resolve under its
-        // assets/ folder the same way build_instances' custom meshes do.
-        let assets_root = self
-            .current_scene_path
-            .as_ref()
-            .and_then(|p| p.parent())
-            .map(|p| p.join("assets"));
+        // Sounds come from the files Play started with (the project folder,
+        // or a game build's pack), not from whatever the editor has open.
+        let game_files = self.game_files.clone();
         let mut sound_messages = Vec::new();
         for _ in 0..owed {
             if let Some(world) = self.game_world.as_mut() {
@@ -6345,7 +6360,7 @@ impl App {
                     world,
                     self.audio_manager.as_mut(),
                     &mut self.sound_cache,
-                    assets_root.as_deref(),
+                    game_files.as_ref(),
                 ));
             }
         }
@@ -6515,12 +6530,7 @@ impl App {
         // egui closure below, the same lazily-cached-on-first-use shape as
         // `thumbnails`/`texture_cache` -- the closure only reads
         // `game_ui_textures`, it never decodes a file itself.
-        let assets_root = self
-            .current_scene_path
-            .as_ref()
-            .and_then(|p| p.parent())
-            .map(|p| p.join("assets"));
-        if let (Some(world), Some(assets)) = (self.game_world.as_ref(), assets_root.as_deref()) {
+        if let (Some(world), Some(files)) = (self.game_world.as_ref(), self.game_files.as_ref()) {
             let names: Vec<String> = world
                 .ui_images
                 .iter()
@@ -6529,10 +6539,13 @@ impl App {
                 .filter(|name| !name.is_empty() && !self.game_ui_textures.contains_key(name))
                 .collect();
             for name in names {
-                let Some(path) = find_image(assets, &name) else {
+                let Some(path) = files.find_by_name("assets", &name) else {
                     continue;
                 };
-                let Ok(decoded) = image::open(&path) else {
+                let Ok(bytes) = files.read(&path) else {
+                    continue;
+                };
+                let Ok(decoded) = image::load_from_memory(&bytes) else {
                     continue;
                 };
                 let rgba = decoded.to_rgba8();
@@ -7198,16 +7211,15 @@ impl App {
     fn refresh_custom_mesh_gpu(&mut self) {
         let custom_names: Vec<String> = self.custom_meshes.keys().cloned().collect();
         let refs: Vec<&frame_engine::assets::MeshData> = self.custom_meshes.values().collect();
-        let assets_root = self
+        let project = self
             .current_scene_path
             .as_ref()
             .and_then(|p| p.parent())
-            .map(|p| p.join("assets"))
-            .unwrap_or_default();
+            .map(|p| ProjectFiles::Folder(p.to_path_buf()));
         let materials = build_material_gpu_data(
             &custom_names,
             &self.world.mesh_meta,
-            &assets_root,
+            project.as_ref(),
             &mut self.texture_cache,
         );
         let pairs: Vec<(&frame_engine::assets::MeshData, &MaterialGpuData)> =
@@ -7699,8 +7711,8 @@ impl ApplicationHandler for App {
         // A game on its own opens only the game window.
         if matches!(self.mode, AppMode::Player) {
             if self.game_window.is_none() {
-                if let Some(root) = self.player_root.clone() {
-                    self.start_play(event_loop, root);
+                if let Some(files) = self.player_files.clone() {
+                    self.start_play(event_loop, files);
                 }
                 if self.game_window.is_none() {
                     eprintln!("{} could not start. See the messages above.", app_name());
@@ -8180,11 +8192,11 @@ impl ApplicationHandler for App {
                 // Same folder the Assets tab and imported models resolve
                 // against, computed here too since the tick loop runs before
                 // that local is set up further down.
-                let tick_assets_root = self
+                let tick_project = self
                     .current_scene_path
                     .as_ref()
                     .and_then(|p| p.parent())
-                    .map(|p| p.join("assets"));
+                    .map(|p| ProjectFiles::Folder(p.to_path_buf()));
                 let mut sound_messages = Vec::new();
                 for _ in 0..owed {
                     // Detection runs first each tick, so a script can read whether
@@ -8219,7 +8231,7 @@ impl ApplicationHandler for App {
                         &mut self.world,
                         self.audio_manager.as_mut(),
                         &mut self.sound_cache,
-                        tick_assets_root.as_deref(),
+                        tick_project.as_ref(),
                     ));
                 }
                 // Logged after the loop ends, once self.world's borrow above
@@ -9673,52 +9685,63 @@ fn load_project_plugins(
     std::collections::BTreeMap<String, String>,
     Vec<String>,
 ) {
-    let mut manifests = std::collections::BTreeMap::new();
-    let mut scripts = std::collections::BTreeMap::new();
-    let mut errors = Vec::new();
-    let plugins_dir = root.join("plugins");
     // Creates the folder if it's missing (a brand new project, or an older
     // one that predates plugins existing at all), so it's sitting there
     // ready to drag a plugin into without anyone having to make it by hand.
     // A no-op if it already exists.
-    let _ = std::fs::create_dir_all(&plugins_dir);
-    let Ok(entries) = std::fs::read_dir(&plugins_dir) else {
-        return (manifests, scripts, errors);
-    };
-    for entry in entries.flatten() {
-        let plugin_dir = entry.path();
-        if !plugin_dir.is_dir() {
-            continue;
-        }
-        let manifest_text = match std::fs::read_to_string(plugin_dir.join("plugin.ron")) {
+    let _ = std::fs::create_dir_all(root.join("plugins"));
+    load_plugins_from(&ProjectFiles::Folder(root.to_path_buf()))
+}
+
+/// Load a project's plugins from its folder or a game build's pack: every
+/// `plugins/<folder>/plugin.ron`, with the `.rhai` files in that folder's
+/// `scripts/`. Shared by the editor and Play.
+fn load_plugins_from(
+    files: &ProjectFiles,
+) -> (
+    std::collections::BTreeMap<String, frame_engine::world::PluginManifest>,
+    std::collections::BTreeMap<String, String>,
+    Vec<String>,
+) {
+    let mut manifests = std::collections::BTreeMap::new();
+    let mut scripts = std::collections::BTreeMap::new();
+    let mut errors = Vec::new();
+    let all = files.files_under("plugins");
+    for manifest_path in &all {
+        let parts: Vec<&str> = manifest_path.split('/').collect();
+        let [_, folder, "plugin.ron"] = parts.as_slice() else {
+            continue; // only a plugin.ron directly inside a plugin's folder
+        };
+        let manifest_text = match files.read_to_string(manifest_path) {
             Ok(text) => text,
-            Err(_) => continue, // no manifest here, not a plugin folder
+            Err(e) => {
+                errors.push(format!("{manifest_path}: {e}"));
+                continue;
+            }
         };
         let manifest: frame_engine::world::PluginManifest = match ron::from_str(&manifest_text) {
             Ok(manifest) => manifest,
             Err(e) => {
-                errors.push(format!("{}: invalid plugin.ron: {e}", plugin_dir.display()));
+                errors.push(format!("plugins/{folder}: invalid plugin.ron: {e}"));
                 continue;
             }
         };
         if let Some(warning) = plugin_engine_warning(&manifest) {
             errors.push(warning);
         }
-        if let Ok(script_entries) = std::fs::read_dir(plugin_dir.join("scripts")) {
-            for script_entry in script_entries.flatten() {
-                let script_path = script_entry.path();
-                if script_path.extension().and_then(|e| e.to_str()) != Some("rhai") {
-                    continue;
+        let scripts_dir = format!("plugins/{folder}/scripts/");
+        for script_path in &all {
+            let Some(file) = script_path.strip_prefix(&scripts_dir) else {
+                continue;
+            };
+            let Some(stem) = file.strip_suffix(".rhai").filter(|s| !s.contains('/')) else {
+                continue;
+            };
+            match files.read_to_string(script_path) {
+                Ok(source) => {
+                    scripts.insert(format!("{}/{stem}", manifest.name), source);
                 }
-                let Some(stem) = script_path.file_stem().and_then(|s| s.to_str()) else {
-                    continue;
-                };
-                match std::fs::read_to_string(&script_path) {
-                    Ok(source) => {
-                        scripts.insert(format!("{}/{stem}", manifest.name), source);
-                    }
-                    Err(e) => errors.push(format!("{}: {e}", script_path.display())),
-                }
+                Err(e) => errors.push(format!("{script_path}: {e}")),
             }
         }
         manifests.insert(manifest.name.clone(), manifest);
@@ -9834,36 +9857,32 @@ fn load_project_models(
     std::collections::BTreeMap<String, frame_engine::assets::MeshData>,
     Vec<String>,
 ) {
-    let mut models = std::collections::BTreeMap::new();
-    let mut errors = Vec::new();
-    scan_models_dir(&root.join("assets"), &mut models, &mut errors);
-    (models, errors)
+    load_models_from(&ProjectFiles::Folder(root.to_path_buf()))
 }
 
-/// Walk a folder and its subfolders for .obj files, parsing each into the map.
-/// Models are named by file stem wherever they sit, so two files with the same
-/// stem in different folders collide and the later one wins.
-fn scan_models_dir(
-    dir: &std::path::Path,
-    models: &mut std::collections::BTreeMap<String, frame_engine::assets::MeshData>,
-    errors: &mut Vec<String>,
+/// Parse every .obj file under a project's `assets/`, from its folder or a
+/// game build's pack. Models are named by file stem wherever they sit, so
+/// two files with the same stem in different folders collide; the later one
+/// in sorted path order wins.
+fn load_models_from(
+    files: &ProjectFiles,
+) -> (
+    std::collections::BTreeMap<String, frame_engine::assets::MeshData>,
+    Vec<String>,
 ) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return; // no folder yet, nothing to load
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            scan_models_dir(&path, models, errors);
-            continue;
-        }
-        if path.extension().and_then(|e| e.to_str()) != Some("obj") {
-            continue;
-        }
-        let Some(name) = path.file_stem().and_then(|s| s.to_str()).map(String::from) else {
+    let mut models = std::collections::BTreeMap::new();
+    let mut errors = Vec::new();
+    for path in files.files_under("assets") {
+        let Some(name) = path
+            .rsplit('/')
+            .next()
+            .and_then(|file| file.strip_suffix(".obj"))
+            .filter(|stem| !stem.is_empty())
+            .map(String::from)
+        else {
             continue;
         };
-        match std::fs::read_to_string(&path) {
+        match files.read_to_string(&path) {
             Ok(text) => match frame_engine::assets::parse_obj(&text) {
                 Ok(data) => {
                     models.insert(name, data);
@@ -9873,6 +9892,7 @@ fn scan_models_dir(
             Err(e) => errors.push(format!("{name}.obj: {e}")),
         }
     }
+    (models, errors)
 }
 
 /// Read a project's manifest, or a default one if it has none yet.
@@ -10050,17 +10070,9 @@ struct RecentProject {
 /// Find a project folder's scene file: the first `.ron` in it that isn't the
 /// `project.ron` manifest. A project's name is this file's stem.
 fn find_scene(folder: &std::path::Path) -> Option<std::path::PathBuf> {
-    let mut scenes: Vec<std::path::PathBuf> = std::fs::read_dir(folder)
-        .ok()?
-        .filter_map(|e| e.ok())
-        .map(|e| e.path())
-        .filter(|p| {
-            p.extension().and_then(|x| x.to_str()) == Some("ron")
-                && p.file_name().and_then(|n| n.to_str()) != Some("project.ron")
-        })
-        .collect();
-    scenes.sort();
-    scenes.into_iter().next()
+    // The same rule a game build uses on its pack (`ProjectFiles::scene`).
+    let scene = ProjectFiles::Folder(folder.to_path_buf()).scene()?;
+    Some(folder.join(scene))
 }
 
 /// Remembered projects that still hold a scene, most-recently-edited first.
@@ -10307,22 +10319,14 @@ const AUDIO_EXTENSIONS: &[&str] = &["wav", "ogg", "mp3", "flac"];
 /// searched, in sorted order so the result is the same every time, for a
 /// file with that name.
 fn find_audio(assets: &std::path::Path, name: &str) -> Option<std::path::PathBuf> {
-    if name.is_empty() {
-        return None;
-    }
-    let direct = assets.join(name);
-    if direct.is_file() {
-        return Some(direct);
-    }
-    let file_name = name.rsplit(['/', '\\']).next()?;
-    let mut matches = Vec::new();
-    walk_files(assets, &mut |path| {
-        if path.file_name().and_then(|f| f.to_str()) == Some(file_name) {
-            matches.push(path.to_path_buf());
-        }
-    });
-    matches.sort();
-    matches.into_iter().next()
+    find_in_assets(assets, name)
+}
+
+/// Find a file under an `assets/` folder by name, by the same rule Play uses
+/// on a project's folder or pack (`ProjectFiles::find_by_name`).
+fn find_in_assets(assets: &std::path::Path, name: &str) -> Option<std::path::PathBuf> {
+    let found = ProjectFiles::Folder(assets.to_path_buf()).find_by_name("", name)?;
+    Some(assets.join(found))
 }
 
 /// Every audio file name under `assets`, sorted and without duplicates, for
@@ -10355,22 +10359,7 @@ const IMAGE_EXTENSIONS: &[&str] = &["png"];
 /// assets/" resolution `find_audio` gives Sound, so a texture can be moved
 /// between asset folders without breaking a mesh's material.
 fn find_image(assets: &std::path::Path, name: &str) -> Option<std::path::PathBuf> {
-    if name.is_empty() {
-        return None;
-    }
-    let direct = assets.join(name);
-    if direct.is_file() {
-        return Some(direct);
-    }
-    let file_name = name.rsplit(['/', '\\']).next()?;
-    let mut matches = Vec::new();
-    walk_files(assets, &mut |path| {
-        if path.file_name().and_then(|f| f.to_str()) == Some(file_name) {
-            matches.push(path.to_path_buf());
-        }
-    });
-    matches.sort();
-    matches.into_iter().next()
+    find_in_assets(assets, name)
 }
 
 /// Every image file name under `assets`, sorted and without duplicates, for
@@ -10403,7 +10392,7 @@ fn list_images(assets: &std::path::Path) -> Vec<String> {
 fn build_material_gpu_data(
     names: &[String],
     mesh_meta: &std::collections::BTreeMap<String, frame_engine::world::MeshMeta>,
-    assets: &std::path::Path,
+    project: Option<&ProjectFiles>,
     cache: &mut std::collections::HashMap<String, (u32, u32, Vec<u8>)>,
 ) -> Vec<MaterialGpuData> {
     names
@@ -10417,8 +10406,10 @@ fn build_material_gpu_data(
                 if let Some(cached) = cache.get(tex_name) {
                     return Some(cached.clone());
                 }
-                let path = find_image(assets, tex_name)?;
-                let img = image::open(&path).ok()?.to_rgba8();
+                let project = project?;
+                let path = project.find_by_name("assets", tex_name)?;
+                let bytes = project.read(&path).ok()?;
+                let img = image::load_from_memory(&bytes).ok()?.to_rgba8();
                 let (width, height) = img.dimensions();
                 let data = (width, height, img.into_raw());
                 cache.insert(tex_name.clone(), data.clone());
@@ -10453,7 +10444,7 @@ fn update_sounds(
     world: &mut World,
     mut audio_manager: Option<&mut kira::AudioManager<kira::DefaultBackend>>,
     sound_cache: &mut std::collections::HashMap<String, kira::sound::static_sound::StaticSoundData>,
-    assets_root: Option<&std::path::Path>,
+    project: Option<&ProjectFiles>,
 ) -> Vec<String> {
     let mut messages = Vec::new();
     let ids: Vec<usize> = world
@@ -10477,20 +10468,31 @@ fn update_sounds(
         let Some(manager) = audio_manager.as_deref_mut() else {
             continue;
         };
-        let Some(root) = assets_root else {
+        let Some(project) = project else {
             messages.push(format!(
                 "Sound '{name}' requested on entity {id}, but no project is open."
             ));
             continue;
         };
         if !sound_cache.contains_key(&name) {
-            let Some(path) = find_audio(root, &name) else {
+            let Some(path) = project.find_by_name("assets", &name) else {
                 messages.push(format!(
                     "Couldn't find sound '{name}' anywhere under assets/"
                 ));
                 continue;
             };
-            match kira::sound::static_sound::StaticSoundData::from_file(&path) {
+            let bytes = match project.read(&path) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    messages.push(format!("Couldn't load sound '{name}': {e}"));
+                    continue;
+                }
+            };
+            // Decoded from memory, so a sound inside a pack plays the same
+            // as one in a folder.
+            match kira::sound::static_sound::StaticSoundData::from_cursor(std::io::Cursor::new(
+                bytes,
+            )) {
                 Ok(data) => {
                     sound_cache.insert(name.clone(), data);
                 }
@@ -10585,7 +10587,8 @@ pub fn run_as(name: &str, app_id: &str, modules: Vec<Box<dyn EditorModule>>) {
 }
 
 /// Start straight into a game, with no editor: the project in `project` (a
-/// folder holding its scene) opens in one window, the same way the editor's
+/// folder holding its scene, or a pack made by `write_pack`, opened with
+/// `cipher` if it is sealed) opens in one window, the same way the editor's
 /// Play button runs it, and closing that window quits. `name` is the window
 /// title and `app_id` the Linux application id. This is what a game build
 /// runs.
@@ -10593,9 +10596,20 @@ pub fn run_player(
     name: &str,
     app_id: &str,
     project: std::path::PathBuf,
+    cipher: Option<Arc<dyn PackCipher>>,
     modules: Vec<Box<dyn EditorModule>>,
 ) {
-    run_app(name, app_id, modules, Some(project));
+    let files = match ProjectFiles::open(&project, cipher) {
+        Ok(files) => files,
+        Err(e) => {
+            eprintln!(
+                "{name} could not open its game files ({}): {e}",
+                project.display()
+            );
+            std::process::exit(1);
+        }
+    };
+    run_app(name, app_id, modules, Some(files));
 }
 
 /// The editor, or with `player` set, a game on its own (see `run_player`).
@@ -10603,7 +10617,7 @@ fn run_app(
     name: &str,
     app_id: &str,
     modules: Vec<Box<dyn EditorModule>>,
-    player: Option<std::path::PathBuf>,
+    player: Option<ProjectFiles>,
 ) {
     let _ = APP_IDENTITY.set((name.to_string(), app_id.to_string()));
     let event_loop = EventLoop::new().unwrap();
@@ -10693,7 +10707,7 @@ fn run_app(
         saved_scripts: std::collections::BTreeMap::new(),
         pending_unsaved: None,
         version_notice: None,
-        player_root: None,
+        player_files: None,
         player_failed: false,
         window_title: String::new(),
         saved_prefs: prefs,
@@ -10728,6 +10742,7 @@ fn run_app(
         game_egui_ctx: None,
         game_egui_state: None,
         game_ui_textures: std::collections::HashMap::new(),
+        game_files: None,
         game_input: InputState::new(),
         game_clock: Clock::new(TICK_RATE, MAX_CATCHUP_TICKS),
         game_closing: false,
@@ -10754,12 +10769,9 @@ fn run_app(
         sound_cache: std::collections::HashMap::new(),
     };
     match player {
-        Some(root) => {
+        Some(files) => {
             app.mode = AppMode::Player;
-            // Sounds and on-screen images are found under the project's
-            // assets/ folder, which Play finds from the scene's path.
-            app.current_scene_path = find_scene(&root);
-            app.player_root = Some(root);
+            app.player_files = Some(files);
             println!("{name} starting.");
         }
         None => println!("Frame Editor started at the launcher."),
@@ -11461,5 +11473,83 @@ mod version_tests {
             warning.contains("weather") && warning.contains("99.0"),
             "{warning}"
         );
+    }
+}
+
+#[cfg(test)]
+mod pack_play_tests {
+    use super::*;
+
+    /// A project with a plugin, a model in a subfolder and a texture, as a
+    /// folder and as a pack: Play must find the same things in both.
+    #[test]
+    fn play_loads_the_same_project_from_a_folder_or_a_pack() {
+        let root = std::env::temp_dir().join(format!("frame-editor-pack-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let png = include_bytes!("../assets/frame-editor.png").to_vec();
+        for (name, bytes) in [
+            (
+                "Game.ron",
+                ron::to_string(&World::new()).unwrap().into_bytes(),
+            ),
+            ("project.ron", b"()".to_vec()),
+            (
+                "assets/models/rock.obj",
+                b"v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n".to_vec(),
+            ),
+            ("assets/textures/stone.png", png),
+            (
+                "plugins/weather/plugin.ron",
+                b"(name: \"weather\", version: \"1.0\", author: \"me\")".to_vec(),
+            ),
+            ("plugins/weather/scripts/rain.rhai", b"let x = 1;".to_vec()),
+            (
+                "plugins/weather/scripts/notes.txt",
+                b"not a script".to_vec(),
+            ),
+        ] {
+            let path = root.join(name);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, bytes).unwrap();
+        }
+        let out = root.with_extension("pack");
+        frame_engine::pack::write_pack(&root, &out, None).unwrap();
+        let folder = ProjectFiles::open(&root, None).unwrap();
+        let pack = ProjectFiles::open(&out, None).unwrap();
+
+        for files in [&folder, &pack] {
+            let scene = files.scene().unwrap();
+            assert_eq!(scene, "Game.ron");
+            World::load_from_str(&files.read_to_string(&scene).unwrap()).unwrap();
+
+            let (manifests, scripts, errors) = load_plugins_from(files);
+            assert!(errors.is_empty(), "{errors:?}");
+            assert_eq!(manifests.keys().collect::<Vec<_>>(), ["weather"]);
+            assert_eq!(scripts.keys().collect::<Vec<_>>(), ["weather/rain"]);
+
+            let (models, errors) = load_models_from(files);
+            assert!(errors.is_empty(), "{errors:?}");
+            assert_eq!(models.keys().collect::<Vec<_>>(), ["rock"]);
+
+            let mut meta = std::collections::BTreeMap::new();
+            let material = frame_engine::world::MeshMaterial {
+                texture: Some("stone.png".to_string()),
+                ..Default::default()
+            };
+            meta.insert(
+                "rock".to_string(),
+                frame_engine::world::MeshMeta {
+                    half_extents: [0.5; 3],
+                    material,
+                },
+            );
+            let mut cache = std::collections::HashMap::new();
+            let gpu =
+                build_material_gpu_data(&["rock".to_string()], &meta, Some(files), &mut cache);
+            let (w, h, rgba) = gpu[0].texture_rgba.clone().expect("texture found");
+            assert_eq!(rgba.len(), (w * h * 4) as usize);
+        }
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_file(&out).ok();
     }
 }
