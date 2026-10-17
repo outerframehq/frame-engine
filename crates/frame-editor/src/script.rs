@@ -5,7 +5,9 @@
 // The Rhai-backed script runtime: the concrete implementation of the engine's
 // `ScriptRuntime` trait, and the only place Rhai is used.
 
-use std::collections::{HashMap, HashSet};
+use std::cell::RefCell;
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::rc::Rc;
 
 use frame_engine::input::{Button, InputState};
 use frame_engine::world::{MoveIntent, Position, ScriptRuntime, Velocity, World};
@@ -155,8 +157,45 @@ fn register_api(engine: &mut rhai::Engine) {
         .register_fn("to_string", |c: Rgb| format!("({}, {}, {})", c.r, c.g, c.b));
 }
 
+/// What the game-wide script calls (`get_global`, `set_global`,
+/// `load_scene`) read and write while one script runs. Copied from the world
+/// before each run and back after, since Rhai functions can't borrow the
+/// world itself.
+#[derive(Default)]
+struct GameCalls {
+    globals: BTreeMap<String, f64>,
+    globals_changed: bool,
+    scene: Option<String>,
+}
+
+/// Teach the engine the game-wide calls. Numbers in scripts can be whole
+/// (`5`) or not (`5.0`); both are accepted and kept as decimals.
+fn register_game_calls(engine: &mut rhai::Engine, calls: &Rc<RefCell<GameCalls>>) {
+    let c = calls.clone();
+    engine.register_fn("get_global", move |name: &str| -> f64 {
+        c.borrow().globals.get(name).copied().unwrap_or(0.0)
+    });
+    let c = calls.clone();
+    engine.register_fn("set_global", move |name: &str, value: f64| {
+        let mut calls = c.borrow_mut();
+        calls.globals.insert(name.to_string(), value);
+        calls.globals_changed = true;
+    });
+    let c = calls.clone();
+    engine.register_fn("set_global", move |name: &str, value: i64| {
+        let mut calls = c.borrow_mut();
+        calls.globals.insert(name.to_string(), value as f64);
+        calls.globals_changed = true;
+    });
+    let c = calls.clone();
+    engine.register_fn("load_scene", move |name: &str| {
+        c.borrow_mut().scene = Some(name.to_string());
+    });
+}
+
 pub struct RhaiRuntime {
     engine: rhai::Engine,
+    calls: Rc<RefCell<GameCalls>>,
     // Compile cache, keyed by source text. Compile once, run every tick. Keying
     // by source means shared scripts compile once and EDITED scripts (new text =
     // new key) recompile themselves. `None` = a script that failed to compile,
@@ -179,8 +218,11 @@ impl RhaiRuntime {
     pub fn new() -> Self {
         let mut engine = rhai::Engine::new();
         register_api(&mut engine);
+        let calls = Rc::new(RefCell::new(GameCalls::default()));
+        register_game_calls(&mut engine, &calls);
         Self {
             engine,
+            calls,
             compiled: HashMap::new(),
             time: 0.0,
             input_up: false,
@@ -543,7 +585,26 @@ impl ScriptRuntime for RhaiRuntime {
         scope.push("cg", cg);
         scope.push("cb", cb);
 
-        if self.engine.run_ast_with_scope(&mut scope, ast).is_err() {
+        {
+            let mut calls = self.calls.borrow_mut();
+            calls.globals = std::mem::take(&mut world.globals);
+            calls.globals_changed = false;
+            calls.scene = None;
+        }
+        let ran = self.engine.run_ast_with_scope(&mut scope, ast);
+        {
+            // Globals go back whatever happened, so a failed script can't
+            // lose them; a scene change counts only from a script that ran.
+            let mut calls = self.calls.borrow_mut();
+            world.globals = std::mem::take(&mut calls.globals);
+            // Always taken, so a failed script's request can't carry over
+            // to the next script that runs.
+            let scene = calls.scene.take();
+            if ran.is_ok() && scene.is_some() {
+                world.pending_scene = scene;
+            }
+        }
+        if ran.is_err() {
             return; // a broken script leaves the entity untouched this tick
         }
 
@@ -689,5 +750,72 @@ impl ScriptRuntime for RhaiRuntime {
         if despawn_id >= 0.0 {
             world.despawn(despawn_id as usize);
         }
+    }
+}
+
+#[cfg(test)]
+mod game_call_tests {
+    use super::*;
+    use frame_engine::world::Script;
+
+    fn world_running(source: &str) -> (World, usize) {
+        let mut world = World::new();
+        let id = world.spawn(
+            Position {
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+            },
+            Velocity {
+                dx: 0.0,
+                dy: 0.0,
+                dz: 0.0,
+            },
+        );
+        world.script_library.insert("s".into(), source.into());
+        world.scripts.insert(id, Script { uses: "s".into() });
+        (world, id)
+    }
+
+    #[test]
+    fn scripts_read_and_write_globals_with_whole_or_decimal_numbers() {
+        let (mut world, id) = world_running(
+            "let s = get_global(\"score\"); set_global(\"score\", s + 1.0); set_global(\"lives\", 3); set_global(\"seen\", get_global(\"missing\"));",
+        );
+        world.globals.insert("score".into(), 4.0);
+        let mut runtime = RhaiRuntime::new();
+        runtime.run(&mut world, id);
+        assert_eq!(world.globals["score"], 5.0);
+        assert_eq!(world.globals["lives"], 3.0);
+        assert_eq!(world.globals["seen"], 0.0, "a missing global reads as 0");
+        assert!(world.pending_scene.is_none());
+        assert!(
+            runtime
+                .warnings("set_global(\"a\", 1); load_scene(\"Cave\");")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn load_scene_asks_for_a_scene_but_a_failing_script_does_not() {
+        let (mut world, id) = world_running("load_scene(\"Cave\");");
+        let mut runtime = RhaiRuntime::new();
+        runtime.run(&mut world, id);
+        assert_eq!(world.pending_scene.as_deref(), Some("Cave"));
+
+        let (mut world, id) =
+            world_running("set_global(\"x\", 1.0); load_scene(\"Cave\"); undefined_fn();");
+        world.globals.insert("keep".into(), 2.0);
+        runtime.run(&mut world, id);
+        assert!(world.pending_scene.is_none());
+        assert_eq!(
+            world.globals["keep"], 2.0,
+            "globals survive a failing script"
+        );
+
+        // The failed script's request doesn't leak into the next run.
+        let (mut world, id) = world_running("let a = 1;");
+        runtime.run(&mut world, id);
+        assert!(world.pending_scene.is_none());
     }
 }

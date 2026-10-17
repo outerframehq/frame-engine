@@ -1254,6 +1254,11 @@ pub struct World {
     /// never saved with the scene.
     #[serde(skip)]
     pub grounded: std::collections::BTreeMap<usize, bool>,
+    /// A scene a script asked to change to with `load_scene` this tick
+    /// (its name, without `.ron`). The game window acts on it after the tick
+    /// and clears it. Transient, never saved.
+    #[serde(skip)]
+    pub pending_scene: Option<String>,
     /// Which characters are crouched as of the last physics step, keyed by
     /// entity id. Rebuilt every step like `grounded`; read by
     /// `systems::apply_parenting` to lower a character's eyes, and by
@@ -1775,16 +1780,30 @@ impl World {
             )
             .into());
         }
-        let ron = if self.units == SCENE_UNITS && self.format == SCENE_FORMAT {
-            ron::ser::to_string_pretty(self, ron::ser::PrettyConfig::default())?
-        } else {
-            let mut current = self.clone();
-            current.units = SCENE_UNITS;
-            current.format = SCENE_FORMAT;
-            ron::ser::to_string_pretty(&current, ron::ser::PrettyConfig::default())?
-        };
-        std::fs::write(path, ron)?;
+        std::fs::write(path, self.to_scene_text()?)?;
         Ok(())
+    }
+
+    /// The scene's saved text, stamped with this editor's `SCENE_FORMAT` and
+    /// units: what `save_to_file` writes. Refuses a scene from a newer editor
+    /// the same way.
+    pub fn to_scene_text(&self) -> Result<String, Box<dyn std::error::Error>> {
+        if let Some(found) = self.newer_format {
+            return Err(format!(
+                "this scene came from a newer Frame Editor (save format {found}, this editor writes {SCENE_FORMAT}). Saving over it here could lose what this editor doesn't know about. Use Save As to keep a copy, or update Frame Editor"
+            )
+            .into());
+        }
+        Ok(
+            if self.units == SCENE_UNITS && self.format == SCENE_FORMAT {
+                ron::ser::to_string_pretty(self, ron::ser::PrettyConfig::default())?
+            } else {
+                let mut current = self.clone();
+                current.units = SCENE_UNITS;
+                current.format = SCENE_FORMAT;
+                ron::ser::to_string_pretty(&current, ron::ser::PrettyConfig::default())?
+            },
+        )
     }
 
     /// Load a world back from a RON file, replacing whatever was there.

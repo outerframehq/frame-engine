@@ -8,6 +8,7 @@ use frame_engine::core::Clock;
 use frame_engine::input::{Button, InputState};
 use frame_engine::pack::ProjectFiles;
 use frame_engine::physics::{GRAVITY_Y, Physics};
+use frame_engine::project;
 use frame_engine::systems;
 use frame_engine::world::{
     Camera, Controlled, Gravity, Light, LightKind, Mesh, Position, RigidBody, Script,
@@ -33,6 +34,7 @@ mod grass;
 mod licences;
 mod origin;
 mod perf;
+mod scenes;
 pub use perf::CountingAlloc;
 mod script;
 mod sky;
@@ -2655,6 +2657,7 @@ enum ConsoleTab {
     Terminal,
     Assets,
     Prefabs,
+    Scenes,
 }
 /// A command chosen from the toolbar menus this frame, applied after the egui
 /// pass. The menu closure can't borrow `self`, so it stages the choice here and
@@ -2705,6 +2708,7 @@ enum MenuAction {
     ToggleStats,
     OpenEditorSettings,
     BuildGame,
+    PlayScene,
     About,
     Quit,
 }
@@ -2717,6 +2721,8 @@ enum GuardedAction {
     CloseProject,
     ReloadScene,
     OpenScene,
+    /// Open the scene named in `pending_scene_switch` (the Scenes tab).
+    SwitchScene,
 }
 
 /// What the user chose in the unsaved-changes prompt.
@@ -4222,9 +4228,23 @@ fn scripts_tab_ui(
                     .hint_text("new script name")
                     .desired_width(f32::INFINITY),
             );
-            if ui.button("Add").clicked() {
-                let key = new_script_name.trim().to_string();
-                if !key.is_empty() {
+            let key = new_script_name.trim().to_string();
+            // Scripts are saved as files named after them, so the name has
+            // to work as one (see `project::script_name_problem`).
+            let problem = (!key.is_empty())
+                .then(|| frame_engine::project::script_name_problem(&key))
+                .flatten();
+            if let Some(problem) = problem {
+                ui.colored_label(egui::Color32::from_rgb(0xe0, 0x6c, 0x6c), problem);
+            }
+            if ui
+                .add_enabled(
+                    !key.is_empty() && problem.is_none(),
+                    egui::Button::new("Add"),
+                )
+                .clicked()
+            {
+                {
                     script_library.entry(key.clone()).or_default();
                     *open_script = Some(key);
                     new_script_name.clear();
@@ -4267,9 +4287,12 @@ fn scripts_tab_ui(
                         let collides = !new_name.is_empty()
                             && new_name != name
                             && script_library.contains_key(&new_name);
+                        let problem = (!new_name.is_empty())
+                            .then(|| frame_engine::project::script_name_problem(&new_name))
+                            .flatten();
                         if ui
                             .add_enabled(
-                                !new_name.is_empty() && !collides,
+                                !new_name.is_empty() && !collides && problem.is_none(),
                                 egui::Button::new("Confirm"),
                             )
                             .clicked()
@@ -4291,6 +4314,8 @@ fn scripts_tab_ui(
                                 egui::Color32::from_rgb(0xe0, 0x6c, 0x6c),
                                 "already used",
                             );
+                        } else if let Some(problem) = problem {
+                            ui.colored_label(egui::Color32::from_rgb(0xe0, 0x6c, 0x6c), problem);
                         }
                     }
                     None => {
@@ -4930,6 +4955,9 @@ struct App {
     // Where "Save scene" writes and "Reload scene" reads. Set by Open/Save-As
     // (and defaulted to the startup scene). None means Save prompts for a path.
     current_scene_path: Option<std::path::PathBuf>,
+    // The open project's folder. Scenes live in its `scenes/` folder, so the
+    // project is no longer simply the folder the scene file is in.
+    project_dir: Option<std::path::PathBuf>,
     // Imported models for the open project, parsed once and kept CPU side so
     // they can be uploaded to any GPU device (editor window and game window).
     // BTreeMap so the name order is stable and sorted.
@@ -5024,6 +5052,10 @@ struct App {
     saved_scripts: std::collections::BTreeMap<String, String>,
     // An action waiting on the unsaved-changes prompt.
     pending_unsaved: Option<GuardedAction>,
+    // The scene to open once the unsaved-changes prompt is answered.
+    pending_scene_switch: Option<String>,
+    // The Scenes tab's own fields (names being typed, delete confirmation).
+    scenes_tab: scenes::ScenesTabState,
     // A warning about versions to show in a window until dismissed: a
     // scene, prefab or project from a newer Frame Editor. See
     // `version_notice_ui`.
@@ -5374,10 +5406,7 @@ impl App {
     }
     /// The open project's folder.
     fn project_root(&self) -> Option<std::path::PathBuf> {
-        self.current_scene_path
-            .as_ref()
-            .and_then(|p| p.parent())
-            .map(|p| p.to_path_buf())
+        self.project_dir.as_deref().map(|p| p.to_path_buf())
     }
 
     /// Open File > Build Game with this project's saved build choices.
@@ -5400,14 +5429,21 @@ impl App {
         let builder = build::game_builder()?;
         let root = self.project_root()?;
         let name = self
-            .current_scene_path
-            .as_ref()
-            .and_then(|p| p.file_stem())
-            .and_then(|s| s.to_str())
-            .unwrap_or("Game")
-            .to_string();
+            .project_name
+            .clone()
+            .unwrap_or_else(|| "Game".to_string());
+        let start_scene = project::start_scene_path(&ProjectFiles::Folder(root.clone()))
+            .map(|p| {
+                p.rsplit('/')
+                    .next()
+                    .unwrap_or("")
+                    .trim_end_matches(".ron")
+                    .to_string()
+            })
+            .unwrap_or_default();
         Some(build::BuildView {
             name,
+            start_scene,
             version: read_manifest(&root).version,
             program: builder.program.clone(),
             can_encrypt: builder.cipher.is_some(),
@@ -5482,12 +5518,9 @@ impl App {
         manifest.build = self.build_settings.clone();
         write_manifest(&root, &manifest);
         let name = self
-            .current_scene_path
-            .as_ref()
-            .and_then(|p| p.file_stem())
-            .and_then(|s| s.to_str())
-            .unwrap_or("Game")
-            .to_string();
+            .project_name
+            .clone()
+            .unwrap_or_else(|| "Game".to_string());
         self.build_progress = vec!["Starting…".to_string()];
         self.build_result = None;
         self.build_job = Some(build::BuildJob::start(build::BuildRequest {
@@ -5524,6 +5557,11 @@ impl App {
             GuardedAction::CloseProject => self.close_project(),
             GuardedAction::ReloadScene => self.reload_scene(),
             GuardedAction::OpenScene => self.open_scene(),
+            GuardedAction::SwitchScene => {
+                if let Some(name) = self.pending_scene_switch.take() {
+                    self.open_scene_named(&name);
+                }
+            }
         }
     }
     /// Snapshot the world onto the undo stack before a mutating action. Clears
@@ -5669,12 +5707,7 @@ impl App {
             ));
             return;
         };
-        let Some(root) = self
-            .current_scene_path
-            .as_ref()
-            .and_then(|p| p.parent())
-            .map(|p| p.to_path_buf())
-        else {
+        let Some(root) = self.project_dir.as_deref().map(|p| p.to_path_buf()) else {
             self.log("Couldn't save prefab: no project open".to_string());
             return;
         };
@@ -5731,25 +5764,37 @@ impl App {
             self.log(format!("Despawned entity {id}"));
         }
     }
-    /// Save the current world to disk.
-    /// Save to the current scene path, or fall back to "Save as…" if there
-    /// isn't one yet.
+    /// The open scene's name (`World` for `scenes/World.ron`).
+    fn current_scene_name(&self) -> Option<String> {
+        self.current_scene_path
+            .as_ref()
+            .and_then(|p| p.file_stem())
+            .and_then(|s| s.to_str())
+            .map(String::from)
+    }
+
+    /// Save the open scene: the scene to `scenes/<name>.ron`, and the
+    /// project's shared data and scripts to their own files (see `project`).
     fn save_scene(&mut self) {
-        match self.current_scene_path.clone() {
-            Some(path) => match self.world.save_to_file(&path) {
-                Ok(()) => {
-                    self.mark_saved();
-                    self.log(format!("Saved scene to {}", path.display()));
-                    stamp_project(&path);
+        let (Some(root), Some(name)) = (self.project_root(), self.current_scene_name()) else {
+            self.log("Open a project to save a scene".to_string());
+            return;
+        };
+        match project::save_scene(&root, &name, &self.world) {
+            Ok(changes) => {
+                self.mark_saved();
+                self.log(format!("Saved scene '{name}'"));
+                for change in changes {
+                    self.log(format!("  {change}"));
                 }
-                Err(e) => {
-                    if self.world.newer_format().is_some() {
-                        self.version_notice = Some(format!("Not saved: {e}."));
-                    }
-                    self.log(format!("Save failed: {e}"));
+                stamp_project(&root);
+            }
+            Err(e) => {
+                if self.world.newer_format().is_some() {
+                    self.version_notice = Some(format!("Not saved: {e}."));
                 }
-            },
-            None => self.save_scene_as(),
+                self.log(format!("Save failed: {e}"));
+            }
         }
     }
 
@@ -5777,74 +5822,203 @@ impl App {
         }
     }
 
-    /// Ask for a path with a native file dialog, save there, and remember it as
-    /// the current scene.
+    /// Save the open scene under a new name in the project's `scenes/`
+    /// folder, and carry on editing the new one.
     fn save_scene_as(&mut self) {
-        let picked = rfd::FileDialog::new()
-            .add_filter("Frame scene", &["ron"])
-            .set_file_name("scene.ron")
-            .set_title("Save scene as")
-            .save_file();
-        if let Some(path) = picked {
-            // Choosing a file on purpose is the way to keep a scene from a
-            // newer editor; the copy is in this editor's format.
-            self.world.clear_newer_format();
-            match self.world.save_to_file(&path) {
-                Ok(()) => {
-                    self.mark_saved();
-                    self.log(format!("Saved scene to {}", path.display()));
-                    stamp_project(&path);
-                    self.current_scene_path = Some(path);
-                }
-                Err(e) => self.log(format!("Save failed: {e}")),
-            }
-        }
-    }
-
-    /// Ask for a scene file with a native file dialog and load it, replacing the
-    /// current world and making it the current scene.
-    fn open_scene(&mut self) {
-        let picked = rfd::FileDialog::new()
-            .add_filter("Frame scene", &["ron"])
-            .set_title("Open scene")
-            .pick_file();
-        if let Some(path) = picked {
-            match World::load_from_file(&path) {
-                Ok(world) => {
-                    self.world = world;
-                    self.selected = None;
-                    self.mark_saved();
-                    self.log(format!("Opened scene from {}", path.display()));
-                    self.current_scene_path = Some(path);
-                    self.check_scene_version(Ok(()));
-                }
-                Err(e) => {
-                    self.log(format!("Open failed: {e}"));
-                    self.check_scene_version(Err(e.to_string()));
-                }
-            }
-        }
-    }
-
-    /// Reload the world from the current scene path, discarding the current one.
-    fn reload_scene(&mut self) {
-        let Some(path) = self.current_scene_path.clone() else {
-            self.log("No scene to reload — open or save one first".to_string());
+        let Some(root) = self.project_root() else {
             return;
         };
-        match World::load_from_file(&path) {
+        let scenes_dir = root.join(project::SCENES_DIR);
+        let _ = std::fs::create_dir_all(&scenes_dir);
+        let picked = rfd::FileDialog::new()
+            .add_filter("Frame scene", &["ron"])
+            .set_directory(&scenes_dir)
+            .set_file_name(format!(
+                "{} copy.ron",
+                self.current_scene_name()
+                    .unwrap_or_else(|| "Scene".to_string())
+            ))
+            .set_title("Save scene as")
+            .save_file();
+        let Some(path) = picked else {
+            return;
+        };
+        let Some(name) = scene_name_in(&scenes_dir, &path) else {
+            self.log(format!(
+                "Scenes are kept in the project's scenes folder ({}); choose a name there",
+                scenes_dir.display()
+            ));
+            return;
+        };
+        // Choosing a new file on purpose is the way to keep a scene from a
+        // newer editor; the copy is in this editor's format.
+        self.world.clear_newer_format();
+        match project::save_scene(&root, &name, &self.world) {
+            Ok(changes) => {
+                self.mark_saved();
+                self.log(format!("Saved scene as '{name}'"));
+                for change in changes {
+                    self.log(format!("  {change}"));
+                }
+                stamp_project(&root);
+                self.current_scene_path = Some(root.join(project::scene_file(&name)));
+            }
+            Err(e) => self.log(format!("Save failed: {e}")),
+        }
+    }
+
+    /// Pick a scene from the project's `scenes/` folder and open it.
+    fn open_scene(&mut self) {
+        let Some(root) = self.project_root() else {
+            return;
+        };
+        let scenes_dir = root.join(project::SCENES_DIR);
+        let picked = rfd::FileDialog::new()
+            .add_filter("Frame scene", &["ron"])
+            .set_directory(&scenes_dir)
+            .set_title("Open scene")
+            .pick_file();
+        let Some(path) = picked else {
+            return;
+        };
+        match scene_name_in(&scenes_dir, &path) {
+            Some(name) => self.open_scene_named(&name),
+            None => self.log(format!(
+                "Only scenes in this project's scenes folder can be opened ({})",
+                scenes_dir.display()
+            )),
+        }
+    }
+
+    /// Open one of the project's scenes by name, replacing the open one.
+    /// Undo history belongs to the scene it was made in, so it is cleared.
+    fn open_scene_named(&mut self, name: &str) {
+        let Some(root) = self.project_root() else {
+            return;
+        };
+        let files = ProjectFiles::Folder(root.clone());
+        match project::load_scene(&files, name) {
             Ok(world) => {
                 self.world = world;
                 self.selected = None;
+                self.undo_stack.clear();
+                self.redo_stack.clear();
+                self.current_scene_path = Some(root.join(project::scene_file(name)));
+                // Plugins' scripts and the models' materials go back in.
+                self.load_project_assets();
                 self.mark_saved();
-                self.log(format!("Reloaded scene from {}", path.display()));
+                self.log(format!("Opened scene '{name}'"));
                 self.check_scene_version(Ok(()));
             }
             Err(e) => {
-                self.log(format!("Reload failed: {e}"));
-                self.check_scene_version(Err(e.to_string()));
+                self.log(format!("Could not open scene '{name}': {e}"));
+                self.check_scene_version(Err(e));
             }
         }
+    }
+
+    /// Reload the open scene from disk, discarding unsaved changes.
+    fn reload_scene(&mut self) {
+        let Some(name) = self.current_scene_name() else {
+            self.log("No scene to reload".to_string());
+            return;
+        };
+        self.open_scene_named(&name);
+    }
+
+    /// Take in script files changed outside the editor since the last load
+    /// or save (see `scenes::merge_outside_edits`). Runs when the editor
+    /// window gets focus back.
+    fn pick_up_outside_script_edits(&mut self) {
+        let Some(root) = self.project_root() else {
+            return;
+        };
+        if !root.join(project::SHARED_FILE).is_file() {
+            return;
+        }
+        let (disk, errors) = project::read_scripts(&ProjectFiles::Folder(root));
+        for e in errors {
+            self.log(format!("Could not read script {e}"));
+        }
+        let installed = &self.world.installed_plugins;
+        let lines = scenes::merge_outside_edits(
+            &mut self.world.script_library,
+            &mut self.saved_scripts,
+            &disk,
+            |name| {
+                name.split_once('/')
+                    .is_some_and(|(owner, _)| installed.contains_key(owner))
+            },
+        );
+        for line in lines {
+            self.log(line);
+        }
+    }
+
+    /// What the Scenes tab shows.
+    fn scenes_view(&self) -> Option<scenes::ScenesView> {
+        let root = self.project_root()?;
+        let files = ProjectFiles::Folder(root.clone());
+        Some(scenes::ScenesView {
+            scenes: project::list_scenes(&files),
+            open: self.current_scene_name(),
+            start: project::start_scene_path(&files)
+                .and_then(|p| {
+                    p.strip_prefix("scenes/")
+                        .and_then(|n| n.strip_suffix(".ron"))
+                        .map(String::from)
+                })
+                .unwrap_or_default(),
+            unsaved: self.is_dirty(),
+        })
+    }
+
+    /// Carry out a Scenes tab action.
+    fn handle_scene_action(&mut self, action: scenes::SceneAction, event_loop: &ActiveEventLoop) {
+        let Some(root) = self.project_root() else {
+            return;
+        };
+        let result = match action {
+            scenes::SceneAction::Open(name) => {
+                self.pending_scene_switch = Some(name);
+                self.request_guarded(GuardedAction::SwitchScene, event_loop);
+                Ok(None)
+            }
+            scenes::SceneAction::New(name) => scenes::create_scene(&root, &name, &default_world())
+                .map(|()| {
+                    self.pending_scene_switch = Some(name.clone());
+                    self.request_guarded(GuardedAction::SwitchScene, event_loop);
+                    Some(format!("Created scene '{name}'"))
+                }),
+            scenes::SceneAction::Duplicate(from, to) => scenes::duplicate_scene(&root, &from, &to)
+                .map(|()| Some(format!("Copied scene '{from}' to '{to}'"))),
+            scenes::SceneAction::Rename(from, to) => scenes::rename_scene(&root, &from, &to)
+                .map(|()| Some(format!("Renamed scene '{from}' to '{to}'"))),
+            scenes::SceneAction::Delete(name) => {
+                scenes::delete_scene(&root, &name).map(|()| Some(format!("Deleted scene '{name}'")))
+            }
+            scenes::SceneAction::SetStart(name) => {
+                scenes::set_start_scene(&root, &name);
+                Ok(Some(format!("The game now starts on '{name}'")))
+            }
+        };
+        match result {
+            Ok(Some(message)) => self.log(message),
+            Ok(None) => {}
+            Err(e) => self.log(format!("Scenes: {e}")),
+        }
+    }
+
+    /// Play the open scene in a game window, as it is now, saved or not.
+    fn play_open_scene(&mut self, event_loop: &ActiveEventLoop) {
+        let (Some(root), Some(name)) = (self.project_root(), self.current_scene_name()) else {
+            return;
+        };
+        self.start_play(
+            event_loop,
+            ProjectFiles::Folder(root),
+            Some((name, self.world.clone())),
+        );
     }
 
     /// Draw the launcher screen: an egui-only frame (no simulation, no 3D) with
@@ -6090,7 +6264,7 @@ impl App {
             Some(LauncherAction::OpenProject) => self.open_project(),
             Some(LauncherAction::OpenRecent(root)) => self.open_project_at(root),
             Some(LauncherAction::PlayRecent(root)) => {
-                self.start_play(event_loop, ProjectFiles::Folder(root))
+                self.start_play(event_loop, ProjectFiles::Folder(root), None)
             }
             Some(LauncherAction::OpenSettings(root)) => self.open_settings(root),
             Some(LauncherAction::ConfirmDelete(root)) => self.pending_delete = Some(root),
@@ -6104,8 +6278,8 @@ impl App {
     }
 
     /// Create a project: take the name typed on the launcher, pick a folder,
-    /// and scaffold `<name>.ron` (a starter scene) into it. The project's name is
-    /// that scene file's stem.
+    /// and make a first scene, `scenes/<name>.ron`, which is also the start
+    /// scene, and `project.ron` with the project's name.
     fn new_project(&mut self) {
         let name = self.new_project_name.trim().to_string();
         if name.is_empty() {
@@ -6122,13 +6296,19 @@ impl App {
         else {
             return;
         };
-        let scene_path = folder.join(format!("{name}.ron"));
+        if !project::valid_scene_name(&name) {
+            self.log(format!("'{name}' can't be used as a file name"));
+            return;
+        }
+        // The first scene is named after the project, and is its start scene.
         let world = default_world();
-        match world.save_to_file(&scene_path) {
-            Ok(()) => {
+        match project::save_scene(&folder, &name, &world) {
+            Ok(_) => {
                 write_manifest(
                     &folder,
                     &ProjectManifest {
+                        name: name.clone(),
+                        start_scene: name.clone(),
                         version: "0.1.0".to_string(),
                         ..Default::default()
                     },
@@ -6136,7 +6316,8 @@ impl App {
                 self.world = world;
                 self.new_project_name.clear();
                 self.add_recent_project(&folder);
-                self.enter_editor(name, scene_path);
+                let scene_path = folder.join(project::scene_file(&name));
+                self.enter_editor(folder, scene_path);
             }
             Err(e) => self.log(format!("Could not create project: {e}")),
         }
@@ -6156,24 +6337,40 @@ impl App {
     /// Open the project at a known folder (the folder picker and the recent
     /// list both route here). Loads the folder's scene file.
     fn open_project_at(&mut self, root: std::path::PathBuf) {
-        let Some(scene_path) = find_scene(&root) else {
+        let files = ProjectFiles::Folder(root.clone());
+        // A project from before scenes had their own folder is converted
+        // first (with a backup), then opened like any other.
+        if project::is_old_layout(&files) {
+            match scenes::convert_old_project(&root) {
+                Ok(done) => {
+                    for line in done {
+                        self.log(line);
+                    }
+                }
+                Err(e) => {
+                    self.log(format!(
+                        "Could not convert this project to the scenes layout: {e}"
+                    ));
+                    return;
+                }
+            }
+        }
+        let Some(scene) = files.scene() else {
             self.log("That folder has no scene to open".to_string());
             return;
         };
-        let name = scene_path
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("Project")
-            .to_string();
+        let scene_path = root.join(&scene);
         // The project's own stamp first: it names the editor version,
         // which reads better than a save format number.
         let manifest = read_manifest(&root);
         let newer_project = frame_engine::version::is_newer_than_this(&manifest.editor);
-        match World::load_from_file(&scene_path) {
+        match project::load_scene_at(&files, &scene) {
             Ok(world) => {
                 self.world = world;
+                self.undo_stack.clear();
+                self.redo_stack.clear();
                 self.add_recent_project(&root);
-                self.enter_editor(name, scene_path);
+                self.enter_editor(root.clone(), scene_path);
                 self.check_scene_version(Ok(()));
                 if newer_project && self.version_notice.is_none() {
                     let text = format!(
@@ -6220,6 +6417,7 @@ impl App {
         self.mode = AppMode::Launcher;
         self.project_name = None;
         self.current_scene_path = None;
+        self.project_dir = None;
         self.selected = None;
         self.paused = false;
         self.world = World::default();
@@ -6234,15 +6432,7 @@ impl App {
     /// Open the project-settings window for a project, loading its current name
     /// (the scene stem) and manifest (description, version) into the fields.
     fn open_settings(&mut self, root: std::path::PathBuf) {
-        let Some(scene) = find_scene(&root) else {
-            self.log("That folder has no scene to configure".to_string());
-            return;
-        };
-        let name = scene
-            .file_stem()
-            .and_then(|s| s.to_str())
-            .unwrap_or("Project")
-            .to_string();
+        let name = project_display_name(&root);
         let manifest = read_manifest(&root);
         self.settings_orig_name = name.clone();
         self.settings_name = name;
@@ -6252,35 +6442,24 @@ impl App {
         self.settings_open = true;
     }
 
-    /// Save the project-settings window's fields: write the manifest, and rename
-    /// the scene file if the name changed (the name *is* the scene file's stem).
-    /// Called when the window closes.
+    /// Save the project-settings window's fields into the manifest. The
+    /// project's name lives there now, so renaming moves no files. Called
+    /// when the window closes.
     fn save_settings(&mut self, name: String, description: String, version: String) {
         let Some(root) = self.settings_root.clone() else {
             return;
         };
+        let mut manifest = read_manifest(&root);
         let new_name = name.trim();
-        // Rename the scene file if the name changed and is usable.
-        if !new_name.is_empty()
-            && new_name != self.settings_orig_name
-            && !new_name.contains(['/', '\\'])
-        {
-            let from = root.join(format!("{}.ron", self.settings_orig_name));
-            let to = root.join(format!("{new_name}.ron"));
-            match std::fs::rename(&from, &to) {
-                Ok(()) => self.log(format!("Renamed project to '{new_name}'")),
-                Err(e) => self.log(format!("Could not rename project: {e}")),
-            }
+        if !new_name.is_empty() && new_name != self.settings_orig_name {
+            manifest.name = new_name.to_string();
+            self.log(format!("Renamed project to '{new_name}'"));
         }
-        write_manifest(
-            &root,
-            &ProjectManifest {
-                description,
-                version,
-                // Kept as they are; File > Build Game edits these.
-                ..read_manifest(&root)
-            },
-        );
+        // The start scene and build choices are kept as they are; the
+        // Scenes tab and File > Build Game edit those.
+        manifest.description = description;
+        manifest.version = version;
+        write_manifest(&root, &manifest);
         self.settings_open = false;
         self.settings_root = None;
         self.recent_projects = sorted_recent_projects();
@@ -6322,20 +6501,23 @@ impl App {
     /// editor chrome. Closing the window returns to the launcher. `files` is
     /// the project folder, or a game build's pack; everything Play reads
     /// comes through it.
-    fn start_play(&mut self, event_loop: &ActiveEventLoop, files: ProjectFiles) {
+    fn start_play(
+        &mut self,
+        event_loop: &ActiveEventLoop,
+        files: ProjectFiles,
+        scene: Option<(String, World)>,
+    ) {
         if self.game_window.is_some() {
             return; // already playing
         }
-        let Some(scene) = files.scene() else {
-            self.log("That project has no scene to play".to_string());
-            return;
+        // The editor's Play scene hands over the scene being edited; the
+        // launcher and a game build start on the project's start scene.
+        let loaded = match scene {
+            Some(given) => Ok(given),
+            None => project::load_start_scene(&files),
         };
-        let loaded = files
-            .read_to_string(&scene)
-            .map_err(|e| e.to_string())
-            .and_then(|text| World::load_from_str(&text).map_err(|e| e.to_string()));
-        let mut world = match loaded {
-            Ok(world) => world,
+        let (name, mut world) = match loaded {
+            Ok(loaded) => loaded,
             Err(e) => {
                 self.log(format!("Could not play project: {e}"));
                 return;
@@ -6351,11 +6533,6 @@ impl App {
             self.log(format!("Plugins: {e}"));
         }
         merge_plugins_into_world(&mut world, manifests, scripts);
-        let name = scene
-            .strip_suffix(".ron")
-            .filter(|s| !s.is_empty())
-            .unwrap_or("Game")
-            .to_string();
         // A game on its own is titled with its own name and grouped under its
         // own app id; the editor's Play window says what it is playing.
         let player = matches!(self.mode, AppMode::Player);
@@ -6449,6 +6626,40 @@ impl App {
         self.log(format!("Playing '{name}'"));
     }
 
+    /// Change the game window to another scene of the same project, as a
+    /// script's `load_scene` asks: fresh physics and the new scene's own
+    /// entities. Globals carry across, so scripts can keep things like a
+    /// score between scenes.
+    fn switch_game_scene(&mut self, name: &str) {
+        let Some(files) = self.game_files.clone() else {
+            return;
+        };
+        let mut world = match project::load_scene(&files, name) {
+            Ok(world) => world,
+            Err(e) => {
+                self.log(format!("load_scene: couldn't load '{name}': {e}"));
+                return;
+            }
+        };
+        let (manifests, scripts, errors) = load_plugins_from(&files);
+        for e in errors {
+            self.log(format!("Plugins: {e}"));
+        }
+        merge_plugins_into_world(&mut world, manifests, scripts);
+        if let Some(old) = &self.game_world {
+            world.globals = old.globals.clone();
+        }
+        self.game_world = Some(world);
+        self.game_physics = Some(Physics::new(GRAVITY_Y));
+        self.game_ui_textures.clear();
+        if !matches!(self.mode, AppMode::Player)
+            && let Some(window) = &self.game_window
+        {
+            window.set_title(&format!("{name} — Play"));
+        }
+        self.log(format!("Changed scene to '{name}'"));
+    }
+
     /// Close the game window and stop playing. GPU state is dropped first (its
     /// surface holds a window handle) — the same teardown order as on exit.
     fn close_game(&mut self) {
@@ -6509,6 +6720,14 @@ impl App {
         // borrow if called from inside the loop.
         for msg in sound_messages {
             self.log(msg);
+        }
+        // A script asked for another scene: swap to it now the tick is done.
+        if let Some(name) = self
+            .game_world
+            .as_mut()
+            .and_then(|w| w.pending_scene.take())
+        {
+            self.switch_game_scene(&name);
         }
         let (width, height) = match &self.game_window {
             Some(w) => {
@@ -7127,7 +7346,7 @@ impl App {
     // parse it, record its half extents, and upload it to the GPU.
     /// File > Import audio: pick one or more audio files and import each.
     fn import_audio(&mut self) {
-        if self.current_scene_path.is_none() {
+        if self.project_dir.is_none() {
             self.log("Open a project before importing audio".to_string());
             return;
         }
@@ -7151,12 +7370,7 @@ impl App {
     /// same name already exists somewhere in there, that file is replaced in
     /// place instead of adding a second copy the lookup can't tell apart.
     fn import_audio_from(&mut self, picked: std::path::PathBuf) {
-        let Some(assets) = self
-            .current_scene_path
-            .as_ref()
-            .and_then(|p| p.parent())
-            .map(|p| p.join("assets"))
-        else {
+        let Some(assets) = self.project_dir.as_deref().map(|p| p.join("assets")) else {
             self.log("Open a project before importing audio".to_string());
             return;
         };
@@ -7216,7 +7430,7 @@ impl App {
     /// the same "one at a time, shared per-file work factored out" shape as
     /// Import audio.
     fn import_texture(&mut self) {
-        if self.current_scene_path.is_none() {
+        if self.project_dir.is_none() {
             self.log("Open a project before importing a texture".to_string());
             return;
         }
@@ -7238,12 +7452,7 @@ impl App {
     /// by name anywhere under assets/ (see `find_image`), matching how a
     /// Sound or a Mesh::Custom resolves its own file.
     fn import_texture_from(&mut self, picked: std::path::PathBuf) {
-        let Some(assets) = self
-            .current_scene_path
-            .as_ref()
-            .and_then(|p| p.parent())
-            .map(|p| p.join("assets"))
-        else {
+        let Some(assets) = self.project_dir.as_deref().map(|p| p.join("assets")) else {
             self.log("Open a project before importing a texture".to_string());
             return;
         };
@@ -7327,7 +7536,7 @@ impl App {
     }
 
     fn import_model(&mut self) {
-        if self.current_scene_path.is_none() {
+        if self.project_dir.is_none() {
             self.log("Open a project before importing a model".to_string());
             return;
         }
@@ -7352,9 +7561,8 @@ impl App {
         let custom_names: Vec<String> = self.custom_meshes.keys().cloned().collect();
         let refs: Vec<&frame_engine::assets::MeshData> = self.custom_meshes.values().collect();
         let project = self
-            .current_scene_path
-            .as_ref()
-            .and_then(|p| p.parent())
+            .project_dir
+            .as_deref()
             .map(|p| ProjectFiles::Folder(p.to_path_buf()));
         let materials = build_material_gpu_data(
             &custom_names,
@@ -7369,12 +7577,7 @@ impl App {
         }
     }
     fn import_model_from(&mut self, picked: std::path::PathBuf) {
-        let Some(root) = self
-            .current_scene_path
-            .as_ref()
-            .and_then(|p| p.parent())
-            .map(|p| p.to_path_buf())
-        else {
+        let Some(root) = self.project_dir.as_deref().map(|p| p.to_path_buf()) else {
             self.log("Open a project before importing a model".to_string());
             return;
         };
@@ -7448,12 +7651,7 @@ impl App {
     // world, and upload them to the editor GPU.
     fn load_project_assets(&mut self) {
         self.custom_meshes.clear();
-        if let Some(root) = self
-            .current_scene_path
-            .as_ref()
-            .and_then(|p| p.parent())
-            .map(|p| p.to_path_buf())
-        {
+        if let Some(root) = self.project_dir.as_deref().map(|p| p.to_path_buf()) {
             let (models, errors) = load_project_models(&root);
             for e in errors {
                 self.log(format!("Model load failed: {e}"));
@@ -7519,12 +7717,7 @@ impl App {
         self.dirty = true;
         let prefix = format!("{plugin_name}/");
         if enabled {
-            if let Some(root) = self
-                .current_scene_path
-                .as_ref()
-                .and_then(|p| p.parent())
-                .map(|p| p.to_path_buf())
-            {
+            if let Some(root) = self.project_dir.as_deref().map(|p| p.to_path_buf()) {
                 let (_, scripts, errors) = load_project_plugins(&root);
                 for e in errors {
                     self.log(format!("Plugins: {e}"));
@@ -7611,7 +7804,9 @@ impl App {
         }
     }
 
-    fn enter_editor(&mut self, name: String, scene_path: std::path::PathBuf) {
+    fn enter_editor(&mut self, root: std::path::PathBuf, scene_path: std::path::PathBuf) {
+        let name = project_display_name(&root);
+        self.project_dir = Some(root);
         self.current_scene_path = Some(scene_path);
         self.selected = None;
         // Open paused: arrange the scene first, press P when ready to run.
@@ -7852,7 +8047,7 @@ impl ApplicationHandler for App {
         if matches!(self.mode, AppMode::Player) {
             if self.game_window.is_none() {
                 if let Some(files) = self.player_files.clone() {
-                    self.start_play(event_loop, files);
+                    self.start_play(event_loop, files, None);
                 }
                 if self.game_window.is_none() {
                     // What went wrong was logged; a player on Windows has no
@@ -8061,6 +8256,11 @@ impl ApplicationHandler for App {
             WindowEvent::ModifiersChanged(mods) => {
                 self.ctrl_held = mods.state().control_key();
                 self.shift_held = mods.state().shift_key();
+            }
+            WindowEvent::Focused(true) => {
+                if matches!(self.mode, AppMode::Editor) {
+                    self.pick_up_outside_script_edits();
+                }
             }
             WindowEvent::Focused(false) => {
                 // Losing focus (e.g. Alt+Tab) drops the fly key without a release
@@ -8309,8 +8509,9 @@ impl ApplicationHandler for App {
                 if let (Some(name), Some(window)) =
                     (self.project_name.as_ref(), self.window.as_ref())
                 {
+                    let scene = self.current_scene_name().unwrap_or_default();
                     let title = format!(
-                        "{} — {name}{}",
+                        "{} — {name} — {scene}{}",
                         app_name(),
                         if self.is_dirty() { " *" } else { "" }
                     );
@@ -8346,9 +8547,8 @@ impl ApplicationHandler for App {
                 // against, computed here too since the tick loop runs before
                 // that local is set up further down.
                 let tick_project = self
-                    .current_scene_path
-                    .as_ref()
-                    .and_then(|p| p.parent())
+                    .project_dir
+                    .as_deref()
                     .map(|p| ProjectFiles::Folder(p.to_path_buf()));
                 let mut sound_messages = Vec::new();
                 for _ in 0..owed {
@@ -8392,6 +8592,13 @@ impl ApplicationHandler for App {
                 // with a still-live world borrow from inside the loop.
                 for msg in sound_messages {
                     self.log(msg);
+                }
+                // Scenes only change in a game window; here the editor stays
+                // on the scene being edited.
+                if let Some(name) = self.world.pending_scene.take() {
+                    self.log(format!(
+                        "A script asked for scene '{name}' (load_scene). Scenes change in Play scene, not in the editor's viewport."
+                    ));
                 }
                 // Refresh collisions once more for the editor's red tint. Inside
                 // the loop, detection ran at each tick's start (before that tick's
@@ -8490,11 +8697,7 @@ impl ApplicationHandler for App {
                 // statuses() walks the working tree, so not every frame.
                 if self.git_refresh_at.elapsed().as_secs_f32() > 2.0 {
                     self.git_refresh_at = std::time::Instant::now();
-                    self.git_summary = self
-                        .current_scene_path
-                        .as_ref()
-                        .and_then(|p| p.parent())
-                        .and_then(git_summary);
+                    self.git_summary = self.project_dir.as_deref().and_then(git_summary);
                 }
                 let ppp = self.egui_ctx.pixels_per_point();
                 let gizmo_draw = self.gizmo.map(|g| {
@@ -8517,11 +8720,7 @@ impl ApplicationHandler for App {
                 let mut console_tab = self.console_tab;
                 let log_lines = std::mem::take(&mut self.log_lines);
                 // Assets tab state, lifted so the closure stays off self.
-                let assets_root = self
-                    .current_scene_path
-                    .as_ref()
-                    .and_then(|p| p.parent())
-                    .map(|p| p.join("assets"));
+                let assets_root = self.project_dir.as_deref().map(|p| p.join("assets"));
                 let mut assets_subdir = std::mem::take(&mut self.assets_subdir);
                 let mut new_asset_folder = std::mem::take(&mut self.new_asset_folder);
                 let thumbnails = self.thumbnails.clone();
@@ -8541,6 +8740,19 @@ impl ApplicationHandler for App {
                 // which the egui closure can borrow), the same
                 // lift-then-write-back pattern plugin_action already uses.
                 let prefabs = self.prefabs.clone();
+                // The Scenes tab's list is read from disk only while it shows.
+                self.poll_build();
+                let mut build_open = self.build_window_open;
+                let mut build_settings_edit = self.build_settings.clone();
+                // Only worked out while the window is open: it reads project.ron.
+                // Taken before the script library is lifted out of the world
+                // below, or the unsaved check would see it empty.
+                let build_view = if build_open { self.build_view() } else { None };
+                let scenes_view = (self.console_tab == ConsoleTab::Scenes)
+                    .then(|| self.scenes_view())
+                    .flatten();
+                let mut scenes_tab = std::mem::take(&mut self.scenes_tab);
+                let mut scene_action: Option<scenes::SceneAction> = None;
                 let mut prefab_spawn_request: Option<String> = None;
                 let mut new_prefab_name = std::mem::take(&mut self.new_prefab_name);
                 let script_library = std::mem::take(&mut self.world.script_library);
@@ -8656,11 +8868,6 @@ impl ApplicationHandler for App {
                 let paused = self.paused;
                 let mut plugins_panel_open = self.plugins_panel_open;
                 let mut editor_settings_open = self.editor_settings_open;
-                self.poll_build();
-                let mut build_open = self.build_window_open;
-                let mut build_settings_edit = self.build_settings.clone();
-                // Only worked out while the window is open: it reads project.ron.
-                let build_view = if build_open { self.build_view() } else { None };
                 let mut build_action: Option<build::BuildUiAction> = None;
                 let mut prefs_edit = self.current_prefs();
                 let pending_unsaved = self.pending_unsaved;
@@ -8860,6 +9067,17 @@ impl ApplicationHandler for App {
                                     {
                                         plugins_panel_open = !plugins_panel_open;
                                     }
+                                    // Opens the game window on the scene being
+                                    // edited, as it is now (saved or not).
+                                    // The View menu's Play only runs the
+                                    // simulation here in the viewport.
+                                    if ui
+                                        .button("Play scene")
+                                        .on_hover_text("Play this scene in its own game window, as a player would. The launcher's Play and game builds start on the start scene instead.")
+                                        .clicked()
+                                    {
+                                        menu_action = Some(MenuAction::PlayScene);
+                                    }
                                 });
                             });
                             // The Plugins slide-down: only shown when toggled on
@@ -8981,7 +9199,8 @@ impl ApplicationHandler for App {
                                             GuardedAction::ReloadScene => format!(
                                                 "Reloading discards your unsaved changes to {project_label}. Save first?"
                                             ),
-                                            GuardedAction::OpenScene => format!(
+                                            GuardedAction::OpenScene
+                                            | GuardedAction::SwitchScene => format!(
                                                 "Save your changes to {project_label} before opening another scene?"
                                             ),
                                         });
@@ -9163,6 +9382,11 @@ impl ApplicationHandler for App {
                                             ConsoleTab::Prefabs,
                                             "Prefabs",
                                         );
+                                        ui.selectable_value(
+                                            &mut console_tab,
+                                            ConsoleTab::Scenes,
+                                            "Scenes",
+                                        );
                                     });
                                     ui.separator();
                                     match console_tab {
@@ -9200,6 +9424,15 @@ impl ApplicationHandler for App {
                                         ConsoleTab::Prefabs => {
                                             if let Some(name) = prefabs_tab_ui(ui, &prefabs) {
                                                 prefab_spawn_request = Some(name);
+                                            }
+                                        }
+                                        ConsoleTab::Scenes => {
+                                            if let Some(view) = &scenes_view {
+                                                scene_action = scenes::scenes_tab_ui(
+                                                    ui,
+                                                    view,
+                                                    &mut scenes_tab,
+                                                );
                                             }
                                         }
                                     }
@@ -9313,6 +9546,10 @@ impl ApplicationHandler for App {
                 self.new_prefab_name = viewer.new_prefab_name;
                 if let Some((id, name)) = viewer.save_prefab_request.take() {
                     self.save_entity_as_prefab(id, &name);
+                }
+                self.scenes_tab = scenes_tab;
+                if let Some(action) = scene_action {
+                    self.handle_scene_action(action, event_loop);
                 }
                 if let Some(name) = prefab_spawn_request {
                     self.spawn_prefab_at_focus(&name);
@@ -9556,6 +9793,7 @@ impl ApplicationHandler for App {
                     Some(MenuAction::ToggleStats) => self.toggle_stats(),
                     Some(MenuAction::OpenEditorSettings) => self.editor_settings_open = true,
                     Some(MenuAction::BuildGame) => self.open_build_window(),
+                    Some(MenuAction::PlayScene) => self.play_open_scene(event_loop),
                     Some(MenuAction::About) => {
                         self.log("Frame Editor — a hand-rolled Rust simulation engine and editor.");
                     }
@@ -9815,6 +10053,15 @@ fn write_recent_projects(roots: &[std::path::PathBuf]) {
 /// name is the scene file's stem, so it isn't duplicated here.
 #[derive(serde::Serialize, serde::Deserialize, Default, Clone)]
 struct ProjectManifest {
+    /// The project's name, shown on the launcher and in window titles. Empty
+    /// in a project from before it was stored here; the editor then uses the
+    /// start scene's name (or the folder's) and writes it in on conversion.
+    #[serde(default)]
+    name: String,
+    /// The scene the game starts on (`World` for `scenes/World.ron`): the
+    /// launcher's Play and game builds start here. See `project`.
+    #[serde(default)]
+    start_scene: String,
     #[serde(default)]
     description: String,
     #[serde(default)]
@@ -10206,10 +10453,7 @@ fn newest_editor(existing: &str) -> String {
 
 /// After saving a scene, stamp the project it belongs to (the folder it is
 /// in, if that folder has a `project.ron`) with this editor's version.
-fn stamp_project(scene_path: &std::path::Path) {
-    let Some(root) = scene_path.parent() else {
-        return;
-    };
+fn stamp_project(root: &std::path::Path) {
     if !root.join("project.ron").exists() {
         return;
     }
@@ -10259,18 +10503,62 @@ fn find_scene(folder: &std::path::Path) -> Option<std::path::PathBuf> {
     Some(folder.join(scene))
 }
 
+/// A project's name: the one in `project.ron`, else its start scene's (an
+/// older project), else its folder's.
+fn project_display_name(root: &std::path::Path) -> String {
+    let manifest = read_manifest(root);
+    if !manifest.name.trim().is_empty() {
+        return manifest.name.trim().to_string();
+    }
+    ProjectFiles::Folder(root.to_path_buf())
+        .scene()
+        .and_then(|scene| {
+            scene
+                .rsplit('/')
+                .next()
+                .and_then(|file| file.strip_suffix(".ron"))
+                .map(String::from)
+        })
+        .or_else(|| root.file_name().and_then(|n| n.to_str()).map(String::from))
+        .unwrap_or_else(|| "Project".to_string())
+}
+
+/// When a project was last edited: its newest scene file's time.
+fn last_edited(root: &std::path::Path) -> Option<std::time::SystemTime> {
+    let files = ProjectFiles::Folder(root.to_path_buf());
+    let mut paths: Vec<std::path::PathBuf> = project::list_scenes(&files)
+        .iter()
+        .map(|name| root.join(project::scene_file(name)))
+        .collect();
+    if let Some(scene) = files.scene() {
+        paths.push(root.join(scene));
+    }
+    paths
+        .iter()
+        .filter_map(|p| std::fs::metadata(p).and_then(|m| m.modified()).ok())
+        .max()
+}
+
+/// A scene's name if `path` is a `.ron` file directly in `scenes_dir`.
+fn scene_name_in(scenes_dir: &std::path::Path, path: &std::path::Path) -> Option<String> {
+    let parent = path.parent()?;
+    let same =
+        parent == scenes_dir || (parent.canonicalize().ok()? == scenes_dir.canonicalize().ok()?);
+    if !same || path.extension().and_then(|e| e.to_str()) != Some("ron") {
+        return None;
+    }
+    let name = path.file_stem()?.to_str()?.to_string();
+    project::valid_scene_name(&name).then_some(name)
+}
+
 /// Remembered projects that still hold a scene, most-recently-edited first.
 fn sorted_recent_projects() -> Vec<RecentProject> {
     let mut projects: Vec<RecentProject> = read_recent_projects()
         .into_iter()
         .filter_map(|root| {
-            let scene = find_scene(&root)?;
-            let name = scene
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("Project")
-                .to_string();
-            let modified = std::fs::metadata(&scene).and_then(|m| m.modified()).ok();
+            find_scene(&root)?;
+            let name = project_display_name(&root);
+            let modified = last_edited(&root);
             let manifest = read_manifest(&root);
             Some(RecentProject {
                 root: root.clone(),
@@ -10919,6 +11207,7 @@ fn run_app(
         settings_version: String::new(),
         // No scene target until a project is opened.
         current_scene_path: None,
+        project_dir: None,
         custom_meshes: std::collections::BTreeMap::new(),
         texture_cache: std::collections::HashMap::new(),
         material_editing: None,
@@ -10966,6 +11255,8 @@ fn run_app(
         dirty: false,
         saved_scripts: std::collections::BTreeMap::new(),
         pending_unsaved: None,
+        pending_scene_switch: None,
+        scenes_tab: scenes::ScenesTabState::default(),
         version_notice: None,
         player_files: None,
         player_failed: false,
@@ -11723,7 +12014,7 @@ mod version_tests {
         .unwrap();
         assert_eq!(read_manifest(&root).editor, "");
         // Saving a scene in the project stamps it.
-        stamp_project(&root.join("game.ron"));
+        stamp_project(&root);
         assert_eq!(read_manifest(&root).editor, frame_engine::version::ENGINE);
         std::fs::remove_dir_all(&root).ok();
     }
@@ -11736,7 +12027,7 @@ mod version_tests {
             "(description: \"\", version: \"0.1.0\", editor: \"99.0.0\")",
         )
         .unwrap();
-        stamp_project(&root.join("game.ron"));
+        stamp_project(&root);
         write_manifest(&root, &read_manifest(&root));
         let back = read_manifest(&root);
         assert_eq!(back.editor, "99.0.0");
@@ -11747,7 +12038,7 @@ mod version_tests {
     #[test]
     fn a_folder_without_a_project_is_not_stamped() {
         let root = temp_project("bare");
-        stamp_project(&root.join("scene.ron"));
+        stamp_project(&root);
         assert!(!root.join("project.ron").exists());
         std::fs::remove_dir_all(&root).ok();
     }

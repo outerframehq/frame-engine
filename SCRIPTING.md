@@ -1,8 +1,11 @@
 # Scripting in Frame Engine
 
 Any entity can carry a **script**: a small piece of code that runs every tick and
-changes that entity. Scripts live in a shared **library**: you write one in the
-editor's **Script Editor** tab, then attach it to an entity from the
+changes that entity. Scripts live in a shared **library**: each one is a `.rhai` file in the
+project's `scripts/` folder (a `/` in a name makes a subfolder, so `enemies/wolf`
+is `scripts/enemies/wolf.rhai`). You write one in the editor's **Script Editor**
+tab, or in any text editor (the editor picks up changed files when its window
+gets focus back), then attach it to an entity from the
 **Inspector**: select an entity, open its **Script** picker, and choose the
 script by name. Because scripts are shared, one script can drive many entities,
 and editing it in the Script Editor updates every entity that uses it at once.
@@ -251,6 +254,30 @@ use without checking `hit` first.
 
 Change any number and watch it update while the simulation plays. The `* 0.08`
 kind of number is speed; the `* 50.0` kind is size or distance.
+
+## Globals and changing scene
+
+A game is often more than one scene: a menu, a level, a cave. Two things let a
+script move between them.
+
+`load_scene("Cave")` asks to change to the scene named `Cave` (the file
+`scenes/Cave.ron`). The change happens after the current tick finishes, so the
+rest of this tick runs as normal. If the script hits an error later in the same
+run, the request is dropped. While playing in the editor, the Play window changes
+scene; in the editor's own viewport the request is only noted in the Output tab.
+
+Everything in the old scene is left behind except **globals**: named numbers
+that belong to the whole game. Read one with `get_global("name")` (a global that
+was never set reads as `0.0`) and set one with `set_global("name", value)`:
+
+```rust
+// On a door: count how often the player has come through, then go to the cave.
+set_global("visits", get_global("visits") + 1);
+if get_global("visits") >= 3.0 { load_scene("Cave"); }
+```
+
+Globals are numbers only. They are saved with the project in
+`project-data.ron`, so a value set in the editor is where Play starts.
 
 ## Spawning and despawning
 

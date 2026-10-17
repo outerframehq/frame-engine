@@ -8,6 +8,7 @@ pub mod input;
 pub mod net;
 pub mod pack;
 pub mod physics;
+pub mod project;
 pub mod render;
 pub mod systems;
 pub mod version;

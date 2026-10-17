@@ -64,7 +64,7 @@ const FLAG_SEALED: u32 = 1;
 
 /// The top-level folders a pack takes from a project. Everything else in
 /// the project folder (source control, notes, build output) is left out.
-pub const PACKED_FOLDERS: &[&str] = &["assets", "plugins", "prefabs"];
+pub const PACKED_FOLDERS: &[&str] = &["assets", "plugins", "prefabs", "scenes", "scripts"];
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct PackEntry {
@@ -410,12 +410,10 @@ impl ProjectFiles {
         names
     }
 
-    /// The project's scene: the first `.ron` file at the top of the project,
-    /// by name, that isn't the `project.ron` manifest.
+    /// The scene a game starts on, as a path inside the project: see
+    /// `project::start_scene_path`.
     pub fn scene(&self) -> Option<String> {
-        self.files_under("")
-            .into_iter()
-            .find(|name| !name.contains('/') && name.ends_with(".ron") && name != "project.ron")
+        crate::project::start_scene_path(self)
     }
 
     /// Find a file under `folder` by name. A path that exists as given

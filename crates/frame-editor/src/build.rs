@@ -787,6 +787,8 @@ pub(crate) fn open_folder(folder: &Path) {
 /// What the Build window shows, copied out of the editor for one frame.
 pub(crate) struct BuildView {
     pub name: String,
+    /// The scene the game starts on, or empty if the project has none.
+    pub start_scene: String,
     pub version: String,
     pub program: String,
     pub can_encrypt: bool,
@@ -832,6 +834,18 @@ pub(crate) fn build_window_ui(
                     ui.end_row();
                     ui.label("");
                     ui.weak("Name and version come from the project. Change the version in the launcher's project Settings.");
+                    ui.end_row();
+
+                    ui.label("Starts on");
+                    if view.start_scene.is_empty() {
+                        ui.colored_label(
+                            egui::Color32::from_rgb(0xE0, 0x6C, 0x60),
+                            "No scene to start on",
+                        );
+                    } else {
+                        ui.label(&view.start_scene)
+                            .on_hover_text("Change it with \"Set as start\" in the Scenes tab.");
+                    }
                     ui.end_row();
 
                     ui.label("Platforms");
