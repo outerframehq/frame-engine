@@ -219,6 +219,13 @@ fn face_normal(a: [f32; 3], b: [f32; 3], c: [f32; 3]) -> [f32; 3] {
     }
 }
 
+/// A model from `vertices` (a flat triangle list) made in code rather than
+/// read from a file: centred and sized like an imported one (see
+/// `MeshData`), for a game to hand the editor (`EditorModule::meshes`).
+pub fn unit_mesh(vertices: Vec<MeshVertexData>) -> MeshData {
+    normalise_to_unit(vertices)
+}
+
 /// Centre the mesh on the origin and scale it uniformly so the largest half
 /// extent is exactly 0.5, the same unit sizing as the primitives. Uniform
 /// scale and translation leave normals alone.

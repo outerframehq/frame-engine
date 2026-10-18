@@ -388,7 +388,7 @@ fn liquid(in: VertexOutput, thin: f32, alpha: f32, ripples: f32) -> vec4<f32> {
     let fresnel = 0.02 + 0.98 * pow(1.0 - facing, 5.0);
     var r = reflect(-v, n);
     r = normalize(vec3<f32>(r.x, max(r.y, 0.01), r.z));
-    let mirrored = with_clouds(sky_gradient(r), r);
+    let mirrored = reflected_sky(sky_gradient(r), r);
     // The sun's glint: a tight spot up close, a broad path far out, where the
     // many small waves it would really sparkle on are too small to draw.
     let far = smoothstep(200.0, 20000.0, dist);

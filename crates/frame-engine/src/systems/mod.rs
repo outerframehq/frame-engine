@@ -33,10 +33,11 @@ fn expand_for_rotation(half: [f32; 3], rotation: &crate::world::Rotation) -> [f3
 /// full cube box if the metadata is missing. Cubes and spheres use the full
 /// scale box.
 ///
-/// `pub(crate)`, not private: `physics::Physics` reuses this to size a
-/// rapier collider the same way, so a rapier-simulated entity's box matches
-/// the one its hand-rolled sibling would have gotten.
-pub(crate) fn half_extents(
+/// Public: `physics::Physics` reuses this to size a rapier collider the same
+/// way, so a rapier-simulated entity's box matches the one its hand-rolled
+/// sibling would have gotten, and a game uses it to find what a ray from the
+/// eyes meets.
+pub fn half_extents(
     mesh: &crate::world::Mesh,
     scale: crate::world::Scale,
     meta: &std::collections::BTreeMap<String, crate::world::MeshMeta>,

@@ -26,8 +26,22 @@ use winit::keyboard::{KeyCode, PhysicalKey};
 use winit::window::{Icon, Window, WindowId};
 /// The editor's shader: the scene part every world pass shares, then the
 /// editor's own entry points.
-pub(crate) const ENTITY_WGSL: &str =
-    concat!(include_str!("scene.wgsl"), include_str!("shader.wgsl"));
+pub(crate) const ENTITY_WGSL: &str = concat!(
+    include_str!("scene.wgsl"),
+    include_str!("shader.wgsl"),
+    include_str!("reflection.wgsl")
+);
+
+/// The entity shader with `reflection` (WGSL defining `reflected_sky`) in
+/// place of the default (see `EditorModule::reflection_wgsl`).
+pub(crate) fn entity_wgsl_with_reflection(reflection: &str) -> String {
+    format!(
+        "{}{}{}",
+        include_str!("scene.wgsl"),
+        include_str!("shader.wgsl"),
+        reflection
+    )
+}
 mod build;
 mod font;
 mod game_audio;
@@ -1731,9 +1745,15 @@ impl GpuState {
         // this buffer and draw the range for whichever primitive an entity uses.
         let (mesh_vertex_buffer, mesh_ranges) = build_mesh_buffer(&device, &[]);
         // --- Entity pipeline (world-space, camera-driven) ---
+        // What the water mirrors of the sky: the first module's own, if one
+        // gives it (its clouds), or the default.
+        let entity_source = match modules.iter().find_map(|m| m.reflection_wgsl()) {
+            Some(reflection) => std::borrow::Cow::Owned(entity_wgsl_with_reflection(&reflection)),
+            None => std::borrow::Cow::Borrowed(ENTITY_WGSL),
+        };
         let entity_shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("entity shader"),
-            source: wgpu::ShaderSource::Wgsl(ENTITY_WGSL.into()),
+            source: wgpu::ShaderSource::Wgsl(entity_source),
         });
         let entity_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
@@ -6659,10 +6679,11 @@ impl App {
         // for it separately, even though it shares the same underlying
         // device as the main window now. Play can start from the launcher
         // with no project open in the editor, so load from `files`.
-        let (models, errors) = load_models_from(&files);
+        let (mut models, errors) = load_models_from(&files);
         for e in errors {
             self.log(format!("Model load failed: {e}"));
         }
+        add_module_meshes(&self.modules.borrow(), &mut models);
         self.game_custom_names = models.keys().cloned().collect();
         let refs: Vec<&frame_engine::assets::MeshData> = models.values().collect();
         // A fresh, local decode cache: Play starts far less often than a
@@ -6694,6 +6715,7 @@ impl App {
         );
         window.request_redraw();
         self.game_gpu = Some(gpu);
+        world.in_play = true;
         self.game_world = Some(world);
         // Fresh physics state for this play session; see `game_physics`'s
         // own doc comment for why it isn't reused across Play runs.
@@ -6739,6 +6761,7 @@ impl App {
         if let Some(old) = &self.game_world {
             world.globals = old.globals.clone();
         }
+        world.in_play = true;
         self.game_world = Some(world);
         self.game_physics = Some(Physics::new(GRAVITY_Y));
         self.game_ui_textures.clear();
@@ -8036,10 +8059,11 @@ impl App {
     fn load_project_assets(&mut self) {
         self.custom_meshes.clear();
         if let Some(root) = self.project_dir.as_deref().map(|p| p.to_path_buf()) {
-            let (models, errors) = load_project_models(&root);
+            let (mut models, errors) = load_project_models(&root);
             for e in errors {
                 self.log(format!("Model load failed: {e}"));
             }
+            add_module_meshes(&self.modules.borrow(), &mut models);
             self.custom_meshes = models;
 
             let (manifests, scripts, errors) = load_project_plugins(&root);
@@ -10692,6 +10716,19 @@ fn load_project_models(
 /// game build's pack. Models are named by file stem wherever they sit, so
 /// two files with the same stem in different folders collide; the later one
 /// in sorted path order wins.
+/// Add the models modules make (see `EditorModule::meshes`) to `models`. A
+/// project's own model of the same name wins.
+fn add_module_meshes(
+    modules: &[Box<dyn EditorModule>],
+    models: &mut std::collections::BTreeMap<String, frame_engine::assets::MeshData>,
+) {
+    for module in modules {
+        for (name, data) in module.meshes() {
+            models.entry(name).or_insert(data);
+        }
+    }
+}
+
 fn load_models_from(
     files: &ProjectFiles,
 ) -> (

@@ -1276,6 +1276,13 @@ pub struct World {
     /// every step like `grounded`.
     #[serde(skip)]
     pub swimming: std::collections::BTreeSet<usize>,
+    /// Whether this world is being played (the Play window, a game build, a
+    /// server) rather than edited. A module that fills the world as players
+    /// go (stones scattered where they walk, say) does so only while it is
+    /// played, so nothing it makes ends up saved in a scene. False for a
+    /// loaded or new world; whoever starts play sets it. Never saved.
+    #[serde(skip)]
+    pub in_play: bool,
     /// The actions each controlled entity is holding this tick (see
     /// `Actions`), keyed by entity id: only those holding one. Written by the
     /// input systems, read by whatever acts on them (a game's tools, in a

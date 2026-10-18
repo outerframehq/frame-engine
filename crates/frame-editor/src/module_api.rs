@@ -194,6 +194,32 @@ pub trait EditorModule {
         Vec::new()
     }
 
+    /// Models this module makes itself, by name, to be drawn like a
+    /// project's own models (`Mesh::Custom(name)`): stones each a little
+    /// different, say, generated rather than modelled. Asked once when a
+    /// project's models are loaded and when Play starts. Build each with
+    /// `frame_engine::assets::unit_mesh`. A project model of the same name
+    /// is used instead. For collision, the module also puts each one's half
+    /// extents in `World::mesh_meta` (a server draws nothing, so it never
+    /// sees these). The default is none.
+    fn meshes(&self) -> Vec<(String, frame_engine::assets::MeshData)> {
+        Vec::new()
+    }
+
+    /// WGSL to compile into the editor's shader in place of what still water
+    /// mirrors of the sky: a function
+    /// `fn reflected_sky(colour: vec3<f32>, direction: vec3<f32>) -> vec3<f32>`,
+    /// given the sky's own colour looking in `direction` and returning what
+    /// the water shows there. For a module that draws clouds of its own
+    /// (`ModuleGpu::draws_clouds`), so the water mirrors those rather than
+    /// the sky's flat ones. It may use everything in `SCENE_WGSL` and the
+    /// editor's shader. Read when a window's pipelines are built; the first
+    /// module to give one is used. Check it with `entity_shader_with`. The
+    /// default is none.
+    fn reflection_wgsl(&self) -> Option<String> {
+        None
+    }
+
     /// Whether `eye` (world space) is under a liquid this module has, and
     /// if so how the view looks from there: a module with water says so
     /// when the camera dips under it. Asked once a frame for each window
@@ -1366,6 +1392,13 @@ pub(crate) fn module_view_distance(
         .filter_map(|m| m.view_distance(world))
         .filter(|r| r.is_finite() && *r > 0.0)
         .reduce(f64::max)
+}
+
+/// The editor's whole entity shader with `reflection` (see
+/// [`EditorModule::reflection_wgsl`]) in place of the default, to check a
+/// module's reflection compiles (with `wgpu::naga`) before it is used.
+pub fn entity_shader_with(reflection: &str) -> String {
+    crate::entity_wgsl_with_reflection(reflection)
 }
 
 /// How the view looks from `eye`, from the first module that has it under a
