@@ -30,6 +30,8 @@ pub(crate) const ENTITY_WGSL: &str =
     concat!(include_str!("scene.wgsl"), include_str!("shader.wgsl"));
 mod build;
 mod font;
+mod game_audio;
+mod game_menu;
 mod grass;
 mod licences;
 mod origin;
@@ -69,6 +71,8 @@ pub use egui;
 pub use frame_engine::pack::{PackCipher, write_pack};
 // For a game program's editor: say which program File > Build Game compiles.
 pub use build::{GameBuilder, set_game_builder};
+// For a game program: its own menu before play (see `run_player_with_menu`).
+pub use game_menu::{GameMenu, GameMenuAction, GameSession, GameSettings, MenuView};
 use module_api::{EditorModule, ExtEdit, ModuleGpu, ModuleScene};
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -5136,6 +5140,23 @@ struct App {
     // Whether the Play window holds the mouse (after a click in it), so the
     // mouse turns the view. Esc lets it go.
     game_mouse_held: bool,
+    // A game build's own menu (see `game_menu`), and whether it is showing.
+    // While it shows, the world runs but takes no input from the player.
+    game_menu: Option<Box<dyn GameMenu>>,
+    menu_open: bool,
+    // Play driven by something else (a multiplayer server, say), started
+    // from the game's menu: see `GameSession`.
+    game_session: Option<Box<dyn GameSession>>,
+    // When the menu last opened, for the camera it moves.
+    menu_opened: std::time::Instant,
+    // The player's overall volume (0 to 1), and what the mixer was last set
+    // to, so it is only told when it changes.
+    game_volume: f32,
+    applied_volume: Option<f32>,
+    // The loops modules hold while a game plays (see game_audio), and when
+    // the last frame's sound was worked out, for the listener's dt.
+    game_audio: game_audio::GameAudio,
+    game_audio_at: Option<std::time::Instant>,
     // Dock tabs currently popped out into their own window (see
     // PoppedOutWindow, App::pop_out_tab). The Viewport tab is never a key
     // here -- it's the live 3D scene, not an egui panel, so popping it out
@@ -6663,6 +6684,11 @@ impl App {
     /// Close the game window and stop playing. GPU state is dropped first (its
     /// surface holds a window handle) — the same teardown order as on exit.
     fn close_game(&mut self) {
+        self.end_game_session();
+        // A playing sound outlives its handle in kira, so loops are stopped
+        // here or they would carry on after the window closes.
+        self.game_audio.stop_all();
+        self.game_audio_at = None;
         self.game_gpu = None;
         self.game_world = None;
         self.game_physics = None;
@@ -6679,6 +6705,17 @@ impl App {
     /// (always running), draw it with the shared 3D pipeline, and no egui/overlay.
     fn render_game(&mut self) {
         self.play_perf.begin(std::time::Instant::now());
+        // The player's volume, from the game's menu: told to the mixer only
+        // when it changes.
+        if self.applied_volume != Some(self.game_volume)
+            && let Some(manager) = self.audio_manager.as_mut()
+        {
+            manager.main_track().set_volume(
+                kira::Decibels(game_menu::volume_decibels(self.game_volume)),
+                kira::Tween::default(),
+            );
+            self.applied_volume = Some(self.game_volume);
+        }
         let owed = self.game_clock.advance(true);
         // Sounds come from the files Play started with (the project folder,
         // or a game build's pack), not from whatever the editor has open.
@@ -6692,13 +6729,23 @@ impl App {
                 // the built-in Controlled input already asked for this tick,
                 // rather than the keyboard unconditionally overwriting
                 // whatever the script just set.
-                systems::input_movement(world, &self.game_input);
-                systems::input_actions(world, &self.game_input);
+                // In a session (a multiplayer server, say) the session moves
+                // the player's character, not this program: it gets the
+                // input, and there is no local movement, actions or physics.
+                match self.game_session.as_mut() {
+                    Some(session) => session.tick(world, &self.game_input),
+                    None => {
+                        systems::input_movement(world, &self.game_input);
+                        systems::input_actions(world, &self.game_input);
+                    }
+                }
                 systems::run_scripts(world, &mut self.script_runtime, &self.game_input);
                 module_api::tick_modules(&self.modules, world, 1.0 / TICK_RATE as f32);
                 systems::gravity(world);
                 systems::movement(world);
-                if let Some(physics) = self.game_physics.as_mut() {
+                if self.game_session.is_none()
+                    && let Some(physics) = self.game_physics.as_mut()
+                {
                     module_api::sync_collision(&self.modules, world, physics);
                     physics.step(world, 1.0 / TICK_RATE as f32);
                 }
@@ -6720,6 +6767,18 @@ impl App {
         // borrow if called from inside the loop.
         for msg in sound_messages {
             self.log(msg);
+        }
+        // A session that ended by itself (the server went away, say): back
+        // to the menu, which is told why.
+        if let Some(reason) = self.game_session.as_ref().and_then(|s| s.finished()) {
+            self.end_game_session();
+            if let Some(menu) = self.game_menu.as_mut() {
+                menu.session_ended(&reason);
+            }
+            if !self.menu_open {
+                self.open_game_menu();
+            }
+            self.log(format!("Left the session: {reason}"));
         }
         // A script asked for another scene: swap to it now the tick is done.
         if let Some(name) = self
@@ -6744,31 +6803,56 @@ impl App {
             .game_world
             .as_ref()
             .and_then(|world| find_camera_entity(world));
+        // While a game's menu shows, the menu may move the camera itself.
+        let menu_view = if self.menu_open {
+            let seconds = self.menu_opened.elapsed().as_secs_f64();
+            match (self.game_menu.as_mut(), self.game_world.as_ref()) {
+                (Some(menu), Some(world)) => menu.view(world, seconds).filter(|v| {
+                    let d = DVec3::from(v.target) - DVec3::from(v.eye);
+                    v.eye.iter().chain(&v.target).all(|c| c.is_finite()) && d.length() > 1e-3
+                }),
+                _ => None,
+            }
+        } else {
+            None
+        };
         // Everything in Play is drawn relative to a point near what the player
-        // sees: the active Camera entity, or the editor's own focus when the
-        // scene has none.
-        let game_origin = self
-            .game_world
-            .as_ref()
-            .zip(active_camera_id)
-            .and_then(|(world, id)| world.positions.get(id))
-            .map(|p| origin::snap(DVec3::new(p.x, p.y, p.z)))
-            .unwrap_or_else(|| {
-                origin::snap(DVec3::new(
-                    self.cam_focus_x,
-                    self.cam_focus_y,
-                    self.cam_focus_z,
-                ))
-            });
+        // sees: the menu's camera, the active Camera entity, or the editor's
+        // own focus when the scene has none.
+        let game_origin = match menu_view {
+            Some(view) => origin::snap(DVec3::from(view.eye)),
+            None => self
+                .game_world
+                .as_ref()
+                .zip(active_camera_id)
+                .and_then(|(world, id)| world.positions.get(id))
+                .map(|p| origin::snap(DVec3::new(p.x, p.y, p.z)))
+                .unwrap_or_else(|| {
+                    origin::snap(DVec3::new(
+                        self.cam_focus_x,
+                        self.cam_focus_y,
+                        self.cam_focus_z,
+                    ))
+                }),
+        };
         // Where Play is looking from, for modules that stream detail around
-        // the viewer: the active Camera entity, or the editor's own focus.
-        let game_viewer = self
-            .game_world
-            .as_ref()
-            .zip(active_camera_id)
-            .and_then(|(world, id)| world.positions.get(id))
-            .map(|p| [p.x, p.y, p.z])
-            .unwrap_or([self.cam_focus_x, self.cam_focus_y, self.cam_focus_z]);
+        // the viewer: the menu's camera, the active Camera entity, or the
+        // editor's own focus. A Camera that is itself a character looks
+        // from its eyes, not the middle of its body.
+        let game_viewer = match menu_view {
+            Some(view) => view.eye,
+            None => self
+                .game_world
+                .as_ref()
+                .zip(active_camera_id)
+                .and_then(|(world, id)| {
+                    systems::character_eyes(world, id)
+                        .map(|(eye, _)| eye)
+                        .or_else(|| world.positions.get(id).map(|p| [p.x, p.y, p.z]))
+                })
+                .unwrap_or([self.cam_focus_x, self.cam_focus_y, self.cam_focus_z]),
+        };
+        self.play_game_audio(menu_view, active_camera_id, game_viewer, game_files.as_ref());
         let (instances, group_counts, lights) = match &self.game_world {
             Some(world) => {
                 let anchors = module_api::anchor_names(&self.modules);
@@ -6796,9 +6880,20 @@ impl App {
         // player actually sees. Otherwise, fall back to the editor's own
         // orbit camera, frozen at whatever it was showing when Play started
         // (the pre-existing behaviour, unchanged for a scene with no camera).
-        let view_proj = active_camera_id
-            .zip(self.game_world.as_ref())
-            .and_then(|(id, world)| camera_entity_view_proj(world, id, width, height, game_origin))
+        let menu_proj = menu_view.map(|view| {
+            let eye = origin::relative(DVec3::from(view.eye), game_origin);
+            let target = origin::relative(DVec3::from(view.target), game_origin);
+            let aspect = width as f32 / height.max(1) as f32;
+            (camera_projection(aspect) * Mat4::look_at_rh(eye, target, Vec3::Y)).to_cols_array_2d()
+        });
+        let view_proj = menu_proj
+            .or_else(|| {
+                active_camera_id
+                    .zip(self.game_world.as_ref())
+                    .and_then(|(id, world)| {
+                        camera_entity_view_proj(world, id, width, height, game_origin)
+                    })
+            })
             .unwrap_or_else(|| {
                 let focus = (DVec3::new(self.cam_focus_x, self.cam_focus_y, self.cam_focus_z)
                     - game_origin)
@@ -6847,6 +6942,67 @@ impl App {
         }
     }
 
+    /// Ask every module (and the game's menu) what should be heard this
+    /// frame, from where Play is drawn, and play it (see `game_audio`).
+    fn play_game_audio(
+        &mut self,
+        menu_view: Option<MenuView>,
+        camera: Option<usize>,
+        position: [f64; 3],
+        files: Option<&ProjectFiles>,
+    ) {
+        let now = std::time::Instant::now();
+        let dt = self
+            .game_audio_at
+            .map_or(0.0, |t| now.duration_since(t).as_secs_f32())
+            .min(0.25);
+        self.game_audio_at = Some(now);
+        // The listener's right, from whatever Play draws from: the menu's
+        // camera, the Camera entity (a character's eyes if it rides one), or
+        // the editor's own orbit camera.
+        let forward = match (menu_view, camera.zip(self.game_world.as_ref())) {
+            (Some(view), _) => (DVec3::from(view.target) - DVec3::from(view.eye)).as_vec3(),
+            (None, Some((id, world))) => {
+                let rotation = match frame_engine::systems::character_eyes(world, id) {
+                    Some((_, look)) => frame_engine::world::Rotation {
+                        yaw: look.yaw,
+                        pitch: look.pitch,
+                        roll: 0.0,
+                    },
+                    None => world.rotations.get(id).copied().unwrap_or_default(),
+                };
+                Vec3::from(rotation.forward())
+            }
+            (None, None) => view_forward(self.cam_yaw, self.cam_pitch),
+        };
+        let right = forward.cross(Vec3::Y).normalize_or(Vec3::X);
+        let listener = module_api::Listener {
+            position,
+            right: right.to_array(),
+            dt,
+            in_menu: self.menu_open,
+        };
+        let mut frame = module_api::AudioFrame::default();
+        if let Some(world) = self.game_world.as_ref() {
+            module_api::module_audio(&self.modules, world, &listener, &mut frame);
+        }
+        if let Some(menu) = self.game_menu.as_mut() {
+            for sound in menu.take_sounds() {
+                frame.play(&sound, 1.0, 1.0);
+            }
+        }
+        let messages = self.game_audio.apply(
+            frame,
+            &listener,
+            self.audio_manager.as_mut(),
+            &mut self.sound_cache,
+            files,
+        );
+        for message in messages {
+            self.log(message);
+        }
+    }
+
     /// The Play overlay's lines (F3 in Play): the frame rate and times,
     /// memory, the simulation's tick rate, how many entities there are and
     /// where the player is, then each module's own lines
@@ -6873,7 +7029,9 @@ impl App {
     /// reason). Not interactive yet -- v1 is display only -- so every Area
     /// below is `.interactable(false)`, just enough for render_game to pass
     /// real paint jobs into GpuState::render instead of the empty stand-ins
-    /// it used before this existed. Returns the empty defaults if there's no
+    /// it used before this existed. A game's own menu (`GameMenu`), while it
+    /// shows, is drawn here too, and is interactive. Returns the empty
+    /// defaults if there's no
     /// game window/egui state yet (Play isn't running).
     fn render_game_ui(&mut self) -> (Vec<egui::ClippedPrimitive>, egui::TexturesDelta, f32) {
         let (Some(window), Some(ctx)) = (self.game_window.clone(), self.game_egui_ctx.clone())
@@ -6921,24 +7079,53 @@ impl App {
                 self.game_ui_textures.insert(name, handle);
             }
         }
+        // The game's menu, while it shows: taken out for the frame so it can
+        // draw while the world is borrowed, and put back after.
+        let mut menu = if self.menu_open {
+            self.game_menu.take()
+        } else {
+            None
+        };
+        let mut settings = GameSettings {
+            look_sensitivity: self.look_sensitivity,
+            invert_look_y: self.invert_look_y,
+            volume: self.game_volume,
+        };
+        let mut action = GameMenuAction::Stay;
         let Some(world) = self.game_world.as_ref() else {
+            self.game_menu = self.game_menu.take().or(menu);
             return (Vec::new(), egui::TexturesDelta::default(), 1.0);
         };
-        let texts: Vec<frame_engine::world::UiText> =
-            world.ui_texts.iter().flatten().cloned().collect();
-        let images: Vec<frame_engine::world::UiImage> =
-            world.ui_images.iter().flatten().cloned().collect();
+        // The game's own on-screen text and images are hidden behind its
+        // menu.
+        let (texts, images): (
+            Vec<frame_engine::world::UiText>,
+            Vec<frame_engine::world::UiImage>,
+        ) = if menu.is_some() {
+            (Vec::new(), Vec::new())
+        } else {
+            (
+                world.ui_texts.iter().flatten().cloned().collect(),
+                world.ui_images.iter().flatten().cloned().collect(),
+            )
+        };
         let textures = &self.game_ui_textures;
         // What to tell the player while the mouse is free: how to start, and
         // why nothing moves when nothing in the scene is Controlled.
-        let hint = (!self.game_mouse_held).then(|| {
+        // A game with its own menu goes back to it on the second Esc.
+        let has_menu = self.game_menu.is_some();
+        let hint = (!self.game_mouse_held && menu.is_none()).then(|| {
             if world.controlled.iter().flatten().next().is_none() {
                 "Nothing in this scene is Controlled: tick Controlled on your \
                  character in the editor and save (Ctrl+S). Esc closes."
+            } else if has_menu {
+                "Click to play: the mouse looks around, WASD moves, Shift runs, \
+                 C crouches, Space jumps, E picks up or puts down, the mouse \
+                 buttons use what you hold, F3 shows the numbers. Esc frees the mouse, Esc again opens the menu."
             } else {
                 "Click to play: the mouse looks around, WASD moves, Shift runs, \
-                 C crouches, Space jumps, the mouse buttons use what you hold, \
-                 F3 shows the numbers. Esc frees the mouse, Esc again closes."
+                 C crouches, Space jumps, E picks up or puts down, the mouse \
+                 buttons use what you hold, F3 shows the numbers. Esc frees the mouse, Esc again closes."
             }
         });
         let aiming = self.game_mouse_held;
@@ -7048,11 +7235,59 @@ impl App {
                     ui.add(egui::Image::new(handle).fit_to_exact_size(size));
                 });
             }
+            if let Some(menu) = menu.as_mut() {
+                action = menu.show(ui.ctx(), world, &mut settings);
+            }
         });
         state.handle_platform_output(&window, full_output.platform_output);
+        if menu.is_some() {
+            self.game_menu = menu;
+            let settings = settings.sanitized();
+            self.look_sensitivity = settings.look_sensitivity;
+            self.invert_look_y = settings.invert_look_y;
+            self.game_volume = settings.volume;
+        }
+        match action {
+            GameMenuAction::Stay => {}
+            GameMenuAction::Play => {
+                // The menu's session, if it has one; one already running
+                // carries on.
+                if self.game_session.is_none() {
+                    self.game_session = self.game_menu.as_mut().and_then(|m| m.take_session());
+                }
+                // Straight into play: the click on the menu's button was the
+                // click that takes the mouse.
+                self.menu_open = false;
+                grab_cursor(&window, true);
+                self.game_mouse_held = true;
+            }
+            GameMenuAction::Leave => self.end_game_session(),
+            GameMenuAction::Quit => self.game_closing = true,
+        }
         let ppp = full_output.pixels_per_point;
         let jobs = ctx.tessellate(full_output.shapes, ppp);
         (jobs, full_output.textures_delta, ppp)
+    }
+
+    /// End the session being played, if any, letting it tidy the world, and
+    /// start local physics afresh: the session moved things physics was not
+    /// told about.
+    fn end_game_session(&mut self) {
+        if let Some(mut session) = self.game_session.take() {
+            if let Some(world) = self.game_world.as_mut() {
+                session.end(world);
+            }
+            self.game_physics = Some(Physics::new(GRAVITY_Y));
+        }
+    }
+
+    /// Show the game's menu again over the running world, letting go of the
+    /// mouse and every held key.
+    fn open_game_menu(&mut self) {
+        self.release_game_mouse();
+        self.game_input = InputState::new();
+        self.menu_open = true;
+        self.menu_opened = std::time::Instant::now();
     }
 
     /// Give the mouse back from the game window.
@@ -7065,6 +7300,7 @@ impl App {
         // A freed mouse holds no action.
         self.game_input.set(Button::Use, false);
         self.game_input.set(Button::UseAlt, false);
+        self.game_input.set(Button::Interact, false);
     }
 
     /// Handle an event addressed to the game window.
@@ -7086,6 +7322,9 @@ impl App {
                     self.game_input = InputState::new();
                 }
             }
+            // The menu takes the mouse for its own buttons (egui saw the
+            // click above); nothing reaches the game.
+            WindowEvent::MouseInput { .. } if self.menu_open => {}
             WindowEvent::MouseInput { state, button, .. } => {
                 let pressed = state == ElementState::Pressed;
                 if !self.game_mouse_held {
@@ -7124,10 +7363,15 @@ impl App {
                         KeyCode::F3 if pressed && !event.repeat => {
                             self.show_play_stats = !self.show_play_stats;
                         }
-                        // Esc lets the mouse go; pressed again, it closes.
+                        // The menu's own keys are egui's; the game gets none.
+                        _ if self.menu_open => {}
+                        // Esc lets the mouse go; pressed again, it brings
+                        // back the game's menu, or closes a game without one.
                         KeyCode::Escape if pressed => {
                             if self.game_mouse_held {
                                 self.release_game_mouse();
+                            } else if self.game_menu.is_some() {
+                                self.open_game_menu();
                             } else {
                                 self.game_closing = true;
                             }
@@ -7143,6 +7387,7 @@ impl App {
                         KeyCode::ControlLeft | KeyCode::KeyC => {
                             self.game_input.set(Button::Crouch, pressed)
                         }
+                        KeyCode::KeyE => self.game_input.set(Button::Interact, pressed),
                         _ => {}
                     }
                 }
@@ -7854,8 +8099,12 @@ impl App {
         let world = self.game_world.as_ref()?;
         Some(
             find_camera_entity(world)
-                .and_then(|id| world.positions.get(id))
-                .map(|p| [p.x, p.y, p.z])
+                .and_then(|id| {
+                    // A character camera sees from its eyes.
+                    systems::character_eyes(world, id)
+                        .map(|(eye, _)| eye)
+                        .or_else(|| world.positions.get(id).map(|p| [p.x, p.y, p.z]))
+                })
                 .unwrap_or([self.cam_focus_x, self.cam_focus_y, self.cam_focus_z]),
         )
     }
@@ -11057,7 +11306,7 @@ pub fn run(modules: Vec<Box<dyn EditorModule>>) {
 /// application id, so a build with extra features can be told apart from the
 /// plain editor in the window switcher.
 pub fn run_as(name: &str, app_id: &str, modules: Vec<Box<dyn EditorModule>>) {
-    run_app(name, app_id, modules, None);
+    run_app(name, app_id, modules, None, None);
 }
 
 /// Start straight into a game, with no editor: the project in `project` (a
@@ -11073,6 +11322,31 @@ pub fn run_player(
     cipher: Option<Arc<dyn PackCipher>>,
     modules: Vec<Box<dyn EditorModule>>,
 ) {
+    start_player(name, app_id, project, cipher, modules, None);
+}
+
+/// Like `run_player`, opening on the game's own `menu` (see `GameMenu`)
+/// with the world running behind it, instead of straight into play. Esc
+/// twice during play brings the menu back.
+pub fn run_player_with_menu(
+    name: &str,
+    app_id: &str,
+    project: std::path::PathBuf,
+    cipher: Option<Arc<dyn PackCipher>>,
+    modules: Vec<Box<dyn EditorModule>>,
+    menu: Box<dyn GameMenu>,
+) {
+    start_player(name, app_id, project, cipher, modules, Some(menu));
+}
+
+fn start_player(
+    name: &str,
+    app_id: &str,
+    project: std::path::PathBuf,
+    cipher: Option<Arc<dyn PackCipher>>,
+    modules: Vec<Box<dyn EditorModule>>,
+    menu: Option<Box<dyn GameMenu>>,
+) {
     let files = match ProjectFiles::open(&project, cipher) {
         Ok(files) => files,
         Err(e) => {
@@ -11087,7 +11361,7 @@ pub fn run_player(
         }
     };
     install_crash_log(name);
-    run_app(name, app_id, modules, Some(files));
+    run_app(name, app_id, modules, Some(files), menu);
 }
 
 /// Tell a player their game couldn't start: on standard error, and in a
@@ -11166,6 +11440,7 @@ fn run_app(
     app_id: &str,
     modules: Vec<Box<dyn EditorModule>>,
     player: Option<ProjectFiles>,
+    game_menu: Option<Box<dyn GameMenu>>,
 ) {
     let _ = APP_IDENTITY.set((name.to_string(), app_id.to_string()));
     let event_loop = EventLoop::new().unwrap();
@@ -11298,6 +11573,14 @@ fn run_app(
         game_clock: Clock::new(TICK_RATE, MAX_CATCHUP_TICKS),
         game_closing: false,
         game_mouse_held: false,
+        menu_open: game_menu.is_some(),
+        game_session: None,
+        game_menu,
+        menu_opened: std::time::Instant::now(),
+        game_volume: 1.0,
+        applied_volume: None,
+        game_audio: game_audio::GameAudio::default(),
+        game_audio_at: None,
         popped_out: std::collections::HashMap::new(),
         popped_out_closing: Vec::new(),
         new_script_name: String::new(),

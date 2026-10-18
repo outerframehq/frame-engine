@@ -272,6 +272,10 @@ pub fn character_eyes(world: &World, id: usize) -> Option<([f64; 3], crate::worl
 /// and looks along the character's `Look`, pitch included. Set the offset to
 /// zero for a first-person view.
 ///
+/// An entity whose `Parent` has `view` set rides the character's view the
+/// same way, but its offset turns with the pitch too, so it stays put on
+/// screen: something held in the hand.
+///
 /// An entity with no `Parent`, or whose named parent has since despawned, is
 /// left untouched, the same tolerance a stale `Script` reference gets.
 pub fn apply_parenting(world: &mut World) {
@@ -308,6 +312,25 @@ pub fn apply_parenting(world: &mut World) {
                     roll: 0.0,
                 },
             );
+            continue;
+        }
+        if parent.view
+            && let Some((eye, look)) = character_eyes(world, parent.entity)
+        {
+            let turn = crate::world::Rotation {
+                yaw: look.yaw,
+                pitch: look.pitch,
+                roll: 0.0,
+            };
+            let [dx, dy, dz] = turn.apply([parent.offset_x, parent.offset_y, parent.offset_z]);
+            if let Some(p) = world.positions.get_mut(id) {
+                p.x = eye[0] + f64::from(dx);
+                p.y = eye[1] + f64::from(dy);
+                p.z = eye[2] + f64::from(dz);
+            }
+            world
+                .rotations
+                .insert(id, turn.with_extra_yaw(parent.offset_yaw));
             continue;
         }
         let [world_dx, world_dy, world_dz] =
@@ -491,11 +514,13 @@ pub fn input_movement(world: &mut World, input: &InputState) {
     }
 }
 
-/// The actions held in `input` (`Button::Use`, `Button::UseAlt`).
+/// The actions held in `input` (`Button::Use`, `Button::UseAlt`,
+/// `Button::Interact`).
 fn held_actions(input: &InputState) -> Actions {
     Actions {
         primary: input.is_held(Button::Use),
         secondary: input.is_held(Button::UseAlt),
+        interact: input.is_held(Button::Interact),
     }
 }
 
@@ -746,7 +771,7 @@ mod tests {
             world.actions.get(&id),
             Some(&Actions {
                 primary: true,
-                secondary: false
+                ..Actions::default()
             })
         );
         assert!(!world.actions.contains_key(&other), "not controlled");
@@ -756,8 +781,8 @@ mod tests {
         assert_eq!(
             world.actions[&id],
             Actions {
-                primary: false,
-                secondary: true
+                secondary: true,
+                ..Actions::default()
             }
         );
         input.set(Button::UseAlt, false);
@@ -824,6 +849,34 @@ mod tests {
     }
 
     #[test]
+    fn a_view_rider_stays_put_in_the_view_as_it_tips() {
+        let mut world = World::new();
+        let id = character(&mut world);
+        let hand = at(&mut world, 0.0, 0.0, 0.0);
+        world.parents.insert(
+            hand,
+            Parent {
+                entity: id,
+                offset_z: -1.0,
+                view: true,
+                ..Parent::default()
+            },
+        );
+        let (eye, _) = character_eyes(&world, id).unwrap();
+        set_view(&mut world, id, 0.0, 0.0);
+        apply_parenting(&mut world);
+        let p = *world.positions.get(hand).unwrap();
+        assert!((p.y - eye[1]).abs() < 1e-5 && (p.z - (eye[2] - 1.0)).abs() < 1e-5);
+        // Looking up, it rises in front of the eyes and tips with the view;
+        // a plain rider would have stayed level with the body.
+        set_view(&mut world, id, 0.0, 0.5);
+        apply_parenting(&mut world);
+        let up = *world.positions.get(hand).unwrap();
+        assert!((up.y - (eye[1] + f64::from(0.5f32.sin()))).abs() < 1e-5);
+        assert!(close(world.rotations.get(hand).unwrap().pitch, 0.5));
+    }
+
+    #[test]
     fn parenting_follows_the_parent_and_ignores_dangling_ones() {
         let mut world = World::new();
         let parent = at(&mut world, 10.0, 0.0, 0.0);
@@ -837,6 +890,7 @@ mod tests {
                 offset_y: 2.0,
                 offset_z: 0.0,
                 offset_yaw: 0.0,
+                view: false,
             },
         );
         world.parents.insert(
@@ -847,6 +901,7 @@ mod tests {
                 offset_y: 0.0,
                 offset_z: 0.0,
                 offset_yaw: 0.0,
+                view: false,
             },
         );
         apply_parenting(&mut world);
@@ -976,6 +1031,7 @@ mod tests {
                 offset_y: 0.0,
                 offset_z: -2.0,
                 offset_yaw: 0.0,
+                view: false,
             },
         );
         apply_parenting(&mut world);

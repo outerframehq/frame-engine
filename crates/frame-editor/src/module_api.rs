@@ -39,6 +39,7 @@ pub use crate::grass::{
     GrassSample,
 };
 /// Bytes as megabytes, worded the way the performance overlay shows them.
+pub use crate::game_audio::{AudioFrame, HEARING, Listener};
 pub use crate::perf::megabytes;
 pub use frame_engine::assets::MeshVertexData;
 pub use frame_engine::physics::{StaticMesh, StaticMeshSet};
@@ -158,6 +159,14 @@ pub trait EditorModule {
     fn wind(&mut self, _world: &World) -> Option<Wind> {
         None
     }
+
+    /// What this module wants heard, once a frame while a game plays (the
+    /// Play window or a game build; never in the editor's viewport).
+    /// `listener` is the camera Play draws from. Fill `out`: loops to keep
+    /// going (wind, rain) and sounds to play once now (a footstep), see
+    /// [`AudioFrame`]. Loops nobody holds fade out by themselves. The default
+    /// is silence.
+    fn audio(&mut self, _world: &World, _listener: &Listener, _out: &mut AudioFrame) {}
 
     /// Whether this module is still working in the background (building
     /// something it will want to show). While any module is, the editor keeps
@@ -1347,6 +1356,19 @@ pub(crate) fn module_moon(
 }
 
 /// The first module's wind (see [`EditorModule::wind`]), if any.
+/// What every module wants heard this frame (see `EditorModule::audio`),
+/// in module order.
+pub(crate) fn module_audio(
+    modules: &std::cell::RefCell<Vec<Box<dyn EditorModule>>>,
+    world: &World,
+    listener: &Listener,
+    out: &mut AudioFrame,
+) {
+    for module in modules.borrow_mut().iter_mut() {
+        module.audio(world, listener, out);
+    }
+}
+
 pub(crate) fn module_wind(
     modules: &std::cell::RefCell<Vec<Box<dyn EditorModule>>>,
     world: &World,

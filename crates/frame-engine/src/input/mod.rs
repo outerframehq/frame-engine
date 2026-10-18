@@ -23,6 +23,10 @@ pub enum Button {
     Use,
     /// The second action, while held (pile ground with a spade, say).
     UseAlt,
+    /// Interact with what is in front of you, while held: pick something up
+    /// or put it down, say. The game decides what it does, and whether a
+    /// press or holding it counts.
+    Interact,
 }
 
 /// Which logical buttons are currently held. Plain runtime state, refreshed by

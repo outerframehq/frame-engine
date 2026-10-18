@@ -309,6 +309,12 @@ pub struct Camera;
 /// stale one from before the parent moved. A dangling `entity` (removed, or
 /// never existed) is simply skipped, the same tolerance a stale `Script`
 /// reference already gets.
+///
+/// `view` makes the entity ride the parent character's view instead of its
+/// body: the offset starts at the character's eyes and turns with where the
+/// character looks, pitch included, so something held in the hand stays in
+/// the same place on screen when the player looks up or down. It only
+/// applies when the parent has a `CharacterBody`; otherwise it is ignored.
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Default)]
 pub struct Parent {
     pub entity: usize,
@@ -316,6 +322,8 @@ pub struct Parent {
     pub offset_y: f32,
     pub offset_z: f32,
     pub offset_yaw: f32,
+    #[serde(default)]
+    pub view: bool,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq)]
@@ -1018,19 +1026,21 @@ pub struct MoveIntent {
     pub crouch: bool,
 }
 
-/// The actions an entity is holding: the main one (`Button::Use`) and the
-/// second (`Button::UseAlt`). What they do is the game's to decide; the
-/// engine only carries them from the input to the world (`World.actions`).
+/// The actions an entity is holding: the main one (`Button::Use`), the
+/// second (`Button::UseAlt`) and interact (`Button::Interact`). What they do
+/// is the game's to decide; the engine only carries them from the input to
+/// the world (`World.actions`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Actions {
     pub primary: bool,
     pub secondary: bool,
+    pub interact: bool,
 }
 
 impl Actions {
-    /// Whether either action is held.
+    /// Whether any action is held.
     pub fn any(&self) -> bool {
-        self.primary || self.secondary
+        self.primary || self.secondary || self.interact
     }
 }
 
@@ -1648,6 +1658,7 @@ impl World {
                     offset_y: child.offset_y,
                     offset_z: child.offset_z,
                     offset_yaw: child.offset_yaw,
+                    view: false,
                 },
             );
             self.spawn_prefab_children(child_id, root_position, &child.prefab);
