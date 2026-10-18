@@ -194,6 +194,24 @@ pub trait EditorModule {
         Vec::new()
     }
 
+    /// Whether this module has a panel for the Play window (see
+    /// `play_panel`). While any module has one, F1 in Play opens and closes
+    /// the panels. The default is no.
+    fn has_play_panel(&self) -> bool {
+        false
+    }
+
+    /// Draw this module's panel over Play, for one frame, while the panels
+    /// are open (F1 in Play). The mouse is free and the game takes no input
+    /// meanwhile. `world` is the running world, only to read: something the
+    /// panel wants changed is kept by the module and made in its own `tick`,
+    /// where it has the world to write, or sent on by the game to wherever
+    /// the world really runs (a multiplayer server, say). The default draws
+    /// nothing.
+    fn play_panel(&mut self, ctx: &egui::Context, world: &World) {
+        let _ = (ctx, world);
+    }
+
     /// Make this module's GPU state for one window.
     fn new_gpu(&self, gpu: &GpuContext) -> Box<dyn ModuleGpu>;
 }

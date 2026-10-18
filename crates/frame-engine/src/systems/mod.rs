@@ -138,6 +138,12 @@ pub fn collision(world: &mut World) {
 /// is deterministic and order-independent within a tick. It is a single pass, so
 /// deep stacks may take a few ticks to settle, fine at these scales. Uses the
 /// same axis-aligned scale-boxes as `collision`.
+///
+/// An entity riding a `Parent` and that parent never push each other: a
+/// carried thing overlapping its carrier (a held item swinging into the
+/// body holding it) would otherwise shove the carrier, and with it the
+/// carrier's camera, every tick. The rider still pushes and is pushed by
+/// everything else.
 pub fn resolve_collisions(world: &mut World) {
     // Snapshot each live entity's centre, half-extents, and static flag.
     let mut boxes: Vec<(usize, [f64; 3], [f64; 3], bool)> = Vec::new();
@@ -168,6 +174,15 @@ pub fn resolve_collisions(world: &mut World) {
             let (id_b, c_b, h_b, static_b) = boxes[j];
             if static_a && static_b {
                 continue; // neither can move
+            }
+            let rides = |rider: usize, carrier: usize| {
+                world
+                    .parents
+                    .get(rider)
+                    .is_some_and(|p| p.entity == carrier)
+            };
+            if rides(id_a, id_b) || rides(id_b, id_a) {
+                continue; // a carried thing and its carrier
             }
             // Overlap on each axis; if any is <= 0 the boxes don't intersect.
             let mut overlap = [0.0f64; 3];
@@ -515,12 +530,13 @@ pub fn input_movement(world: &mut World, input: &InputState) {
 }
 
 /// The actions held in `input` (`Button::Use`, `Button::UseAlt`,
-/// `Button::Interact`).
+/// `Button::Interact`, `Button::Swap`).
 fn held_actions(input: &InputState) -> Actions {
     Actions {
         primary: input.is_held(Button::Use),
         secondary: input.is_held(Button::UseAlt),
         interact: input.is_held(Button::Interact),
+        swap: input.is_held(Button::Swap),
     }
 }
 
@@ -929,6 +945,31 @@ mod tests {
                 .iter()
                 .all(|(p, q, _)| *p != far && *q != far)
         );
+    }
+
+    #[test]
+    fn a_rider_and_its_parent_do_not_push_each_other() {
+        use crate::world::Parent;
+        let mut world = World::new();
+        let body = at(&mut world, 0.0, 0.0, 0.0);
+        let held = at(&mut world, 0.0, 0.5, 0.0);
+        let bystander = at(&mut world, 0.0, 1.25, 0.0);
+        world.parents.insert(
+            held,
+            Parent {
+                entity: body,
+                offset_x: 0.0,
+                offset_y: 0.5,
+                offset_z: 0.0,
+                offset_yaw: 0.0,
+                view: false,
+            },
+        );
+        resolve_collisions(&mut world);
+        assert_eq!(world.positions.get(body).unwrap().y, 0.0);
+        // Still pushed by (and pushing) anything else.
+        assert!(world.positions.get(held).unwrap().y < 0.5);
+        assert!(world.positions.get(bystander).unwrap().y > 1.25);
     }
 
     #[test]

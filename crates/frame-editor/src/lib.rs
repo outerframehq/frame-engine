@@ -5037,6 +5037,9 @@ struct App {
     // Play window's frame timing. Off each time Play starts.
     show_play_stats: bool,
     play_perf: perf::FrameStats,
+    // Whether the modules' Play panels are open (F1 in Play; see
+    // `EditorModule::play_panel`). Closed each time Play starts.
+    play_panels_open: bool,
     // Why the editor is drawing every frame right now, or None when it only
     // draws on change (shown in the performance overlay).
     redraw_reason: Option<String>,
@@ -6633,6 +6636,7 @@ impl App {
         self.game_input = InputState::new();
         self.game_clock = Clock::new(TICK_RATE, MAX_CATCHUP_TICKS);
         self.show_play_stats = false;
+        self.play_panels_open = false;
         self.play_perf = perf::FrameStats::frames_only(std::time::Instant::now());
         self.game_egui_ctx = Some(game_egui_ctx);
         self.game_egui_state = Some(game_egui_state);
@@ -7114,20 +7118,28 @@ impl App {
         // why nothing moves when nothing in the scene is Controlled.
         // A game with its own menu goes back to it on the second Esc.
         let has_menu = self.game_menu.is_some();
-        let hint = (!self.game_mouse_held && menu.is_none()).then(|| {
+        let panels_open = self.play_panels_open;
+        let has_panels = self.modules.borrow().iter().any(|m| m.has_play_panel());
+        let hint = (!self.game_mouse_held && menu.is_none() && !panels_open).then(|| {
             if world.controlled.iter().flatten().next().is_none() {
                 "Nothing in this scene is Controlled: tick Controlled on your \
                  character in the editor and save (Ctrl+S). Esc closes."
+                    .to_string()
             } else if has_menu {
                 "Click to play: the mouse looks around, WASD moves, Shift runs, \
-                 C crouches, Space jumps, E picks up or puts down, the mouse \
-                 buttons use what you hold, F3 shows the numbers. Esc frees the mouse, Esc again opens the menu."
+                 C crouches, Space jumps, E picks up or puts down, Q uses the other \
+                 hand, the mouse buttons use what you hold, F3 shows the numbers. Esc frees the mouse, Esc again opens the menu."
+                    .to_string()
+                    + if has_panels { " F1 opens the game's panel." } else { "" }
             } else {
                 "Click to play: the mouse looks around, WASD moves, Shift runs, \
-                 C crouches, Space jumps, E picks up or puts down, the mouse \
-                 buttons use what you hold, F3 shows the numbers. Esc frees the mouse, Esc again closes."
+                 C crouches, Space jumps, E picks up or puts down, Q uses the other \
+                 hand, the mouse buttons use what you hold, F3 shows the numbers. Esc frees the mouse, Esc again closes."
+                    .to_string()
+                    + if has_panels { " F1 opens the game's panel." } else { "" }
             }
         });
+        let modules = &self.modules;
         let aiming = self.game_mouse_held;
         let full_output = ctx.run_ui(raw_input, |ui| {
             let screen = ui.max_rect();
@@ -7164,7 +7176,7 @@ impl App {
                             });
                     });
             }
-            if let Some(hint) = hint {
+            if let Some(hint) = &hint {
                 egui::Area::new(egui::Id::new("play-hint"))
                     .anchor(egui::Align2::CENTER_BOTTOM, egui::vec2(0.0, -24.0))
                     .order(egui::Order::Foreground)
@@ -7235,6 +7247,11 @@ impl App {
                     ui.add(egui::Image::new(handle).fit_to_exact_size(size));
                 });
             }
+            if panels_open && menu.is_none() {
+                for module in modules.borrow_mut().iter_mut() {
+                    module.play_panel(ui.ctx(), world);
+                }
+            }
             if let Some(menu) = menu.as_mut() {
                 action = menu.show(ui.ctx(), world, &mut settings);
             }
@@ -7281,9 +7298,31 @@ impl App {
         }
     }
 
+    /// Open the modules' Play panels, letting go of the mouse and every held
+    /// key, or close them and take the mouse back for looking around. Does
+    /// nothing when no module has a panel.
+    fn toggle_play_panels(&mut self) {
+        if self.play_panels_open {
+            self.play_panels_open = false;
+            if let Some(window) = &self.game_window {
+                grab_cursor(window, true);
+                window.request_redraw();
+            }
+            self.game_mouse_held = true;
+            return;
+        }
+        if !self.modules.borrow().iter().any(|m| m.has_play_panel()) {
+            return;
+        }
+        self.release_game_mouse();
+        self.game_input = InputState::new();
+        self.play_panels_open = true;
+    }
+
     /// Show the game's menu again over the running world, letting go of the
     /// mouse and every held key.
     fn open_game_menu(&mut self) {
+        self.play_panels_open = false;
         self.release_game_mouse();
         self.game_input = InputState::new();
         self.menu_open = true;
@@ -7301,6 +7340,7 @@ impl App {
         self.game_input.set(Button::Use, false);
         self.game_input.set(Button::UseAlt, false);
         self.game_input.set(Button::Interact, false);
+        self.game_input.set(Button::Swap, false);
     }
 
     /// Handle an event addressed to the game window.
@@ -7325,6 +7365,8 @@ impl App {
             // The menu takes the mouse for its own buttons (egui saw the
             // click above); nothing reaches the game.
             WindowEvent::MouseInput { .. } if self.menu_open => {}
+            // So do the panels (F1).
+            WindowEvent::MouseInput { .. } if self.play_panels_open => {}
             WindowEvent::MouseInput { state, button, .. } => {
                 let pressed = state == ElementState::Pressed;
                 if !self.game_mouse_held {
@@ -7365,6 +7407,17 @@ impl App {
                         }
                         // The menu's own keys are egui's; the game gets none.
                         _ if self.menu_open => {}
+                        // F1: the modules' panels (see `play_panel`). The
+                        // mouse is let go while they are open, and taken
+                        // back for looking around when they close.
+                        KeyCode::F1 if pressed && !event.repeat => self.toggle_play_panels(),
+                        // Esc closes the panels, leaving the mouse free.
+                        KeyCode::Escape if pressed && self.play_panels_open => {
+                            self.play_panels_open = false;
+                        }
+                        // While they are open, keys are theirs (typing in a
+                        // box), not the game's.
+                        _ if self.play_panels_open => {}
                         // Esc lets the mouse go; pressed again, it brings
                         // back the game's menu, or closes a game without one.
                         KeyCode::Escape if pressed => {
@@ -7388,6 +7441,7 @@ impl App {
                             self.game_input.set(Button::Crouch, pressed)
                         }
                         KeyCode::KeyE => self.game_input.set(Button::Interact, pressed),
+                        KeyCode::KeyQ => self.game_input.set(Button::Swap, pressed),
                         _ => {}
                     }
                 }
@@ -11523,6 +11577,7 @@ fn run_app(
         perf: perf::FrameStats::new(std::time::Instant::now()),
         show_play_stats: false,
         play_perf: perf::FrameStats::frames_only(std::time::Instant::now()),
+        play_panels_open: false,
         redraw_reason: None,
         idle_wake: None,
         wave_clock: None,
