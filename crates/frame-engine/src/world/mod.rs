@@ -1012,6 +1012,24 @@ impl Default for UiImage {
     }
 }
 
+/// Water, or any liquid, an entity is in this tick, as a game tells the
+/// engine through `World.liquids` (the engine has no water of its own; a
+/// module that draws rivers knows where they are). The physics step uses it:
+/// a falling body floats or sinks by its `density` and is slowed and carried
+/// by the liquid, and a character wades through it or swims in it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Liquid {
+    /// The height (world y) of the liquid's surface above the entity.
+    pub surface: f64,
+    /// How the liquid moves there, in metres a second (x, y, z): a river's
+    /// current, a flood's rush. Things in it are carried along.
+    pub flow: [f32; 3],
+    /// The entity's density as a share of the liquid's: below 1 floats (0.5
+    /// rides half under), 1 hangs where it is, above 1 sinks, slowed by the
+    /// liquid. Characters ignore it: they wade and swim instead.
+    pub density: f32,
+}
+
 /// What a physics-controlled entity asked to do this tick: move (dx, dz) in
 /// world units, and whether Jump is held. Whether it can actually move or
 /// jump is decided by the physics step, not here.
@@ -1027,20 +1045,21 @@ pub struct MoveIntent {
 }
 
 /// The actions an entity is holding: the main one (`Button::Use`), the
-/// second (`Button::UseAlt`) and interact (`Button::Interact`). What they do
-/// is the game's to decide; the engine only carries them from the input to
-/// the world (`World.actions`).
+/// second (`Button::UseAlt`), interact (`Button::Interact`) and swap
+/// (`Button::Swap`). What they do is the game's to decide; the engine only
+/// carries them from the input to the world (`World.actions`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Actions {
     pub primary: bool,
     pub secondary: bool,
     pub interact: bool,
+    pub swap: bool,
 }
 
 impl Actions {
     /// Whether any action is held.
     pub fn any(&self) -> bool {
-        self.primary || self.secondary || self.interact
+        self.primary || self.secondary || self.interact || self.swap
     }
 }
 
@@ -1246,6 +1265,17 @@ pub struct World {
     /// saved with the scene.
     #[serde(skip)]
     pub move_intents: std::collections::BTreeMap<usize, MoveIntent>,
+    /// The liquid each entity is in this tick, keyed by entity id: only
+    /// those in one. A game's module writes it in its tick (see `Liquid`)
+    /// and `physics::Physics::step` uses it up. Transient like
+    /// `move_intents`, never saved.
+    #[serde(skip)]
+    pub liquids: std::collections::BTreeMap<usize, Liquid>,
+    /// Characters swimming after the last physics step (in liquid deeper
+    /// than their chest), keyed by entity id: only those swimming. Rebuilt
+    /// every step like `grounded`.
+    #[serde(skip)]
+    pub swimming: std::collections::BTreeSet<usize>,
     /// The actions each controlled entity is holding this tick (see
     /// `Actions`), keyed by entity id: only those holding one. Written by the
     /// input systems, read by whatever acts on them (a game's tools, in a

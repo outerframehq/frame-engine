@@ -255,6 +255,64 @@ fn set_tide(tide: Option<f32>) {
 fn tide() -> f32 {
     f32::from_bits(TIDE_BITS.load(std::sync::atomic::Ordering::Relaxed))
 }
+/// The view under a liquid this frame (see `EditorModule::underwater`), with
+/// the eye's height, or None above it. Set before each window draws, like
+/// the tide.
+static UNDERWATER: std::sync::Mutex<Option<(module_api::Underwater, f64)>> =
+    std::sync::Mutex::new(None);
+fn set_underwater(view: Option<module_api::Underwater>, eye_y: f64) {
+    if let Ok(mut slot) = UNDERWATER.lock() {
+        *slot = view.map(|v| (v, eye_y));
+    }
+}
+fn underwater() -> Option<(module_api::Underwater, f64)> {
+    UNDERWATER.lock().ok().and_then(|slot| *slot)
+}
+/// How far fog under a liquid has to reach to all but hide a thing
+/// `Underwater::visibility` away: the fog lets through e to the minus this.
+const UNDERWATER_FOG: f32 = 3.0;
+/// How much of the sound gets through under a liquid: a low-pass cutoff in
+/// hertz, and how quickly it closes or opens when the head dips or comes up.
+const UNDERWATER_CUTOFF: f64 = 500.0;
+const UNDERWATER_EASE: std::time::Duration = std::time::Duration::from_millis(150);
+
+/// The sky's uniform turned to the inside of a liquid: every colour the
+/// liquid's, dimmed with the light, fog thick enough to hide things at the
+/// liquid's visibility, and no sun, clouds, moon or stars.
+fn under_liquid(
+    mut uniform: sky::SkyUniform,
+    view: module_api::Underwater,
+    eye_y: f64,
+) -> sky::SkyUniform {
+    let light = uniform.ground[3].clamp(0.06, 1.0);
+    let c = view.color.map(|v| v.clamp(0.0, 1.0) * light);
+    for field in [
+        &mut uniform.zenith,
+        &mut uniform.horizon,
+        &mut uniform.ground,
+        &mut uniform.sun_colour,
+    ] {
+        field[0] = c[0];
+        field[1] = c[1];
+        field[2] = c[2];
+    }
+    // The sky is drawn (it is the water all around); the sun's disc,
+    // twilight thinning, near haze, clouds, moon and stars are not.
+    uniform.zenith[3] = 1.0;
+    uniform.sun_direction[3] = 0.0;
+    uniform.sun_colour[3] = 0.0;
+    uniform.motion[3] = 0.0;
+    uniform.clouds[0] = 0.0;
+    uniform.moon[3] = 0.0;
+    uniform.night[2] = 0.0;
+    // The fog thins with height (`sky::FOG_HEIGHT_SCALE`): thickened back by
+    // as much at the eye's height, so a mountain lake is as murky as the
+    // sea.
+    let height = (eye_y.max(0.0) as f32 / sky::FOG_HEIGHT_SCALE).min(20.0);
+    uniform.horizon[3] = UNDERWATER_FOG / view.visibility.max(0.1) * height.exp();
+    uniform
+}
+
 fn set_view_reach(reach: Option<f64>) {
     let reach = reach.filter(|r| r.is_finite() && *r > 0.0).unwrap_or(0.0) as f32;
     VIEW_REACH_BITS.store(reach.to_bits(), std::sync::atomic::Ordering::Relaxed);
@@ -388,7 +446,10 @@ fn sky_uniform_for_frame(
         }
         None => uniform.ground[3] = 1.0,
     }
-    uniform
+    match underwater() {
+        Some((view, eye_y)) => under_liquid(uniform, view, eye_y),
+        None => uniform,
+    }
 }
 /// Work out the shadow map's view for this frame: an orthographic box,
 /// looking along the first shadow-casting directional light, sized to just
@@ -5199,6 +5260,10 @@ struct App {
     // opened (a headless CI box, say); Sound components still exist and
     // edit fine, they just never actually play without a manager.
     audio_manager: Option<kira::AudioManager<kira::DefaultBackend>>,
+    // A low-pass filter on everything heard, dry (off) until Play's camera
+    // is under a liquid, and whether it is on now.
+    audio_muffle: Option<kira::effect::filter::FilterHandle>,
+    muffled: bool,
     // Loaded sound files, keyed by their name as a Sound component names
     // them, so the same file is decoded once and every play() after that is
     // a cheap Arc-backed clone (see StaticSoundData's own docs), not a
@@ -6876,6 +6941,26 @@ impl App {
                 sun::set_module_wind(module_api::module_wind(&self.modules, world));
                 set_view_reach(module_api::module_view_distance(&self.modules, world));
                 set_tide(module_api::module_tide(&self.modules, world));
+                let under = module_api::module_underwater(&self.modules, world, game_viewer);
+                set_underwater(under, game_viewer[1]);
+                // Under water, sound is muffled.
+                if under.is_some() != self.muffled {
+                    self.muffled = under.is_some();
+                    if let Some(muffle) = self.audio_muffle.as_mut() {
+                        let mix = if self.muffled {
+                            kira::Mix::WET
+                        } else {
+                            kira::Mix::DRY
+                        };
+                        muffle.set_mix(
+                            mix,
+                            kira::Tween {
+                                duration: UNDERWATER_EASE,
+                                ..Default::default()
+                            },
+                        );
+                    }
+                }
                 (instances, group_counts, build_lights(world, game_origin))
             }
             None => return,
@@ -8934,6 +9019,15 @@ impl ApplicationHandler for App {
                 sun::set_module_wind(module_api::module_wind(&self.modules, &self.world));
                 set_view_reach(module_api::module_view_distance(&self.modules, &self.world));
                 set_tide(module_api::module_tide(&self.modules, &self.world));
+                let eye = self.viewer_world();
+                set_underwater(
+                    module_api::module_underwater(
+                        &self.modules,
+                        &self.world,
+                        [eye.x, eye.y, eye.z],
+                    ),
+                    eye.y,
+                );
                 let lights = build_lights(&self.world, view_origin);
                 // Features from editor modules. While a mouse button is held
                 // (dragging an Inspector slider, say) they keep showing what
@@ -11510,6 +11604,21 @@ fn run_app(
     set_cloud_amount(prefs.clouds);
     set_grass_quality(prefs.grass);
     apply_sun_prefs(&prefs);
+    // A missing/unusable audio device (headless, no default output) is a
+    // real, expected case, not a crash: the editor still runs, sounds just
+    // silently don't play, the same graceful-degradation the game window
+    // already gives a closed window. Everything heard goes through a
+    // low-pass filter, dry until it is wanted (under water).
+    let mut audio_settings = kira::AudioManagerSettings::<kira::DefaultBackend>::default();
+    let muffle = audio_settings.main_track_builder.add_effect(
+        kira::effect::filter::FilterBuilder::new()
+            .cutoff(UNDERWATER_CUTOFF)
+            .mix(kira::Mix::DRY),
+    );
+    let audio_manager = kira::AudioManager::<kira::DefaultBackend>::new(audio_settings)
+        .map_err(|e| eprintln!("Audio device unavailable, sounds won't play: {e:?}"))
+        .ok();
+    let audio_muffle = audio_manager.is_some().then_some(muffle);
     let mut app = App {
         window: None,
         gpu: None,
@@ -11651,15 +11760,9 @@ fn run_app(
         build_result: None,
         script_runtime: script::RhaiRuntime::new(),
         logo_texture: None,
-        // A missing/unusable audio device (headless, no default output) is a
-        // real, expected case, not a crash: the editor still runs, sounds
-        // just silently don't play, the same graceful-degradation the game
-        // window already gives a closed window.
-        audio_manager: kira::AudioManager::<kira::DefaultBackend>::new(
-            kira::AudioManagerSettings::default(),
-        )
-        .map_err(|e| eprintln!("Audio device unavailable, sounds won't play: {e:?}"))
-        .ok(),
+        audio_manager,
+        audio_muffle,
+        muffled: false,
         sound_cache: std::collections::HashMap::new(),
     };
     match player {
@@ -12287,6 +12390,44 @@ mod ambient_tests {
             [0.0; 2],
         );
         assert_eq!(uniform.ground[3], 1.0);
+    }
+
+    #[test]
+    fn under_a_liquid_everything_is_its_colour_in_a_thick_fog() {
+        let lights = [LightRaw::zeroed(); MAX_LIGHTS];
+        let above = sky_uniform_for_frame(
+            Mat4::IDENTITY.to_cols_array_2d(),
+            &lights,
+            true,
+            0.0,
+            [0.0; 2],
+            [0.0; 2],
+        );
+        let view = module_api::Underwater {
+            color: [0.1, 0.3, 0.35],
+            visibility: 12.0,
+        };
+        let under = under_liquid(above, view, 0.0);
+        for field in [under.zenith, under.horizon, under.ground, under.sun_colour] {
+            assert_eq!(&field[..3], &view.color[..], "lit by full daylight here");
+        }
+        assert!((under.horizon[3] - UNDERWATER_FOG / 12.0).abs() < 1e-6);
+        assert!(
+            under.horizon[3] > 100.0 * above.horizon[3],
+            "far thicker than air"
+        );
+        assert_eq!(
+            (under.sun_direction[3], under.clouds[0], under.motion[3]),
+            (0.0, 0.0, 0.0)
+        );
+        // Higher up the fog would thin; it is thickened back to match.
+        let lake = under_liquid(above, view, 1200.0);
+        assert!((lake.horizon[3] / under.horizon[3] - std::f32::consts::E).abs() < 1e-3);
+        // At night the water is dark.
+        let mut night = above;
+        night.ground[3] = 0.1;
+        let dark = under_liquid(night, view, 0.0);
+        assert!(dark.horizon[0] < 0.02);
     }
 }
 

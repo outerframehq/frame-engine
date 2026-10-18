@@ -32,7 +32,7 @@ pub(crate) const FOG_REFERENCE_DISTANCE: f32 = 1800.0;
 /// peak a few thousand units up stays clear while the lowland around it
 /// fades out, and a camera above the haze sees the ground below through it.
 /// The shader holds the working value; tests check this one matches it.
-#[cfg(test)]
+/// Fog under a liquid is thickened back by it (see `under_liquid`).
 pub(crate) const FOG_HEIGHT_SCALE: f32 = 1200.0;
 
 /// How thin the haze gets with the sun on the horizon: fog thickness is

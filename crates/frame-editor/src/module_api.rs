@@ -194,6 +194,15 @@ pub trait EditorModule {
         Vec::new()
     }
 
+    /// Whether `eye` (world space) is under a liquid this module has, and
+    /// if so how the view looks from there: a module with water says so
+    /// when the camera dips under it. Asked once a frame for each window
+    /// that draws. The default is never.
+    fn underwater(&mut self, world: &World, eye: [f64; 3]) -> Option<Underwater> {
+        let _ = (world, eye);
+        None
+    }
+
     /// Whether this module has a panel for the Play window (see
     /// `play_panel`). While any module has one, F1 in Play opens and closes
     /// the panels. The default is no.
@@ -222,6 +231,18 @@ pub struct SunOverride {
     /// Unit vector pointing toward the sun: X east, Y up, Z south. A negative
     /// Y puts the sun below the horizon, which is night.
     pub direction: [f32; 3],
+}
+
+/// What the view looks like with the eye under a liquid (see
+/// [`EditorModule::underwater`]): everything fades into the liquid's colour
+/// within `visibility`, and sound is muffled.
+#[derive(Copy, Clone, Debug, PartialEq)]
+pub struct Underwater {
+    /// The liquid's colour in daylight (linear RGB, 0 to 1). It darkens
+    /// with the light, so it is dark at night.
+    pub color: [f32; 3],
+    /// How far (m) one can see in it: things this far off are all but gone.
+    pub visibility: f32,
 }
 
 /// A moon supplied by a module (see [`EditorModule::moon`]).
@@ -1345,6 +1366,22 @@ pub(crate) fn module_view_distance(
         .filter_map(|m| m.view_distance(world))
         .filter(|r| r.is_finite() && *r > 0.0)
         .reduce(f64::max)
+}
+
+/// How the view looks from `eye`, from the first module that has it under a
+/// liquid (see [`EditorModule::underwater`]).
+pub(crate) fn module_underwater(
+    modules: &std::cell::RefCell<Vec<Box<dyn EditorModule>>>,
+    world: &World,
+    eye: [f64; 3],
+) -> Option<Underwater> {
+    modules
+        .borrow_mut()
+        .iter_mut()
+        .find_map(|module| module.underwater(world, eye))
+        .filter(|u| {
+            u.visibility.is_finite() && u.visibility > 0.0 && u.color.iter().all(|c| c.is_finite())
+        })
 }
 
 /// The tide, from the first module that keeps one (see

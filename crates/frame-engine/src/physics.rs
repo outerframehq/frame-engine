@@ -22,6 +22,17 @@
 //!   character turns to face the way it's going, at `TURN_SPEED`. Not yet:
 //!   pushing dynamic bodies, or moving relative to the entity's yaw.
 //!   `Controlled` together with `Static` is contradictory and skipped.
+//! - Liquids: a game says each tick which entities are in water (or any
+//!   liquid), how high its surface is and how it flows (`World.liquids`;
+//!   the engine has no water of its own). A dynamic body is lifted by the
+//!   share of it under the surface over its `Liquid::density`, so a light
+//!   one floats and a heavy one sinks, and is dragged towards the liquid's
+//!   own motion, so it slows down and drifts with the current
+//!   (`float_bodies`). A character in liquid up to its chest wades: slower
+//!   the deeper it is, pushed by the current. Deeper than that it swims:
+//!   no falling, it floats with its eyes just above the surface, Jump swims
+//!   up, Crouch dives, it moves at a share of its walking speed and the
+//!   current carries it all the way (see `move_characters`).
 //! - Orientation follows the full `Rotation` component (yaw, pitch and
 //!   roll). A `Static` body keeps whatever tilt it was given, so a tilted
 //!   ramp is a tilted collider. A dynamic body is free to tumble, and its
@@ -73,6 +84,32 @@ use crate::world::{Position, World};
 /// squared (a world unit is a metre): real gravity. Make it less negative for
 /// floatier falls and jumps.
 pub const GRAVITY_Y: f32 = -9.81;
+
+/// How strongly a liquid drags a body towards its own motion, per second,
+/// for a body all the way under. A brick twice as dense as water sinks at
+/// about 1.6 m/s with this.
+pub const LIQUID_DRAG: f32 = 3.0;
+/// How much faster a body's spin dies away in a liquid, per second.
+pub const LIQUID_SPIN_DRAG: f32 = 2.0;
+/// How deep a character's feet are in a liquid, as a share of its standing
+/// height, before it swims instead of wading: about the chest.
+pub const SWIM_DEPTH: f32 = 0.75;
+/// How far (m) above the surface a floating swimmer's eyes ride.
+pub const EYES_ABOVE_WATER: f32 = 0.12;
+/// Swimming speed as a share of walking (or running) speed.
+pub const SWIM_SPEED: f32 = 0.55;
+/// How fast a swimmer goes up (Jump) or down (Crouch), in m/s.
+pub const SWIM_CLIMB: f32 = 1.6;
+/// How quickly a swimmer's up and down speed comes to what it wants, per
+/// second: water takes the jolt out of falling in.
+pub const SWIM_EASE: f32 = 4.0;
+/// How much slower wading is at the deepest (just under the chest).
+pub const WADE_SLOWING: f32 = 0.5;
+/// How much of the current pushes a wading character at the deepest.
+pub const WADE_PUSH: f32 = 0.6;
+/// How high (m) a fresh Jump at the surface lifts a swimmer: enough to get
+/// up onto a low bank.
+pub const SWIM_HOP: f32 = 1.0;
 
 /// How fast a character turns to face the way it's moving, in radians per
 /// second. 10.0 is a snappy half turn in about a third of a second. Lower
@@ -229,6 +266,33 @@ fn capsule_for(body: &crate::world::CharacterBody, crouched: bool) -> (f32, f32)
 
 /// The controller settings for one character: its body's step height and
 /// steepest slope, or the defaults for a character with no body.
+/// A character in a liquid this step.
+#[derive(Clone, Copy, Debug)]
+struct Water {
+    liquid: crate::world::Liquid,
+    /// How deep its feet are under the surface (m).
+    depth: f32,
+    /// How deep the feet are when floating with the eyes just above.
+    float_depth: f32,
+    /// Whether it swims (deeper than its chest) rather than wades.
+    swimming: bool,
+    /// How deep, as a share of the swimming depth (0 to 1).
+    share: f32,
+}
+
+impl Water {
+    fn new(liquid: crate::world::Liquid, depth: f32, body: &crate::world::CharacterBody) -> Water {
+        let chest = SWIM_DEPTH * body.height;
+        Water {
+            liquid,
+            depth,
+            float_depth: (body.eye_height - EYES_ABOVE_WATER).max(chest),
+            swimming: depth >= chest,
+            share: (depth / chest).clamp(0.0, 1.0),
+        }
+    }
+}
+
 fn controller_for(body: Option<&crate::world::CharacterBody>) -> KinematicCharacterController {
     let mut controller = KinematicCharacterController {
         offset: CharacterLength::Absolute(SKIN),
@@ -360,7 +424,9 @@ impl Physics {
     /// rapier disagree with everything else about how much time a tick is.
     pub fn step(&mut self, world: &mut World, dt: f32) {
         self.sync_new_and_removed(world);
-        self.move_characters(world, dt);
+        let liquids = std::mem::take(&mut world.liquids);
+        self.move_characters(world, &liquids, dt);
+        self.float_bodies(&liquids, dt);
         self.rapier.integration_parameters.dt = f64::from(dt);
         self.rapier.step();
         self.write_back(world);
@@ -514,12 +580,72 @@ impl Physics {
     /// returns how far it can really go, then that is queued on the kinematic
     /// body for rapier's next step. Uses up all of `move_intents`, so a stale
     /// intent never carries over to the next tick.
-    fn move_characters(&mut self, world: &mut World, dt: f32) {
+    /// Lift, slow and carry every dynamic body in a liquid (see the module
+    /// doc comment), by changing its speed before the step: the step's own
+    /// gravity then pulls against the lift.
+    fn float_bodies(
+        &mut self,
+        liquids: &std::collections::BTreeMap<usize, crate::world::Liquid>,
+        dt: f32,
+    ) {
+        for (id, liquid) in liquids {
+            if self.characters.contains_key(id) {
+                continue;
+            }
+            let Some(&(body_handle, collider_handle)) = self.handles.get(id) else {
+                continue;
+            };
+            let Some(collider) = self.rapier.colliders.get(collider_handle) else {
+                continue;
+            };
+            let aabb = collider.compute_aabb();
+            let (bottom, top) = (aabb.mins.y, aabb.maxs.y);
+            let Some(body) = self.rapier.bodies.get_mut(body_handle) else {
+                continue;
+            };
+            if !body.is_dynamic() || !liquid.surface.is_finite() {
+                continue;
+            }
+            let under =
+                ((liquid.surface - bottom) / (top - bottom).max(1e-3)).clamp(0.0, 1.0) as f32;
+            if under <= 0.0 {
+                continue;
+            }
+            let density = if liquid.density.is_finite() {
+                liquid.density.max(0.05)
+            } else {
+                1.0
+            };
+            let lift = -self.gravity_y * under / density * dt;
+            let pull = (LIQUID_DRAG * under * dt).min(1.0);
+            let flow = liquid.flow.map(|f| if f.is_finite() { f } else { 0.0 });
+            let v = body.linvel();
+            let mut next = [v.x as f32, v.y as f32 + lift, v.z as f32];
+            for (axis, n) in next.iter_mut().enumerate() {
+                *n += (flow[axis] - *n) * pull;
+            }
+            body.set_linvel(
+                Vector::new(f64::from(next[0]), f64::from(next[1]), f64::from(next[2])),
+                true,
+            );
+            let spin = 1.0 - f64::from((LIQUID_SPIN_DRAG * under * dt).min(1.0));
+            let w = body.angvel();
+            body.set_angvel(w * spin, true);
+        }
+    }
+
+    fn move_characters(
+        &mut self,
+        world: &mut World,
+        liquids: &std::collections::BTreeMap<usize, crate::world::Liquid>,
+        dt: f32,
+    ) {
         // Rebuilt fresh every step from `self.characters`, the live set,
         // rather than left to accumulate stale entries for a despawned or
         // un-Controlled entity.
         world.grounded.clear();
         world.crouched.clear();
+        world.swimming.clear();
         let intents = std::mem::take(&mut world.move_intents);
         // The query pipeline borrows all of `self.rapier`, so a body can't be
         // changed while it's alive. Work out every move first, then apply.
@@ -533,10 +659,25 @@ impl Physics {
                 continue;
             };
             let body = world.characters.get(id).map(|b| b.sanitized());
-            let intent = intents.get(&id).copied().unwrap_or_default();
+            let mut intent = intents.get(&id).copied().unwrap_or_default();
             let jump_pressed = intent.jump && !character.jump_held;
             character.jump_held = intent.jump;
             let falls = world.gravities.get(id).is_some();
+            // In a liquid: how deep the feet are, wading or swimming.
+            let water = match (liquids.get(&id), &body, character.capsule) {
+                (Some(liquid), Some(body), Some((half, radius))) if falls => {
+                    let feet = collider.position().translation.y - f64::from(half + radius);
+                    let depth = (liquid.surface - feet) as f32;
+                    (depth > 0.0).then(|| Water::new(*liquid, depth, body))
+                }
+                _ => None,
+            };
+            let swimming = water.is_some_and(|w| w.swimming);
+            // Crouch dives while swimming; it doesn't shrink the body.
+            let dive = swimming && intent.crouch;
+            if swimming {
+                intent.crouch = false;
+            }
             let filter = QueryFilter::default().exclude_rigid_body(body_handle);
             let queries = self.rapier.query_pipeline_with_filter(filter);
 
@@ -575,7 +716,23 @@ impl Physics {
                 world.crouched.insert(id, crouched);
             }
 
-            if falls && !character.grounded {
+            if let (Some(w), true) = (water, swimming) {
+                // Swimming: no falling. Up and down eases towards what is
+                // asked: Jump up, Crouch down, else float with the eyes
+                // just above the surface.
+                let want = if intent.jump {
+                    SWIM_CLIMB
+                } else if dive {
+                    -SWIM_CLIMB
+                } else {
+                    ((w.depth - w.float_depth) * 2.0).clamp(-1.0, 1.0)
+                };
+                character.fall_speed += (want - character.fall_speed) * (SWIM_EASE * dt).min(1.0);
+                if jump_pressed && w.depth < w.float_depth + 0.2 {
+                    // At the surface, a fresh Jump hops up: out onto a bank.
+                    character.fall_speed = (2.0 * -self.gravity_y * SWIM_HOP).sqrt();
+                }
+            } else if falls && !character.grounded {
                 // Only build up falling speed in the air. Pushing down into
                 // the floor every tick while standing makes a box snag on it
                 // and stutter when walking; `snap_to_ground` keeps it on the
@@ -584,7 +741,7 @@ impl Physics {
             } else {
                 character.fall_speed = 0.0;
             }
-            if falls && character.grounded && jump_pressed {
+            if falls && character.grounded && jump_pressed && !swimming {
                 // Launch speed that peaks at the jump height under this
                 // gravity, from v^2 = 2 * g * h. Moving in whole ticks
                 // overshoots a little.
@@ -595,8 +752,20 @@ impl Physics {
             // Across the ground: on the ground (or with no body) the
             // character goes where it asks; in the air it keeps its speed,
             // steering only as much as its body's `air_control` allows.
-            let wanted = [intent.dx / dt, intent.dz / dt];
-            let airborne = falls && !character.grounded;
+            let mut wanted = [intent.dx / dt, intent.dz / dt];
+            if let Some(w) = water {
+                // Slower in water, and carried by it.
+                let (speed, push) = if w.swimming {
+                    (SWIM_SPEED, 1.0)
+                } else {
+                    (1.0 - WADE_SLOWING * w.share, WADE_PUSH * w.share)
+                };
+                wanted = [
+                    wanted[0] * speed + w.liquid.flow[0] * push,
+                    wanted[1] * speed + w.liquid.flow[2] * push,
+                ];
+            }
+            let airborne = falls && !character.grounded && !swimming;
             match &body {
                 Some(body) if airborne => {
                     let steer = (body.air_control * 10.0 * dt).min(1.0);
@@ -614,7 +783,11 @@ impl Physics {
 
             let mut pose = *collider.position();
             pose.translation += Vector::new(0.0, f64::from(shift), 0.0);
-            let controller = controller_for(body.as_ref());
+            let mut controller = controller_for(body.as_ref());
+            if swimming {
+                // Floating, not walking: nothing pulls it down onto the bed.
+                controller.snap_to_ground = None;
+            }
             let movement = controller.move_shape(
                 f64::from(dt),
                 &queries,
@@ -626,7 +799,10 @@ impl Physics {
 
             character.grounded = movement.grounded;
             world.grounded.insert(id, character.grounded);
-            if movement.grounded && character.fall_speed < 0.0 {
+            if swimming {
+                world.swimming.insert(id);
+            }
+            if movement.grounded && character.fall_speed < 0.0 && !swimming {
                 // Landed: stop building up speed while standing still.
                 character.fall_speed = 0.0;
             }
@@ -1157,6 +1333,188 @@ mod tests {
     fn feet(world: &World, id: usize, crouched: bool) -> f64 {
         let body = crate::world::CharacterBody::default();
         world.positions.get(id).unwrap().y - f64::from(body.height_now(crouched)) * 0.5
+    }
+
+    /// A pool: a deep floor at y = -10 and water up to y = 0, `flow` m/s.
+    fn water(surface: f64, flow: [f32; 3], density: f32) -> crate::world::Liquid {
+        crate::world::Liquid {
+            surface,
+            flow,
+            density,
+        }
+    }
+
+    /// A 0.4 m falling box at `y`, over a floor at y = -10.
+    fn floater(world: &mut World, y: f64) -> usize {
+        block(world, [0.0, -10.0, 0.0], [40.0, 1.0, 40.0]);
+        let id = world.spawn(
+            Position { x: 0.0, y, z: 0.0 },
+            Velocity {
+                dx: 0.0,
+                dy: 0.0,
+                dz: 0.0,
+            },
+        );
+        world.scales.insert(
+            id,
+            crate::world::Scale {
+                x: 0.4,
+                y: 0.4,
+                z: 0.4,
+            },
+        );
+        world.gravities.insert(id, Gravity);
+        world.rigid_bodies.insert(id, crate::world::RigidBody);
+        id
+    }
+
+    /// Step `ticks` ticks with `id` in `liquid` the whole time.
+    fn soak(
+        physics: &mut Physics,
+        world: &mut World,
+        id: usize,
+        liquid: crate::world::Liquid,
+        ticks: usize,
+    ) {
+        for _ in 0..ticks {
+            world.liquids.insert(id, liquid);
+            physics.step(world, 1.0 / 30.0);
+        }
+    }
+
+    #[test]
+    fn a_light_body_floats_riding_as_deep_as_its_density() {
+        let mut world = World::new();
+        let id = floater(&mut world, -3.0);
+        let mut physics = Physics::new(GRAVITY_Y);
+        soak(&mut physics, &mut world, id, water(0.0, [0.0; 3], 0.5), 300);
+        let y = world.positions.get(id).unwrap().y;
+        // Half under: its middle at the surface.
+        assert!(y.abs() < 0.05, "floating at {y}");
+    }
+
+    #[test]
+    fn a_heavy_body_sinks_slower_than_it_falls_through_air() {
+        let mut world = World::new();
+        let id = floater(&mut world, -0.5);
+        let mut physics = Physics::new(GRAVITY_Y);
+        soak(&mut physics, &mut world, id, water(0.0, [0.0; 3], 2.0), 30);
+        let sunk = -0.5 - world.positions.get(id).unwrap().y;
+        // A second's fall through air would be 4.9 m.
+        assert!(sunk > 0.5 && sunk < 2.5, "sank {sunk} m in a second");
+        soak(&mut physics, &mut world, id, water(0.0, [0.0; 3], 2.0), 300);
+        let y = world.positions.get(id).unwrap().y;
+        assert!((y - (-9.8)).abs() < 0.05, "on the bottom: {y}");
+    }
+
+    #[test]
+    fn a_current_carries_what_is_in_it() {
+        let mut world = World::new();
+        let id = floater(&mut world, 0.0);
+        let mut physics = Physics::new(GRAVITY_Y);
+        soak(
+            &mut physics,
+            &mut world,
+            id,
+            water(0.0, [2.0, 0.0, 0.0], 0.5),
+            90,
+        );
+        let x = world.positions.get(id).unwrap().x;
+        // Three seconds at up to 2 m/s, once up to speed.
+        assert!(x > 4.0 && x < 6.1, "carried {x} m");
+    }
+
+    /// A character on a floor at y = 0 in water up to `surface`.
+    fn bather(surface: f64) -> (World, usize, Physics, crate::world::Liquid) {
+        let mut world = World::new();
+        let id = walker(&mut world);
+        let mut physics = Physics::new(GRAVITY_Y);
+        run(&mut physics, &mut world, id, walk(0.0), 10);
+        (world, id, physics, water(surface, [0.0; 3], 1.0))
+    }
+
+    fn bathe(
+        physics: &mut Physics,
+        world: &mut World,
+        id: usize,
+        liquid: crate::world::Liquid,
+        intent: MoveIntent,
+        ticks: usize,
+    ) {
+        for _ in 0..ticks {
+            world.liquids.insert(id, liquid);
+            world.move_intents.insert(id, intent);
+            physics.step(world, 1.0 / 30.0);
+        }
+    }
+
+    #[test]
+    fn deep_water_floats_a_character_with_its_eyes_above_and_jump_and_crouch_swim() {
+        let (mut world, id, mut physics, deep) = bather(3.0);
+        bathe(&mut physics, &mut world, id, deep, walk(0.0), 150);
+        let body = crate::world::CharacterBody::default();
+        let eyes = feet(&world, id, false) + f64::from(body.eye_height);
+        assert!(
+            (eyes - 3.0 - f64::from(EYES_ABOVE_WATER)).abs() < 0.05,
+            "eyes at {eyes}"
+        );
+        assert!(world.swimming.contains(&id));
+        assert!(
+            !world.crouched.get(&id).copied().unwrap_or(false),
+            "diving is not crouching"
+        );
+        // Crouch dives, Jump comes back up.
+        let dive = MoveIntent {
+            crouch: true,
+            ..Default::default()
+        };
+        bathe(&mut physics, &mut world, id, deep, dive, 30);
+        let down = feet(&world, id, false);
+        assert!(
+            down < 3.0 - f64::from(body.eye_height) - 1.0,
+            "dived to {down}"
+        );
+        let up = MoveIntent {
+            jump: true,
+            ..Default::default()
+        };
+        bathe(&mut physics, &mut world, id, deep, up, 45);
+        let rose = feet(&world, id, false);
+        assert!(rose > down + 1.0, "{down} then {rose}");
+        // Swimming is slower than walking.
+        let start = world.positions.get(id).unwrap().x;
+        bathe(&mut physics, &mut world, id, deep, walk(1.4), 30);
+        let swam = world.positions.get(id).unwrap().x - start;
+        assert!(
+            (swam - 1.4 * f64::from(SWIM_SPEED)).abs() < 0.15,
+            "swam {swam} m in a second"
+        );
+    }
+
+    #[test]
+    fn a_strong_current_carries_a_swimmer_off_and_pushes_a_wader() {
+        let (mut world, id, mut physics, _) = bather(3.0);
+        let flood = water(3.0, [0.0, 0.0, 3.0], 1.0);
+        // Swimming against it at full effort: still carried away.
+        let against = MoveIntent {
+            dz: -5.0 / 30.0,
+            ..Default::default()
+        };
+        bathe(&mut physics, &mut world, id, flood, against, 60);
+        let z = world.positions.get(id).unwrap().z;
+        assert!(z > 0.3, "carried downstream to {z}");
+        // Knee deep: walking, a little slower, nudged.
+        let (mut world, id, mut physics, _) = bather(0.5);
+        let stream = water(0.5, [0.0, 0.0, 1.0], 1.0);
+        bathe(&mut physics, &mut world, id, stream, walk(1.4), 30);
+        let p = *world.positions.get(id).unwrap();
+        assert!(!world.swimming.contains(&id), "wading");
+        assert!(p.x > 0.9 && p.x < 1.4, "slower: {}", p.x);
+        assert!(p.z > 0.05, "pushed: {}", p.z);
+        assert!(
+            feet(&world, id, false).abs() < 0.05,
+            "standing on the floor"
+        );
     }
 
     #[test]
