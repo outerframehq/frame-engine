@@ -170,6 +170,8 @@ struct InputUpload {
     secondary: bool,
     #[serde(default)]
     interact: bool,
+    #[serde(default)]
+    swap: bool,
 }
 
 /// Serialize `message` and write it framed. False if either step fails.
@@ -464,6 +466,7 @@ impl Server {
                 input.set(Button::Use, upload.primary);
                 input.set(Button::UseAlt, upload.secondary);
                 input.set(Button::Interact, upload.interact);
+                input.set(Button::Swap, upload.swap);
                 if let Some((yaw, pitch)) = upload.look {
                     input.set_look(yaw, pitch);
                 }
@@ -564,6 +567,7 @@ impl Client {
             primary: input.is_held(Button::Use),
             secondary: input.is_held(Button::UseAlt),
             interact: input.is_held(Button::Interact),
+            swap: input.is_held(Button::Swap),
         };
         let Ok(payload) = ron::ser::to_string_pretty(&upload, ron::ser::PrettyConfig::default())
         else {

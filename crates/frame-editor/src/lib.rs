@@ -159,6 +159,8 @@ struct LightRaw {
     // intensity, 0.0 marks an unused slot. w: 1.0 if this light casts the
     // scene's shadow (the first directional light), else 0.0.
     params: [f32; 4],
+    // rgb: the light's colour (see `Light::color`). w unused.
+    color: [f32; 4],
 }
 // A fixed number of simultaneously active lights sent to the shader every
 // frame, unused slots zeroed (intensity 0.0), matching MAX_LIGHTS in
@@ -3965,6 +3967,10 @@ fn inspector_tab_ui(
                         ui.horizontal(|ui| {
                             ui.label("Range");
                             ui.add(egui::DragValue::new(range).speed(1.0).range(0.0..=f32::MAX));
+                        });
+                        ui.horizontal(|ui| {
+                            ui.label("Colour");
+                            ui.color_edit_button_rgb(&mut l.color);
                         });
                     }
                 }
@@ -11152,13 +11158,29 @@ fn build_lights(world: &World, origin: DVec3) -> [LightRaw; MAX_LIGHTS] {
     let mut count = 0usize;
     // Only the first directional light casts the scene's shadow.
     let mut shadow_caster_assigned = false;
-    for (id, slot) in world.lights.iter().enumerate() {
+    // Directional lights first (a sun lights everything), then point lights
+    // nearest the view first: with only MAX_LIGHTS slots, a campfire beside
+    // the player wins over one across the valley.
+    let away = |id: usize| {
+        world.positions.get(id).map_or(f64::MAX, |p| {
+            (DVec3::new(p.x, p.y, p.z) - origin).length_squared()
+        })
+    };
+    let mut order: Vec<(bool, f64, usize, &Light)> = world
+        .lights
+        .iter()
+        .enumerate()
+        .filter_map(|(id, slot)| slot.as_ref().map(|l| (id, l)))
+        .map(|(id, l)| {
+            let point = matches!(l.kind, LightKind::Point { .. });
+            (point, if point { away(id) } else { 0.0 }, id, l)
+        })
+        .collect();
+    order.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.total_cmp(&b.1)).then(a.2.cmp(&b.2)));
+    for (_, _, id, light) in order {
         if count >= MAX_LIGHTS {
             break;
         }
-        let Some(light) = slot.as_ref() else {
-            continue;
-        };
         let (position_or_direction, kind_flag, range) = match light.kind {
             LightKind::Directional { direction } => {
                 ([direction[0], direction[1], direction[2], 0.0], 0.0, 0.0)
@@ -11189,6 +11211,7 @@ fn build_lights(world: &World, origin: DVec3) -> [LightRaw; MAX_LIGHTS] {
                 light.intensity,
                 if casts_shadow { 1.0 } else { 0.0 },
             ],
+            color: [light.color[0], light.color[1], light.color[2], 1.0],
         };
         count += 1;
     }
@@ -11894,18 +11917,21 @@ mod prefs_tests {
         lights[0] = LightRaw {
             position_or_direction: [5.0, 5.0, 5.0, 0.0],
             params: [1.0, 50.0, 1.0, 0.0],
+            color: [1.0; 4],
         };
         assert_eq!(sun_direction(&lights), None);
         // A directional light that is not the shadow caster still counts...
         lights[1] = LightRaw {
             position_or_direction: [0.0, 1.0, 0.0, 0.0],
             params: [0.0, 0.0, 1.0, 0.0],
+            color: [1.0; 4],
         };
         assert_eq!(sun_direction(&lights), Some([0.0, 1.0, 0.0]));
         // ...but the shadow caster wins.
         lights[2] = LightRaw {
             position_or_direction: [1.0, 0.5, 0.0, 0.0],
             params: [0.0, 0.0, 1.0, 1.0],
+            color: [1.0; 4],
         };
         assert_eq!(sun_direction(&lights), Some([1.0, 0.5, 0.0]));
         // A switched-off light (intensity 0) is not a sun.
@@ -11913,6 +11939,7 @@ mod prefs_tests {
         off[0] = LightRaw {
             position_or_direction: [0.0, 1.0, 0.0, 0.0],
             params: [0.0, 0.0, 0.0, 0.0],
+            color: [1.0; 4],
         };
         assert_eq!(sun_direction(&off), None);
     }
@@ -12138,6 +12165,7 @@ mod shadow_fit_tests {
         lights[0] = LightRaw {
             position_or_direction: [-1.0, 1.0, 0.1, 0.0],
             params: [0.0, 0.0, 1.0, 1.0],
+            color: [1.0; 4],
         };
         lights
     }
@@ -12336,11 +12364,42 @@ mod far_from_the_origin_tests {
             Light {
                 kind: LightKind::Point { range: 30.0 },
                 intensity: 1.0,
+                color: [1.0; 3],
             },
         );
         let origin = origin::snap(DVec3::new(2.0e7, 0.0, 2.0e7));
         let lights = build_lights(&world, origin);
         assert_eq!(lights[0].position_or_direction[..3], [2.0, 4.0, -6.0]);
+    }
+
+    #[test]
+    fn the_sun_comes_first_then_the_nearest_point_lights_in_their_colours() {
+        use frame_engine::world::{Light, LightKind};
+        let mut world = World::new();
+        let point = |world: &mut World, x: f64, color: [f32; 3]| {
+            let id = spawn_at(world, x, 0.0, 0.0);
+            world.lights.insert(
+                id,
+                Light {
+                    kind: LightKind::Point { range: 10.0 },
+                    intensity: 1.0,
+                    color,
+                },
+            );
+        };
+        // Five campfires, nearest last, and a sun.
+        for (x, c) in [(50.0, 0.5), (40.0, 0.4), (30.0, 0.3), (20.0, 0.2), (10.0, 0.1)] {
+            point(&mut world, x, [c, c, c]);
+        }
+        let sun = spawn_at(&mut world, 0.0, 0.0, 0.0);
+        world.lights.insert(sun, Light::default());
+        let lights = build_lights(&world, DVec3::ZERO);
+        assert_eq!(lights[0].params[0], 0.0, "the sun first");
+        let near: Vec<f32> = lights[1..].iter().map(|l| l.color[0]).collect();
+        assert_eq!(near, vec![0.1, 0.2, 0.3], "then the three nearest, in order");
+        // A saved scene from before colour is white.
+        let old: Light = ron::from_str("(kind: Point(range: 5.0), intensity: 1.0)").unwrap();
+        assert_eq!(old.color, [1.0; 3]);
     }
 
     #[test]

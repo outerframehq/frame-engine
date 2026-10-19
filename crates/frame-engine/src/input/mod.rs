@@ -27,6 +27,9 @@ pub enum Button {
     /// or put it down, say. The game decides what it does, and whether a
     /// press or holding it counts.
     Interact,
+    /// Swap, while held: move what is in hand to the other hand, or the
+    /// game's own idea of a swap. The game decides what it does.
+    Swap,
 }
 
 /// Which logical buttons are currently held. Plain runtime state, refreshed by

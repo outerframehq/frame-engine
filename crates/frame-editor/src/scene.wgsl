@@ -37,6 +37,9 @@ struct Light {
     // z: intensity, a brightness multiplier; 0.0 means "unused slot".
     // w: 1.0 if this light casts the scene's shadow, else 0.0.
     params: vec4<f32>,
+    // rgb: the light's colour (a point light's own; a directional light
+    // takes the sky's tint instead). w unused.
+    color: vec4<f32>,
 };
 
 const MAX_LIGHTS: u32 = 4u;

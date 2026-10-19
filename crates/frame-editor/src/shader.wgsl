@@ -193,6 +193,9 @@ fn shade_fragment(in: VertexOutput) -> vec3<f32> {
     // the day-night cycle has dimmed it for night (a zero means "not set").
     let ambient = 0.4 * select(sky.ground.w, 1.0, sky.ground.w <= 0.0);
     var accumulated: f32 = ambient;
+    // Point lights in their own colour (a campfire's orange), kept apart
+    // from the sky's light, which takes the day's or night's tint.
+    var points = vec3<f32>(0.0);
     let normal = normalize(in.world_normal);
     for (var i: u32 = 0u; i < MAX_LIGHTS; i = i + 1u) {
         let light = lights.lights[i];
@@ -229,7 +232,12 @@ fn shade_fragment(in: VertexOutput) -> vec3<f32> {
         if (light.params.w > 0.5) {
             diffuse = diffuse * shadow_factor(in.world_position, normal);
         }
-        accumulated = accumulated + diffuse * attenuation * intensity * mix(1.0, 1.3, metalness);
+        let amount = diffuse * attenuation * intensity * mix(1.0, 1.3, metalness);
+        if (kind < 0.5) {
+            accumulated = accumulated + amount;
+        } else {
+            points = points + amount * light.color.rgb;
+        }
     }
     let shade = min(accumulated, 1.0);
 
@@ -243,7 +251,7 @@ fn shade_fragment(in: VertexOutput) -> vec3<f32> {
     // blends between normal shading and full unlit brightness, so a high
     // emissive value makes an entity glow, ignoring every light. The
     // selected entity is then brightened toward white so it stands out.
-    let shaded = base_color * shade_metal_adjusted * light_tint();
+    let shaded = base_color * min(shade_metal_adjusted * light_tint() + points, vec3<f32>(1.2));
 
     let lit = mix(shaded, base_color, in.emissive);
     let highlighted = mix(lit, vec3<f32>(1.0, 1.0, 1.0), 0.3 * in.selected);
@@ -288,6 +296,10 @@ const WAVE_PERIOD: f32 = 4096.0;
 const FLOW_CYCLE: f32 = 2.0;
 const RUNNING_SCALE: f32 = 3.0;
 const RAPID_SPEED: f32 = 3.0;
+// How much ground (m) one pixel may cover before running water's ripples
+// (the shortest about a metre long) fade out, so they never alias into
+// stripes.
+const RIPPLE_PIXEL: f32 = 0.3;
 const TAU: f32 = 6.2831853;
 
 // The slope (x and z) of one wave at `p` after `t` seconds. `cycles` is how
@@ -357,7 +369,17 @@ fn liquid(in: VertexOutput, thin: f32, alpha: f32, ripples: f32) -> vec4<f32> {
     // weighted so each fades out before it restarts: the ripples move
     // downstream without ever stretching.
     let speed = length(in.flow);
-    let running = smoothstep(0.05, 0.4, speed);
+    // Where the ripples would only make stripes, they give way to the
+    // waves: where they are finer than a pixel (far off, or seen low), and
+    // where the flow changes so fast from one spot to the next that carrying
+    // them squeezes them into bands. `seen` is how much ground a pixel
+    // covers (m); `squeeze` how far the carried ripples shift across one
+    // pixel, for each metre of it.
+    let seen = length(fwidth(in.world_position.xz));
+    let squeeze = length(fwidth(in.flow)) * FLOW_CYCLE / max(seen, 1e-3);
+    let resolved = (1.0 - smoothstep(RIPPLE_PIXEL * 0.5, RIPPLE_PIXEL, seen))
+        * (1.0 - smoothstep(0.25, 0.75, squeeze));
+    let running = smoothstep(0.05, 0.4, speed) * resolved;
     var white = 0.0;
     if (running > 0.0) {
         let phase = fract(sky.motion.x / FLOW_CYCLE);
@@ -372,7 +394,7 @@ fn liquid(in: VertexOutput, thin: f32, alpha: f32, ripples: f32) -> vec4<f32> {
         // White water where it runs fast: streaks drawn out along the flow,
         // carried with it.
         let rapid = smoothstep(RAPID_SPEED, 2.0 * RAPID_SPEED, speed)
-            * (1.0 - smoothstep(300.0, 3000.0, dist));
+            * (1.0 - smoothstep(300.0, 3000.0, dist)) * resolved;
         if (rapid > 0.0) {
             let along = in.flow / speed;
             let foam_a = white_water(p_wave - carried * phase, along);
@@ -930,9 +952,30 @@ fn grass_light(world_position: vec3<f32>, normal: vec3<f32>) -> f32 {
         if (light.params.w > 0.5) {
             lit = lit * shadow_factor(world_position, vec3<f32>(0.0, 1.0, 0.0));
         }
-        total = total + lit * attenuation * intensity;
+        if (light.params.x < 0.5) {
+            total = total + lit * attenuation * intensity;
+        }
     }
     return min(total, 1.25);
+}
+
+// The point lights on a blade, in their own colours (see `shade_fragment`).
+fn grass_point_light(world_position: vec3<f32>, normal: vec3<f32>) -> vec3<f32> {
+    var total = vec3<f32>(0.0);
+    for (var i: u32 = 0u; i < MAX_LIGHTS; i = i + 1u) {
+        let light = lights.lights[i];
+        let intensity = light.params.z;
+        if (intensity <= 0.0 || light.params.x < 0.5) {
+            continue;
+        }
+        let to_light = light.position_or_direction.xyz - world_position;
+        let dist = length(to_light);
+        let facing = dot(normal, to_light / max(dist, 0.0001));
+        let lit = clamp(facing * 0.6 + 0.4, 0.0, 1.0) + 0.35 * max(-facing, 0.0);
+        let attenuation = clamp(1.0 - dist / max(light.params.y, 0.0001), 0.0, 1.0);
+        total = total + lit * attenuation * intensity * light.color.rgb;
+    }
+    return total;
 }
 
 // Light on flat ground as the solid shader gives it (rough, facing up), for
@@ -967,7 +1010,7 @@ fn fs_grass(in: GrassVarying) -> @location(0) vec4<f32> {
     let far = smoothstep(0.35 * grass.range, 0.9 * grass.range, distance);
     let gradient = mix(mix(0.32, 1.2, pow(in.along, 0.8)), 1.0, far);
     let light = mix(grass_light(in.world_position, normal), grass_ground_light(in.world_position), far);
-    var colour = in.color * gradient * light * light_tint();
+    var colour = in.color * gradient * (light * light_tint() + grass_point_light(in.world_position, normal));
     // Looking toward the sun, the tips glow as light comes through them.
     let to_eye = normalize(sky.eye.xyz - in.world_position);
     let against = max(dot(-to_eye, sky.sun_direction.xyz), 0.0);

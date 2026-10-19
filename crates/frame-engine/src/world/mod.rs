@@ -896,6 +896,16 @@ pub struct Light {
     /// active lights will usually want each dimmer than that, or the
     /// combined shading blows out past full white.
     pub intensity: f32,
+    /// The point light's colour (linear RGB, 0 to 1): a campfire's warm
+    /// orange, say. White by default, and for a scene saved before it
+    /// existed. A directional light takes the sky's colour instead (the
+    /// day's light, or the night's).
+    #[serde(default = "white_light")]
+    pub color: [f32; 3],
+}
+
+fn white_light() -> [f32; 3] {
+    [1.0, 1.0, 1.0]
 }
 
 impl Default for Light {
@@ -903,6 +913,7 @@ impl Default for Light {
         Light {
             kind: LightKind::default(),
             intensity: 1.0,
+            color: white_light(),
         }
     }
 }

@@ -1119,6 +1119,9 @@ pub struct Placement {
     /// Multiplies the mesh's colour (its material's texture), so copies of
     /// one mesh can differ a little. White leaves it as it is.
     pub color: [f32; 3],
+    /// How much it glows, 0 lit as usual to 1 its own colour whatever the
+    /// light (a flame, an ember), as an entity's `Material::emissive`.
+    pub glow: f32,
 }
 
 impl Placement {
@@ -1130,6 +1133,7 @@ impl Placement {
             rotation: [0.0; 3],
             scale: [1.0; 3],
             color: [1.0; 3],
+            glow: 0.0,
         }
     }
 }
@@ -1210,6 +1214,35 @@ impl WorldInstances {
         ))
     }
 
+    /// Move the copies to `placements`, around a new `anchor`: for things
+    /// that change every frame (flames, smoke). Reuses the buffer when they
+    /// fit in it, and makes a bigger one when not. Writes them at once at
+    /// the render origin last set, so they are ready to draw.
+    pub fn replace(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        anchor: [f64; 3],
+        placements: &[Placement],
+    ) {
+        let needed = (placements.len().max(1) * std::mem::size_of::<InstanceRaw>()) as u64;
+        if needed > self.buffer.size() {
+            self.buffer = device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("module instances"),
+                size: needed,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        }
+        self.anchor = anchor;
+        self.count = placements.len() as u32;
+        self.placements = placements.to_vec();
+        if let Some(origin) = self.origin {
+            let raw = raw_instances(anchor, origin, &self.placements);
+            queue.write_buffer(&self.buffer, 0, bytemuck::cast_slice(&raw));
+        }
+    }
+
     /// GPU memory the placements take, in bytes.
     pub fn bytes(&self) -> u64 {
         self.buffer.size()
@@ -1237,7 +1270,7 @@ fn raw_instances(anchor: [f64; 3], origin: [f64; 3], placements: &[Placement]) -
             color: p.color,
             selected: 0.0,
             scale: p.scale.map(|s| s / QUAD_SIZE),
-            emissive: 0.0,
+            emissive: p.glow.clamp(0.0, 1.0),
             rotation: p.rotation,
         })
         .collect()
@@ -1849,6 +1882,7 @@ mod tests {
         lights[0] = LightRaw {
             position_or_direction: [-1.0, 1.0, 0.1, 0.0],
             params: [0.0, 0.0, 1.0, 1.0],
+            color: [1.0; 4],
         };
         let view = Mat4::look_at_rh(Vec3::new(0.0, 30.0, 60.0), Vec3::ZERO, Vec3::Y);
         let proj = camera_projection(16.0 / 9.0);
@@ -2123,6 +2157,7 @@ fn fs_custom(@builtin(position) at: vec4<f32>) -> @location(0) vec4<f32> {{
                 rotation: [1.0, 0.0, 0.5],
                 scale: [2.0, 3.0, 2.0],
                 color: [0.5, 0.8, 0.5],
+                glow: 0.0,
             },
         ];
         let raw = raw_instances(anchor, origin, &placements);

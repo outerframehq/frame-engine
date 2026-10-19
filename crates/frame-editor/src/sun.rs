@@ -263,6 +263,7 @@ mod tests {
         LightRaw {
             position_or_direction: [direction[0], direction[1], direction[2], 0.0],
             params: [0.0, 0.0, intensity, if casts_shadow { 1.0 } else { 0.0 }],
+            color: [1.0; 4],
         }
     }
 
@@ -270,6 +271,7 @@ mod tests {
         LightRaw {
             position_or_direction: [position[0], position[1], position[2], 0.0],
             params: [1.0, 10.0, intensity, 0.0],
+            color: [1.0; 4],
         }
     }
 
