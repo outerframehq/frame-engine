@@ -2950,9 +2950,31 @@ fn render_thumbnail(data: &frame_engine::assets::MeshData) -> egui::ColorImage {
     };
     // Unit coords sit in -0.5..0.5. Scale by 0.9 to leave a margin.
     let to_px = |v: f32| (v * 0.9 + 0.5) * SIZE as f32;
+    // A model kept at the size it was made (see
+    // `EditorModule::project_models`) is brought to unit size about its own
+    // middle first; a unit model is left as it is.
+    let (lo, hi) = data.vertices.iter().fold(
+        ([f32::MAX; 3], [f32::MIN; 3]),
+        |(lo, hi), v| {
+            (
+                [0, 1, 2].map(|i| lo[i].min(v.position[i])),
+                [0, 1, 2].map(|i| hi[i].max(v.position[i])),
+            )
+        },
+    );
+    let middle = [0, 1, 2].map(|i| (lo[i] + hi[i]) * 0.5);
+    let widest = (0..3).map(|i| hi[i] - lo[i]).fold(0.0f32, f32::max);
+    let already_unit = widest <= 1.0 + 1e-4 && middle.iter().all(|m| m.abs() <= 1e-4);
+    let unit = |p: [f32; 3]| {
+        if already_unit {
+            p
+        } else {
+            [0, 1, 2].map(|i| (p[i] - middle[i]) / widest.max(1e-6))
+        }
+    };
 
     for tri in data.vertices.chunks_exact(3) {
-        let p: Vec<[f32; 3]> = tri.iter().map(|v| rotate(v.position)).collect();
+        let p: Vec<[f32; 3]> = tri.iter().map(|v| rotate(unit(v.position))).collect();
         let n = {
             let m = [
                 (tri[0].normal[0] + tri[1].normal[0] + tri[2].normal[0]) / 3.0,
@@ -5053,6 +5075,10 @@ struct App {
     // they can be uploaded to any GPU device (editor window and game window).
     // BTreeMap so the name order is stable and sorted.
     custom_meshes: std::collections::BTreeMap<String, frame_engine::assets::MeshData>,
+    // The texture each model a module read from the project's files brought
+    // with it (see `EditorModule::project_models`), as image file bytes, by
+    // model name: used when the model's material names no texture.
+    embedded_textures: std::collections::BTreeMap<String, Vec<u8>>,
     // Decoded material textures, keyed by file name, shared with build_material_gpu_data
     // the same way sound_cache caches decoded audio: so editing a mesh's
     // roughness/metalness in the Assets tab (which rebuilds every material
@@ -6526,6 +6552,7 @@ impl App {
     /// Save (F5) first to keep changes.
     fn close_project(&mut self) {
         self.custom_meshes.clear();
+        self.embedded_textures.clear();
         if let Some(gpu) = &mut self.gpu {
             gpu.set_custom_meshes(&[]);
         }
@@ -6689,6 +6716,12 @@ impl App {
         for e in errors {
             self.log(format!("Model load failed: {e}"));
         }
+        let mut embedded = std::collections::BTreeMap::new();
+        let errors =
+            add_project_models(&self.modules.borrow(), &files, &mut models, &mut embedded);
+        for e in errors {
+            self.log(format!("Model load failed: {e}"));
+        }
         add_module_meshes(&self.modules.borrow(), &mut models);
         self.game_custom_names = models.keys().cloned().collect();
         let refs: Vec<&frame_engine::assets::MeshData> = models.values().collect();
@@ -6700,6 +6733,7 @@ impl App {
             &self.game_custom_names,
             &world.mesh_meta,
             Some(&files),
+            &embedded,
             &mut game_texture_cache,
         );
         let pairs: Vec<(&frame_engine::assets::MeshData, &MaterialGpuData)> =
@@ -7922,17 +7956,20 @@ impl App {
         }
     }
 
-    /// Import dropped files: .obj as a model, a supported audio format as
-    /// audio, a supported image format as a texture, anything else skipped
-    /// with a message.
+    /// Import dropped files: .obj (or a model type a module reads) as a
+    /// model, a supported audio format as audio, a supported image format as
+    /// a texture, anything else skipped with a message.
     fn import_dropped(&mut self, path: std::path::PathBuf) {
         let ext = path
             .extension()
             .and_then(|e| e.to_str())
             .map(|e| e.to_ascii_lowercase())
             .unwrap_or_default();
+        let module_types = module_model_types(&self.modules.borrow());
         if ext == "obj" {
             self.import_model_from(path);
+        } else if module_types.contains(&ext.as_str()) {
+            self.import_module_model_from(path);
         } else if AUDIO_EXTENSIONS.contains(&ext.as_str()) {
             self.import_audio_from(path);
         } else if IMAGE_EXTENSIONS.contains(&ext.as_str()) {
@@ -7953,13 +7990,64 @@ impl App {
             self.log("Open a project before importing a model".to_string());
             return;
         }
+        let mut types = vec!["obj"];
+        types.extend(module_model_types(&self.modules.borrow()));
         let Some(picked) = rfd::FileDialog::new()
-            .add_filter("OBJ model", &["obj"])
+            .add_filter("Model", &types)
             .pick_file()
         else {
             return; // dialog cancelled
         };
-        self.import_model_from(picked);
+        let is_obj = picked
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|e| e.eq_ignore_ascii_case("obj"));
+        if is_obj {
+            self.import_model_from(picked);
+        } else {
+            self.import_module_model_from(picked);
+        }
+    }
+
+    /// Import a model of a type a module reads (see
+    /// `EditorModule::model_file_types`): copy it into the project's assets
+    /// folder, replacing a file of the same name, and load the project's
+    /// models again so the module reads it.
+    fn import_module_model_from(&mut self, picked: std::path::PathBuf) {
+        let Some(root) = self.project_dir.as_deref().map(|p| p.to_path_buf()) else {
+            self.log("Open a project before importing a model".to_string());
+            return;
+        };
+        let (Some(file_name), Some(name)) = (
+            picked.file_name().map(|f| f.to_owned()),
+            picked
+                .file_stem()
+                .and_then(|st| st.to_str())
+                .map(String::from),
+        ) else {
+            return;
+        };
+        let assets = root.join("assets");
+        if let Err(e) = std::fs::create_dir_all(&assets) {
+            self.log(format!("Could not create assets folder: {e}"));
+            return;
+        }
+        let dest = assets.join(&file_name);
+        if picked != dest
+            && let Err(e) = std::fs::copy(&picked, &dest)
+        {
+            self.log(format!("Could not copy model into assets: {e}"));
+            return;
+        }
+        let replaced = self.custom_meshes.contains_key(&name);
+        self.load_project_assets();
+        if !self.custom_meshes.contains_key(&name) {
+            self.log(format!("'{name}' was copied into assets but did not load as a model"));
+        } else if replaced {
+            self.log(format!("Replaced model '{name}'"));
+        } else {
+            self.log(format!("Imported model '{name}'"));
+        }
     }
 
     /// Import one .obj into the project's assets folder. Shared by the File
@@ -7981,6 +8069,7 @@ impl App {
             &custom_names,
             &self.world.mesh_meta,
             project.as_ref(),
+            &self.embedded_textures,
             &mut self.texture_cache,
         );
         let pairs: Vec<(&frame_engine::assets::MeshData, &MaterialGpuData)> =
@@ -8069,8 +8158,19 @@ impl App {
             for e in errors {
                 self.log(format!("Model load failed: {e}"));
             }
+            let mut embedded = std::collections::BTreeMap::new();
+            let files = ProjectFiles::Folder(root.clone());
+            let errors =
+                add_project_models(&self.modules.borrow(), &files, &mut models, &mut embedded);
+            for e in errors {
+                self.log(format!("Model load failed: {e}"));
+            }
             add_module_meshes(&self.modules.borrow(), &mut models);
             self.custom_meshes = models;
+            // A model read again may bring a different texture: decode
+            // them afresh.
+            self.texture_cache.retain(|key, _| !key.ends_with(EMBEDDED_TEXTURE));
+            self.embedded_textures = embedded;
 
             let (manifests, scripts, errors) = load_project_plugins(&root);
             for e in errors {
@@ -10722,6 +10822,46 @@ fn load_project_models(
 /// game build's pack. Models are named by file stem wherever they sit, so
 /// two files with the same stem in different folders collide; the later one
 /// in sorted path order wins.
+/// Add the models modules read from the project's `files` (see
+/// `EditorModule::project_models`) to `models`, and the textures they
+/// brought to `embedded`. A model already there (a project's `.obj` of the
+/// same name) wins. Returns what went wrong, to log.
+fn add_project_models(
+    modules: &[Box<dyn EditorModule>],
+    files: &ProjectFiles,
+    models: &mut std::collections::BTreeMap<String, frame_engine::assets::MeshData>,
+    embedded: &mut std::collections::BTreeMap<String, Vec<u8>>,
+) -> Vec<String> {
+    let mut errors = Vec::new();
+    for module in modules {
+        let read = module.project_models(files);
+        errors.extend(read.errors);
+        for model in read.models {
+            if models.contains_key(&model.name) {
+                continue;
+            }
+            if let Some(texture) = model.texture {
+                embedded.insert(model.name.clone(), texture);
+            }
+            models.insert(model.name, model.mesh);
+        }
+    }
+    errors
+}
+
+/// The model file types the modules read (see
+/// `EditorModule::model_file_types`), lower case.
+fn module_model_types(modules: &[Box<dyn EditorModule>]) -> Vec<&'static str> {
+    let mut types: Vec<&'static str> = modules
+        .iter()
+        .flat_map(|m| m.model_file_types())
+        .copied()
+        .collect();
+    types.sort_unstable();
+    types.dedup();
+    types
+}
+
 /// Add the models modules make (see `EditorModule::meshes`) to `models`. A
 /// project's own model of the same name wins.
 fn add_module_meshes(
@@ -11322,6 +11462,7 @@ fn build_material_gpu_data(
     names: &[String],
     mesh_meta: &std::collections::BTreeMap<String, frame_engine::world::MeshMeta>,
     project: Option<&ProjectFiles>,
+    embedded: &std::collections::BTreeMap<String, Vec<u8>>,
     cache: &mut std::collections::HashMap<String, (u32, u32, Vec<u8>)>,
 ) -> Vec<MaterialGpuData> {
     names
@@ -11344,6 +11485,21 @@ fn build_material_gpu_data(
                 cache.insert(tex_name.clone(), data.clone());
                 Some(data)
             });
+            // With no texture of its own named, the one the model brought.
+            let texture_rgba = texture_rgba.or_else(|| {
+                if material.texture.is_some() {
+                    return None;
+                }
+                let key = format!("{name}{EMBEDDED_TEXTURE}");
+                if let Some(cached) = cache.get(&key) {
+                    return Some(cached.clone());
+                }
+                let img = image::load_from_memory(embedded.get(name)?).ok()?.to_rgba8();
+                let (width, height) = img.dimensions();
+                let data = (width, height, img.into_raw());
+                cache.insert(key, data.clone());
+                Some(data)
+            });
             MaterialGpuData {
                 texture_rgba,
                 roughness: material.roughness,
@@ -11352,6 +11508,11 @@ fn build_material_gpu_data(
         })
         .collect()
 }
+
+/// What a model's own texture (see `ProjectModel::texture`) is cached under in
+/// the decoded-texture cache, after its model's name: a name no texture file
+/// can have.
+const EMBEDDED_TEXTURE: &str = "#embedded";
 
 /// Call `visit` for every file under `dir`, in every subfolder. Unreadable
 /// folders are skipped rather than failing the whole walk.
@@ -11707,6 +11868,7 @@ fn run_app(
         current_scene_path: None,
         project_dir: None,
         custom_meshes: std::collections::BTreeMap::new(),
+        embedded_textures: std::collections::BTreeMap::new(),
         texture_cache: std::collections::HashMap::new(),
         material_editing: None,
         prefabs: std::collections::BTreeMap::new(),
@@ -12704,11 +12866,155 @@ mod pack_play_tests {
             );
             let mut cache = std::collections::HashMap::new();
             let gpu =
-                build_material_gpu_data(&["rock".to_string()], &meta, Some(files), &mut cache);
+                build_material_gpu_data(
+                    &["rock".to_string()],
+                    &meta,
+                    Some(files),
+                    &std::collections::BTreeMap::new(),
+                    &mut cache,
+                );
             let (w, h, rgba) = gpu[0].texture_rgba.clone().expect("texture found");
             assert_eq!(rgba.len(), (w * h * 4) as usize);
         }
         std::fs::remove_dir_all(&root).ok();
         std::fs::remove_file(&out).ok();
+    }
+}
+
+#[cfg(test)]
+mod project_model_tests {
+    use super::*;
+    use crate::module_api::{GpuContext, ProjectModel, ProjectModels};
+    use frame_engine::assets::{MeshData, MeshVertexData};
+
+    /// A box `size` across and `tall` high standing on the origin, at the
+    /// size it was made (not unit sized).
+    fn standing_box(size: f32, tall: f32) -> MeshData {
+        let h = size * 0.5;
+        let corner = |x: f32, y: f32, z: f32| MeshVertexData {
+            position: [x * h, y * tall, z * h],
+            normal: [0.0, 1.0, 0.0],
+            uv: [0.0, 0.0],
+        };
+        let vertices = vec![
+            corner(-1.0, 0.0, -1.0),
+            corner(1.0, 0.0, -1.0),
+            corner(1.0, 1.0, 1.0),
+            corner(-1.0, 1.0, 1.0),
+            corner(1.0, 1.0, 1.0),
+            corner(-1.0, 0.0, -1.0),
+        ];
+        MeshData {
+            vertices,
+            half_extents: [h, tall * 0.5, h],
+        }
+    }
+
+    /// A two by two red PNG, as a file's bytes.
+    fn red_png() -> Vec<u8> {
+        let img = image::RgbaImage::from_pixel(2, 2, image::Rgba([255, 0, 0, 255]));
+        let mut bytes = Vec::new();
+        img.write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageFormat::Png)
+            .unwrap();
+        bytes
+    }
+
+    /// A module that reads "person" and "rock" from any project, with a
+    /// texture for the person, and fails on one file.
+    struct Reader;
+    impl EditorModule for Reader {
+        fn name(&self) -> &str {
+            "reader"
+        }
+        fn project_models(&self, _files: &ProjectFiles) -> ProjectModels {
+            ProjectModels {
+                models: vec![
+                    ProjectModel {
+                        name: "person".to_string(),
+                        mesh: standing_box(0.5, 1.8),
+                        texture: Some(red_png()),
+                    },
+                    ProjectModel {
+                        name: "rock".to_string(),
+                        mesh: standing_box(1.0, 1.0),
+                        texture: None,
+                    },
+                ],
+                errors: vec!["broken.glb: not a model".to_string()],
+            }
+        }
+        fn model_file_types(&self) -> &'static [&'static str] {
+            &["glb", "fbx"]
+        }
+        fn new_gpu(&self, _gpu: &GpuContext) -> Box<dyn ModuleGpu> {
+            unreachable!("no GPU in tests")
+        }
+    }
+
+    struct AlsoGlb;
+    impl EditorModule for AlsoGlb {
+        fn name(&self) -> &str {
+            "also"
+        }
+        fn model_file_types(&self) -> &'static [&'static str] {
+            &["glb"]
+        }
+        fn new_gpu(&self, _gpu: &GpuContext) -> Box<dyn ModuleGpu> {
+            unreachable!("no GPU in tests")
+        }
+    }
+
+    #[test]
+    fn models_a_module_reads_keep_their_size_and_texture_and_an_obj_of_the_same_name_wins() {
+        let modules: Vec<Box<dyn EditorModule>> = vec![Box::new(Reader), Box::new(AlsoGlb)];
+        let files = ProjectFiles::Folder(std::env::temp_dir());
+        let mut models = std::collections::BTreeMap::new();
+        models.insert("rock".to_string(), standing_box(0.2, 0.2));
+        let mut embedded = std::collections::BTreeMap::new();
+        let errors = add_project_models(&modules, &files, &mut models, &mut embedded);
+        assert_eq!(errors, vec!["broken.glb: not a model".to_string()]);
+        assert_eq!(models["person"].half_extents, [0.25, 0.9, 0.25], "its own size");
+        assert_eq!(models["rock"].half_extents, [0.1, 0.1, 0.1], "the .obj kept");
+        assert_eq!(embedded.keys().collect::<Vec<_>>(), ["person"]);
+        assert_eq!(module_model_types(&modules), vec!["fbx", "glb"]);
+    }
+
+    #[test]
+    fn a_models_own_texture_is_used_unless_its_material_names_one() {
+        let mut embedded = std::collections::BTreeMap::new();
+        embedded.insert("person".to_string(), red_png());
+        let mut meta = std::collections::BTreeMap::new();
+        meta.insert(
+            "person".to_string(),
+            frame_engine::world::MeshMeta {
+                half_extents: [0.25, 0.9, 0.25],
+                material: Default::default(),
+            },
+        );
+        let mut cache = std::collections::HashMap::new();
+        let names = ["person".to_string()];
+        let gpu = build_material_gpu_data(&names, &meta, None, &embedded, &mut cache);
+        let (w, h, rgba) = gpu[0].texture_rgba.clone().expect("its own texture");
+        assert_eq!((w, h, &rgba[..4]), (2, 2, &[255, 0, 0, 255][..]));
+        // A texture named in its material wins, even one not found.
+        meta.get_mut("person").unwrap().material.texture = Some("skin.png".to_string());
+        let gpu = build_material_gpu_data(&names, &meta, None, &embedded, &mut cache);
+        assert!(gpu[0].texture_rgba.is_none());
+    }
+
+    #[test]
+    fn a_thumbnail_fits_a_model_kept_at_its_own_size() {
+        // A person-sized box standing on the origin: without fitting, most
+        // of it would be off the picture.
+        let tall = render_thumbnail(&standing_box(0.5, 1.8));
+        let unit = render_thumbnail(&standing_box(0.5, 0.5));
+        let drawn = |img: &egui::ColorImage| {
+            img.pixels
+                .iter()
+                .filter(|p| **p != egui::Color32::from_rgb(30, 30, 34))
+                .count()
+        };
+        assert!(drawn(&tall) > 50, "{}", drawn(&tall));
+        assert!(drawn(&unit) > 50);
     }
 }

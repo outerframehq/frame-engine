@@ -42,6 +42,29 @@ pub use crate::grass::{
 pub use crate::game_audio::{AudioFrame, HEARING, Listener};
 pub use crate::perf::megabytes;
 pub use frame_engine::assets::MeshVertexData;
+pub use frame_engine::pack::ProjectFiles;
+
+/// The models a module read from a project's files (see
+/// `EditorModule::project_models`), and what went wrong reading the rest.
+#[derive(Clone, Debug, Default)]
+pub struct ProjectModels {
+    pub models: Vec<ProjectModel>,
+    /// One line each, naming the file: shown in the editor's log.
+    pub errors: Vec<String>,
+}
+
+/// One model a module read from a project's files.
+#[derive(Clone, Debug)]
+pub struct ProjectModel {
+    /// What it is drawn as: `Mesh::Custom(name)`.
+    pub name: String,
+    /// Its triangles, at the size it was made (see
+    /// `EditorModule::project_models`).
+    pub mesh: frame_engine::assets::MeshData,
+    /// An image file's bytes (PNG or JPEG) the model brought with it, used
+    /// when its material names no texture of its own.
+    pub texture: Option<Vec<u8>>,
+}
 pub use frame_engine::physics::{StaticMesh, StaticMeshSet};
 
 /// Whatever a module builds from the world, shared between every window that
@@ -204,6 +227,28 @@ pub trait EditorModule {
     /// sees these). The default is none.
     fn meshes(&self) -> Vec<(String, frame_engine::assets::MeshData)> {
         Vec::new()
+    }
+
+    /// Models this module reads from a project's own files, in a format the
+    /// editor does not read itself (see `model_file_types`). Asked when a
+    /// project's models are loaded and when Play starts, after the
+    /// project's `.obj` models: an `.obj` of the same name is used instead.
+    /// Unlike `meshes`, each keeps the size it was made at (build its
+    /// `MeshData` directly, not with `unit_mesh`), so a person modelled
+    /// 1.8 m tall stands 1.8 m tall at scale 1, and it may bring its own
+    /// texture. The editor records each one's half extents in
+    /// `World::mesh_meta` and logs the errors. The default is none.
+    fn project_models(&self, _files: &ProjectFiles) -> ProjectModels {
+        ProjectModels::default()
+    }
+
+    /// The file types (extensions, lower case, without the dot: `"glb"`)
+    /// this module reads models from (see `project_models`). The editor's
+    /// File > Import model and drag and drop accept them, copying the file
+    /// into the project's assets and loading the project's models again.
+    /// The default is none.
+    fn model_file_types(&self) -> &'static [&'static str] {
+        &[]
     }
 
     /// WGSL to compile into the editor's shader in place of what still water
