@@ -1319,6 +1319,7 @@ fn raw_instances(anchor: [f64; 3], origin: [f64; 3], placements: &[Placement]) -
             emissive: p.glow.clamp(0.0, 1.0),
             rotation: p.rotation,
             shape: 0,
+            bones: 0,
         })
         .collect()
 }
@@ -1377,6 +1378,7 @@ impl WorldInstance {
             emissive: 0.0,
             rotation: [0.0; 3],
             shape: 0,
+            bones: 0,
         };
         queue.write_buffer(&self.buffer, 0, bytemuck::cast_slice(&[instance]));
     }

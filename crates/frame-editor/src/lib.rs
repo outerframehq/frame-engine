@@ -48,6 +48,7 @@ mod game_audio;
 mod game_menu;
 mod grass;
 mod licences;
+mod locomotion;
 mod origin;
 mod perf;
 mod scenes;
@@ -661,6 +662,12 @@ struct MeshVertex {
     // sits in the shared list, and how many follow. [0, 0] for a vertex no
     // key moves, which is every vertex but an imported model's.
     shape: [u32; 2],
+    // The bones it follows (see `frame_engine::assets::skin`), packed to
+    // fit the 16 inputs a pipeline may have: four bone indexes a byte each,
+    // then four weights a byte each (0 to 255 for 0 to 1). All weights 0
+    // for a vertex that follows no bone, which is every vertex but a
+    // skinned model's.
+    skin: [u32; 2],
 }
 impl MeshVertex {
     /// A vertex that never morphs.
@@ -674,9 +681,10 @@ impl MeshVertex {
             morph_uv: uv,
             water: [0; 4],
             shape: [0; 2],
+            skin: [0; 2],
         }
     }
-    const ATTRIBS: [wgpu::VertexAttribute; 8] = [
+    const ATTRIBS: [wgpu::VertexAttribute; 9] = [
         wgpu::VertexAttribute {
             format: wgpu::VertexFormat::Float32x3,
             offset: 0,
@@ -718,6 +726,11 @@ impl MeshVertex {
             format: wgpu::VertexFormat::Uint32x2,
             offset: std::mem::size_of::<[f32; 18]>() as wgpu::BufferAddress, // 72
             shader_location: 13,
+        },
+        wgpu::VertexAttribute {
+            format: wgpu::VertexFormat::Uint32x2,
+            offset: std::mem::size_of::<[f32; 20]>() as wgpu::BufferAddress, // 80
+            shader_location: 15,
         },
     ];
     fn layout() -> wgpu::VertexBufferLayout<'static> {
@@ -845,6 +858,9 @@ struct InstanceRaw {
     // one, in the order its model numbers its keys (see `build_instances`).
     // 0 for none: the model as made.
     shape: u32,
+    // Where this entity's bone matrices start in the frame's list, plus one
+    // (see `build_instances`). 0 for none: the model as made.
+    bones: u32,
 }
 impl InstanceRaw {
     // Locations 0-2 belong to the mesh vertex buffer (MeshVertex, which grew
@@ -881,8 +897,10 @@ impl InstanceRaw {
             offset: std::mem::size_of::<[f32; 11]>() as wgpu::BufferAddress, // 44
             shader_location: 8,
         },
+        // `shape` and `bones` together, one input: a pipeline may have 16
+        // in all, and these make it 16.
         wgpu::VertexAttribute {
-            format: wgpu::VertexFormat::Uint32,
+            format: wgpu::VertexFormat::Uint32x2,
             offset: std::mem::size_of::<[f32; 14]>() as wgpu::BufferAddress, // 56
             shader_location: 14,
         },
@@ -1303,6 +1321,29 @@ fn shaped_vertices(
         .iter()
         .map(|v| MeshVertex::plain(v.position, v.normal, v.uv))
         .collect();
+    if let Some(skin) = &data.skin {
+        let bones = skin.bones.len();
+        for (vertex, follows) in verts.iter_mut().zip(&skin.vertices) {
+            // A bone the skeleton does not have counts for nothing.
+            let total: f32 = (0..4)
+                .filter(|&k| usize::from(follows.bones[k]) < bones)
+                .map(|k| follows.weights[k].max(0.0))
+                .sum();
+            if total <= 0.0 || !total.is_finite() {
+                continue;
+            }
+            let (mut indexes, mut weights) = ([0u8; 4], [0u8; 4]);
+            for k in 0..4 {
+                if usize::from(follows.bones[k]) < bones {
+                    // A skeleton has at most 256 bones (see `MOST_BONES`).
+                    indexes[k] = follows.bones[k].min(255) as u8;
+                    let w = follows.weights[k].max(0.0) / total;
+                    weights[k] = (w * 255.0).round() as u8;
+                }
+            }
+            vertex.skin = [u32::from_le_bytes(indexes), u32::from_le_bytes(weights)];
+        }
+    }
     if data.shapes.is_empty() {
         return verts;
     }
@@ -1361,6 +1402,16 @@ fn build_mesh_buffer(
 /// The shape weights buffer's first size, in bytes: room for a crowd's
 /// faces before it ever has to grow.
 const SHAPE_WEIGHTS_START: u64 = 16 * 1024;
+/// The bone matrices buffer's first size, in bytes: 64 people of 64 bones.
+const BONE_MATRICES_START: u64 = 64 * 64 * 64;
+
+/// Each frame's shape key weights and bone matrices, for the entities drawn
+/// that frame, each entity's together (see `build_instances`).
+#[derive(Clone, Debug, Default, PartialEq)]
+struct ShapeFrame {
+    weights: Vec<f32>,
+    bones: Vec<[f32; 16]>,
+}
 
 /// The list of every model's shape key moves on the graphics card. A storage
 /// binding cannot be empty, so with no moves it holds one that is never read.
@@ -1373,11 +1424,12 @@ fn shape_moves_buffer(device: &wgpu::Device, moves: &[ShapeMoveGpu]) -> wgpu::Bu
     })
 }
 
-/// A buffer for each frame's shape key weights, `size` bytes.
-fn shape_weights_buffer(device: &wgpu::Device, size: u64) -> wgpu::Buffer {
+/// A buffer written each frame (shape key weights, bone matrices), `size`
+/// bytes.
+fn frame_buffer(device: &wgpu::Device, label: &str, size: u64) -> wgpu::Buffer {
     device.create_buffer(&wgpu::BufferDescriptor {
-        label: Some("shape key weights"),
-        size,
+        label: Some(label),
+        size: size.max(64),
         usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     })
@@ -1388,6 +1440,7 @@ fn create_shape_bind_group(
     layout: &wgpu::BindGroupLayout,
     moves: &wgpu::Buffer,
     weights: &wgpu::Buffer,
+    bones: &wgpu::Buffer,
 ) -> wgpu::BindGroup {
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("shape key bind group"),
@@ -1400,6 +1453,10 @@ fn create_shape_bind_group(
             wgpu::BindGroupEntry {
                 binding: 1,
                 resource: weights.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: bones.as_entire_binding(),
             },
         ],
     })
@@ -1458,9 +1515,12 @@ struct GpuState {
     // shaders through `shape_bind_group`: group 2 of the entity pipelines,
     // group 1 of the shadow pipeline. The weights buffer grows when a frame
     // needs more and keeps its size after.
+    // Skinning (see `frame_engine::assets::skin`) rides in the same group:
+    // each frame's bone matrices, which each drawn entity points into.
     shape_layout: wgpu::BindGroupLayout,
     shape_moves: wgpu::Buffer,
     shape_weights: wgpu::Buffer,
+    bone_matrices: wgpu::Buffer,
     shape_bind_group: wgpu::BindGroup,
     camera_buffer: wgpu::Buffer,
     lights_buffer: wgpu::Buffer,
@@ -1884,12 +1944,18 @@ impl GpuState {
         };
         let shape_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
             label: Some("shape key bind group layout"),
-            entries: &[shape_entry(0), shape_entry(1)],
+            entries: &[shape_entry(0), shape_entry(1), shape_entry(2)],
         });
         let shape_moves = shape_moves_buffer(&device, &moves);
-        let shape_weights = shape_weights_buffer(&device, SHAPE_WEIGHTS_START);
-        let shape_bind_group =
-            create_shape_bind_group(&device, &shape_layout, &shape_moves, &shape_weights);
+        let shape_weights = frame_buffer(&device, "shape key weights", SHAPE_WEIGHTS_START);
+        let bone_matrices = frame_buffer(&device, "bone matrices", BONE_MATRICES_START);
+        let shape_bind_group = create_shape_bind_group(
+            &device,
+            &shape_layout,
+            &shape_moves,
+            &shape_weights,
+            &bone_matrices,
+        );
         // --- Entity pipeline (world-space, camera-driven) ---
         // What the water mirrors of the sky: the first module's own, if one
         // gives it (its clouds), or the default.
@@ -2200,6 +2266,7 @@ impl GpuState {
                 shape_layout,
                 shape_moves,
                 shape_weights,
+                bone_matrices,
                 shape_bind_group,
                 camera_buffer,
                 lights_buffer,
@@ -2250,6 +2317,7 @@ impl GpuState {
             &self.shape_layout,
             &self.shape_moves,
             &self.shape_weights,
+            &self.bone_matrices,
         );
         let default_view = create_default_white_texture(&self.device, &self.queue);
         let mut bind_groups: Vec<wgpu::BindGroup> = (0..3)
@@ -2288,26 +2356,42 @@ impl GpuState {
         }
         self.material_bind_groups = bind_groups;
     }
-    /// Hand this frame's shape key weights to the graphics card (see
-    /// `build_instances`), growing the buffer when they no longer fit. Called
-    /// by each render just before it records, so a preview's weights never
-    /// mix with the main view's: each write lands before its own submit.
-    fn set_shape_weights(&mut self, weights: &[f32]) {
-        if weights.is_empty() {
-            return;
+    /// Hand this frame's shape key weights and bone matrices to the graphics
+    /// card (see `build_instances`), growing a buffer when they no longer
+    /// fit. Called by each render just before it records, so a preview's
+    /// never mix with the main view's: each write lands before its own
+    /// submit.
+    fn set_shape_frame(&mut self, frame: &ShapeFrame) {
+        let weights: &[u8] = bytemuck::cast_slice(&frame.weights);
+        let bones: &[u8] = bytemuck::cast_slice(&frame.bones);
+        let grow = |buffer: &wgpu::Buffer, bytes: &[u8]| bytes.len() as u64 > buffer.size();
+        let (grow_weights, grow_bones) = (
+            grow(&self.shape_weights, weights),
+            grow(&self.bone_matrices, bones),
+        );
+        if grow_weights {
+            let size = (weights.len() as u64).next_power_of_two();
+            self.shape_weights = frame_buffer(&self.device, "shape key weights", size);
         }
-        let needed = std::mem::size_of_val(weights) as u64;
-        if needed > self.shape_weights.size() {
-            self.shape_weights = shape_weights_buffer(&self.device, needed.next_power_of_two());
+        if grow_bones {
+            let size = (bones.len() as u64).next_power_of_two();
+            self.bone_matrices = frame_buffer(&self.device, "bone matrices", size);
+        }
+        if grow_weights || grow_bones {
             self.shape_bind_group = create_shape_bind_group(
                 &self.device,
                 &self.shape_layout,
                 &self.shape_moves,
                 &self.shape_weights,
+                &self.bone_matrices,
             );
         }
-        self.queue
-            .write_buffer(&self.shape_weights, 0, bytemuck::cast_slice(weights));
+        if !weights.is_empty() {
+            self.queue.write_buffer(&self.shape_weights, 0, weights);
+        }
+        if !bones.is_empty() {
+            self.queue.write_buffer(&self.bone_matrices, 0, bones);
+        }
     }
     fn resize(&mut self, width: u32, height: u32) {
         if width > 0 && height > 0 {
@@ -2502,8 +2586,9 @@ impl GpuState {
         // order. `instances` is laid out in that same order, so these counts also
         // give each primitive's contiguous slice of the instance buffer.
         group_counts: &[u32],
-        // The instances' shape key weights (see `build_instances`).
-        shape_weights: &[f32],
+        // The instances' shape key weights and bone matrices (see
+        // `build_instances`).
+        shapes: &ShapeFrame,
         text_instances: &[TextInstance],
         view_proj: [[f32; 4]; 4],
         lights: &[LightRaw; MAX_LIGHTS],
@@ -2511,7 +2596,7 @@ impl GpuState {
         egui_textures_delta: &egui::TexturesDelta,
         egui_ppp: f32,
     ) {
-        self.set_shape_weights(shape_weights);
+        self.set_shape_frame(shapes);
         let camera_uniform = CameraUniform::new(view_proj);
         self.queue.write_buffer(
             &self.camera_buffer,
@@ -2777,11 +2862,11 @@ impl GpuState {
         &mut self,
         instances: &[InstanceRaw],
         group_counts: &[u32],
-        shape_weights: &[f32],
+        shapes: &ShapeFrame,
         view_proj: [[f32; 4]; 4],
         lights: &[LightRaw; MAX_LIGHTS],
     ) {
-        self.set_shape_weights(shape_weights);
+        self.set_shape_frame(shapes);
         self.queue.write_buffer(
             &self.preview_camera_buffer,
             0,
@@ -3045,6 +3130,10 @@ struct EditedEntity {
     shape_weights: frame_engine::world::ShapeWeights,
     // The names of its model's shape keys, for the sliders; not written back.
     shape_keys: Vec<String>,
+    animation: Option<frame_engine::world::Animation>,
+    // Its model's clips, by name with their lengths, for the picker; not
+    // written back.
+    clips: Vec<(String, f32)>,
     // The entity's extension components, for editor modules' Inspector sections.
     ext: ExtEdit,
 }
@@ -3928,6 +4017,8 @@ fn inspector_tab_ui(
             character,
             shape_weights,
             shape_keys,
+            animation,
+            clips,
             ext,
         }) => {
             ui.heading(format!("Entity {id}"));
@@ -4146,6 +4237,60 @@ fn inspector_tab_ui(
                         }
                         ui.label(key);
                     });
+                }
+            }
+            if !clips.is_empty() {
+                ui.add_space(8.0);
+                section_label(ui, "Animation");
+                let current = animation
+                    .as_ref()
+                    .and_then(|a| a.clips.first())
+                    .map(|c| c.clip.clone());
+                let mut chosen = current.clone();
+                egui::ComboBox::from_id_salt("clip_picker")
+                    .selected_text(chosen.as_deref().unwrap_or("None"))
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut chosen, None, "None");
+                        for (name, _) in clips.iter() {
+                            ui.selectable_value(&mut chosen, Some(name.clone()), name);
+                        }
+                    })
+                    .response
+                    .on_hover_text(
+                        "A clip from the model to play on this entity. A game \
+                         can choose clips itself (from how a character moves, \
+                         say), over what is chosen here.",
+                    );
+                if chosen != current {
+                    *animation = chosen.map(|name| {
+                        let length = clips
+                            .iter()
+                            .find(|(n, _)| *n == name)
+                            .map_or(0.0, |(_, l)| *l);
+                        frame_engine::world::Animation {
+                            clips: vec![frame_engine::world::PlayingClip {
+                                clip: name,
+                                length,
+                                ..Default::default()
+                            }],
+                        }
+                    });
+                }
+                if let Some(play) = animation.as_mut().and_then(|a| a.clips.first_mut()) {
+                    let mut playing = play.speed != 0.0;
+                    if outerface_checkbox(ui, &mut playing, "Playing").changed() {
+                        play.speed = if playing { 1.0 } else { 0.0 };
+                    }
+                    outerface_checkbox(ui, &mut play.looping, "Loop");
+                    if play.length > 0.0 {
+                        ui.horizontal(|ui| {
+                            ui.add(
+                                egui::Slider::new(&mut play.time, 0.0..=play.length)
+                                    .suffix(" s"),
+                            );
+                            ui.label("Time");
+                        });
+                    }
                 }
             }
             ui.add_space(8.0);
@@ -5313,7 +5458,13 @@ struct App {
     // like new_script_name is.
     new_prefab_name: String,
     // Names of the game window's uploaded models, same sorted order.
-    game_models: Vec<DrawnModel>,
+    // The game window's models, kept on the CPU too for posing and shape
+    // keys each frame (see `build_instances`).
+    game_meshes: std::collections::BTreeMap<String, frame_engine::assets::MeshData>,
+    // Characters picking their clips from how they move (see
+    // `locomotion`): the editor's world's, and Play's.
+    locomotion: locomotion::Locomotion,
+    game_locomotion: locomotion::Locomotion,
     // Assets tab browser state: the open subfolder inside assets/ and the
     // pending new folder name.
     assets_subdir: std::path::PathBuf,
@@ -5567,6 +5718,9 @@ impl App {
             self.physics.step(&mut self.world, 1.0 / TICK_RATE as f32);
             systems::resolve_collisions(&mut self.world);
             systems::apply_parenting(&mut self.world);
+            self.locomotion
+                .tick(&mut self.world, &self.custom_meshes, 1.0 / TICK_RATE as f32);
+            systems::animate(&mut self.world, 1.0 / TICK_RATE as f32);
             self.log("Stepped one tick");
         }
     }
@@ -6595,7 +6749,7 @@ impl App {
             gpu.render(
                 &[],
                 &[0, 0, 0],
-                &[],
+                &ShapeFrame::default(),
                 &[],
                 Mat4::IDENTITY.to_cols_array_2d(),
                 &[LightRaw::zeroed(); MAX_LIGHTS],
@@ -6940,7 +7094,6 @@ impl App {
             self.log(format!("Model: {e}"));
         }
         add_module_meshes(&self.modules.borrow(), &mut models);
-        self.game_models = drawn_models(&models);
         let names: Vec<String> = models.keys().cloned().collect();
         let refs: Vec<&frame_engine::assets::MeshData> = models.values().collect();
         // A fresh, local decode cache: Play starts far less often than a
@@ -6957,6 +7110,8 @@ impl App {
         let pairs: Vec<(&frame_engine::assets::MeshData, &MaterialGpuData)> =
             refs.iter().copied().zip(materials.iter()).collect();
         gpu.set_custom_meshes(&pairs);
+        self.game_meshes = models;
+        self.game_locomotion = locomotion::Locomotion::default();
         // The game window's own egui context, used only for the UiText/
         // UiImage overlay (see render_game_ui) -- same creation shape as
         // pop_out_tab's PoppedOutWindow, just kept as loose fields instead
@@ -7104,6 +7259,9 @@ impl App {
                 // Parent) sees this tick's real final position, not the
                 // parent's position from before movement/physics ran.
                 systems::apply_parenting(world);
+                self.game_locomotion
+                    .tick(world, &self.game_meshes, 1.0 / TICK_RATE as f32);
+                systems::animate(world, 1.0 / TICK_RATE as f32);
                 sound_messages.extend(update_sounds(
                     world,
                     self.audio_manager.as_mut(),
@@ -7203,15 +7361,16 @@ impl App {
                 .unwrap_or([self.cam_focus_x, self.cam_focus_y, self.cam_focus_z]),
         };
         self.play_game_audio(menu_view, active_camera_id, game_viewer, game_files.as_ref());
-        let (instances, group_counts, shape_weights, lights) = match &self.game_world {
+        let (instances, group_counts, shapes, lights) = match &self.game_world {
             Some(world) => {
                 let anchors = module_api::anchor_names(&self.modules);
                 let empty = std::collections::HashSet::new();
-                let (instances, group_counts, shape_weights) = build_instances(
+                let models = drawn_models(&self.game_meshes);
+                let (instances, group_counts, shapes) = build_instances(
                     world,
                     None,
                     &empty,
-                    &self.game_models,
+                    &models,
                     &anchors,
                     active_camera_id,
                     game_origin,
@@ -7245,7 +7404,7 @@ impl App {
                 (
                     instances,
                     group_counts,
-                    shape_weights,
+                    shapes,
                     build_lights(world, game_origin),
                 )
             }
@@ -7303,7 +7462,7 @@ impl App {
             gpu.render(
                 &instances,
                 &group_counts,
-                &shape_weights,
+                &shapes,
                 &[],
                 view_proj,
                 &lights,
@@ -7957,7 +8116,7 @@ impl App {
             popped.gpu.render(
                 &[],
                 &[],
-                &[],
+                &ShapeFrame::default(),
                 &[],
                 Mat4::IDENTITY.to_cols_array_2d(),
                 &[LightRaw::zeroed(); MAX_LIGHTS],
@@ -9323,6 +9482,12 @@ impl ApplicationHandler for App {
                     // Last, so a mounted camera (or anything else riding on
                     // a Parent) sees this tick's real final position.
                     systems::apply_parenting(&mut self.world);
+                    self.locomotion.tick(
+                        &mut self.world,
+                        &self.custom_meshes,
+                        1.0 / TICK_RATE as f32,
+                    );
+                    systems::animate(&mut self.world, 1.0 / TICK_RATE as f32);
                     sound_messages.extend(update_sounds(
                         &mut self.world,
                         self.audio_manager.as_mut(),
@@ -9357,14 +9522,13 @@ impl ApplicationHandler for App {
                     .collect();
                 let selected = self.selected;
                 // Per-primitive instance buckets from the world (see build_instances).
-                let models = drawn_models(&self.custom_meshes);
                 let anchors = module_api::anchor_names(&self.modules);
                 let view_origin = self.view_origin();
-                let (instances, group_counts, shape_weights) = build_instances(
+                let (instances, group_counts, shapes) = build_instances(
                     &self.world,
                     selected,
                     &colliding,
-                    &models,
+                    &drawn_models(&self.custom_meshes),
                     &anchors,
                     None,
                     view_origin,
@@ -9582,6 +9746,21 @@ impl ApplicationHandler for App {
                                 .custom_meshes
                                 .get(name)
                                 .map(|m| m.shapes.iter().map(|k| k.name.clone()).collect())
+                                .unwrap_or_default(),
+                            _ => Vec::new(),
+                        },
+                        animation: self.world.animations.get(id).cloned(),
+                        clips: match self.world.meshes.get(id) {
+                            Some(Mesh::Custom(name)) => self
+                                .custom_meshes
+                                .get(name)
+                                .and_then(|m| m.skin.as_ref())
+                                .map(|skin| {
+                                    skin.clips
+                                        .iter()
+                                        .map(|c| (c.name.clone(), c.duration))
+                                        .collect()
+                                })
                                 .unwrap_or_default(),
                             _ => Vec::new(),
                         },
@@ -10377,6 +10556,8 @@ impl ApplicationHandler for App {
                     character,
                     shape_weights,
                     shape_keys: _,
+                    animation,
+                    clips: _,
                     ext,
                 }) = edited
                 {
@@ -10476,6 +10657,14 @@ impl ApplicationHandler for App {
                         self.world.shape_weights.remove(id);
                     } else {
                         self.world.shape_weights.insert(id, shape_weights);
+                    }
+                    match animation {
+                        Some(a) => {
+                            self.world.animations.insert(id, a);
+                        }
+                        None => {
+                            self.world.animations.remove(id);
+                        }
                     }
                     ext.apply(&mut self.world, id);
                 }
@@ -10600,12 +10789,12 @@ impl ApplicationHandler for App {
                             // rather than reusing `instances` above, which
                             // deliberately keeps every entity for the main
                             // viewport.
-                            let (preview_instances, preview_group_counts, preview_weights) =
+                            let (preview_instances, preview_group_counts, preview_shapes) =
                                 build_instances(
                                     &self.world,
                                     selected,
                                     &colliding,
-                                    &models,
+                                    &drawn_models(&self.custom_meshes),
                                     &anchors,
                                     Some(id),
                                     preview_origin,
@@ -10615,7 +10804,7 @@ impl ApplicationHandler for App {
                                 gpu.render_preview(
                                     &preview_instances,
                                     &preview_group_counts,
-                                    &preview_weights,
+                                    &preview_shapes,
                                     preview_view_proj,
                                     &lights,
                                 );
@@ -10628,7 +10817,7 @@ impl ApplicationHandler for App {
                     gpu.render(
                         &instances,
                         &group_counts,
-                        &shape_weights,
+                        &shapes,
                         &text_instances,
                         view_proj,
                         &lights,
@@ -11460,7 +11649,7 @@ fn build_instances(
     selected: Option<usize>,
     colliding: &std::collections::HashSet<usize>,
     // The imported models, in the order the mesh buffer holds them.
-    models: &[DrawnModel],
+    models: &[DrawnModel<'_>],
     // Extension component names whose entities are only anchors for a
     // module's own geometry (see `module_api`): they are not drawn here.
     anchors: &[&str],
@@ -11476,13 +11665,13 @@ fn build_instances(
     exclude: Option<usize>,
     // The render origin (see `origin`): every position is drawn relative to it.
     origin: DVec3,
-) -> (Vec<InstanceRaw>, Vec<u32>, Vec<f32>) {
+) -> (Vec<InstanceRaw>, Vec<u32>, ShapeFrame) {
     // One bucket per mesh: the three primitives, then the imported models in
     // the same sorted name order the mesh buffer uses.
     let mut buckets: Vec<Vec<InstanceRaw>> = vec![Vec::new(); 3 + models.len()];
-    // Every drawn entity's shape key weights, each entity's together (see
-    // `shape_slot`).
-    let mut weights: Vec<f32> = Vec::new();
+    // Every drawn entity's shape key weights and bone matrices, each
+    // entity's together (see `shape_slot` and `bone_slot`).
+    let mut frame = ShapeFrame::default();
     for (id, slot) in world.positions.iter().enumerate() {
         if Some(id) == exclude {
             continue;
@@ -11523,12 +11712,16 @@ fn build_instances(
             // person with arms out comes out thin. So its model keeps its own
             // proportions, sized to the body's height.
             if world.characters.get(id).is_some() {
-                drawn_scale = [scale.y / (2.0 * model.half_extents[1].max(1e-4)); 3];
+                drawn_scale = [scale.y / (2.0 * model.data.half_extents[1].max(1e-4)); 3];
             }
         }
         let shape = model.map_or(0, |m| {
-            shape_slot(&mut weights, &m.shape_keys, world.shape_weights.get(id))
+            shape_slot(&mut frame.weights, &m.data.shapes, world.shape_weights.get(id))
         });
+        let bones = match (model.and_then(|m| m.data.skin.as_ref()), world.animations.get(id)) {
+            (Some(skin), Some(animation)) => bone_slot(&mut frame.bones, skin, animation),
+            _ => 0,
+        };
         let rgb = if colliding.contains(&id) {
             const T: f32 = 0.6; // how far toward red
             [
@@ -11547,38 +11740,77 @@ fn build_instances(
             emissive: material.emissive,
             rotation: [rotation.yaw, rotation.pitch, rotation.roll],
             shape,
+            bones,
         };
         buckets[bucket].push(raw);
     }
     let group_counts: Vec<u32> = buckets.iter().map(|b| b.len() as u32).collect();
     let instances: Vec<InstanceRaw> = buckets.into_iter().flatten().collect();
-    (instances, group_counts, weights)
+    (instances, group_counts, frame)
 }
 
-/// What drawing an entity needs to know about an imported model besides its
-/// vertices, which are on the graphics card: its size, for characters (see
-/// `build_instances`), and its shape keys' names in the order the card
-/// numbers them.
-#[derive(Clone, Debug, Default, PartialEq)]
-struct DrawnModel {
-    name: String,
-    half_extents: [f32; 3],
-    shape_keys: Vec<String>,
+/// An imported model as `build_instances` sees it: its name, and its data
+/// on the CPU (its size, for characters, and its shape keys' names and
+/// skeleton, in the order the graphics card numbers them).
+#[derive(Clone, Copy, Debug)]
+struct DrawnModel<'a> {
+    name: &'a str,
+    data: &'a frame_engine::assets::MeshData,
 }
 
 /// `models` as `build_instances` needs them, in the same name order the mesh
 /// buffer uses.
 fn drawn_models(
     models: &std::collections::BTreeMap<String, frame_engine::assets::MeshData>,
-) -> Vec<DrawnModel> {
+) -> Vec<DrawnModel<'_>> {
     models
         .iter()
-        .map(|(name, data)| DrawnModel {
-            name: name.clone(),
-            half_extents: data.half_extents,
-            shape_keys: data.shapes.iter().map(|k| k.name.clone()).collect(),
-        })
+        .map(|(name, data)| DrawnModel { name, data })
         .collect()
+}
+
+/// Add an entity's bone matrices to `out`, posed by the clips playing on it
+/// (see `Animation`), and give the instance's `bones`: where they start,
+/// plus one. 0, and nothing added, when no clip it names is playing: the
+/// model is then drawn as made, with no skinning work at all.
+fn bone_slot(
+    out: &mut Vec<[f32; 16]>,
+    skin: &frame_engine::assets::skin::Skin,
+    animation: &frame_engine::world::Animation,
+) -> u32 {
+    let rest = skin.rest_pose();
+    let mut pose = rest.clone();
+    let mut layer = rest.clone();
+    let mut total = 0.0;
+    for play in &animation.clips {
+        if !(play.weight > 0.0 && play.weight.is_finite()) {
+            continue;
+        }
+        let Some(clip) = skin.clip(&play.clip) else {
+            continue;
+        };
+        let time = if !play.time.is_finite() {
+            0.0
+        } else if play.looping && clip.duration > 0.0 {
+            play.time.rem_euclid(clip.duration)
+        } else {
+            play.time.clamp(0.0, clip.duration)
+        };
+        layer.copy_from_slice(&rest);
+        clip.apply(time, &mut layer);
+        // A running average: each clip counts by its weight.
+        total += play.weight;
+        let t = play.weight / total;
+        for (p, l) in pose.iter_mut().zip(&layer) {
+            *p = p.blend(l, t);
+        }
+    }
+    if total <= 0.0 {
+        return 0;
+    }
+    let start = out.len() as u32 + 1;
+    out.extend(skin.skinning(&pose));
+    start
 }
 
 /// Add an entity's weights to `out`, one for each of its model's `keys` in
@@ -11588,16 +11820,16 @@ fn drawn_models(
 /// every weight 0.
 fn shape_slot(
     out: &mut Vec<f32>,
-    keys: &[String],
+    keys: &[frame_engine::assets::ShapeKey],
     weights: Option<&frame_engine::world::ShapeWeights>,
 ) -> u32 {
     let Some(weights) = weights else {
         return 0;
     };
-    let weight = |key: &String| {
+    let weight = |key: &frame_engine::assets::ShapeKey| {
         weights
             .0
-            .get(key)
+            .get(&key.name)
             .copied()
             .filter(|w| w.is_finite())
             .unwrap_or(0.0)
@@ -12196,7 +12428,9 @@ fn run_app(
         material_editing: None,
         prefabs: std::collections::BTreeMap::new(),
         new_prefab_name: String::new(),
-        game_models: Vec::new(),
+        game_meshes: std::collections::BTreeMap::new(),
+        locomotion: locomotion::Locomotion::default(),
+        game_locomotion: locomotion::Locomotion::default(),
         assets_subdir: std::path::PathBuf::new(),
         new_asset_folder: String::new(),
         thumbnails: std::collections::HashMap::new(),
@@ -12643,6 +12877,7 @@ mod shadow_fit_tests {
             emissive: 0.0,
             rotation: [0.0; 3],
             shape: 0,
+            bones: 0,
         }
     }
 
@@ -12784,6 +13019,7 @@ mod shape_key_tests {
                     moves: vec![moved(2, 0.3)],
                 },
             ],
+            skin: None,
         };
         // Another model's moves are already in the list.
         let mut moves = vec![ShapeMoveGpu::zeroed(); 5];
@@ -12814,25 +13050,183 @@ mod shape_key_tests {
         id
     }
 
-    fn person() -> DrawnModel {
-        DrawnModel {
-            name: "person".to_string(),
+    /// A person 1.8 tall with three shape keys and a two-bone arm: `upper`
+    /// at the middle, `lower` one above it, and clip `bend` turning `lower`
+    /// a quarter round z over a second. Vertex 0 follows `lower`, vertex 1
+    /// both bones, vertex 2 none.
+    fn person() -> MeshData {
+        use frame_engine::assets::skin::{
+            Bone, BoneTransform, Clip, IDENTITY, Property, Skin, Track, VertexBones,
+        };
+        let key = |name: &str| ShapeKey {
+            name: name.to_string(),
+            moves: Vec::new(),
+        };
+        let corner = MeshVertexData {
+            position: [0.0; 3],
+            normal: [0.0, 1.0, 0.0],
+            uv: [0.0; 2],
+        };
+        let h = std::f32::consts::FRAC_1_SQRT_2;
+        let mut skin = Skin {
+            bones: vec![
+                Bone {
+                    name: "upper".to_string(),
+                    parent: None,
+                    rest: BoneTransform::default(),
+                    hangs_from: IDENTITY,
+                    bind: IDENTITY,
+                },
+                Bone {
+                    name: "lower".to_string(),
+                    parent: Some(0),
+                    rest: BoneTransform {
+                        translation: [0.0, 1.0, 0.0],
+                        ..BoneTransform::default()
+                    },
+                    hangs_from: IDENTITY,
+                    bind: IDENTITY,
+                },
+            ],
+            vertices: vec![
+                VertexBones {
+                    bones: [1, 0, 0, 0],
+                    weights: [1.0, 0.0, 0.0, 0.0],
+                },
+                VertexBones {
+                    bones: [0, 1, 0, 0],
+                    weights: [0.25, 0.75, 0.0, 0.0],
+                },
+                VertexBones::default(),
+            ],
+            clips: vec![Clip {
+                name: "bend".to_string(),
+                duration: 1.0,
+                tracks: vec![Track {
+                    bone: 1,
+                    property: Property::Rotation,
+                    step: false,
+                    times: vec![0.0, 1.0],
+                    values: vec![[0.0, 0.0, 0.0, 1.0], [0.0, 0.0, h, h]],
+                }],
+            }],
+        };
+        let rest = skin.world(&skin.rest_pose());
+        for (bone, world) in skin.bones.iter_mut().zip(rest) {
+            bone.bind = frame_engine::assets::skin::invert(&world);
+        }
+        MeshData {
+            vertices: vec![corner; 3],
             half_extents: [0.3, 0.9, 0.2],
-            shape_keys: vec!["jaw".to_string(), "nose".to_string(), "brow".to_string()],
+            shapes: vec![key("jaw"), key("nose"), key("brow")],
+            skin: Some(skin),
         }
     }
 
-    fn draw(world: &World) -> (Vec<InstanceRaw>, Vec<f32>) {
-        let (instances, _, weights) = build_instances(
+    fn draw(world: &World) -> (Vec<InstanceRaw>, ShapeFrame) {
+        let data = person();
+        let models = [DrawnModel {
+            name: "person",
+            data: &data,
+        }];
+        let (instances, _, frame) = build_instances(
             world,
             None,
             &std::collections::HashSet::new(),
-            &[person()],
+            &models,
             &[],
             None,
             DVec3::ZERO,
         );
-        (instances, weights)
+        (instances, frame)
+    }
+
+    #[test]
+    fn the_entity_pipelines_fit_the_sixteen_inputs_a_pipeline_may_have() {
+        let locations: Vec<u32> = MeshVertex::ATTRIBS
+            .iter()
+            .chain(InstanceRaw::ATTRIBS.iter())
+            .map(|a| a.shader_location)
+            .collect();
+        assert!(locations.len() <= 16, "{} inputs", locations.len());
+        assert!(locations.iter().all(|l| *l < 16), "{locations:?}");
+        let unique: std::collections::BTreeSet<u32> = locations.iter().copied().collect();
+        assert_eq!(unique.len(), locations.len(), "no input used twice");
+    }
+
+    #[test]
+    fn a_skinned_models_vertices_carry_their_bones_and_weights() {
+        let verts = shaped_vertices(&person(), &mut Vec::new());
+        let unpack = |v: &MeshVertex| (v.skin[0].to_le_bytes(), v.skin[1].to_le_bytes());
+        assert_eq!(unpack(&verts[0]), ([1, 0, 0, 0], [255, 0, 0, 0]));
+        assert_eq!(unpack(&verts[1]), ([0, 1, 0, 0], [64, 191, 0, 0]));
+        assert_eq!(unpack(&verts[2]).1, [0; 4], "follows no bone");
+    }
+
+    #[test]
+    fn an_entity_playing_a_clip_gets_its_posed_bones_and_others_get_none() {
+        use frame_engine::world::{Animation, PlayingClip};
+        let mut world = World::new();
+        let bent = spawn(&mut world, Mesh::Custom("person".to_string()));
+        world.animations.insert(
+            bent,
+            Animation {
+                clips: vec![PlayingClip {
+                    clip: "bend".to_string(),
+                    time: 1.0,
+                    looping: false,
+                    ..PlayingClip::default()
+                }],
+            },
+        );
+        let still = spawn(&mut world, Mesh::Custom("person".to_string()));
+        let unknown = spawn(&mut world, Mesh::Custom("person".to_string()));
+        world.animations.insert(
+            unknown,
+            Animation {
+                clips: vec![PlayingClip {
+                    clip: "dance".to_string(),
+                    ..PlayingClip::default()
+                }],
+            },
+        );
+        let (instances, frame) = draw(&world);
+        let bones: Vec<u32> = instances.iter().map(|i| i.bones).collect();
+        assert_eq!(bones, [1, 0, 0], "{still} has no clip, {unknown} one it lacks");
+        assert_eq!(frame.bones.len(), 2, "one matrix per bone");
+        // `upper` is unmoved; `lower` takes the top of the arm (0, 2, 0) a
+        // quarter round the elbow at (0, 1, 0) to (-1, 1, 0).
+        let place = |m: &[f32; 16], p: [f32; 3]| {
+            [0, 1, 2].map(|r| m[r] * p[0] + m[4 + r] * p[1] + m[8 + r] * p[2] + m[12 + r])
+        };
+        assert_eq!(place(&frame.bones[0], [0.0, 2.0, 0.0]), [0.0, 2.0, 0.0]);
+        let top = place(&frame.bones[1], [0.0, 2.0, 0.0]);
+        assert!((top[0] + 1.0).abs() < 1e-5 && (top[1] - 1.0).abs() < 1e-5, "{top:?}");
+        // Two clips half and half: half way round.
+        world.animations.insert(
+            bent,
+            Animation {
+                clips: vec![
+                    PlayingClip {
+                        clip: "bend".to_string(),
+                        time: 1.0,
+                        looping: false,
+                        weight: 0.5,
+                        ..PlayingClip::default()
+                    },
+                    PlayingClip {
+                        clip: "bend".to_string(),
+                        time: 0.0,
+                        weight: 0.5,
+                        ..PlayingClip::default()
+                    },
+                ],
+            },
+        );
+        let (_, frame) = draw(&world);
+        let half = place(&frame.bones[1], [0.0, 2.0, 0.0]);
+        let s = std::f32::consts::FRAC_1_SQRT_2;
+        assert!((half[0] + s).abs() < 1e-5 && (half[1] - (1.0 + s)).abs() < 1e-5, "{half:?}");
     }
 
     #[test]
@@ -12860,10 +13254,10 @@ mod shape_key_tests {
         world
             .shape_weights
             .insert(cube, ShapeWeights([("jaw".to_string(), 1.0)].into()));
-        let (instances, weights) = draw(&world);
+        let (instances, frame) = draw(&world);
         // In model order: jaw, nose (not a number, so 0), brow. The model
         // has no tail, so that weight does nothing.
-        assert_eq!(weights, [0.5, 0.0, 0.25]);
+        assert_eq!(frame.weights, [0.5, 0.0, 0.25]);
         let shapes: Vec<u32> = instances.iter().map(|i| i.shape).collect();
         // The cube is drawn first (primitives before models), then the
         // three people in entity order.
@@ -13378,6 +13772,7 @@ mod project_model_tests {
             vertices,
             half_extents: [h, tall * 0.5, h],
             shapes: Vec::new(),
+            skin: None,
         }
     }
 

@@ -46,6 +46,10 @@ struct VertexInput {
     // This vertex's shape key moves: the first's place in `shape_moves`, and
     // how many. [0, 0] when no key moves it.
     @location(13) shape: vec2<u32>,
+    // The bones it follows, packed (MeshVertex::skin in lib.rs): four
+    // indexes into its model's skeleton a byte each, then four weights a
+    // byte each. All weights 0 when it follows none.
+    @location(15) skin: vec2<u32>,
 };
 
 // MUST match FLOW_RANGE and TIDE_REACH in module_api.rs.
@@ -62,9 +66,10 @@ struct InstanceInput {
     @location(7) emissive: f32,
     // x: yaw, y: pitch, z: roll, in radians (world::Rotation).
     @location(8) rotation: vec3<f32>,
-    // Where this entity's shape key weights start in `shape_weights`, plus
-    // one; 0 for none.
-    @location(14) shape: u32,
+    // x: where this entity's shape key weights start in `shape_weights`,
+    // plus one; y: where its bone matrices start in `bone_matrices`, plus
+    // one. 0 for none.
+    @location(14) slots: vec2<u32>,
 };
 
 // Shape keys (ShapeMoveGpu in lib.rs, ShapeKey in frame_engine::assets): one
@@ -79,6 +84,11 @@ struct ShapeMove {
 };
 @group(2) @binding(0) var<storage, read> shape_moves: array<ShapeMove>;
 @group(2) @binding(1) var<storage, read> shape_weights: array<f32>;
+// Each drawn entity's skinning matrices (Skin::skinning in
+// frame_engine::assets::skin), one per bone of its model, in the model's own
+// space: each takes a vertex from where the model was made to where the
+// entity's pose puts it.
+@group(2) @binding(2) var<storage, read> bone_matrices: array<mat4x4<f32>>;
 
 // A vertex's place and normal with the entity's shape keys applied: each
 // key's move times its weight, added together. Unchanged for a vertex no
@@ -89,10 +99,10 @@ struct Shaped {
 };
 fn shaped(vertex: VertexInput, instance: InstanceInput) -> Shaped {
     var out = Shaped(vertex.position, vertex.normal);
-    if (vertex.shape.y == 0u || instance.shape == 0u) {
+    if (vertex.shape.y == 0u || instance.slots.x == 0u) {
         return out;
     }
-    let weights = instance.shape - 1u;
+    let weights = instance.slots.x - 1u;
     for (var i = 0u; i < vertex.shape.y; i = i + 1u) {
         let m = shape_moves[vertex.shape.x + i];
         let w = shape_weights[weights + m.key];
@@ -103,6 +113,32 @@ fn shaped(vertex: VertexInput, instance: InstanceInput) -> Shaped {
         out.normal = normalize(out.normal);
     } else {
         out.normal = vertex.normal;
+    }
+    return out;
+}
+
+// `shape` moved by the entity's pose: each of the vertex's bones' matrices,
+// blended by its weights. Shape keys come first, as glTF does it, so a
+// wider jaw still opens and closes with the head. Unchanged for a vertex
+// that follows no bone or an entity with no pose.
+fn skinned(shape: Shaped, vertex: VertexInput, instance: InstanceInput) -> Shaped {
+    let weights = unpack4x8unorm(vertex.skin.y);
+    let total = dot(weights, vec4<f32>(1.0));
+    if (instance.slots.y == 0u || total <= 0.0) {
+        return shape;
+    }
+    let base = instance.slots.y - 1u;
+    let w = weights / total;
+    let b = vertex.skin.x;
+    let m = bone_matrices[base + (b & 255u)] * w.x
+        + bone_matrices[base + ((b >> 8u) & 255u)] * w.y
+        + bone_matrices[base + ((b >> 16u) & 255u)] * w.z
+        + bone_matrices[base + (b >> 24u)] * w.w;
+    var out = Shaped((m * vec4<f32>(shape.position, 1.0)).xyz, (m * vec4<f32>(shape.normal, 0.0)).xyz);
+    if (dot(out.normal, out.normal) > 1e-12) {
+        out.normal = normalize(out.normal);
+    } else {
+        out.normal = shape.normal;
     }
     return out;
 }
@@ -152,8 +188,8 @@ fn vs_main(vertex: VertexInput, instance: InstanceInput) -> VertexOutput {
     // Per-axis scale (component-wise), then the entity's rotation, then place
     // at the entity's position. Scale first so rotation spins the
     // already-sized shape rather than an elongated axis. The entity's shape
-    // keys come before all of it: they change the model itself.
-    let shape = shaped(vertex, instance);
+    // keys and pose come before all of it: they change the model itself.
+    let shape = skinned(shaped(vertex, instance), vertex, instance);
     let unmorphed = instance.position
         + rotate_by(shape.position * MESH_SIZE * instance.scale, instance.rotation);
     // A level-of-detail mesh slides toward its coarser shape with distance.

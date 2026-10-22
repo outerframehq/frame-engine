@@ -22,6 +22,8 @@
 // gets (0.0, 0.0) at every corner, same "missing data gets a harmless
 // default, not an error" tolerance the normal fallback already has.
 
+pub mod skin;
+
 /// One vertex of a parsed mesh. Position, normal and UV, same layout the
 /// editor feeds the GPU. Plain data, no graphics types in the engine.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -45,6 +47,10 @@ pub struct MeshData {
     /// The model's shape keys, if it has any (an OBJ never does). Each
     /// entity says how far each one is applied (`world::ShapeWeights`).
     pub shapes: Vec<ShapeKey>,
+    /// The model's skeleton and clips, if it has them (an OBJ never does).
+    /// Shape keys apply first, then the bones, so a wider jaw still opens
+    /// and closes with the head.
+    pub skin: Option<skin::Skin>,
 }
 
 /// A named change to a model's shape, such as a wider jaw: how far each
@@ -287,5 +293,6 @@ fn normalise_to_unit(mut vertices: Vec<MeshVertexData>) -> MeshData {
         vertices,
         half_extents: half,
         shapes: Vec::new(),
+        skin: None,
     }
 }

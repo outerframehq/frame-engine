@@ -292,6 +292,18 @@ pub fn character_eyes(world: &World, id: usize) -> Option<([f64; 3], crate::worl
 /// same way, but its offset turns with the pitch too, so it stays put on
 /// screen: something held in the hand.
 ///
+/// Move every playing clip's time on by `dt` seconds (see `Animation`).
+/// Runs once a tick, so animation keeps step with the simulation, and on
+/// every computer that draws the world, so it needs nothing sent over the
+/// network.
+pub fn animate(world: &mut World, dt: f32) {
+    for (_, animation) in world.animations.query_mut() {
+        for clip in &mut animation.clips {
+            clip.advance(dt);
+        }
+    }
+}
+
 /// An entity with no `Parent`, or whose named parent has since despawned, is
 /// left untouched, the same tolerance a stale `Script` reference gets.
 pub fn apply_parenting(world: &mut World) {

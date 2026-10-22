@@ -137,6 +137,69 @@ pub const GRAVITY: f32 = 9.81 / (crate::core::TICK_RATE as f32 * crate::core::TI
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Default)]
 pub struct ShapeWeights(pub std::collections::BTreeMap<String, f32>);
 
+/// What an entity's model is doing: the clips playing on it (see
+/// `assets::skin`), each at its own time and strength. The pose drawn is the
+/// clips' poses blended by weight; a bone no clip moves stays as made. Plain
+/// data: the Inspector, a script or a game's own systems set it, and
+/// `systems::animate` moves each clip's time on every tick.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Default)]
+#[serde(default)]
+pub struct Animation {
+    pub clips: Vec<PlayingClip>,
+}
+
+/// One clip playing on an entity (see `Animation`).
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+#[serde(default)]
+pub struct PlayingClip {
+    /// The clip's name in the model (`walk`).
+    pub clip: String,
+    /// Seconds into the clip.
+    pub time: f32,
+    /// The clip's length in seconds, copied from the model when the clip is
+    /// chosen, so its time can wrap round as it plays. 0 if not known: time
+    /// then keeps growing and the drawing wraps it.
+    pub length: f32,
+    /// How much it counts in the blend, 0 to 1.
+    pub weight: f32,
+    /// How fast its time moves: 1 as made, 0 held still, 2 twice as fast.
+    pub speed: f32,
+    /// Whether it starts again when it ends, or holds its last pose.
+    pub looping: bool,
+}
+
+impl Default for PlayingClip {
+    fn default() -> Self {
+        PlayingClip {
+            clip: String::new(),
+            time: 0.0,
+            length: 0.0,
+            weight: 1.0,
+            speed: 1.0,
+            looping: true,
+        }
+    }
+}
+
+impl PlayingClip {
+    /// Move time on by `dt` seconds at this clip's speed: round again when
+    /// a looping clip ends, held at the end when one that does not loop
+    /// does.
+    pub fn advance(&mut self, dt: f32) {
+        if !dt.is_finite() || !self.speed.is_finite() {
+            return;
+        }
+        self.time += dt * self.speed;
+        if self.length > 0.0 {
+            self.time = if self.looping {
+                self.time.rem_euclid(self.length)
+            } else {
+                self.time.clamp(0.0, self.length)
+            };
+        }
+    }
+}
+
 /// How a character's body is built, in metres, kilograms and metres per
 /// second. The character controller (`physics`) reads it every tick to size
 /// the capsule it moves and to decide how fast it walks, runs and jumps. It is
@@ -1139,6 +1202,8 @@ pub struct Prefab {
     pub character: Option<CharacterBody>,
     #[serde(default)]
     pub shape_weights: Option<ShapeWeights>,
+    #[serde(default)]
+    pub animation: Option<Animation>,
     /// See `SCENE_UNITS`. Missing in a prefab saved before metres, which is
     /// scaled up when it is spawned.
     #[serde(default)]
@@ -1218,6 +1283,9 @@ pub struct World {
     /// `ShapeWeights`.
     #[serde(default)]
     pub shape_weights: ComponentStorage<ShapeWeights>,
+    /// The clips playing on each entity's model. See `Animation`.
+    #[serde(default)]
+    pub animations: ComponentStorage<Animation>,
     /// Components that belong to crates outside the engine, keyed by name.
     /// A crate that adds its own component (a game-specific feature, say) never
     /// needs a field here: it stores each entity's value under its own name
@@ -1511,6 +1579,7 @@ impl World {
             self.characters.remove(id);
             self.looks.remove(id);
             self.shape_weights.remove(id);
+            self.animations.remove(id);
             for storage in self.extensions.values_mut() {
                 storage.remove(id);
             }
@@ -1613,6 +1682,7 @@ impl World {
             children,
             character: self.characters.get(id).copied(),
             shape_weights: self.shape_weights.get(id).cloned(),
+            animation: self.animations.get(id).cloned(),
             units: SCENE_UNITS,
             format: SCENE_FORMAT,
         })
@@ -1681,6 +1751,9 @@ impl World {
         }
         if let Some(weights) = &prefab.shape_weights {
             self.shape_weights.insert(id, weights.clone());
+        }
+        if let Some(animation) = &prefab.animation {
+            self.animations.insert(id, animation.clone());
         }
         if prefab.units < SCENE_UNITS {
             // A prefab saved before metres: scale it as it was drawn then.
@@ -2076,6 +2149,40 @@ mod unit_tests {
         std::fs::remove_dir_all(&dir).ok();
         world.despawn(id);
         assert_eq!(world.shape_weights.get(id), None);
+    }
+
+    #[test]
+    fn a_clip_loops_round_its_length_or_holds_its_end() {
+        let mut walk = PlayingClip {
+            clip: "walk".to_string(),
+            length: 1.0,
+            speed: 2.0,
+            ..PlayingClip::default()
+        };
+        walk.advance(0.375);
+        assert_eq!(walk.time, 0.75);
+        walk.advance(0.25);
+        assert_eq!(walk.time, 0.25, "round again");
+        walk.looping = false;
+        walk.advance(1.0);
+        assert_eq!(walk.time, 1.0, "held at the end");
+        walk.speed = -1.0;
+        walk.advance(5.0);
+        assert_eq!(walk.time, 0.0, "backwards stops at the start");
+        // Animations go with prefabs and leave with the entity.
+        let mut world = World::new();
+        let pos = Position {
+            x: 0.0,
+            y: 0.0,
+            z: 0.0,
+        };
+        let id = world.spawn_from_prefab(&Prefab::default(), pos);
+        let animation = Animation { clips: vec![walk] };
+        world.animations.insert(id, animation.clone());
+        let copy = world.spawn_from_prefab(&world.capture_prefab(id).unwrap(), pos);
+        assert_eq!(world.animations.get(copy), Some(&animation));
+        world.despawn(id);
+        assert_eq!(world.animations.get(id), None);
     }
 
     #[test]
