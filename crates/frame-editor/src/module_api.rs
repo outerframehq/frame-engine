@@ -34,12 +34,12 @@ use std::collections::{BTreeMap, BTreeSet};
 /// fragment shaders, and the sky in both.
 pub const SCENE_WGSL: &str = include_str!("scene.wgsl");
 
+/// Bytes as megabytes, worded the way the performance overlay shows them.
+pub use crate::game_audio::{AudioFrame, HEARING, Listener};
 pub use crate::grass::{
     GRASS_GRID_MAX, GRASS_PATCHES_MAX, GrassFactory, GrassField, GrassPatch, GrassQuality,
     GrassSample,
 };
-/// Bytes as megabytes, worded the way the performance overlay shows them.
-pub use crate::game_audio::{AudioFrame, HEARING, Listener};
 pub use crate::perf::megabytes;
 pub use frame_engine::assets::MeshVertexData;
 pub use frame_engine::pack::ProjectFiles;
@@ -1922,7 +1922,8 @@ mod tests {
         let (with, _, _) =
             build_instances(&world, None, &none, &[], &anchors, None, glam::DVec3::ZERO);
         assert_eq!(with.len(), 1, "only the ordinary entity is drawn");
-        let (without, _, _) = build_instances(&world, None, &none, &[], &[], None, glam::DVec3::ZERO);
+        let (without, _, _) =
+            build_instances(&world, None, &none, &[], &[], None, glam::DVec3::ZERO);
         assert_eq!(without.len(), 2, "no module: both drawn");
     }
 

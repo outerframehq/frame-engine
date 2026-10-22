@@ -10,6 +10,12 @@ lands and the patch version bumps for fixes and small additions.
 ## [Unreleased]
 
 ### Changed
+- **Create** on the launcher makes the project a folder of its own. Picking a folder used to save `project.ron` and `scenes/` straight into it, so choosing Documents spread a project's files among everything else there. Now picking Documents for a project called FirstGame makes `Documents/FirstGame`. A folder of that name that already has files in it is refused rather than mixed into, and picking an empty folder already named after the project uses it as it is (`new_project_folder`, with a test).
+- The launcher shows why a Create or Open did nothing (no name typed, a name that can't be a file name, a folder that is already in use, a folder with no scene), under its header. Those messages only went to the terminal before.
+- The README's Building section says what a first build needs: Rust 1.92 or newer, the Linux packages (a C compiler, `pkg-config` and the ALSA headers, with the commands for Debian-based systems and Fedora), the desktop file picker the launcher uses, and how long and how much disk a first build takes. The controls are split into the editor's and the Play window's.
+- `cargo run -p frame-engine` shows its demo entities crossing the ASCII view over several seconds. They moved a metre a tick (30 m/s) and were gone in under a second; they now move a tenth of that.
+- User-facing text uses plain punctuation in place of long dashes (git status lines, empty lists, window titles, the About text).
+- The whole repository is formatted with `cargo fmt`, and `cargo fmt --all -- --check` passes. Four files had drifted from it.
 - The README's Status section is now two short lists, what the engine and editor have and what they do not have yet, in place of the long feature list and its out-of-date "frontier" paragraph, and its map of the source files matches the code again. DESIGN.md explains the choices behind shape keys and skinning, and model import mentions the file types a module adds.
 - A character's imported model keeps its own proportions. A character's Scale is its body's capsule, and the model was stretched to fill it, so a person with arms out came out thin. Now an entity with a `CharacterBody` draws its imported model at the model's own proportions, sized to the body's height; the capsule is unchanged. The built-in shapes still fill the capsule. Covered by a test.
 - Running water no longer shows stripes. Its small ripples are carried along the flow, and where the flow changed sharply from one place to the next, or the ripples were finer than a pixel (far off, or seen low), they were squeezed into wood-grain bands and long rays. Each pixel now measures how much ground it covers and how fast the flow changes across it, and the ripples fade into the ordinary waves where they could only make stripes (`RIPPLE_PIXEL`). Close-up flowing water looks as before.
@@ -27,6 +33,7 @@ lands and the patch version bumps for fixes and small additions.
 - An entity riding a `Parent` and that parent no longer push each other in `systems::resolve_collisions`. A carried thing overlapping the body carrying it (a held item swinging into its holder) used to shove the holder, and with it the holder's camera, every tick; online, where a player's own character has no physics body on their computer, this showed as the view jittering. A rider still pushes and is pushed by everything else. Covered by a test.
 
 ### Added
+- A model the editor can't load says so. When a project opens, and when the Play window starts, any model file in `assets/` of a type nothing reads (`.glb`, `.fbx`, `.blend` and others, when no module reads them) is listed in the log with the types the editor does read, and so is each model an entity asks for that isn't loaded, which is otherwise drawn as a cube without a word (`model_notes`, with a test).
 
 Engine:
 

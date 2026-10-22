@@ -3162,8 +3162,8 @@ fn source_tab_ui(ui: &mut egui::Ui, summary: &Option<GitSummary>) {
             let state = match (ahead, behind) {
                 (0, 0) => "Up to date with upstream".to_string(),
                 (a, 0) => format!("{a} commit(s) ahead, ready to push"),
-                (0, b) => format!("{b} commit(s) behind — pull to catch up"),
-                (a, b) => format!("{a} ahead, {b} behind — diverged"),
+                (0, b) => format!("{b} commit(s) behind: pull to catch up"),
+                (a, b) => format!("{a} ahead, {b} behind: diverged"),
             };
             ui.weak(state);
             ui.add_space(2.0);
@@ -3177,7 +3177,7 @@ fn source_tab_ui(ui: &mut egui::Ui, summary: &Option<GitSummary>) {
     if s.files.is_empty() {
         ui.colored_label(
             egui::Color32::from_rgb(0x7c, 0xc5, 0x7c),
-            "Working tree clean — nothing to commit",
+            "Working tree clean, nothing to commit",
         );
         return;
     }
@@ -3234,15 +3234,15 @@ fn render_thumbnail(data: &frame_engine::assets::MeshData) -> egui::ColorImage {
     // A model kept at the size it was made (see
     // `EditorModule::project_models`) is brought to unit size about its own
     // middle first; a unit model is left as it is.
-    let (lo, hi) = data.vertices.iter().fold(
-        ([f32::MAX; 3], [f32::MIN; 3]),
-        |(lo, hi), v| {
+    let (lo, hi) = data
+        .vertices
+        .iter()
+        .fold(([f32::MAX; 3], [f32::MIN; 3]), |(lo, hi), v| {
             (
                 [0, 1, 2].map(|i| lo[i].min(v.position[i])),
                 [0, 1, 2].map(|i| hi[i].max(v.position[i])),
             )
-        },
-    );
+        });
     let middle = [0, 1, 2].map(|i| (lo[i] + hi[i]) * 0.5);
     let widest = (0..3).map(|i| hi[i] - lo[i]).fold(0.0f32, f32::max);
     let already_unit = widest <= 1.0 + 1e-4 && middle.iter().all(|m| m.abs() <= 1e-4);
@@ -3553,7 +3553,7 @@ fn assets_tab_ui(
                         }
                     });
                 if image_names.is_empty() {
-                    ui.weak("(no images yet — File > Import texture…)");
+                    ui.weak("(no images yet: File > Import texture…)");
                 }
             });
             changed |= ui
@@ -4285,8 +4285,7 @@ fn inspector_tab_ui(
                     if play.length > 0.0 {
                         ui.horizontal(|ui| {
                             ui.add(
-                                egui::Slider::new(&mut play.time, 0.0..=play.length)
-                                    .suffix(" s"),
+                                egui::Slider::new(&mut play.time, 0.0..=play.length).suffix(" s"),
                             );
                             ui.label("Time");
                         });
@@ -4583,7 +4582,7 @@ fn inspector_tab_ui(
             ui.add_space(8.0);
             section_label(ui, "Script");
             if script_library.is_empty() {
-                ui.weak("No scripts yet — add some in the Script Editor tab.");
+                ui.weak("No scripts yet. Add some in the Script Editor tab.");
             } else {
                 let selected_text = script_source
                     .clone()
@@ -5075,6 +5074,9 @@ mod theme {
     pub const MUTED: Color32 = Color32::from_rgb(0x8E, 0x93, 0x8D);
     pub const ACCENT: Color32 = Color32::from_rgb(0x58, 0x84, 0x4C);
     pub const ACCENT_HOVER: Color32 = Color32::from_rgb(0x6B, 0x9A, 0x5E);
+    // Dark text for a control filled with the accent. Part of the Outerface
+    // palette, not used by the theme below yet.
+    #[allow(dead_code)]
     pub const ON_ACCENT: Color32 = Color32::from_rgb(0x0E, 0x17, 0x10);
     // The wood-brown secondary accent from the mockup. Not used by the
     // theme below yet -- it was the mockup's tick-mark/marker color, which
@@ -5403,6 +5405,9 @@ struct App {
     recent_projects: Vec<RecentProject>,
     // The name typed on the launcher for a new project (becomes its scene file).
     new_project_name: String,
+    // The last message logged while the launcher is showing, shown under its
+    // header so a refused Create or Open says why, not only in the terminal.
+    launcher_note: Option<String>,
     // Project-settings window state (opened from a card's Settings button).
     settings_open: bool,
     // A project the user clicked Delete on, awaiting Confirm/Cancel on its card.
@@ -5695,6 +5700,9 @@ impl App {
     fn log(&mut self, msg: impl Into<String>) {
         let msg = msg.into();
         println!("{msg}");
+        if matches!(self.mode, AppMode::Launcher) {
+            self.launcher_note = Some(msg.clone());
+        }
         self.log_lines.push(msg);
         if self.log_lines.len() > 500 {
             self.log_lines.remove(0);
@@ -6547,6 +6555,7 @@ impl App {
         let mut s_desc = std::mem::take(&mut self.settings_description);
         let mut s_version = std::mem::take(&mut self.settings_version);
         let notice = self.version_notice.clone();
+        let launcher_note = self.launcher_note.clone();
         let mut dismiss_notice = false;
         let (jobs, tex_delta, ppp) = if let (Some(state), Some(window)) =
             (self.egui_state.as_mut(), self.window.as_ref())
@@ -6573,12 +6582,16 @@ impl App {
                             action = Some(LauncherAction::OpenProject);
                         }
                     });
+                    if let Some(note) = &launcher_note {
+                        ui.add_space(6.0);
+                        ui.label(note);
+                    }
                     ui.add_space(12.0);
                     ui.separator();
                     ui.add_space(8.0);
 
                     if recent.is_empty() {
-                        ui.weak("No projects yet — create one above to begin.");
+                        ui.weak("No projects yet. Create one above to begin.");
                     } else {
                         ui.heading("Projects");
                         ui.add_space(8.0);
@@ -6789,7 +6802,8 @@ impl App {
         }
     }
 
-    /// Create a project: take the name typed on the launcher, pick a folder,
+    /// Create a project: take the name typed on the launcher, pick where it
+    /// goes, make it a folder of its own there (see `new_project_folder`),
     /// and make a first scene, `scenes/<name>.ron`, which is also the start
     /// scene, and `project.ron` with the project's name.
     fn new_project(&mut self) {
@@ -6802,16 +6816,23 @@ impl App {
             self.log("Project name can't contain slashes".to_string());
             return;
         }
-        let Some(folder) = rfd::FileDialog::new()
-            .set_title("Choose a folder for the new project")
-            .pick_folder()
-        else {
-            return;
-        };
         if !project::valid_scene_name(&name) {
             self.log(format!("'{name}' can't be used as a file name"));
             return;
         }
+        let Some(chosen) = rfd::FileDialog::new()
+            .set_title(format!("Choose where to put the '{name}' folder"))
+            .pick_folder()
+        else {
+            return;
+        };
+        let folder = match new_project_folder(&chosen, &name) {
+            Ok(folder) => folder,
+            Err(e) => {
+                self.log(format!("Could not create project: {e}"));
+                return;
+            }
+        };
         // The first scene is named after the project, and is its start scene.
         let world = default_world();
         match project::save_scene(&folder, &name, &world) {
@@ -6928,6 +6949,7 @@ impl App {
             gpu.set_custom_meshes(&[]);
         }
         self.mode = AppMode::Launcher;
+        self.launcher_note = None;
         self.project_name = None;
         self.current_scene_path = None;
         self.project_dir = None;
@@ -7052,7 +7074,7 @@ impl App {
         let title = if player {
             app_name().to_string()
         } else {
-            format!("{name} — Play")
+            format!("{name} - Play")
         };
         #[allow(unused_mut)]
         let mut attributes = Window::default_attributes().with_title(title);
@@ -7088,12 +7110,20 @@ impl App {
             self.log(format!("Model load failed: {e}"));
         }
         let mut embedded = std::collections::BTreeMap::new();
-        let errors =
-            add_project_models(&self.modules.borrow(), &files, &mut models, &mut embedded);
+        let errors = add_project_models(&self.modules.borrow(), &files, &mut models, &mut embedded);
         for e in errors {
             self.log(format!("Model: {e}"));
         }
         add_module_meshes(&self.modules.borrow(), &mut models);
+        let notes = model_notes(
+            &files,
+            &module_model_types(&self.modules.borrow()),
+            &models,
+            &world,
+        );
+        for note in notes {
+            self.log(format!("Model: {note}"));
+        }
         let names: Vec<String> = models.keys().cloned().collect();
         let refs: Vec<&frame_engine::assets::MeshData> = models.values().collect();
         // A fresh, local decode cache: Play starts far less often than a
@@ -7181,7 +7211,7 @@ impl App {
         if !matches!(self.mode, AppMode::Player)
             && let Some(window) = &self.game_window
         {
-            window.set_title(&format!("{name} — Play"));
+            window.set_title(&format!("{name} - Play"));
         }
         self.log(format!("Changed scene to '{name}'"));
     }
@@ -7360,7 +7390,12 @@ impl App {
                 })
                 .unwrap_or([self.cam_focus_x, self.cam_focus_y, self.cam_focus_z]),
         };
-        self.play_game_audio(menu_view, active_camera_id, game_viewer, game_files.as_ref());
+        self.play_game_audio(
+            menu_view,
+            active_camera_id,
+            game_viewer,
+            game_files.as_ref(),
+        );
         let (instances, group_counts, shapes, lights) = match &self.game_world {
             Some(world) => {
                 let anchors = module_api::anchor_names(&self.modules);
@@ -8003,7 +8038,7 @@ impl App {
             Tab::Source => "Source Control",
             Tab::Viewport => unreachable!("Viewport is never popped out"),
         };
-        let title = format!("{} — {part}", app_name());
+        let title = format!("{} - {part}", app_name());
         let attributes = Window::default_attributes().with_title(title);
         let window = match event_loop.create_window(attributes) {
             Ok(w) => Arc::new(w),
@@ -8426,7 +8461,9 @@ impl App {
         let replaced = self.custom_meshes.contains_key(&name);
         self.load_project_assets();
         if !self.custom_meshes.contains_key(&name) {
-            self.log(format!("'{name}' was copied into assets but did not load as a model"));
+            self.log(format!(
+                "'{name}' was copied into assets but did not load as a model"
+            ));
         } else if replaced {
             self.log(format!("Replaced model '{name}'"));
         } else {
@@ -8550,10 +8587,20 @@ impl App {
                 self.log(format!("Model: {e}"));
             }
             add_module_meshes(&self.modules.borrow(), &mut models);
+            let notes = model_notes(
+                &files,
+                &module_model_types(&self.modules.borrow()),
+                &models,
+                &self.world,
+            );
+            for note in notes {
+                self.log(format!("Model: {note}"));
+            }
             self.custom_meshes = models;
             // A model read again may bring a different texture: decode
             // them afresh.
-            self.texture_cache.retain(|key, _| !key.ends_with(EMBEDDED_TEXTURE));
+            self.texture_cache
+                .retain(|key, _| !key.ends_with(EMBEDDED_TEXTURE));
             self.embedded_textures = embedded;
 
             let (manifests, scripts, errors) = load_project_plugins(&root);
@@ -8703,6 +8750,7 @@ impl App {
     }
 
     fn enter_editor(&mut self, root: std::path::PathBuf, scene_path: std::path::PathBuf) {
+        self.launcher_note = None;
         let name = project_display_name(&root);
         self.project_dir = Some(root);
         self.current_scene_path = Some(scene_path);
@@ -8711,7 +8759,7 @@ impl App {
         self.paused = true;
         self.mode = AppMode::Editor;
         if let Some(window) = &self.window {
-            window.set_title(&format!("{} — {name}", app_name()));
+            window.set_title(&format!("{} - {name}", app_name()));
         }
         self.log(format!("Opened project '{name}'"));
         self.project_name = Some(name);
@@ -9413,7 +9461,7 @@ impl ApplicationHandler for App {
                 {
                     let scene = self.current_scene_name().unwrap_or_default();
                     let title = format!(
-                        "{} — {name} — {scene}{}",
+                        "{} - {name} - {scene}{}",
                         app_name(),
                         if self.is_dirty() { " *" } else { "" }
                     );
@@ -9670,7 +9718,7 @@ impl ApplicationHandler for App {
                 let mut scenes_tab = std::mem::take(&mut self.scenes_tab);
                 let mut scene_action: Option<scenes::SceneAction> = None;
                 let mut prefab_spawn_request: Option<String> = None;
-                let mut new_prefab_name = std::mem::take(&mut self.new_prefab_name);
+                let new_prefab_name = std::mem::take(&mut self.new_prefab_name);
                 let script_library = std::mem::take(&mut self.world.script_library);
                 let new_script_name = std::mem::take(&mut self.new_script_name);
                 let script_filter = std::mem::take(&mut self.script_filter);
@@ -10757,7 +10805,7 @@ impl ApplicationHandler for App {
                     Some(MenuAction::BuildGame) => self.open_build_window(),
                     Some(MenuAction::PlayScene) => self.play_open_scene(event_loop),
                     Some(MenuAction::About) => {
-                        self.log("Frame Editor — a hand-rolled Rust simulation engine and editor.");
+                        self.log("Frame Editor: a hand-rolled Rust simulation engine and editor.");
                     }
                     Some(MenuAction::Quit) => self.request_guarded(GuardedAction::Quit, event_loop),
                     None => {}
@@ -11300,6 +11348,86 @@ fn module_model_types(modules: &[Box<dyn EditorModule>]) -> Vec<&'static str> {
     types
 }
 
+/// Where a new project called `name` goes when `chosen` is picked: a folder
+/// of its own, `chosen/name`, made if it is not there, so a project's files
+/// never land loose among others. A folder of that name that already has
+/// files in it is refused. Picking an empty folder that already has the
+/// project's name uses it as it is, rather than making another inside it.
+fn new_project_folder(chosen: &std::path::Path, name: &str) -> Result<std::path::PathBuf, String> {
+    let is_empty = |folder: &std::path::Path| {
+        std::fs::read_dir(folder)
+            .map(|mut entries| entries.next().is_none())
+            .unwrap_or(false)
+    };
+    if chosen.file_name().is_some_and(|f| f == name) && is_empty(chosen) {
+        return Ok(chosen.to_path_buf());
+    }
+    let folder = chosen.join(name);
+    if folder.exists() {
+        if !folder.is_dir() {
+            return Err(format!("{} is a file, not a folder", folder.display()));
+        }
+        if !is_empty(&folder) {
+            return Err(format!(
+                "{} already has files in it. Choose another place or another name.",
+                folder.display()
+            ));
+        }
+        return Ok(folder);
+    }
+    std::fs::create_dir_all(&folder).map_err(|e| format!("{}: {e}", folder.display()))?;
+    Ok(folder)
+}
+
+/// File types other tools save models in. A project file of one of these
+/// types that nothing here reads (the editor reads `.obj`; a module may add
+/// more, see `EditorModule::model_file_types`) is reported rather than
+/// silently left out.
+const OTHER_MODEL_TYPES: [&str; 10] = [
+    "glb", "gltf", "fbx", "dae", "blend", "stl", "ply", "3ds", "usd", "usdz",
+];
+
+/// What to tell someone about a project's models, one line each: a file under
+/// `assets` that looks like a model but that nothing here reads (`readable`
+/// are the extra types modules read), and a model an entity in `world` uses
+/// that is not among `models`, so it is drawn as a cube.
+fn model_notes(
+    files: &ProjectFiles,
+    readable: &[&str],
+    models: &std::collections::BTreeMap<String, frame_engine::assets::MeshData>,
+    world: &World,
+) -> Vec<String> {
+    let mut notes = Vec::new();
+    for path in files.files_under("assets") {
+        let Some((_, ext)) = path.rsplit_once('.') else {
+            continue;
+        };
+        let ext = ext.to_ascii_lowercase();
+        if OTHER_MODEL_TYPES.contains(&ext.as_str())
+            && !readable.iter().any(|r| r.eq_ignore_ascii_case(&ext))
+        {
+            notes.push(format!(
+                "{path}: nothing here reads .{ext} files, so it is not loaded. The editor \
+                 reads .obj; a game's module can add other types."
+            ));
+        }
+    }
+    let missing: std::collections::BTreeSet<&String> = world
+        .meshes
+        .query()
+        .filter_map(|(_, mesh)| match mesh {
+            Mesh::Custom(name) if !models.contains_key(name) => Some(name),
+            _ => None,
+        })
+        .collect();
+    for name in missing {
+        notes.push(format!(
+            "No model named '{name}' is loaded, so entities using it are drawn as a cube."
+        ));
+    }
+    notes
+}
+
 /// Add the models modules make (see `EditorModule::meshes`) to `models`. A
 /// project's own model of the same name wins.
 fn add_module_meshes(
@@ -11716,9 +11844,16 @@ fn build_instances(
             }
         }
         let shape = model.map_or(0, |m| {
-            shape_slot(&mut frame.weights, &m.data.shapes, world.shape_weights.get(id))
+            shape_slot(
+                &mut frame.weights,
+                &m.data.shapes,
+                world.shape_weights.get(id),
+            )
         });
-        let bones = match (model.and_then(|m| m.data.skin.as_ref()), world.animations.get(id)) {
+        let bones = match (
+            model.and_then(|m| m.data.skin.as_ref()),
+            world.animations.get(id),
+        ) {
             (Some(skin), Some(animation)) => bone_slot(&mut frame.bones, skin, animation),
             _ => 0,
         };
@@ -12049,7 +12184,9 @@ fn build_material_gpu_data(
                 if let Some(cached) = cache.get(&key) {
                     return Some(cached.clone());
                 }
-                let img = image::load_from_memory(embedded.get(name)?).ok()?.to_rgba8();
+                let img = image::load_from_memory(embedded.get(name)?)
+                    .ok()?
+                    .to_rgba8();
                 let (width, height) = img.dimensions();
                 let data = (width, height, img.into_raw());
                 cache.insert(key, data.clone());
@@ -12412,6 +12549,7 @@ fn run_app(
         project_name: None,
         recent_projects: sorted_recent_projects(),
         new_project_name: String::new(),
+        launcher_note: None,
         settings_open: false,
         pending_delete: None,
         settings_root: None,
@@ -12986,6 +13124,77 @@ mod rotation_shader_tests {
 }
 
 #[cfg(test)]
+mod new_project_tests {
+    use super::*;
+
+    #[test]
+    fn a_new_project_gets_a_folder_of_its_own_and_never_lands_among_other_files() {
+        let base = std::env::temp_dir().join(format!("frame-new-project-{}", std::process::id()));
+        std::fs::create_dir_all(base.join("Documents")).unwrap();
+        std::fs::write(base.join("Documents/letter.txt"), b"mine").unwrap();
+        let documents = base.join("Documents");
+        // Picking Documents makes Documents/FirstGame.
+        let made = new_project_folder(&documents, "FirstGame").unwrap();
+        assert_eq!(made, documents.join("FirstGame"));
+        assert!(made.is_dir());
+        // That folder is empty, so picking Documents again is fine...
+        assert_eq!(new_project_folder(&documents, "FirstGame").unwrap(), made);
+        // ...but once it has files, a second project of that name is refused.
+        std::fs::write(made.join("project.ron"), b"()").unwrap();
+        let err = new_project_folder(&documents, "FirstGame").unwrap_err();
+        assert!(err.contains("already has files"), "{err}");
+        // An empty folder already named after the project is used as it is.
+        let own = base.join("Second");
+        std::fs::create_dir_all(&own).unwrap();
+        assert_eq!(new_project_folder(&own, "Second").unwrap(), own);
+        // A file in the way is refused.
+        std::fs::write(documents.join("Third"), b"").unwrap();
+        assert!(new_project_folder(&documents, "Third").is_err());
+        std::fs::remove_dir_all(&base).ok();
+    }
+}
+
+#[cfg(test)]
+mod model_note_tests {
+    use super::*;
+    use frame_engine::world::Velocity;
+
+    #[test]
+    fn a_model_nothing_reads_and_a_missing_model_are_reported() {
+        let dir = std::env::temp_dir().join(format!("frame-model-notes-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("assets/people")).unwrap();
+        for file in [
+            "assets/people/walker.glb",
+            "assets/rock.obj",
+            "assets/tree.GLTF",
+            "assets/notes.txt",
+        ] {
+            std::fs::write(dir.join(file), b"").unwrap();
+        }
+        let files = ProjectFiles::Folder(dir.clone());
+        let mut world = World::new();
+        let id = world.spawn(
+            Position {
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+            },
+            Velocity {
+                dx: 0.0,
+                dy: 0.0,
+                dz: 0.0,
+            },
+        );
+        world.meshes.insert(id, Mesh::Custom("walker".to_string()));
+        let notes = model_notes(&files, &["gltf"], &Default::default(), &world);
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(notes.len(), 2, "{notes:?}");
+        assert!(notes[0].starts_with("assets/people/walker.glb: nothing here reads .glb"));
+        assert!(notes[1].contains("'walker'") && notes[1].contains("cube"));
+    }
+}
+
+#[cfg(test)]
 mod shape_key_tests {
     use super::*;
     use frame_engine::assets::{MeshData, MeshVertexData, ShapeKey, ShapeMove};
@@ -13192,7 +13401,11 @@ mod shape_key_tests {
         );
         let (instances, frame) = draw(&world);
         let bones: Vec<u32> = instances.iter().map(|i| i.bones).collect();
-        assert_eq!(bones, [1, 0, 0], "{still} has no clip, {unknown} one it lacks");
+        assert_eq!(
+            bones,
+            [1, 0, 0],
+            "{still} has no clip, {unknown} one it lacks"
+        );
         assert_eq!(frame.bones.len(), 2, "one matrix per bone");
         // `upper` is unmoved; `lower` takes the top of the arm (0, 2, 0) a
         // quarter round the elbow at (0, 1, 0) to (-1, 1, 0).
@@ -13201,7 +13414,10 @@ mod shape_key_tests {
         };
         assert_eq!(place(&frame.bones[0], [0.0, 2.0, 0.0]), [0.0, 2.0, 0.0]);
         let top = place(&frame.bones[1], [0.0, 2.0, 0.0]);
-        assert!((top[0] + 1.0).abs() < 1e-5 && (top[1] - 1.0).abs() < 1e-5, "{top:?}");
+        assert!(
+            (top[0] + 1.0).abs() < 1e-5 && (top[1] - 1.0).abs() < 1e-5,
+            "{top:?}"
+        );
         // Two clips half and half: half way round.
         world.animations.insert(
             bent,
@@ -13226,7 +13442,10 @@ mod shape_key_tests {
         let (_, frame) = draw(&world);
         let half = place(&frame.bones[1], [0.0, 2.0, 0.0]);
         let s = std::f32::consts::FRAC_1_SQRT_2;
-        assert!((half[0] + s).abs() < 1e-5 && (half[1] - (1.0 + s)).abs() < 1e-5, "{half:?}");
+        assert!(
+            (half[0] + s).abs() < 1e-5 && (half[1] - (1.0 + s)).abs() < 1e-5,
+            "{half:?}"
+        );
     }
 
     #[test]
@@ -13282,7 +13501,11 @@ mod shape_key_tests {
         world.characters.insert(boxed, CharacterBody::default());
         let (instances, _) = draw(&world);
         // The cube character, then the two models.
-        assert_eq!(instances[0].scale, [0.55, 1.76, 0.55], "a box fills its capsule");
+        assert_eq!(
+            instances[0].scale,
+            [0.55, 1.76, 0.55],
+            "a box fills its capsule"
+        );
         // The model is 1.8 tall: drawn 1.76 tall, as wide as it was made.
         let s = 1.76 / 1.8;
         assert!(instances[1].scale.iter().all(|v| (v - s).abs() < 1e-6));
@@ -13414,7 +13637,13 @@ mod far_from_the_origin_tests {
             );
         };
         // Five campfires, nearest last, and a sun.
-        for (x, c) in [(50.0, 0.5), (40.0, 0.4), (30.0, 0.3), (20.0, 0.2), (10.0, 0.1)] {
+        for (x, c) in [
+            (50.0, 0.5),
+            (40.0, 0.4),
+            (30.0, 0.3),
+            (20.0, 0.2),
+            (10.0, 0.1),
+        ] {
             point(&mut world, x, [c, c, c]);
         }
         let sun = spawn_at(&mut world, 0.0, 0.0, 0.0);
@@ -13422,7 +13651,11 @@ mod far_from_the_origin_tests {
         let lights = build_lights(&world, DVec3::ZERO);
         assert_eq!(lights[0].params[0], 0.0, "the sun first");
         let near: Vec<f32> = lights[1..].iter().map(|l| l.color[0]).collect();
-        assert_eq!(near, vec![0.1, 0.2, 0.3], "then the three nearest, in order");
+        assert_eq!(
+            near,
+            vec![0.1, 0.2, 0.3],
+            "then the three nearest, in order"
+        );
         // A saved scene from before colour is white.
         let old: Light = ron::from_str("(kind: Point(range: 5.0), intensity: 1.0)").unwrap();
         assert_eq!(old.color, [1.0; 3]);
@@ -13729,14 +13962,13 @@ mod pack_play_tests {
                 },
             );
             let mut cache = std::collections::HashMap::new();
-            let gpu =
-                build_material_gpu_data(
-                    &["rock".to_string()],
-                    &meta,
-                    Some(files),
-                    &std::collections::BTreeMap::new(),
-                    &mut cache,
-                );
+            let gpu = build_material_gpu_data(
+                &["rock".to_string()],
+                &meta,
+                Some(files),
+                &std::collections::BTreeMap::new(),
+                &mut cache,
+            );
             let (w, h, rgba) = gpu[0].texture_rgba.clone().expect("texture found");
             assert_eq!(rgba.len(), (w * h * 4) as usize);
         }
@@ -13780,8 +14012,11 @@ mod project_model_tests {
     fn red_png() -> Vec<u8> {
         let img = image::RgbaImage::from_pixel(2, 2, image::Rgba([255, 0, 0, 255]));
         let mut bytes = Vec::new();
-        img.write_to(&mut std::io::Cursor::new(&mut bytes), image::ImageFormat::Png)
-            .unwrap();
+        img.write_to(
+            &mut std::io::Cursor::new(&mut bytes),
+            image::ImageFormat::Png,
+        )
+        .unwrap();
         bytes
     }
 
@@ -13839,8 +14074,16 @@ mod project_model_tests {
         let mut embedded = std::collections::BTreeMap::new();
         let errors = add_project_models(&modules, &files, &mut models, &mut embedded);
         assert_eq!(errors, vec!["broken.glb: not a model".to_string()]);
-        assert_eq!(models["person"].half_extents, [0.25, 0.9, 0.25], "its own size");
-        assert_eq!(models["rock"].half_extents, [0.1, 0.1, 0.1], "the .obj kept");
+        assert_eq!(
+            models["person"].half_extents,
+            [0.25, 0.9, 0.25],
+            "its own size"
+        );
+        assert_eq!(
+            models["rock"].half_extents,
+            [0.1, 0.1, 0.1],
+            "the .obj kept"
+        );
         assert_eq!(embedded.keys().collect::<Vec<_>>(), ["person"]);
         assert_eq!(module_model_types(&modules), vec!["fbx", "glb"]);
     }

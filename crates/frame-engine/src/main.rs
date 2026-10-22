@@ -35,6 +35,8 @@ fn main() {
 
 /// The four spawned entities that standalone and server mode both start
 /// from, pulled out once so the same setup isn't duplicated between them.
+/// They move a tenth of a metre a tick (3 m/s), so they cross the ASCII
+/// view over several seconds rather than leaving it in under one.
 /// The client starts from an empty world instead; it has no simulation of
 /// its own, only whatever a server sends it.
 fn default_world() -> World {
@@ -46,7 +48,7 @@ fn default_world() -> World {
             z: 0.0,
         },
         Velocity {
-            dx: 1.0,
+            dx: 0.1,
             dy: 0.0,
             dz: 0.0,
         },
@@ -59,7 +61,7 @@ fn default_world() -> World {
         },
         Velocity {
             dx: 0.0,
-            dy: 1.0,
+            dy: 0.1,
             dz: 0.0,
         },
     );
@@ -70,8 +72,8 @@ fn default_world() -> World {
             z: 1.0,
         },
         Velocity {
-            dx: 1.0,
-            dy: 1.0,
+            dx: 0.1,
+            dy: 0.1,
             dz: 0.0,
         },
     );
@@ -82,8 +84,8 @@ fn default_world() -> World {
             z: 2.0,
         },
         Velocity {
-            dx: 1.0,
-            dy: 1.0,
+            dx: 0.1,
+            dy: 0.1,
             dz: 0.0,
         },
     );

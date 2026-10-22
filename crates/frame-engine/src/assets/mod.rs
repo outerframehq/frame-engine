@@ -108,8 +108,9 @@ pub fn parse_obj(text: &str) -> Result<MeshData, String> {
                 let mut corners: Vec<([f32; 3], [f32; 2], Option<[f32; 3]>)> = Vec::new();
                 for token in parts {
                     let (pi, ti, ni) = parse_face_corner(token, line_no)?;
-                    let position = *resolve(&positions, pi)
-                        .ok_or_else(|| format!("line {line_no}: face vertex index {pi} is out of range"))?;
+                    let position = *resolve(&positions, pi).ok_or_else(|| {
+                        format!("line {line_no}: face vertex index {pi} is out of range")
+                    })?;
                     let uv = match ti {
                         Some(ti) => *resolve(&uvs, ti).ok_or_else(|| {
                             format!("line {line_no}: face texture coord index {ti} is out of range")
@@ -194,7 +195,10 @@ fn parse_uv<'a>(
 /// Parse one face corner token (v, v/vt, v//vn or v/vt/vn) into a
 /// (position index, optional texture coord index, optional normal index)
 /// triple. Still 1 based or negative.
-fn parse_face_corner(token: &str, line_no: usize) -> Result<(i64, Option<i64>, Option<i64>), String> {
+fn parse_face_corner(
+    token: &str,
+    line_no: usize,
+) -> Result<(i64, Option<i64>, Option<i64>), String> {
     let mut fields = token.split('/');
     let pi = fields
         .next()
@@ -280,7 +284,11 @@ fn normalise_to_unit(mut vertices: Vec<MeshVertexData>) -> MeshData {
     ];
     let largest = half[0].max(half[1]).max(half[2]);
     // A single point or degenerate model still normalises without dividing by zero.
-    let scale = if largest <= f32::EPSILON { 1.0 } else { 0.5 / largest };
+    let scale = if largest <= f32::EPSILON {
+        1.0
+    } else {
+        0.5 / largest
+    };
     for v in &mut vertices {
         for axis in 0..3 {
             v.position[axis] = (v.position[axis] - centre[axis]) * scale;

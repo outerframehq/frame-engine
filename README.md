@@ -135,33 +135,62 @@ The engine and editor live in one repo so they evolve together, but build as sep
 
 ## Building
 
-Requires [Rust](https://rustup.rs).
+You need [Rust](https://rustup.rs) 1.92 or newer. If you already have Rust, `rustup update` brings it up to date.
 
-Run the engine (headless tick loop and ASCII debug view):
+On Linux the editor also needs a C compiler, `pkg-config` and the ALSA headers for sound:
 
 ```
-cargo run -p frame-engine
+# Debian, Ubuntu, Pop!_OS
+sudo apt install build-essential pkg-config libasound2-dev
+
+# Fedora
+sudo dnf install gcc pkgconf-pkg-config alsa-lib-devel
 ```
 
-Run the editor (opens the project launcher; pick or create a project to enter the 3D editor):
+The launcher's Create and Open buttons use your desktop's own file picker, through `xdg-desktop-portal`. Most desktops have it already; if nothing opens when you press them, install `xdg-desktop-portal` and the one for your desktop (`xdg-desktop-portal-gtk`, `-gnome` or `-kde`).
+
+The first build compiles every library the editor uses, so expect it to take around 10 to 15 minutes and about 3.5 GB of disk in `target/`. Later builds only rebuild what changed and take seconds.
+
+Run the editor (opens the project launcher):
 
 ```
 cargo run -p frame-editor
 ```
 
-Editor controls:
+On the launcher, type a name next to **New project**, press **Create…** and choose where to put it. The project gets a folder of its own with that name, holding `project.ron` and a first scene. **Open existing project…** picks a project's folder, and projects you have opened before are listed below.
 
-- **P** play or pause, **.** step one tick while paused
-- **WASD** drive a `Controlled` entity (while playing), **Space** jump (a physics character with Gravity, standing on something), **Shift** run and **C** crouch (a character with a `CharacterBody`). In the Play window, click to take the mouse and it turns a character's view; **Esc** frees the mouse and **Esc** again closes the window; **F3** shows the game's numbers (frame rate, memory, where you are, and each module's own); **F1** opens the game's own panels, when a module has one (`EditorModule::play_panel`), freeing the mouse while they are open; with the mouse taken, the **left** and **right mouse buttons** are the two actions (`Button::Use` and `Button::UseAlt`) **E** is `Button::Interact` and **Q** is `Button::Swap`, which the game decides what to do with, and a dot in the middle of the screen shows where you are looking; **Ctrl** crouches too. In water a game says is deep (`World.liquids`) a character swims: **Space** swims up and **Ctrl** or **C** dives
+Run the engine on its own (no window: a headless tick loop with an ASCII view in the terminal, **Ctrl+C** stops it):
+
+```
+cargo run -p frame-engine
+```
+
+### Editor controls
+
+- **P** play or pause in the editor, **.** step one tick while paused
 - **Left-click** select an entity, **Esc** clear selection
-- **Arrow keys** move selection on X and Y, **Page Up / Page Down** move on Z
+- **Arrow keys** move the selection on X and Y, **Page Up / Page Down** move it on Z
+- **Drag a gizmo arm** move the selected entity along that axis
 - **N** spawn an entity, **Delete** despawn the selection
 - **Ctrl+Z** undo, **Ctrl+Y** (or **Ctrl+Shift+Z**) redo
-- **Ctrl+S** (or **F5**) save scene, **F9** reload scene (asks first if there are unsaved changes)
+- **Ctrl+S** (or **F5**) save the scene, **F9** reload it (asks first if there are unsaved changes)
 - **Middle-drag** orbit, **Shift+Middle-drag** pan, **Scroll** zoom
-- **Drag a gizmo arm** move the selected entity along that axis
-- **Hold right mouse** flythrough camera: mouse looks, **WASD** flies, **Scroll** sets fly speed, left-click picks the centred entity as the orbit pivot
-- **H** toggle the controls overlay
+- **Hold right mouse** flythrough camera: the mouse looks, **WASD** flies, **Scroll** sets fly speed, left-click picks the centred entity as the orbit pivot
+- **WASD** drives a `Controlled` entity while playing in the editor
+- **H** show or hide the controls overlay
+
+### Play window controls
+
+The Play window runs the game as a player would see it.
+
+- **Click** the window to take the mouse: moving it turns a character's view, and a dot in the middle shows where you are looking
+- **WASD** move, **Space** jump (a character with Gravity, standing on something)
+- **Shift** run, **C** or **Ctrl** crouch (a character with a `CharacterBody`)
+- **Left** and **right mouse buttons** are `Button::Use` and `Button::UseAlt`, **E** is `Button::Interact` and **Q** is `Button::Swap`: the game decides what each does
+- In water a game says is deep (`World.liquids`), a character swims: **Space** swims up, **Ctrl** or **C** dives
+- **F1** opens the game's own panels, when a module has one (`EditorModule::play_panel`), and frees the mouse while they are open
+- **F3** shows the game's numbers: frame rate, memory, where you are, and each module's own
+- **Esc** frees the mouse, and **Esc** again closes the window
 
 ## License
 

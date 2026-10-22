@@ -22,8 +22,8 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use frame_engine::pack::ProjectFiles;
-use kira::sound::static_sound::{StaticSoundData, StaticSoundHandle};
 use kira::backend::Backend;
+use kira::sound::static_sound::{StaticSoundData, StaticSoundHandle};
 use kira::{AudioManager, Decibels, Panning, PlaybackRate, Tween};
 
 /// Who hears the game: the camera Play draws from.
@@ -271,7 +271,10 @@ impl GameAudio {
                         }
                         Err(e) => {
                             if self.missing.insert(request.sound.clone()) {
-                                messages.push(format!("Couldn't play sound '{}': {e:?}", request.sound));
+                                messages.push(format!(
+                                    "Couldn't play sound '{}': {e:?}",
+                                    request.sound
+                                ));
                             }
                         }
                     }
@@ -321,9 +324,8 @@ impl GameAudio {
             let path = files.find_by_name("assets", name)?;
             files.read(&path).ok()
         });
-        let decoded = found.and_then(|bytes| {
-            StaticSoundData::from_cursor(std::io::Cursor::new(bytes)).ok()
-        });
+        let decoded =
+            found.and_then(|bytes| StaticSoundData::from_cursor(std::io::Cursor::new(bytes)).ok());
         match decoded {
             Some(data) => {
                 cache.insert(name.to_string(), data.clone());
@@ -374,7 +376,10 @@ mod tests {
         assert_eq!(placed(&l, [0.0, 0.0, -1.0]), (1.0, 0.0));
         let (near, _) = placed(&l, [0.0, 0.0, -4.0]);
         let (far, _) = placed(&l, [0.0, 0.0, -8.0]);
-        assert!((near - 0.5).abs() < 1e-6 && (far - 0.25).abs() < 1e-6, "{near} {far}");
+        assert!(
+            (near - 0.5).abs() < 1e-6 && (far - 0.25).abs() < 1e-6,
+            "{near} {far}"
+        );
         assert_eq!(placed(&l, [0.0, 0.0, -61.0]).0, 0.0);
         // Faded to nothing at the edge, not cut off.
         assert!(placed(&l, [0.0, 0.0, -59.9]).0 < 0.01);
@@ -445,7 +450,9 @@ mod tests {
     fn loops_start_keep_going_and_stop_and_missing_sounds_are_told_once() {
         use kira::backend::mock::{MockBackend, MockBackendSettings};
         let mut manager = AudioManager::<MockBackend>::new(kira::AudioManagerSettings {
-            backend_settings: MockBackendSettings { sample_rate: 48_000 },
+            backend_settings: MockBackendSettings {
+                sample_rate: 48_000,
+            },
             ..Default::default()
         })
         .unwrap();
@@ -455,23 +462,47 @@ mod tests {
         let mut frame = AudioFrame::default();
         frame.hold_loop("wind", "wind.wav", 0.5);
         frame.play_at("wind.wav", 1.0, 1.0, [3.0, 0.0, 0.0]);
-        let messages = audio.apply(frame, &listener(), Some(&mut manager), &mut cache, Some(&files));
+        let messages = audio.apply(
+            frame,
+            &listener(),
+            Some(&mut manager),
+            &mut cache,
+            Some(&files),
+        );
         assert!(messages.is_empty(), "{messages:?}");
         assert_eq!(audio.keys(), vec!["wind".to_string()]);
         // Held again at another volume: still the one loop.
         let mut frame = AudioFrame::default();
         frame.hold_loop("wind", "wind.wav", 0.9);
-        audio.apply(frame, &listener(), Some(&mut manager), &mut cache, Some(&files));
+        audio.apply(
+            frame,
+            &listener(),
+            Some(&mut manager),
+            &mut cache,
+            Some(&files),
+        );
         assert_eq!(audio.keys(), vec!["wind".to_string()]);
         // Not held: gone.
-        audio.apply(AudioFrame::default(), &listener(), Some(&mut manager), &mut cache, Some(&files));
+        audio.apply(
+            AudioFrame::default(),
+            &listener(),
+            Some(&mut manager),
+            &mut cache,
+            Some(&files),
+        );
         assert!(audio.keys().is_empty());
         // A sound that isn't there is reported once, however often asked for.
         let mut told = Vec::new();
         for _ in 0..3 {
             let mut frame = AudioFrame::default();
             frame.play("nothing.wav", 1.0, 1.0);
-            told.extend(audio.apply(frame, &listener(), Some(&mut manager), &mut cache, Some(&files)));
+            told.extend(audio.apply(
+                frame,
+                &listener(),
+                Some(&mut manager),
+                &mut cache,
+                Some(&files),
+            ));
         }
         assert_eq!(told.len(), 1, "{told:?}");
         let _ = std::fs::remove_dir_all(dir);
