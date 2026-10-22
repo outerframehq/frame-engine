@@ -151,6 +151,8 @@ The launcher's Create and Open buttons use your desktop's own file picker, throu
 
 The first build compiles every library the editor uses, so expect it to take around 10 to 15 minutes and about 3.5 GB of disk in `target/`. Later builds only rebuild what changed and take seconds.
 
+New to Frame Engine? [GETTING_STARTED.md](GETTING_STARTED.md) goes from a first project to a few scripts, then to a game crate of your own in Rust, joined up with its scripts.
+
 Run the editor (opens the project launcher):
 
 ```
@@ -211,4 +213,4 @@ The editor embeds three fonts from `crates/frame-editor/assets/fonts/`: [Manrope
 
 ## Design notes
 
-See [DESIGN.md](DESIGN.md) for architecture decisions and reasoning, [SCRIPTING.md](SCRIPTING.md) for the guide to writing entity scripts, and [PLUGINS.md](PLUGINS.md) for the guide to building a plugin.
+See [GETTING_STARTED.md](GETTING_STARTED.md) for a first walk through scripts and your own Rust crate, [DESIGN.md](DESIGN.md) for architecture decisions and reasoning, [SCRIPTING.md](SCRIPTING.md) for the guide to writing entity scripts, and [PLUGINS.md](PLUGINS.md) for the guide to building a plugin.

@@ -10,6 +10,7 @@ lands and the patch version bumps for fixes and small additions.
 ## [Unreleased]
 
 ### Changed
+- Spawning from a script works. The request was a variable called `spawn`, but Rhai keeps that word for itself, so any script using it failed to compile with "'spawn' is a reserved keyword", and it never worked. It is now `spawn_new = true;`, next to `spawn_at` and `despawn_id`. SCRIPTING.md is updated, and its examples use sizes in metres (an orbit 5 m across rather than 50, a bob of half a metre).
 - Clicking or dragging a row in the Scene tree no longer prints a diagnostic line to the terminal. It was left in while a click problem was being tracked down, and clicks work again.
 - **Create** on the launcher makes the project a folder of its own. Picking a folder used to save `project.ron` and `scenes/` straight into it, so choosing Documents spread a project's files among everything else there. Now picking Documents for a project called FirstGame makes `Documents/FirstGame`. A folder of that name that already has files in it is refused rather than mixed into, and picking an empty folder already named after the project uses it as it is (`new_project_folder`, with a test).
 - The launcher shows why a Create or Open did nothing (no name typed, a name that can't be a file name, a folder that is already in use, a folder with no scene), under its header. Those messages only went to the terminal before.
@@ -34,6 +35,8 @@ lands and the patch version bumps for fixes and small additions.
 - An entity riding a `Parent` and that parent no longer push each other in `systems::resolve_collisions`. A carried thing overlapping the body carrying it (a held item swinging into its holder) used to shove the holder, and with it the holder's camera, every tick; online, where a player's own character has no physics body on their computer, this showed as the view jittering. A rider still pushes and is pushed by everything else. Covered by a test.
 
 ### Added
+- `GETTING_STARTED.md`, linked from the README: a first project, a handful of scripts to paste in, when to reach for Rust instead of Rhai, a game crate of your own with an `EditorModule` (a small Hunger feature, with its `Cargo.toml`, `main.rs` and a test), and how Rust and scripts share numbers (`custom_<name>` values on an entity, and globals).
+- A test runs every script example in SCRIPTING.md and GETTING_STARTED.md and checks each one compiles, uses only names the engine knows, and runs to its last line, so the docs can't drift from the engine again.
 - A model the editor can't load says so. When a project opens, and when the Play window starts, any model file in `assets/` of a type nothing reads (`.glb`, `.fbx`, `.blend` and others, when no module reads them) is listed in the log with the types the editor does read, and so is each model an entity asks for that isn't loaded, which is otherwise drawn as a cube without a word (`model_notes`, with a test).
 
 Engine:

@@ -60,7 +60,7 @@ These are set for you every tick. Read them, write them, or both.
 | `input_run` / `input_crouch` | Run or Crouch key held | read-only | `true` while Shift (run) or C (crouch) is held. Same shared-per-tick caveat. |
 | `crouched` | Crouched | read-only | `true` if this entity is a character with a `CharacterBody` and was crouched as of the last physics step. It stays crouched while there is no room to stand. |
 | `spawn_at` | Where a new entity appears | read/write | `spawn_at.x/.y/.z`. Defaults to this entity's own position. |
-| `spawn`   | Request a new entity        | read/write | Set `true` to spawn one at `spawn_at`, at the end of this tick. Resets to `false` at the start of every script run, so it has to be set again each time you want another one. |
+| `spawn_new` | Request a new entity      | read/write | Set `true` to spawn one at `spawn_at`, at the end of this tick. Resets to `false` at the start of every script run, so it has to be set again each time you want another one. |
 | `despawn_id` | Request an entity removed | read/write | An entity id, or `-1.0` for no request. Can be this entity's own `id`, or any other, `hit_id` included. |
 | `move_dx` / `move_dz` | Requested movement | read/write | How far to move this tick along the world's X and Z axes, in metres (30 ticks a second, so `0.05` is 1.5 m/s). Only acted on for a `Controlled` + `RigidBody` entity (a physics character); harmless on anything else. Seeded with whatever `Controlled` input already asked for this tick, so leaving it alone doesn't cancel keyboard movement. For a character with a `CharacterBody` the keys have already been turned into a step the way it faces, at its walking, running or crouching speed, before the script runs; a value the script sets is used as it is. |
 | `move_jump` | Requested jump | read/write | Same physics-character-only rule as `move_dx`/`move_dz`. Needs a fresh `true` (not held) to actually jump, same as the Jump key. |
@@ -109,9 +109,9 @@ spellings of the same value in one script, the vector one wins.
 
 There are two ways to make something move, and they behave differently:
 
-- **Set velocity** (`vel`) and let it accumulate. `vel.x = 0.5;` means
-  "drift east forever." You set it once and motion continues on its own.
-- **Set position** (`pos`) directly. `pos.x = cos(t * 0.05) * 50.0;`
+- **Set velocity** (`vel`) and let it accumulate. `vel.x = 0.05;` means
+  "drift east at 1.5 m/s forever." You set it once and motion continues on its own.
+- **Set position** (`pos`) directly. `pos.x = cos(t * 0.05) * 5.0;`
   means "be exactly here this tick." You're placing the entity yourself every
   tick, so you have total control of the path.
 
@@ -123,14 +123,14 @@ will fight (the script places the entity, then velocity nudges it off again).
 **Orbit** the origin around the floor (the XZ plane):
 
 ```rust
-pos.x = cos(t * 0.08) * 50.0;
-pos.z = sin(t * 0.08) * 50.0;
+pos.x = cos(t * 0.08) * 5.0;
+pos.z = sin(t * 0.08) * 5.0;
 ```
 
 **Bob** up and down on the Y axis:
 
 ```rust
-pos.y = sin(t * 0.1) * 20.0;
+pos.y = 1.0 + sin(t * 0.1) * 0.5;
 ```
 
 **Pulse**, breathe in and out by scaling:
@@ -140,10 +140,10 @@ let s = 1.0 + sin(t * 0.1) * 0.5;
 scale = vec3(s, s, s);
 ```
 
-**Climb** steadily using velocity (set once, keeps going):
+**Climb** steadily using velocity (set once, keeps going, 1.5 m/s):
 
 ```rust
-vel.y = 0.5;
+vel.y = 0.05;
 ```
 
 **Throb** the colour between dim and bright red:
@@ -169,10 +169,10 @@ yaw = yaw + 0.02;
 **React** to position, fall until low, then rise (a rough bounce):
 
 ```rust
-if pos.y > 60.0 {
-    vel.y = -0.5;
+if pos.y > 3.0 {
+    vel.y = -0.05;
 } else if pos.y < 0.0 {
-    vel.y = 0.5;
+    vel.y = 0.05;
 }
 ```
 
@@ -217,7 +217,7 @@ moves entities that aren't pinned in place:
 
 ```rust
 if !is_static {
-    vel.x = sin(t * 0.05) * 0.5;
+    vel.x = sin(t * 0.05) * 0.05;
 }
 ```
 
@@ -253,7 +253,7 @@ colliding it reads back as this entity's own position, so it's always safe to
 use without checking `hit` first.
 
 Change any number and watch it update while the simulation plays. The `* 0.08`
-kind of number is speed; the `* 50.0` kind is size or distance.
+kind of number is speed; the `* 5.0` kind is size or distance, in metres.
 
 ## Globals and changing scene
 
@@ -281,28 +281,28 @@ Globals are numbers only. They are saved with the project in
 
 ## Spawning and despawning
 
-`spawn` and `despawn_id` are different from everything else above: they're not
-a value the entity holds, they're a request. Setting `spawn = true;` doesn't
+`spawn_new` and `despawn_id` are different from everything else above: they're not
+a value the entity holds, they're a request. Setting `spawn_new = true;` doesn't
 create anything immediately, it tells the engine "spawn one, once this script
 finishes running." Same idea for `despawn_id`.
 
-This matters because `spawn` resets to `false` at the start of every script run.
-If a script sets `spawn = true;` unconditionally, with nothing guarding it, it
+This matters because `spawn_new` resets to `false` at the start of every script run.
+If a script sets `spawn_new = true;` unconditionally, with nothing guarding it, it
 spawns a new entity *every tick, forever*, same as any loop with no exit
 condition. Nothing here throttles that for you. Guard it:
 
 ```rust
 if t % 30.0 == 0.0 {
-    spawn = true;
+    spawn_new = true;
 }
 ```
 
-**Multiply**, spawn a copy of yourself once a second (30 ticks):
+**Multiply**, spawn a new entity where you stand once a second (30 ticks):
 
 ```rust
 if t % 30.0 == 0.0 {
     spawn_at = pos;
-    spawn = true;
+    spawn_new = true;
 }
 ```
 

@@ -58,7 +58,7 @@ const API_VARS: &[&str] = &[
     "hit_id",
     "hit_point", // Actions — a script requests these, Rust performs them.
     "spawn_at",
-    "spawn",
+    "spawn_new",
     "despawn_id",
     // Physics character control. Also a request, same shape as spawn/despawn
     // above, but only ever acted on by a Controlled + RigidBody entity's
@@ -495,9 +495,11 @@ impl ScriptRuntime for RhaiRuntime {
         // interpreter mid-script.
         //
         // spawn_at defaults to this entity's own position, same convention as
-        // hit_point, so `spawn = true;` alone spawns a copy on the spot. Setting
-        // spawn unconditionally every tick spawns every tick, forever, same as
-        // any other loop with no exit condition — nothing here throttles it.
+        // hit_point, so `spawn_new = true;` alone spawns one on the spot.
+        // Setting it unconditionally every tick spawns every tick, forever,
+        // same as any other loop with no exit condition: nothing here
+        // throttles it. It is not called `spawn`, because Rhai keeps that
+        // word for itself and a script using it would not compile.
         scope.push(
             "spawn_at",
             Vec3 {
@@ -506,7 +508,7 @@ impl ScriptRuntime for RhaiRuntime {
                 z: pz,
             },
         );
-        scope.push("spawn", false);
+        scope.push("spawn_new", false);
         // despawn_id: -1.0 means no request, the same sentinel hit_id uses. A
         // script can pass its own id to despawn itself, or any other id (say,
         // hit_id) to despawn whatever it just collided with.
@@ -727,7 +729,7 @@ impl ScriptRuntime for RhaiRuntime {
         }
 
         // --- Actions, applied last, after the entity's own state is settled ---
-        if scope.get_value::<bool>("spawn").unwrap_or(false) {
+        if scope.get_value::<bool>("spawn_new").unwrap_or(false) {
             let at = scope.get_value::<Vec3>("spawn_at").unwrap_or(Vec3 {
                 x: px,
                 y: py,
@@ -817,5 +819,123 @@ mod game_call_tests {
         let (mut world, id) = world_running("let a = 1;");
         runtime.run(&mut world, id);
         assert!(world.pending_scene.is_none());
+    }
+}
+
+#[cfg(test)]
+mod doc_example_tests {
+    use super::*;
+    use frame_engine::world::Script;
+
+    /// The Rhai examples in a Markdown page: every ```rust block that is not
+    /// Rust itself (Rust blocks all declare a `fn`) and is not a sketch with
+    /// `...` standing in for code.
+    fn rhai_blocks(page: &str) -> Vec<String> {
+        page.split("```rust\n")
+            .skip(1)
+            .filter_map(|rest| rest.split("```").next())
+            .filter(|block| !block.contains("fn ") && !block.contains("..."))
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Run `source` on one entity for a second of ticks. It counts as having
+    /// worked when a line added after it ran too, so a script that stops
+    /// partway (a name Rhai does not know, a wrong type) fails here.
+    fn runs_to_the_end(source: &str) -> Result<(), String> {
+        let mut runtime = RhaiRuntime::new();
+        runtime
+            .check(source)
+            .map_err(|e| format!("does not compile: {}", e.message))?;
+        if let Some(w) = runtime.warnings(source).first() {
+            return Err(format!("unknown name: {}", w.message));
+        }
+        let mut world = World::new();
+        let id = world.spawn(
+            Position {
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+            },
+            Velocity {
+                dx: 0.0,
+                dy: 0.0,
+                dz: 0.0,
+            },
+        );
+        // A `custom_<name>` only exists once Rust has given the entity a
+        // value under that name, as a module would.
+        for word in source.split(|c: char| !(c.is_alphanumeric() || c == '_')) {
+            if let Some(name) = word.strip_prefix("custom_") {
+                world.insert_dynamic::<f64>(name, id, 0.5);
+            }
+        }
+        let full = format!("{source}\nset_global(\"reached_the_end\", 1.0);");
+        world.script_library.insert("example".into(), full);
+        world.scripts.insert(
+            id,
+            Script {
+                uses: "example".into(),
+            },
+        );
+        for _ in 0..30 {
+            runtime.begin_tick(&InputState::default());
+            runtime.run(&mut world, id);
+        }
+        match world.globals.get("reached_the_end") {
+            Some(_) => Ok(()),
+            None => Err("stops partway when it runs".to_string()),
+        }
+    }
+
+    #[test]
+    fn every_script_example_in_the_docs_compiles_and_runs() {
+        let pages = [
+            ("SCRIPTING.md", include_str!("../../../SCRIPTING.md")),
+            (
+                "GETTING_STARTED.md",
+                include_str!("../../../GETTING_STARTED.md"),
+            ),
+        ];
+        let mut checked = 0;
+        let mut broken = Vec::new();
+        for (page, text) in pages {
+            for block in rhai_blocks(text) {
+                checked += 1;
+                if let Err(why) = runs_to_the_end(&block) {
+                    broken.push(format!("{page}: {why}\n{block}"));
+                }
+            }
+        }
+        assert!(checked >= 30, "only {checked} examples found");
+        assert!(broken.is_empty(), "{}", broken.join("\n"));
+    }
+
+    #[test]
+    fn spawn_new_makes_an_entity_where_spawn_at_says() {
+        let mut world = World::new();
+        let id = world.spawn(
+            Position {
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+            },
+            Velocity {
+                dx: 0.0,
+                dy: 0.0,
+                dz: 0.0,
+            },
+        );
+        world.script_library.insert(
+            "s".into(),
+            "spawn_at = vec3(2.0, 0.0, 3.0); spawn_new = true;".into(),
+        );
+        world.scripts.insert(id, Script { uses: "s".into() });
+        let mut runtime = RhaiRuntime::new();
+        runtime.run(&mut world, id);
+        let made: Vec<usize> = world.positions.entities().filter(|&e| e != id).collect();
+        assert_eq!(made.len(), 1);
+        let at = world.positions.get(made[0]).unwrap();
+        assert_eq!((at.x, at.z), (2.0, 3.0));
     }
 }
