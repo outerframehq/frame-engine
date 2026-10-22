@@ -10,6 +10,7 @@ lands and the patch version bumps for fixes and small additions.
 ## [Unreleased]
 
 ### Changed
+- Clicking or dragging a row in the Scene tree no longer prints a diagnostic line to the terminal. It was left in while a click problem was being tracked down, and clicks work again.
 - **Create** on the launcher makes the project a folder of its own. Picking a folder used to save `project.ron` and `scenes/` straight into it, so choosing Documents spread a project's files among everything else there. Now picking Documents for a project called FirstGame makes `Documents/FirstGame`. A folder of that name that already has files in it is refused rather than mixed into, and picking an empty folder already named after the project uses it as it is (`new_project_folder`, with a test).
 - The launcher shows why a Create or Open did nothing (no name typed, a name that can't be a file name, a folder that is already in use, a folder with no scene), under its header. Those messages only went to the terminal before.
 - The README's Building section says what a first build needs: Rust 1.92 or newer, the Linux packages (a C compiler, `pkg-config` and the ALSA headers, with the commands for Debian-based systems and Fedora), the desktop file picker the launcher uses, and how long and how much disk a first build takes. The controls are split into the editor's and the Play window's.

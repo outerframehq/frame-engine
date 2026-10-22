@@ -3839,22 +3839,6 @@ fn scene_tree_node(
             *selection = Some(id);
         }
 
-        // TEMPORARY diagnostic. Three fixes in a row have each looked right
-        // and then not actually worked on Luke's machine — this prints what
-        // egui itself thinks is happening on the row that's actually being
-        // pressed, to the terminal the editor was launched from, so if this
-        // fourth attempt is *also* wrong, the next round is a real
-        // diagnosis instead of a fifth guess. Safe to delete once clicking
-        // is confirmed working again.
-        if response.clicked() || response.dragged() {
-            eprintln!(
-                "[scene_tree] entity {id}: clicked={} dragged={} hovered={}",
-                response.clicked(),
-                response.dragged(),
-                response.hovered(),
-            );
-        }
-
         // This row is the drag's own origin this frame. Start (or keep
         // advancing) the one shared timer `scene_tab_ui` resolves after
         // every row has had its turn — never resolved here, since a
