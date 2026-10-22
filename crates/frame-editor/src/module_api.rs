@@ -49,7 +49,8 @@ pub use frame_engine::pack::ProjectFiles;
 #[derive(Clone, Debug, Default)]
 pub struct ProjectModels {
     pub models: Vec<ProjectModel>,
-    /// One line each, naming the file: shown in the editor's log.
+    /// One line each, naming the file, shown in the editor's log: a file
+    /// that could not be read, or something worth knowing about one that was.
     pub errors: Vec<String>,
 }
 
@@ -1317,6 +1318,7 @@ fn raw_instances(anchor: [f64; 3], origin: [f64; 3], placements: &[Placement]) -
             scale: p.scale.map(|s| s / QUAD_SIZE),
             emissive: p.glow.clamp(0.0, 1.0),
             rotation: p.rotation,
+            shape: 0,
         })
         .collect()
 }
@@ -1374,6 +1376,7 @@ impl WorldInstance {
             scale: [1.0 / QUAD_SIZE; 3],
             emissive: 0.0,
             rotation: [0.0; 3],
+            shape: 0,
         };
         queue.write_buffer(&self.buffer, 0, bytemuck::cast_slice(&[instance]));
     }
@@ -1914,10 +1917,10 @@ mod tests {
         let anchors = anchor_names(&modules);
         assert_eq!(anchors, vec!["anchor_thing"]);
         let none = std::collections::HashSet::new();
-        let (with, _) =
+        let (with, _, _) =
             build_instances(&world, None, &none, &[], &anchors, None, glam::DVec3::ZERO);
         assert_eq!(with.len(), 1, "only the ordinary entity is drawn");
-        let (without, _) = build_instances(&world, None, &none, &[], &[], None, glam::DVec3::ZERO);
+        let (without, _, _) = build_instances(&world, None, &none, &[], &[], None, glam::DVec3::ZERO);
         assert_eq!(without.len(), 2, "no module: both drawn");
     }
 

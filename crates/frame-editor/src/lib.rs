@@ -657,6 +657,10 @@ struct MeshVertex {
     // for flooding water the still sea level less the vertex's height, over
     // TIDE_REACH. All zero for anything else.
     water: [i16; 4],
+    // This vertex's shape key moves (see `ShapeMoveGpu`): where its first
+    // sits in the shared list, and how many follow. [0, 0] for a vertex no
+    // key moves, which is every vertex but an imported model's.
+    shape: [u32; 2],
 }
 impl MeshVertex {
     /// A vertex that never morphs.
@@ -669,9 +673,10 @@ impl MeshVertex {
             morph_normal: [0.0; 3],
             morph_uv: uv,
             water: [0; 4],
+            shape: [0; 2],
         }
     }
-    const ATTRIBS: [wgpu::VertexAttribute; 7] = [
+    const ATTRIBS: [wgpu::VertexAttribute; 8] = [
         wgpu::VertexAttribute {
             format: wgpu::VertexFormat::Float32x3,
             offset: 0,
@@ -707,6 +712,12 @@ impl MeshVertex {
             format: wgpu::VertexFormat::Snorm16x4,
             offset: std::mem::size_of::<[f32; 16]>() as wgpu::BufferAddress, // 64
             shader_location: 12,
+        },
+        // Location 14 is the instance's.
+        wgpu::VertexAttribute {
+            format: wgpu::VertexFormat::Uint32x2,
+            offset: std::mem::size_of::<[f32; 18]>() as wgpu::BufferAddress, // 72
+            shader_location: 13,
         },
     ];
     fn layout() -> wgpu::VertexBufferLayout<'static> {
@@ -830,12 +841,16 @@ struct InstanceRaw {
     emissive: f32,
     // Yaw, pitch and roll in radians (see `world::Rotation`).
     rotation: [f32; 3],
+    // Where this entity's shape key weights start in the frame's list, plus
+    // one, in the order its model numbers its keys (see `build_instances`).
+    // 0 for none: the model as made.
+    shape: u32,
 }
 impl InstanceRaw {
     // Locations 0-2 belong to the mesh vertex buffer (MeshVertex, which grew
     // a uv attribute at location 2 alongside textures); the instance
     // attributes continue from 3.
-    const ATTRIBS: [wgpu::VertexAttribute; 6] = [
+    const ATTRIBS: [wgpu::VertexAttribute; 7] = [
         wgpu::VertexAttribute {
             format: wgpu::VertexFormat::Float32x3,
             offset: 0,
@@ -865,6 +880,11 @@ impl InstanceRaw {
             format: wgpu::VertexFormat::Float32x3,
             offset: std::mem::size_of::<[f32; 11]>() as wgpu::BufferAddress, // 44
             shader_location: 8,
+        },
+        wgpu::VertexAttribute {
+            format: wgpu::VertexFormat::Uint32,
+            offset: std::mem::size_of::<[f32; 14]>() as wgpu::BufferAddress, // 56
+            shader_location: 14,
         },
     ];
     fn layout() -> wgpu::VertexBufferLayout<'static> {
@@ -1257,12 +1277,65 @@ fn dist_to_segment(p: (f32, f32), a: (f32, f32), b: (f32, f32)) -> f32 {
 // imported models, each with its vertex range recorded. Bucket order here must
 // match build_instances: Cube, Sphere, Plane, then customs in the given order
 // (sorted by name at the call sites).
+/// One vertex's move under one shape key, as the vertex shader reads it
+/// (`ShapeMove` in shader.wgsl; WGSL lays a vec3 and a u32 out in 16 bytes).
+/// A vertex's moves sit together in one list shared by every model, found
+/// through the vertex's `shape`; `key` is the key's number in its own model,
+/// which picks the entity's weight for it.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, PartialEq, bytemuck::Pod, bytemuck::Zeroable)]
+struct ShapeMoveGpu {
+    position: [f32; 3],
+    key: u32,
+    normal: [f32; 3],
+    _pad: u32,
+}
+
+/// The vertices of `data` as the renderer stores them, with each vertex's
+/// shape key moves appended to `moves` and pointed at from its `shape`. A
+/// move naming a vertex the model does not have is dropped.
+fn shaped_vertices(
+    data: &frame_engine::assets::MeshData,
+    moves: &mut Vec<ShapeMoveGpu>,
+) -> Vec<MeshVertex> {
+    let mut verts: Vec<MeshVertex> = data
+        .vertices
+        .iter()
+        .map(|v| MeshVertex::plain(v.position, v.normal, v.uv))
+        .collect();
+    if data.shapes.is_empty() {
+        return verts;
+    }
+    // Each vertex's moves, gathered from every key.
+    let mut by_vertex: Vec<Vec<ShapeMoveGpu>> = vec![Vec::new(); verts.len()];
+    for (key, shape) in data.shapes.iter().enumerate() {
+        for m in &shape.moves {
+            if let Some(list) = by_vertex.get_mut(m.vertex as usize) {
+                list.push(ShapeMoveGpu {
+                    position: m.position,
+                    key: key as u32,
+                    normal: m.normal,
+                    _pad: 0,
+                });
+            }
+        }
+    }
+    for (vertex, list) in verts.iter_mut().zip(by_vertex) {
+        if !list.is_empty() {
+            vertex.shape = [moves.len() as u32, list.len() as u32];
+            moves.extend(list);
+        }
+    }
+    verts
+}
+
 fn build_mesh_buffer(
     device: &wgpu::Device,
     customs: &[&frame_engine::assets::MeshData],
-) -> (wgpu::Buffer, Vec<std::ops::Range<u32>>) {
+) -> (wgpu::Buffer, Vec<std::ops::Range<u32>>, Vec<ShapeMoveGpu>) {
     let mut mesh_verts: Vec<MeshVertex> = Vec::new();
     let mut ranges: Vec<std::ops::Range<u32>> = Vec::new();
+    let mut moves: Vec<ShapeMoveGpu> = Vec::new();
     let push = |verts: Vec<MeshVertex>,
                 mesh_verts: &mut Vec<MeshVertex>,
                 ranges: &mut Vec<std::ops::Range<u32>>| {
@@ -1274,11 +1347,7 @@ fn build_mesh_buffer(
     push(sphere_vertices(), &mut mesh_verts, &mut ranges);
     push(plane_vertices(), &mut mesh_verts, &mut ranges);
     for data in customs {
-        let verts: Vec<MeshVertex> = data
-            .vertices
-            .iter()
-            .map(|v| MeshVertex::plain(v.position, v.normal, v.uv))
-            .collect();
+        let verts = shaped_vertices(data, &mut moves);
         push(verts, &mut mesh_verts, &mut ranges);
     }
     let buffer = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -1286,7 +1355,54 @@ fn build_mesh_buffer(
         contents: bytemuck::cast_slice(&mesh_verts),
         usage: wgpu::BufferUsages::VERTEX,
     });
-    (buffer, ranges)
+    (buffer, ranges, moves)
+}
+
+/// The shape weights buffer's first size, in bytes: room for a crowd's
+/// faces before it ever has to grow.
+const SHAPE_WEIGHTS_START: u64 = 16 * 1024;
+
+/// The list of every model's shape key moves on the graphics card. A storage
+/// binding cannot be empty, so with no moves it holds one that is never read.
+fn shape_moves_buffer(device: &wgpu::Device, moves: &[ShapeMoveGpu]) -> wgpu::Buffer {
+    let none = [ShapeMoveGpu::zeroed()];
+    device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+        label: Some("shape key moves"),
+        contents: bytemuck::cast_slice(if moves.is_empty() { &none } else { moves }),
+        usage: wgpu::BufferUsages::STORAGE,
+    })
+}
+
+/// A buffer for each frame's shape key weights, `size` bytes.
+fn shape_weights_buffer(device: &wgpu::Device, size: u64) -> wgpu::Buffer {
+    device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("shape key weights"),
+        size,
+        usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    })
+}
+
+fn create_shape_bind_group(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    moves: &wgpu::Buffer,
+    weights: &wgpu::Buffer,
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("shape key bind group"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: moves.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: weights.as_entire_binding(),
+            },
+        ],
+    })
 }
 
 /// The Vulkan instance/adapter/device/queue, shared across every window this
@@ -1337,6 +1453,15 @@ struct GpuState {
     // (matching the engine's `Mesh` enum). Built once; static for the app's life.
     mesh_vertex_buffer: wgpu::Buffer,
     mesh_ranges: Vec<std::ops::Range<u32>>,
+    // Shape keys: every model's moves in one list (see `ShapeMoveGpu`), and
+    // each frame's entity weights (see `build_instances`), read by the vertex
+    // shaders through `shape_bind_group`: group 2 of the entity pipelines,
+    // group 1 of the shadow pipeline. The weights buffer grows when a frame
+    // needs more and keeps its size after.
+    shape_layout: wgpu::BindGroupLayout,
+    shape_moves: wgpu::Buffer,
+    shape_weights: wgpu::Buffer,
+    shape_bind_group: wgpu::BindGroup,
     camera_buffer: wgpu::Buffer,
     lights_buffer: wgpu::Buffer,
     /// The sky and fog data for the main viewport's camera (scene bind group
@@ -1745,7 +1870,26 @@ impl GpuState {
         // Concatenate every primitive's vertices and remember each one's range,
         // in the engine's Mesh order (Cube, Sphere, Plane). At draw time we bind
         // this buffer and draw the range for whichever primitive an entity uses.
-        let (mesh_vertex_buffer, mesh_ranges) = build_mesh_buffer(&device, &[]);
+        let (mesh_vertex_buffer, mesh_ranges, moves) = build_mesh_buffer(&device, &[]);
+        // --- Shape keys (group 2 of the entity pipelines) ---
+        let shape_entry = |binding: u32| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::VERTEX,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        };
+        let shape_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("shape key bind group layout"),
+            entries: &[shape_entry(0), shape_entry(1)],
+        });
+        let shape_moves = shape_moves_buffer(&device, &moves);
+        let shape_weights = shape_weights_buffer(&device, SHAPE_WEIGHTS_START);
+        let shape_bind_group =
+            create_shape_bind_group(&device, &shape_layout, &shape_moves, &shape_weights);
         // --- Entity pipeline (world-space, camera-driven) ---
         // What the water mirrors of the sky: the first module's own, if one
         // gives it (its clouds), or the default.
@@ -1763,9 +1907,12 @@ impl GpuState {
                 // Group 0: camera + lights (scene-wide). Group 1: this mesh's
                 // own material (texture, sampler, roughness/metalness),
                 // rebound before each mesh's draw call.
+                // Group 2: shape keys (every model's moves and this frame's
+                // weights), bound once per pass.
                 bind_group_layouts: &[
                     Some(&scene_bind_group_layout),
                     Some(&material_bind_group_layout),
+                    Some(&shape_layout),
                 ],
                 immediate_size: 0,
             });
@@ -1910,7 +2057,7 @@ impl GpuState {
         let shadow_pipeline_layout =
             device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
                 label: Some("shadow pipeline layout"),
-                bind_group_layouts: &[Some(&shadow_pass_layout)],
+                bind_group_layouts: &[Some(&shadow_pass_layout), Some(&shape_layout)],
                 immediate_size: 0,
             });
         let shadow_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
@@ -2050,6 +2197,10 @@ impl GpuState {
                 text_pipeline,
                 mesh_vertex_buffer,
                 mesh_ranges,
+                shape_layout,
+                shape_moves,
+                shape_weights,
+                shape_bind_group,
                 camera_buffer,
                 lights_buffer,
                 sky_buffer,
@@ -2090,9 +2241,16 @@ impl GpuState {
     ) {
         let mesh_data: Vec<&frame_engine::assets::MeshData> =
             customs.iter().map(|(data, _)| *data).collect();
-        let (buffer, ranges) = build_mesh_buffer(&self.device, &mesh_data);
+        let (buffer, ranges, moves) = build_mesh_buffer(&self.device, &mesh_data);
         self.mesh_vertex_buffer = buffer;
         self.mesh_ranges = ranges;
+        self.shape_moves = shape_moves_buffer(&self.device, &moves);
+        self.shape_bind_group = create_shape_bind_group(
+            &self.device,
+            &self.shape_layout,
+            &self.shape_moves,
+            &self.shape_weights,
+        );
         let default_view = create_default_white_texture(&self.device, &self.queue);
         let mut bind_groups: Vec<wgpu::BindGroup> = (0..3)
             .map(|_| {
@@ -2129,6 +2287,27 @@ impl GpuState {
             ));
         }
         self.material_bind_groups = bind_groups;
+    }
+    /// Hand this frame's shape key weights to the graphics card (see
+    /// `build_instances`), growing the buffer when they no longer fit. Called
+    /// by each render just before it records, so a preview's weights never
+    /// mix with the main view's: each write lands before its own submit.
+    fn set_shape_weights(&mut self, weights: &[f32]) {
+        if weights.is_empty() {
+            return;
+        }
+        let needed = std::mem::size_of_val(weights) as u64;
+        if needed > self.shape_weights.size() {
+            self.shape_weights = shape_weights_buffer(&self.device, needed.next_power_of_two());
+            self.shape_bind_group = create_shape_bind_group(
+                &self.device,
+                &self.shape_layout,
+                &self.shape_moves,
+                &self.shape_weights,
+            );
+        }
+        self.queue
+            .write_buffer(&self.shape_weights, 0, bytemuck::cast_slice(weights));
     }
     fn resize(&mut self, width: u32, height: u32) {
         if width > 0 && height > 0 {
@@ -2190,6 +2369,7 @@ impl GpuState {
         });
         pass.set_pipeline(&self.shadow_pipeline);
         pass.set_bind_group(0, &self.shadow_pass_bind_group, &[]);
+        pass.set_bind_group(1, &self.shape_bind_group, &[]);
         if let Some(buffer) = instance_buffer {
             pass.set_vertex_buffer(0, self.mesh_vertex_buffer.slice(..));
             let stride = std::mem::size_of::<InstanceRaw>() as wgpu::BufferAddress;
@@ -2322,6 +2502,8 @@ impl GpuState {
         // order. `instances` is laid out in that same order, so these counts also
         // give each primitive's contiguous slice of the instance buffer.
         group_counts: &[u32],
+        // The instances' shape key weights (see `build_instances`).
+        shape_weights: &[f32],
         text_instances: &[TextInstance],
         view_proj: [[f32; 4]; 4],
         lights: &[LightRaw; MAX_LIGHTS],
@@ -2329,6 +2511,7 @@ impl GpuState {
         egui_textures_delta: &egui::TexturesDelta,
         egui_ppp: f32,
     ) {
+        self.set_shape_weights(shape_weights);
         let camera_uniform = CameraUniform::new(view_proj);
         self.queue.write_buffer(
             &self.camera_buffer,
@@ -2473,6 +2656,7 @@ impl GpuState {
             // contiguous slice of instances.
             render_pass.set_pipeline(&self.render_pipeline);
             render_pass.set_bind_group(0, &self.scene_bind_group, &[]);
+            render_pass.set_bind_group(2, &self.shape_bind_group, &[]);
             if let Some(buffer) = &instance_buffer {
                 render_pass.set_vertex_buffer(0, self.mesh_vertex_buffer.slice(..));
                 let stride = std::mem::size_of::<InstanceRaw>() as wgpu::BufferAddress;
@@ -2520,6 +2704,7 @@ impl GpuState {
             if self.module_gpu.iter().any(|m| m.has_transparent()) {
                 render_pass.set_pipeline(&self.transparent_pipeline);
                 render_pass.set_bind_group(1, &self.material_bind_groups[0], &[]);
+                render_pass.set_bind_group(2, &self.shape_bind_group, &[]);
                 for module in &self.module_gpu {
                     render_pass.set_bind_group(1, &self.material_bind_groups[0], &[]);
                     module.draw_transparent_in_view(&mut render_pass, &view);
@@ -2592,9 +2777,11 @@ impl GpuState {
         &mut self,
         instances: &[InstanceRaw],
         group_counts: &[u32],
+        shape_weights: &[f32],
         view_proj: [[f32; 4]; 4],
         lights: &[LightRaw; MAX_LIGHTS],
     ) {
+        self.set_shape_weights(shape_weights);
         self.queue.write_buffer(
             &self.preview_camera_buffer,
             0,
@@ -2679,6 +2866,7 @@ impl GpuState {
             }
             render_pass.set_pipeline(&self.render_pipeline);
             render_pass.set_bind_group(0, &self.preview_bind_group, &[]);
+            render_pass.set_bind_group(2, &self.shape_bind_group, &[]);
             if let Some(buffer) = &instance_buffer {
                 render_pass.set_vertex_buffer(0, self.mesh_vertex_buffer.slice(..));
                 let stride = std::mem::size_of::<InstanceRaw>() as wgpu::BufferAddress;
@@ -2715,6 +2903,7 @@ impl GpuState {
             if self.module_gpu.iter().any(|m| m.has_transparent()) {
                 render_pass.set_pipeline(&self.transparent_pipeline);
                 render_pass.set_bind_group(1, &self.material_bind_groups[0], &[]);
+                render_pass.set_bind_group(2, &self.shape_bind_group, &[]);
                 for module in &self.module_gpu {
                     render_pass.set_bind_group(1, &self.material_bind_groups[0], &[]);
                     module.draw_transparent_in_view(&mut render_pass, &view);
@@ -2853,6 +3042,9 @@ struct EditedEntity {
     ui_text: Option<frame_engine::world::UiText>,
     ui_image: Option<frame_engine::world::UiImage>,
     character: Option<frame_engine::world::CharacterBody>,
+    shape_weights: frame_engine::world::ShapeWeights,
+    // The names of its model's shape keys, for the sliders; not written back.
+    shape_keys: Vec<String>,
     // The entity's extension components, for editor modules' Inspector sections.
     ext: ExtEdit,
 }
@@ -3734,6 +3926,8 @@ fn inspector_tab_ui(
             ui_text,
             ui_image,
             character,
+            shape_weights,
+            shape_keys,
             ext,
         }) => {
             ui.heading(format!("Entity {id}"));
@@ -3931,6 +4125,28 @@ fn inspector_tab_ui(
                 row(ui, "Mass", &mut body.mass, 0.5, " kg");
                 row(ui, "Air control", &mut body.air_control, 0.01, "");
                 *body = body.sanitized();
+            }
+            if !shape_keys.is_empty() {
+                ui.add_space(8.0);
+                section_label(ui, "Shape keys");
+                for key in shape_keys.iter() {
+                    let mut weight = shape_weights.0.get(key).copied().unwrap_or(0.0);
+                    ui.horizontal(|ui| {
+                        let slider = ui
+                            .add(egui::Slider::new(&mut weight, 0.0..=1.0))
+                            .on_hover_text(
+                                "How far this shape key is applied: 0 is the \
+                                 model as made, 1 the key's full change. Keys \
+                                 add together. A game can set these itself (a \
+                                 face from a person's genes, say), over what is \
+                                 set here.",
+                            );
+                        if slider.changed() {
+                            shape_weights.0.insert(key.clone(), weight);
+                        }
+                        ui.label(key);
+                    });
+                }
             }
             ui.add_space(8.0);
             section_label(ui, "Light");
@@ -5097,7 +5313,7 @@ struct App {
     // like new_script_name is.
     new_prefab_name: String,
     // Names of the game window's uploaded models, same sorted order.
-    game_custom_names: Vec<String>,
+    game_models: Vec<DrawnModel>,
     // Assets tab browser state: the open subfolder inside assets/ and the
     // pending new folder name.
     assets_subdir: std::path::PathBuf,
@@ -6380,6 +6596,7 @@ impl App {
                 &[],
                 &[0, 0, 0],
                 &[],
+                &[],
                 Mat4::IDENTITY.to_cols_array_2d(),
                 &[LightRaw::zeroed(); MAX_LIGHTS],
                 &jobs,
@@ -6720,17 +6937,18 @@ impl App {
         let errors =
             add_project_models(&self.modules.borrow(), &files, &mut models, &mut embedded);
         for e in errors {
-            self.log(format!("Model load failed: {e}"));
+            self.log(format!("Model: {e}"));
         }
         add_module_meshes(&self.modules.borrow(), &mut models);
-        self.game_custom_names = models.keys().cloned().collect();
+        self.game_models = drawn_models(&models);
+        let names: Vec<String> = models.keys().cloned().collect();
         let refs: Vec<&frame_engine::assets::MeshData> = models.values().collect();
         // A fresh, local decode cache: Play starts far less often than a
         // material gets tweaked in the editor, so there's no need to share
         // App::texture_cache here.
         let mut game_texture_cache = std::collections::HashMap::new();
         let materials = build_material_gpu_data(
-            &self.game_custom_names,
+            &names,
             &world.mesh_meta,
             Some(&files),
             &embedded,
@@ -6985,15 +7203,15 @@ impl App {
                 .unwrap_or([self.cam_focus_x, self.cam_focus_y, self.cam_focus_z]),
         };
         self.play_game_audio(menu_view, active_camera_id, game_viewer, game_files.as_ref());
-        let (instances, group_counts, lights) = match &self.game_world {
+        let (instances, group_counts, shape_weights, lights) = match &self.game_world {
             Some(world) => {
                 let anchors = module_api::anchor_names(&self.modules);
                 let empty = std::collections::HashSet::new();
-                let (instances, group_counts) = build_instances(
+                let (instances, group_counts, shape_weights) = build_instances(
                     world,
                     None,
                     &empty,
-                    &self.game_custom_names,
+                    &self.game_models,
                     &anchors,
                     active_camera_id,
                     game_origin,
@@ -7024,7 +7242,12 @@ impl App {
                         );
                     }
                 }
-                (instances, group_counts, build_lights(world, game_origin))
+                (
+                    instances,
+                    group_counts,
+                    shape_weights,
+                    build_lights(world, game_origin),
+                )
             }
             None => return,
         };
@@ -7080,6 +7303,7 @@ impl App {
             gpu.render(
                 &instances,
                 &group_counts,
+                &shape_weights,
                 &[],
                 view_proj,
                 &lights,
@@ -7734,6 +7958,7 @@ impl App {
                 &[],
                 &[],
                 &[],
+                &[],
                 Mat4::IDENTITY.to_cols_array_2d(),
                 &[LightRaw::zeroed(); MAX_LIGHTS],
                 &egui_paint_jobs,
@@ -8163,7 +8388,7 @@ impl App {
             let errors =
                 add_project_models(&self.modules.borrow(), &files, &mut models, &mut embedded);
             for e in errors {
-                self.log(format!("Model load failed: {e}"));
+                self.log(format!("Model: {e}"));
             }
             add_module_meshes(&self.modules.borrow(), &mut models);
             self.custom_meshes = models;
@@ -9132,14 +9357,14 @@ impl ApplicationHandler for App {
                     .collect();
                 let selected = self.selected;
                 // Per-primitive instance buckets from the world (see build_instances).
-                let custom_names: Vec<String> = self.custom_meshes.keys().cloned().collect();
+                let models = drawn_models(&self.custom_meshes);
                 let anchors = module_api::anchor_names(&self.modules);
                 let view_origin = self.view_origin();
-                let (instances, group_counts) = build_instances(
+                let (instances, group_counts, shape_weights) = build_instances(
                     &self.world,
                     selected,
                     &colliding,
-                    &custom_names,
+                    &models,
                     &anchors,
                     None,
                     view_origin,
@@ -9346,6 +9571,20 @@ impl ApplicationHandler for App {
                         ui_text: self.world.ui_texts.get(id).cloned(),
                         ui_image: self.world.ui_images.get(id).cloned(),
                         character: self.world.characters.get(id).copied(),
+                        shape_weights: self
+                            .world
+                            .shape_weights
+                            .get(id)
+                            .cloned()
+                            .unwrap_or_default(),
+                        shape_keys: match self.world.meshes.get(id) {
+                            Some(Mesh::Custom(name)) => self
+                                .custom_meshes
+                                .get(name)
+                                .map(|m| m.shapes.iter().map(|k| k.name.clone()).collect())
+                                .unwrap_or_default(),
+                            _ => Vec::new(),
+                        },
                         ext: ExtEdit::from_world(&self.world, id),
                     })
                 });
@@ -10136,6 +10375,8 @@ impl ApplicationHandler for App {
                     ui_text,
                     ui_image,
                     character,
+                    shape_weights,
+                    shape_keys: _,
                     ext,
                 }) = edited
                 {
@@ -10230,6 +10471,11 @@ impl ApplicationHandler for App {
                         None => {
                             self.world.characters.remove(id);
                         }
+                    }
+                    if shape_weights.0.is_empty() {
+                        self.world.shape_weights.remove(id);
+                    } else {
+                        self.world.shape_weights.insert(id, shape_weights);
                     }
                     ext.apply(&mut self.world, id);
                 }
@@ -10354,20 +10600,22 @@ impl ApplicationHandler for App {
                             // rather than reusing `instances` above, which
                             // deliberately keeps every entity for the main
                             // viewport.
-                            let (preview_instances, preview_group_counts) = build_instances(
-                                &self.world,
-                                selected,
-                                &colliding,
-                                &custom_names,
-                                &anchors,
-                                Some(id),
-                                preview_origin,
-                            );
+                            let (preview_instances, preview_group_counts, preview_weights) =
+                                build_instances(
+                                    &self.world,
+                                    selected,
+                                    &colliding,
+                                    &models,
+                                    &anchors,
+                                    Some(id),
+                                    preview_origin,
+                                );
                             if let Some(gpu) = &mut self.gpu {
                                 gpu.sync_modules(&module_scenes, view_origin);
                                 gpu.render_preview(
                                     &preview_instances,
                                     &preview_group_counts,
+                                    &preview_weights,
                                     preview_view_proj,
                                     &lights,
                                 );
@@ -10380,6 +10628,7 @@ impl ApplicationHandler for App {
                     gpu.render(
                         &instances,
                         &group_counts,
+                        &shape_weights,
                         &text_instances,
                         view_proj,
                         &lights,
@@ -11210,7 +11459,8 @@ fn build_instances(
     world: &World,
     selected: Option<usize>,
     colliding: &std::collections::HashSet<usize>,
-    custom_names: &[String],
+    // The imported models, in the order the mesh buffer holds them.
+    models: &[DrawnModel],
     // Extension component names whose entities are only anchors for a
     // module's own geometry (see `module_api`): they are not drawn here.
     anchors: &[&str],
@@ -11226,10 +11476,13 @@ fn build_instances(
     exclude: Option<usize>,
     // The render origin (see `origin`): every position is drawn relative to it.
     origin: DVec3,
-) -> (Vec<InstanceRaw>, Vec<u32>) {
+) -> (Vec<InstanceRaw>, Vec<u32>, Vec<f32>) {
     // One bucket per mesh: the three primitives, then the imported models in
     // the same sorted name order the mesh buffer uses.
-    let mut buckets: Vec<Vec<InstanceRaw>> = vec![Vec::new(); 3 + custom_names.len()];
+    let mut buckets: Vec<Vec<InstanceRaw>> = vec![Vec::new(); 3 + models.len()];
+    // Every drawn entity's shape key weights, each entity's together (see
+    // `shape_slot`).
+    let mut weights: Vec<f32> = Vec::new();
     for (id, slot) in world.positions.iter().enumerate() {
         if Some(id) == exclude {
             continue;
@@ -11253,7 +11506,7 @@ fn build_instances(
             Mesh::Plane => 2,
             // An imported model draws with its own vertices. A name with no
             // loaded model falls back to the cube.
-            Mesh::Custom(name) => match custom_names.iter().position(|n| n == name) {
+            Mesh::Custom(name) => match models.iter().position(|m| m.name == *name) {
                 Some(i) => 3 + i,
                 None => 0,
             },
@@ -11262,6 +11515,20 @@ fn build_instances(
         let scale = world.scales.get(id).copied().unwrap_or_default();
         let material = world.materials.get(id).copied().unwrap_or_default();
         let rotation = world.rotations.get(id).copied().unwrap_or_default();
+        let model = bucket.checked_sub(3).and_then(|i| models.get(i));
+        let mut drawn_scale = [scale.x, scale.y, scale.z];
+        if let Some(model) = model {
+            // A character's Scale is its body's capsule (see `CharacterBody`),
+            // which a model is not shaped like: stretched to fill it, a
+            // person with arms out comes out thin. So its model keeps its own
+            // proportions, sized to the body's height.
+            if world.characters.get(id).is_some() {
+                drawn_scale = [scale.y / (2.0 * model.half_extents[1].max(1e-4)); 3];
+            }
+        }
+        let shape = model.map_or(0, |m| {
+            shape_slot(&mut weights, &m.shape_keys, world.shape_weights.get(id))
+        });
         let rgb = if colliding.contains(&id) {
             const T: f32 = 0.6; // how far toward red
             [
@@ -11276,15 +11543,71 @@ fn build_instances(
             position: origin::relative(DVec3::new(p.x, p.y, p.z), origin).to_array(),
             color: rgb,
             selected: if Some(id) == selected { 1.0 } else { 0.0 },
-            scale: [scale.x, scale.y, scale.z],
+            scale: drawn_scale,
             emissive: material.emissive,
             rotation: [rotation.yaw, rotation.pitch, rotation.roll],
+            shape,
         };
         buckets[bucket].push(raw);
     }
     let group_counts: Vec<u32> = buckets.iter().map(|b| b.len() as u32).collect();
     let instances: Vec<InstanceRaw> = buckets.into_iter().flatten().collect();
-    (instances, group_counts)
+    (instances, group_counts, weights)
+}
+
+/// What drawing an entity needs to know about an imported model besides its
+/// vertices, which are on the graphics card: its size, for characters (see
+/// `build_instances`), and its shape keys' names in the order the card
+/// numbers them.
+#[derive(Clone, Debug, Default, PartialEq)]
+struct DrawnModel {
+    name: String,
+    half_extents: [f32; 3],
+    shape_keys: Vec<String>,
+}
+
+/// `models` as `build_instances` needs them, in the same name order the mesh
+/// buffer uses.
+fn drawn_models(
+    models: &std::collections::BTreeMap<String, frame_engine::assets::MeshData>,
+) -> Vec<DrawnModel> {
+    models
+        .iter()
+        .map(|(name, data)| DrawnModel {
+            name: name.clone(),
+            half_extents: data.half_extents,
+            shape_keys: data.shapes.iter().map(|k| k.name.clone()).collect(),
+        })
+        .collect()
+}
+
+/// Add an entity's weights to `out`, one for each of its model's `keys` in
+/// order (0 for a key it does not name, or a weight that is not a number),
+/// and give the instance's `shape`: where they start, plus one. 0, and
+/// nothing added, when there is nothing to change: no keys, no weights, or
+/// every weight 0.
+fn shape_slot(
+    out: &mut Vec<f32>,
+    keys: &[String],
+    weights: Option<&frame_engine::world::ShapeWeights>,
+) -> u32 {
+    let Some(weights) = weights else {
+        return 0;
+    };
+    let weight = |key: &String| {
+        weights
+            .0
+            .get(key)
+            .copied()
+            .filter(|w| w.is_finite())
+            .unwrap_or(0.0)
+    };
+    if keys.iter().all(|k| weight(k) == 0.0) {
+        return 0;
+    }
+    let start = out.len() as u32 + 1;
+    out.extend(keys.iter().map(weight));
+    start
 }
 
 /// Gather up to MAX_LIGHTS active Light entities from the world into the
@@ -11873,7 +12196,7 @@ fn run_app(
         material_editing: None,
         prefabs: std::collections::BTreeMap::new(),
         new_prefab_name: String::new(),
-        game_custom_names: Vec::new(),
+        game_models: Vec::new(),
         assets_subdir: std::path::PathBuf::new(),
         new_asset_folder: String::new(),
         thumbnails: std::collections::HashMap::new(),
@@ -12319,6 +12642,7 @@ mod shadow_fit_tests {
             scale: [scale; 3],
             emissive: 0.0,
             rotation: [0.0; 3],
+            shape: 0,
         }
     }
 
@@ -12427,6 +12751,152 @@ mod rotation_shader_tests {
 }
 
 #[cfg(test)]
+mod shape_key_tests {
+    use super::*;
+    use frame_engine::assets::{MeshData, MeshVertexData, ShapeKey, ShapeMove};
+    use frame_engine::world::{CharacterBody, Scale, ShapeWeights, Velocity};
+
+    fn moved(vertex: u32, x: f32) -> ShapeMove {
+        ShapeMove {
+            vertex,
+            position: [x, 0.0, 0.0],
+            normal: [0.0; 3],
+        }
+    }
+
+    #[test]
+    fn each_vertex_points_at_its_own_moves_from_every_key() {
+        let corner = MeshVertexData {
+            position: [0.0; 3],
+            normal: [0.0, 1.0, 0.0],
+            uv: [0.0; 2],
+        };
+        let data = MeshData {
+            vertices: vec![corner; 3],
+            half_extents: [0.5; 3],
+            shapes: vec![
+                ShapeKey {
+                    name: "jaw".to_string(),
+                    moves: vec![moved(2, 0.1), moved(0, 0.2), moved(9, 1.0)],
+                },
+                ShapeKey {
+                    name: "nose".to_string(),
+                    moves: vec![moved(2, 0.3)],
+                },
+            ],
+        };
+        // Another model's moves are already in the list.
+        let mut moves = vec![ShapeMoveGpu::zeroed(); 5];
+        let verts = shaped_vertices(&data, &mut moves);
+        assert_eq!(verts[0].shape, [5, 1]);
+        assert_eq!(verts[1].shape, [0, 0], "no key moves it");
+        assert_eq!(verts[2].shape, [6, 2]);
+        assert_eq!(moves.len(), 8, "the move past the last vertex is dropped");
+        assert_eq!((moves[5].key, moves[5].position[0]), (0, 0.2));
+        assert_eq!((moves[6].key, moves[6].position[0]), (0, 0.1));
+        assert_eq!((moves[7].key, moves[7].position[0]), (1, 0.3));
+    }
+
+    fn spawn(world: &mut World, mesh: Mesh) -> usize {
+        let id = world.spawn(
+            Position {
+                x: 0.0,
+                y: 0.0,
+                z: 0.0,
+            },
+            Velocity {
+                dx: 0.0,
+                dy: 0.0,
+                dz: 0.0,
+            },
+        );
+        world.meshes.insert(id, mesh);
+        id
+    }
+
+    fn person() -> DrawnModel {
+        DrawnModel {
+            name: "person".to_string(),
+            half_extents: [0.3, 0.9, 0.2],
+            shape_keys: vec!["jaw".to_string(), "nose".to_string(), "brow".to_string()],
+        }
+    }
+
+    fn draw(world: &World) -> (Vec<InstanceRaw>, Vec<f32>) {
+        let (instances, _, weights) = build_instances(
+            world,
+            None,
+            &std::collections::HashSet::new(),
+            &[person()],
+            &[],
+            None,
+            DVec3::ZERO,
+        );
+        (instances, weights)
+    }
+
+    #[test]
+    fn each_entity_gets_its_weights_in_its_models_key_order() {
+        let mut world = World::new();
+        let shaped = spawn(&mut world, Mesh::Custom("person".to_string()));
+        world.shape_weights.insert(
+            shaped,
+            ShapeWeights(
+                [
+                    ("brow".to_string(), 0.25),
+                    ("jaw".to_string(), 0.5),
+                    ("nose".to_string(), f32::NAN),
+                    ("tail".to_string(), 1.0),
+                ]
+                .into(),
+            ),
+        );
+        let plain = spawn(&mut world, Mesh::Custom("person".to_string()));
+        let zero = spawn(&mut world, Mesh::Custom("person".to_string()));
+        world
+            .shape_weights
+            .insert(zero, ShapeWeights([("jaw".to_string(), 0.0)].into()));
+        let cube = spawn(&mut world, Mesh::Cube);
+        world
+            .shape_weights
+            .insert(cube, ShapeWeights([("jaw".to_string(), 1.0)].into()));
+        let (instances, weights) = draw(&world);
+        // In model order: jaw, nose (not a number, so 0), brow. The model
+        // has no tail, so that weight does nothing.
+        assert_eq!(weights, [0.5, 0.0, 0.25]);
+        let shapes: Vec<u32> = instances.iter().map(|i| i.shape).collect();
+        // The cube is drawn first (primitives before models), then the
+        // three people in entity order.
+        assert_eq!(shapes, [0, 1, 0, 0], "{plain} {zero}: nothing to change");
+    }
+
+    #[test]
+    fn a_characters_model_keeps_its_proportions_at_the_bodys_height() {
+        let mut world = World::new();
+        let body = Scale {
+            x: 0.55,
+            y: 1.76,
+            z: 0.55,
+        };
+        let character = spawn(&mut world, Mesh::Custom("person".to_string()));
+        world.scales.insert(character, body);
+        world.characters.insert(character, CharacterBody::default());
+        let statue = spawn(&mut world, Mesh::Custom("person".to_string()));
+        world.scales.insert(statue, body);
+        let boxed = spawn(&mut world, Mesh::Cube);
+        world.scales.insert(boxed, body);
+        world.characters.insert(boxed, CharacterBody::default());
+        let (instances, _) = draw(&world);
+        // The cube character, then the two models.
+        assert_eq!(instances[0].scale, [0.55, 1.76, 0.55], "a box fills its capsule");
+        // The model is 1.8 tall: drawn 1.76 tall, as wide as it was made.
+        let s = 1.76 / 1.8;
+        assert!(instances[1].scale.iter().all(|v| (v - s).abs() < 1e-6));
+        assert_eq!(instances[2].scale, [0.55, 1.76, 0.55], "not a character");
+    }
+}
+
+#[cfg(test)]
 mod far_from_the_origin_tests {
     use super::*;
     use frame_engine::world::{Camera, Velocity};
@@ -12448,7 +12918,7 @@ mod far_from_the_origin_tests {
         let shown = spawn_at(&mut world, 0.0, 0.0, 0.0);
         let hidden = spawn_at(&mut world, 3.0, 0.0, 0.0);
         world.meshes.insert(hidden, Mesh::Empty);
-        let (instances, counts) = build_instances(
+        let (instances, counts, _) = build_instances(
             &world,
             None,
             &std::collections::HashSet::new(),
@@ -12471,7 +12941,7 @@ mod far_from_the_origin_tests {
         let mut world = World::new();
         let id = spawn_at(&mut world, 2.0e7 + 5.25, 1.5, -3.125);
         let origin = origin::snap(eye);
-        let (instances, _) = build_instances(
+        let (instances, _, _) = build_instances(
             &world,
             None,
             &std::collections::HashSet::new(),
@@ -12500,7 +12970,7 @@ mod far_from_the_origin_tests {
         spawn_at(&mut world, 1.0e9 + 0.5, 0.0, 1.0e9);
         spawn_at(&mut world, 1.0e9 + 1.75, 0.0, 1.0e9);
         let origin = origin::snap(DVec3::new(1.0e9, 0.0, 1.0e9));
-        let (instances, _) = build_instances(
+        let (instances, _, _) = build_instances(
             &world,
             None,
             &std::collections::HashSet::new(),
@@ -12907,6 +13377,7 @@ mod project_model_tests {
         MeshData {
             vertices,
             half_extents: [h, tall * 0.5, h],
+            shapes: Vec::new(),
         }
     }
 

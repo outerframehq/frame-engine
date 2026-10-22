@@ -127,6 +127,16 @@ fn newer_scene_error(found: u32) -> String {
 /// `Gravity` marker are affected.
 pub const GRAVITY: f32 = 9.81 / (crate::core::TICK_RATE as f32 * crate::core::TICK_RATE as f32);
 
+/// How far each of a model's shape keys (`assets::ShapeKey`) is applied on
+/// this entity, by the key's name: 0 is the model as made, 1 the key's full
+/// change, and keys add together. A key not named here stays at 0, and a
+/// name the model has no key for is kept but does nothing, so the weights
+/// survive a change of model. Plain data that anything can write: the
+/// Inspector, a script, or a game's own systems (one that gives each person
+/// a face from their parents, say).
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Default)]
+pub struct ShapeWeights(pub std::collections::BTreeMap<String, f32>);
+
 /// How a character's body is built, in metres, kilograms and metres per
 /// second. The character controller (`physics`) reads it every tick to size
 /// the capsule it moves and to decide how fast it walks, runs and jumps. It is
@@ -1127,6 +1137,8 @@ pub struct Prefab {
     pub children: Vec<PrefabChild>,
     #[serde(default)]
     pub character: Option<CharacterBody>,
+    #[serde(default)]
+    pub shape_weights: Option<ShapeWeights>,
     /// See `SCENE_UNITS`. Missing in a prefab saved before metres, which is
     /// scaled up when it is spawned.
     #[serde(default)]
@@ -1202,6 +1214,10 @@ pub struct World {
     /// Where each character is looking. See `Look`.
     #[serde(default)]
     pub looks: ComponentStorage<Look>,
+    /// How far each entity's model's shape keys are applied. See
+    /// `ShapeWeights`.
+    #[serde(default)]
+    pub shape_weights: ComponentStorage<ShapeWeights>,
     /// Components that belong to crates outside the engine, keyed by name.
     /// A crate that adds its own component (a game-specific feature, say) never
     /// needs a field here: it stores each entity's value under its own name
@@ -1494,6 +1510,7 @@ impl World {
             self.ui_images.remove(id);
             self.characters.remove(id);
             self.looks.remove(id);
+            self.shape_weights.remove(id);
             for storage in self.extensions.values_mut() {
                 storage.remove(id);
             }
@@ -1595,6 +1612,7 @@ impl World {
             sound: self.sounds.get(id).cloned(),
             children,
             character: self.characters.get(id).copied(),
+            shape_weights: self.shape_weights.get(id).cloned(),
             units: SCENE_UNITS,
             format: SCENE_FORMAT,
         })
@@ -1660,6 +1678,9 @@ impl World {
         }
         if let Some(character) = prefab.character {
             self.characters.insert(id, character);
+        }
+        if let Some(weights) = &prefab.shape_weights {
+            self.shape_weights.insert(id, weights.clone());
         }
         if prefab.units < SCENE_UNITS {
             // A prefab saved before metres: scale it as it was drawn then.
@@ -2029,6 +2050,32 @@ mod unit_tests {
         assert_eq!(world.scales.get(new).unwrap().z, 2.0);
         // A captured prefab is current.
         assert_eq!(world.capture_prefab(new).unwrap().units, SCENE_UNITS);
+    }
+
+    #[test]
+    fn shape_weights_go_with_prefabs_and_saves_and_leave_with_the_entity() {
+        let mut world = World::new();
+        let pos = Position {
+            x: 0.0,
+            y: 0.0,
+            z: 0.0,
+        };
+        let id = world.spawn_from_prefab(&Prefab::default(), pos);
+        let weights = ShapeWeights([("jaw_width_wide".to_string(), 0.6)].into());
+        world.shape_weights.insert(id, weights.clone());
+        let prefab = world.capture_prefab(id).unwrap();
+        assert_eq!(prefab.shape_weights.as_ref(), Some(&weights));
+        let copy = world.spawn_from_prefab(&prefab, pos);
+        assert_eq!(world.shape_weights.get(copy), Some(&weights));
+        let dir = std::env::temp_dir().join(format!("frame-shapes-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("shapes.ron");
+        world.save_to_file(&path).unwrap();
+        let loaded = World::load_from_file(&path).unwrap();
+        assert_eq!(loaded.shape_weights.get(id), Some(&weights));
+        std::fs::remove_dir_all(&dir).ok();
+        world.despawn(id);
+        assert_eq!(world.shape_weights.get(id), None);
     }
 
     #[test]

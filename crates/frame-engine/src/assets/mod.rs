@@ -42,6 +42,30 @@ pub struct MeshVertexData {
 pub struct MeshData {
     pub vertices: Vec<MeshVertexData>,
     pub half_extents: [f32; 3],
+    /// The model's shape keys, if it has any (an OBJ never does). Each
+    /// entity says how far each one is applied (`world::ShapeWeights`).
+    pub shapes: Vec<ShapeKey>,
+}
+
+/// A named change to a model's shape, such as a wider jaw: how far each
+/// vertex it touches moves, and how its normal turns, at full weight. A
+/// drawn vertex is its place in `MeshData::vertices` plus each key's move
+/// times that key's weight on the entity, so keys add together.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ShapeKey {
+    pub name: String,
+    /// Only the vertices the key moves, in any order.
+    pub moves: Vec<ShapeMove>,
+}
+
+/// One vertex's move in a [`ShapeKey`], in the model's own units.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ShapeMove {
+    /// The vertex's index in `MeshData::vertices`.
+    pub vertex: u32,
+    pub position: [f32; 3],
+    /// Added to the vertex's normal before it is normalised again.
+    pub normal: [f32; 3],
 }
 
 /// Parse Wavefront OBJ text into a unit normalised MeshData.
@@ -262,5 +286,6 @@ fn normalise_to_unit(mut vertices: Vec<MeshVertexData>) -> MeshData {
     MeshData {
         vertices,
         half_extents: half,
+        shapes: Vec::new(),
     }
 }

@@ -43,6 +43,9 @@ struct VertexInput {
     // tide, -1 floods where the tide is higher, 0 still), then for flooding
     // water the still sea level less the vertex's height, over TIDE_REACH.
     @location(12) water: vec4<f32>,
+    // This vertex's shape key moves: the first's place in `shape_moves`, and
+    // how many. [0, 0] when no key moves it.
+    @location(13) shape: vec2<u32>,
 };
 
 // MUST match FLOW_RANGE and TIDE_REACH in module_api.rs.
@@ -59,7 +62,50 @@ struct InstanceInput {
     @location(7) emissive: f32,
     // x: yaw, y: pitch, z: roll, in radians (world::Rotation).
     @location(8) rotation: vec3<f32>,
+    // Where this entity's shape key weights start in `shape_weights`, plus
+    // one; 0 for none.
+    @location(14) shape: u32,
 };
+
+// Shape keys (ShapeMoveGpu in lib.rs, ShapeKey in frame_engine::assets): one
+// vertex's move under one key at full weight. Every model's moves share one
+// list; each vertex finds its own through its `shape`, and `key` picks the
+// entity's weight for that key.
+struct ShapeMove {
+    position: vec3<f32>,
+    key: u32,
+    normal: vec3<f32>,
+    pad: u32,
+};
+@group(2) @binding(0) var<storage, read> shape_moves: array<ShapeMove>;
+@group(2) @binding(1) var<storage, read> shape_weights: array<f32>;
+
+// A vertex's place and normal with the entity's shape keys applied: each
+// key's move times its weight, added together. Unchanged for a vertex no
+// key moves or an entity with no weights.
+struct Shaped {
+    position: vec3<f32>,
+    normal: vec3<f32>,
+};
+fn shaped(vertex: VertexInput, instance: InstanceInput) -> Shaped {
+    var out = Shaped(vertex.position, vertex.normal);
+    if (vertex.shape.y == 0u || instance.shape == 0u) {
+        return out;
+    }
+    let weights = instance.shape - 1u;
+    for (var i = 0u; i < vertex.shape.y; i = i + 1u) {
+        let m = shape_moves[vertex.shape.x + i];
+        let w = shape_weights[weights + m.key];
+        out.position = out.position + m.position * w;
+        out.normal = out.normal + m.normal * w;
+    }
+    if (dot(out.normal, out.normal) > 1e-12) {
+        out.normal = normalize(out.normal);
+    } else {
+        out.normal = vertex.normal;
+    }
+    return out;
+}
 
 struct VertexOutput {
     @builtin(position) clip_position: vec4<f32>,
@@ -105,12 +151,14 @@ fn rotate_by(v: vec3<f32>, angles: vec3<f32>) -> vec3<f32> {
 fn vs_main(vertex: VertexInput, instance: InstanceInput) -> VertexOutput {
     // Per-axis scale (component-wise), then the entity's rotation, then place
     // at the entity's position. Scale first so rotation spins the
-    // already-sized shape rather than an elongated axis.
+    // already-sized shape rather than an elongated axis. The entity's shape
+    // keys come before all of it: they change the model itself.
+    let shape = shaped(vertex, instance);
     let unmorphed = instance.position
-        + rotate_by(vertex.position * MESH_SIZE * instance.scale, instance.rotation);
+        + rotate_by(shape.position * MESH_SIZE * instance.scale, instance.rotation);
     // A level-of-detail mesh slides toward its coarser shape with distance.
     let t = morph_amount(unmorphed, camera.eye.xyz, vertex.morph.yz);
-    let local = vertex.position + vec3<f32>(0.0, vertex.morph.x * t, 0.0);
+    let local = shape.position + vec3<f32>(0.0, vertex.morph.x * t, 0.0);
     let scaled = local * MESH_SIZE * instance.scale;
     let rotated = rotate_by(scaled, instance.rotation);
     var world_pos = instance.position + rotated;
@@ -123,9 +171,9 @@ fn vs_main(vertex: VertexInput, instance: InstanceInput) -> VertexOutput {
     } else if (vertex.water.z < -0.5) {
         world_pos.y = world_pos.y + max(vertex.water.w * TIDE_REACH * size + tide, 0.0);
     }
-    var normal = vertex.normal;
+    var normal = shape.normal;
     if (t > 0.0) {
-        normal = normalize(mix(vertex.normal, vertex.morph_normal, t));
+        normal = normalize(mix(shape.normal, vertex.morph_normal, t));
     }
 
     // The mesh's own normal, rotated the same way the shape was, so shading

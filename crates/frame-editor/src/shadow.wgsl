@@ -23,6 +23,7 @@ const MESH_SIZE: f32 = 1.0;
 struct VertexInput {
     @location(0) position: vec3<f32>,
     @location(9) morph: vec3<f32>,
+    @location(13) shape: vec2<u32>,
 };
 
 // Only the instance fields that affect geometry are declared; the buffer
@@ -31,7 +32,32 @@ struct InstanceInput {
     @location(3) position: vec3<f32>,
     @location(6) scale: vec3<f32>,
     @location(8) rotation: vec3<f32>,
+    @location(14) shape: u32,
 };
+
+// Shape keys, as `shaped` in shader.wgsl (positions only: a shadow needs no
+// normals); keep them in step, or shadows would drift from their casters.
+struct ShapeMove {
+    position: vec3<f32>,
+    key: u32,
+    normal: vec3<f32>,
+    pad: u32,
+};
+@group(1) @binding(0) var<storage, read> shape_moves: array<ShapeMove>;
+@group(1) @binding(1) var<storage, read> shape_weights: array<f32>;
+
+fn shaped(vertex: VertexInput, instance: InstanceInput) -> vec3<f32> {
+    var position = vertex.position;
+    if (vertex.shape.y == 0u || instance.shape == 0u) {
+        return position;
+    }
+    let weights = instance.shape - 1u;
+    for (var i = 0u; i < vertex.shape.y; i = i + 1u) {
+        let m = shape_moves[vertex.shape.x + i];
+        position = position + m.position * shape_weights[weights + m.key];
+    }
+    return position;
+}
 
 // Same rotation as `rotate_by` in shader.wgsl (yaw, pitch, roll); keep them in
 // step, or shadows would drift away from their casters.
@@ -58,10 +84,11 @@ fn morph_amount(world: vec3<f32>, eye: vec3<f32>, band: vec2<f32>) -> f32 {
 
 @vertex
 fn vs_main(vertex: VertexInput, instance: InstanceInput) -> @builtin(position) vec4<f32> {
+    let position = shaped(vertex, instance);
     let unmorphed = instance.position
-        + rotate_by(vertex.position * MESH_SIZE * instance.scale, instance.rotation);
+        + rotate_by(position * MESH_SIZE * instance.scale, instance.rotation);
     let t = morph_amount(unmorphed, shadow_cam.eye.xyz, vertex.morph.yz);
-    let local = vertex.position + vec3<f32>(0.0, vertex.morph.x * t, 0.0);
+    let local = position + vec3<f32>(0.0, vertex.morph.x * t, 0.0);
     let scaled = local * MESH_SIZE * instance.scale;
     let rotated = rotate_by(scaled, instance.rotation);
     return shadow_cam.light_view_proj * vec4<f32>(instance.position + rotated, 1.0);
