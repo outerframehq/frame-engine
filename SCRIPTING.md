@@ -62,9 +62,9 @@ These are set for you every tick. Read them, write them, or both.
 | `spawn_at` | Where a new entity appears | read/write | `spawn_at.x/.y/.z`. Defaults to this entity's own position. |
 | `spawn`   | Request a new entity        | read/write | Set `true` to spawn one at `spawn_at`, at the end of this tick. Resets to `false` at the start of every script run, so it has to be set again each time you want another one. |
 | `despawn_id` | Request an entity removed | read/write | An entity id, or `-1.0` for no request. Can be this entity's own `id`, or any other, `hit_id` included. |
-| `move_dx` / `move_dz` | Requested movement | read/write | World-space movement this tick, same units `Controlled` input uses. Only acted on for a `Controlled` + `RigidBody` entity (a physics character); harmless on anything else. Seeded with whatever `Controlled` input already asked for this tick, so leaving it alone doesn't cancel keyboard movement. |
+| `move_dx` / `move_dz` | Requested movement | read/write | How far to move this tick along the world's X and Z axes, in metres (30 ticks a second, so `0.05` is 1.5 m/s). Only acted on for a `Controlled` + `RigidBody` entity (a physics character); harmless on anything else. Seeded with whatever `Controlled` input already asked for this tick, so leaving it alone doesn't cancel keyboard movement. For a character with a `CharacterBody` the keys have already been turned into a step the way it faces, at its walking, running or crouching speed, before the script runs; a value the script sets is used as it is. |
 | `move_jump` | Requested jump | read/write | Same physics-character-only rule as `move_dx`/`move_dz`. Needs a fresh `true` (not held) to actually jump, same as the Jump key. |
-| `move_run` / `move_crouch` | Requested run or crouch | read/write | For a character with a `CharacterBody`: run at its run speed, or crouch. Seeded from the keys, like `move_dx`. |
+| `move_run` / `move_crouch` | Requested run or crouch | read/write | For a character with a `CharacterBody`, seeded from the Run and Crouch keys. Setting `move_crouch` crouches it. Setting `move_run` does not change its speed yet: the speed is chosen from the keys before scripts run, so to move a character faster from a script, set a bigger `move_dx`/`move_dz`. |
 | `look_yaw` / `look_pitch` | Where a character looks | read/write | In radians, for an entity with a `CharacterBody`. Yaw 0 faces -Z and turns the whole body; pitch tips the view, up positive, kept just short of straight up or down. Changing them turns the character. |
 | `pos`     | Position                  | read/write | `pos.x`, `pos.y`, `pos.z`. Where the entity is.    |
 | `vel`     | Velocity (per tick)       | read/write | `vel.x`, `vel.y`, `vel.z`. Added to position each tick. |
@@ -354,7 +354,7 @@ if grounded && (input_up || input_down || input_left || input_right) {
 other, and for jump:
 
 ```rust
-move_dz = -2.0;  // always drift forward, regardless of input
+move_dz = -0.05;  // always drift towards -Z at 1.5 m/s, regardless of input
 ```
 
 ## Dynamic values: `custom_<name>`
