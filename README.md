@@ -149,7 +149,7 @@ sudo dnf install gcc pkgconf-pkg-config alsa-lib-devel
 
 The launcher's Create and Open buttons use your desktop's own file picker, through `xdg-desktop-portal`. Most desktops have it already; if nothing opens when you press them, install `xdg-desktop-portal` and the one for your desktop (`xdg-desktop-portal-gtk`, `-gnome` or `-kde`).
 
-The first build compiles every library the editor uses, so expect it to take around 10 to 15 minutes and about 3.5 GB of disk in `target/`. Later builds only rebuild what changed and take seconds.
+The first build compiles every library the editor uses: about 2 minutes on a fast desktop, and up to 15 on a laptop or an older machine, with about 3.5 GB of disk in `target/`. Later builds only rebuild what changed and take seconds.
 
 New to Frame Engine? [GETTING_STARTED.md](GETTING_STARTED.md) goes from a first project to a few scripts, then to a game crate of your own in Rust, joined up with its scripts.
 
