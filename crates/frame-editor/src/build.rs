@@ -42,7 +42,7 @@ use serde::{Deserialize, Serialize};
 /// What a game tells the editor so it can make builds of it.
 #[derive(Clone)]
 pub struct GameBuilder {
-    /// The game program's binary name in its Cargo workspace (`ichor`).
+    /// The game program's binary name in its Cargo workspace (`my-game`).
     pub program: String,
     /// The Cargo workspace holding that program. A game program usually
     /// passes its own source location, known when it is compiled:
@@ -1242,17 +1242,17 @@ mod tests {
     #[test]
     fn build_names_are_safe_and_settings_default_to_release_and_encrypted() {
         let windows = platform_by_id("windows").unwrap();
-        assert_eq!(build_name("Ichor", "0.1", windows), "Ichor-0.1-windows");
+        assert_eq!(build_name("MyGame", "0.1", windows), "MyGame-0.1-windows");
         assert_eq!(build_name("My/Game?", "", windows), "My-Game--windows");
         let old: BuildSettings = ron::from_str("()").unwrap();
         assert!(old.release && old.encrypt && old.output.is_empty());
         // A project from before platforms existed builds for this computer.
         assert_eq!(old.platforms, [host_platform().id]);
         assert!(can_build_for(host_platform()));
-        let project = Path::new("/home/me/Dev/Ichor");
+        let project = Path::new("/home/me/Dev/MyGame");
         assert_eq!(
             old.output_folder(project),
-            Path::new("/home/me/Dev/Ichor-builds")
+            Path::new("/home/me/Dev/MyGame-builds")
         );
     }
 }

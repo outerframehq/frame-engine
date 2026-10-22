@@ -132,8 +132,8 @@ pub const GRAVITY: f32 = 9.81 / (crate::core::TICK_RATE as f32 * crate::core::TI
 /// change, and keys add together. A key not named here stays at 0, and a
 /// name the model has no key for is kept but does nothing, so the weights
 /// survive a change of model. Plain data that anything can write: the
-/// Inspector, a script, or a game's own systems (one that gives each person
-/// a face from their parents, say).
+/// Inspector, a script, or a game's own systems (one that sets each
+/// character's face, say).
 #[derive(Serialize, Deserialize, Clone, PartialEq, Debug, Default)]
 pub struct ShapeWeights(pub std::collections::BTreeMap<String, f32>);
 

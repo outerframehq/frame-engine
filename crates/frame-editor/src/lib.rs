@@ -4229,7 +4229,7 @@ fn inspector_tab_ui(
                                 "How far this shape key is applied: 0 is the \
                                  model as made, 1 the key's full change. Keys \
                                  add together. A game can set these itself (a \
-                                 face from a person's genes, say), over what is \
+                                 character's face, say), over what is \
                                  set here.",
                             );
                         if slider.changed() {

@@ -392,7 +392,7 @@ mod tests {
             .script_library
             .insert("door".into(), "let open = true;".into());
         world.globals.insert("difficulty".into(), 3.0);
-        world.save_to_file(root.join("Ichor.ron")).unwrap();
+        world.save_to_file(root.join("MyGame.ron")).unwrap();
         std::fs::write(
             root.join("project.ron"),
             "(description: \"A game\", version: \"0.1.0\")",
@@ -401,25 +401,25 @@ mod tests {
 
         let done = convert_old_project(&root).unwrap();
         assert!(
-            done.iter().any(|l| l.contains("Backed up Ichor.ron")),
+            done.iter().any(|l| l.contains("Backed up MyGame.ron")),
             "{done:?}"
         );
-        assert!(root.join("Ichor.ron.backup").is_file());
-        assert!(!root.join("Ichor.ron").exists());
-        assert!(root.join("scenes/Ichor.ron").is_file());
+        assert!(root.join("MyGame.ron.backup").is_file());
+        assert!(!root.join("MyGame.ron").exists());
+        assert!(root.join("scenes/MyGame.ron").is_file());
         assert_eq!(
             std::fs::read_to_string(root.join("scripts/door.rhai")).unwrap(),
             "let open = true;"
         );
 
         let manifest = read_manifest(&root);
-        assert_eq!(manifest.name, "Ichor");
-        assert_eq!(manifest.start_scene, "Ichor");
+        assert_eq!(manifest.name, "MyGame");
+        assert_eq!(manifest.start_scene, "MyGame");
         assert_eq!(manifest.description, "A game");
 
         let files = ProjectFiles::Folder(root.clone());
         assert!(!project::is_old_layout(&files));
-        let back = project::load_scene(&files, "Ichor").unwrap();
+        let back = project::load_scene(&files, "MyGame").unwrap();
         assert_eq!(back.globals.get("difficulty"), Some(&3.0));
         assert_eq!(back.script_library["door"], "let open = true;");
         std::fs::remove_dir_all(&root).ok();

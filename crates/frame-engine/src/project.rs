@@ -495,12 +495,12 @@ mod tests {
         assert_eq!(start_scene_path(&files), None);
 
         // Old layout: a scene at the top.
-        World::new().save_to_file(root.join("Ichor.ron")).unwrap();
+        World::new().save_to_file(root.join("MyGame.ron")).unwrap();
         std::fs::write(root.join("project.ron"), "(version: \"0.1.0\")").unwrap();
         assert!(is_old_layout(&files));
-        assert_eq!(start_scene_path(&files).as_deref(), Some("Ichor.ron"));
+        assert_eq!(start_scene_path(&files).as_deref(), Some("MyGame.ron"));
         let (name, _) = load_start_scene(&files).unwrap();
-        assert_eq!(name, "Ichor");
+        assert_eq!(name, "MyGame");
 
         // New layout wins once there are scenes.
         save_scene(&root, "Cave", &World::new()).unwrap();
@@ -509,14 +509,14 @@ mod tests {
         assert_eq!(start_scene_path(&files).as_deref(), Some("scenes/Cave.ron"));
         std::fs::write(
             root.join("project.ron"),
-            "(name: \"Ichor\", start_scene: \"World\", version: \"0.1.0\")",
+            "(name: \"MyGame\", start_scene: \"World\", version: \"0.1.0\")",
         )
         .unwrap();
         assert_eq!(
             start_scene_path(&files).as_deref(),
             Some("scenes/World.ron")
         );
-        assert_eq!(ProjectSettings::read(&files).name, "Ichor");
+        assert_eq!(ProjectSettings::read(&files).name, "MyGame");
         std::fs::remove_dir_all(&root).ok();
     }
 
