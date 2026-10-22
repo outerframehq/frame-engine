@@ -35,65 +35,42 @@ Releases come at most once a week. A crash, data loss or security bug gets a pat
 
 ## Status
 
-Early development, past the toy stage, with a working engine and a usable editor shell.
+Early development, past the toy stage: a working engine and a usable editor that a small game is being built on. The [CHANGELOG](CHANGELOG.md) has every change in detail; this is the short version of what is here and what is not yet.
 
-**Engine**
+### What it has
 
-- A deterministic fixed-timestep clock (in `core/`) with spiral-of-death protection, used by both the engine binary and the editor.
-- A hand-rolled ECS world with a growing set of component types (position, velocity, colour, a per-axis scale, a full yaw/pitch/roll rotation, an emissive material strength, health, a `Mesh` (a primitive, an imported model, or none), plus opt-in `Light`, `Sound`, `Camera`, `Parent`, `UiText`, `UiImage` and `RigidBody` components and the `Controlled`, `Static` and `Gravity` markers) and runtime spawn and despawn, both reachable from a script as well as the editor. Spawn reuses freed slots, so entity ids stay stable and despawned slots are reclaimed.
-- A `Light` component (`Directional`, a fixed no-falloff direction like a sun, or `Point`, at the entity's own position with a linear falloff to a set range, plus an intensity multiplier and a colour) and a `Sound` component (a file name and a one-shot `play` request flag, the same request-and-clear pattern `spawn`/`despawn` already use from scripts). Both are just data the engine carries and serializes; drawing a light and actually playing a sound are the editor's job.
-- Runtime component registration: `World` can hold component types it wasn't compiled knowing about, through a generic, string-keyed `insert_dynamic`/`get_dynamic` API. `f64` values survive a save and reload; a value of any other type still resets on reload. Scripts can reach these too, through `custom_<name>` variables.
-- A `Substance` schema (melting point, durability, conductivity, and more) and a name-keyed registry for it on `World`, the shape for a wood, a stone, or a metal, with `Substance::blend` mixing two into a new one, freeform, any ratio, no fixed recipes. No actual substances are defined; that stays game content.
-- A generic `ComponentStorage<T>` type, wired into the world. It implements `Default`, and `World` derives `Default`, so a fresh world is built in one place and adding a component type is cheap and uniform. A small query API (`query`, `join`, `with`, `without`) lets systems ask for "every entity with these components" without index loops.
-- A movement system that advances entities each tick, and an input system that drives `Controlled` entities from held WASD keys.
-- Per-entity colour and scale, stored as component data and serialized with the scene.
-- A per-entity `Mesh` primitive (cube, sphere, or plane), stored as component data and serialized with the scene; defaults to cube, so older scenes load unchanged. `Mesh::Empty` is an entity with no shape, for something that is only a point in the world (a spawn marker, a sound source, a holder for settings): it is not drawn, has no collision box and gets no physics body.
-- A hand rolled OBJ importer: an assets module parses Wavefront OBJ text (Blender's export works with default settings), reads texture coordinates, normalises models to unit size, and reports their half extents so collision fits their real shape. Imported models are a `Mesh::Custom(name)` on an entity.
-- AABB collision, detection and response: a `collision` system records which entity boxes overlap each run, along with the contact point where they overlap (feeding the `hit`/`hit_id`/`hit_point` script variables and the editor's red tint), and a `resolve_collisions` system pushes overlapping entities apart along their least-overlapping axis after movement. A `Static` marker keeps an entity immovable, so others rest against it. Boxes are axis-aligned scale-boxes derived from a shared `ENTITY_SIZE` (1 m: a world unit is a metre), the world-space size the editor also renders and picks against. A box is expanded conservatively to bound an entity's rotation, yaw, pitch and roll (not true oriented-box precision), and entities that opt into physics skip this hand-rolled path.
-- Rigid-body physics through `rapier3d`, the one dependency the engine crate takes beyond `serde` and `ron`, bought rather than hand-rolled: a `RigidBody` marker opts an entity in, with `Static` giving a fixed body and `Gravity` a dynamic one. A `Controlled` plus `RigidBody` entity is a physics character, swept through the world by a kinematic character controller: it stops at walls, slides along them, falls, lands, jumps on Space when standing on something, and turns to face the way it moves. Give it a `CharacterBody` and it becomes a person-sized capsule built from that body's numbers (height, radius, eye height, walk, run and crouch speeds, jump height, step height, steepest slope, mass, air control): it walks where it looks, runs and crouches, steps up small ledges, keeps its speed through a jump and stays crouched under a low ceiling. A `Look` holds where it is looking, and a `Camera` on it, or attached to it, sees from its eyes. The body is plain data, so a game can grow or change it over a character's life. Physics state is runtime-only; the scene saves only which entities opt in.
-- Parenting, cameras, prefabs and UI: `Parent` attaches one entity to another with a local offset that turns with the parent, `Camera` marks the entity Play looks through, and a prefab captures an entity and its whole parented subtree as an unlinked, stamp-and-forget template saved as its own RON file. `UiText` and `UiImage` are screen-space UI components (normalised position, display-only for now).
-- Per-entity scripting: an entity can carry a `Script` that names a shared library script (source held once on the world, in a name-to-source map), with a `ScriptRuntime` trait and a `run_scripts` system forming the seam. The engine stores script source as data and runs nothing itself; the interpreter lives in the editor, the same way rendering does.
-- A graphics-free input abstraction (which buttons are held), fed by the editor and read by systems, so input can drive the simulation without the engine knowing about windowing.
-- Scene serialization to and from a human-readable RON file (`serde` and RON), with backward compatibility for scenes saved before newer fields like colour and scale existed.
-- Version checks: scenes and prefabs carry a save format number and projects record the editor version that last saved them, so an older editor warns about, and won't save over, something from a newer one. Multiplayer clients and servers check versions on connect, and plugins can name the engine version they need.
-- A read-only ASCII debug renderer that draws the world as a grid.
-- A library and binary split, so the engine is importable by other crates.
-- A first slice of multiplayer, in `net/`: an authoritative `Server` that accepts clients, applies their uploaded input, and broadcasts every entity's position, and a receiving `Client` that applies whatever arrives and uploads its own held input back, learning which entity is its own from a one-time `Welcome` message. Positions and input only, no interest management, and a disconnected client's entity is despawned but can't yet reconnect to it, all deliberately left for later. This replaces an earlier lockstep plan, a better fit for a small closed session than a persistent, always-joinable world; see [DESIGN.md](DESIGN.md) for why. Runnable now through the engine binary's own `server`/`client` modes.
+**Engine** (`crates/frame-engine`, no graphics)
 
-**frame-editor** (companion editor; links to the engine, runs the sim in a window)
+- A deterministic fixed-timestep clock, 30 ticks a second, shared by everything that runs the world.
+- A hand-rolled ECS: `ComponentStorage<T>` with a small query API, built-in components (position, velocity, colour, scale, full yaw/pitch/roll rotation, mesh, material, lights, sounds, cameras, parents, health), components a game adds by name (extension components), and world-wide resources.
+- Everything in metres, with world positions in `f64`, so a world can be planet-sized without jitter far from the origin.
+- Physics through `rapier3d`: static and dynamic bodies, fixed mesh colliders, and characters with their own body (`CharacterBody`: height, speeds, jump, step height, slope, crouch), a view that turns them, and swimming in liquids a game describes.
+- Scenes, prefabs and projects saved as readable RON, with save-format and version checks so an older editor warns about newer files instead of breaking them.
+- Rhai scripting per entity from a shared library: movement, physics characters, spawning, scene changes, globals across scenes.
+- Models: a hand-rolled OBJ reader, plus models a game builds in code or reads itself. A model can carry shape keys and a skeleton with clips (`assets::skin`); each entity has its own shape key weights and its own playing clips (`Animation`).
+- Pack files for game builds, with optional encryption a game provides.
+- A first slice of multiplayer in `net/`: an authoritative server, clients that upload input, and a version handshake.
 
-- Opens a native window (`winit`) and renders the world on the GPU through `wgpu`.
-- Draws entities as instanced, shaded primitives (cube, sphere, or plane) in real 3D, each in its own colour, size, optional glow (an emissive material strength), and full yaw, pitch and roll rotation, with a perspective camera and a depth buffer for correct occlusion. Overlapping entities are tinted red, a live view of the engine's collision detection.
-- Multi-light shading: up to four active `Light` entities are summed per fragment (not per vertex, so falloff reads correctly across a face) on top of a flat ambient base. A Light beyond the cap is simply not drawn, a real, named limit rather than an unbounded cost. Lights are edited from the Inspector: pick Directional or Point, set direction or range, and set intensity and, for a point light, colour. With more lights than the cap, directional lights win, then the point lights nearest the camera. The first directional light also casts shadows: a 2048 shadow map follows the part of the world in front of the camera (out to a Shadow distance you set), with soft (filtered) edges that don't shimmer as the camera moves. Shadows and the distance are in Edit > Editor settings…. Point lights do not cast shadows yet.
-- Sound playback through `kira`: a Sound section in the Inspector picks a file from a dropdown of the project's audio (found by name anywhere under `assets/`, so it can be moved between folders) and a "Play now" button fires it for a quick manual test. Each tick, any entity with a pending `Sound.play` request gets it turned into a real play call, the file decoded once into a small cache and reused (cheaply cloned, not re-read) on every later play. No audio device or no project open both just mean the request is quietly dropped.
-- An orbit, pan, and zoom camera (middle-drag orbit, Shift+middle-drag pan, scroll zoom). Left-click only ever selects.
-- Textured models: a model's Material panel in the Assets tab picks a base-colour PNG and roughness and metalness sliders, shared by every entity that uses that model. Roughness and metalness are an honest approximation, not a physically based specular highlight.
-- Click-to-pick selection: click an entity to select it. The selected entity is brightened rather than recoloured, so its own colour stays visible while you edit it.
-- Live entity editing: nudge the selection with the arrow keys and Page Up/Down, spawn with `N`, despawn with `Delete`, and drive a `Controlled` entity with WASD while the sim is playing.
-- A project launcher: the editor opens on a launcher to create a named project, open one by folder, or reopen a recent one from a list of cards (name, description, last-edited date, version, and Edit / Play / Settings actions). A project is a folder holding `project.ron` (name, start scene, description, version), its scenes in `scenes/`, its scripts as `.rhai` files in `scripts/`, and what every scene shares (materials, plugin settings, globals) in `project-data.ron`; Settings edits the manifest. A project from before scenes (one scene file at the top) is converted the first time it opens, with a `.backup` copy of the old file kept beside it.
-- Scenes: a project holds any number of scenes. The Scenes tab in the console lists them, marks the open one and the start scene, and creates, opens, duplicates, renames and deletes them (two steps to delete; the open scene and the last scene can't be). Play scene in the menu bar plays the scene that is open, as it is now; the launcher's Play and a game build start on the start scene. A script changes scene with `load_scene("name")`, and keeps numbers across the change with `set_global` and `get_global`. Script files edited outside the editor (another text editor, or git) are picked up when the editor window gets focus back.
-- Scene save and load: opening a project loads its scene, `Ctrl+S` (or `F5`) saves it and `F9` reloads it, and the File menu also opens or saves a scene to any path through a native file dialog.
-- Unsaved-changes protection: the window title shows a `*` while the scene has edits that aren't saved, and quitting, closing the window, closing the project, reloading, or opening another scene asks first (Save, Don't save, or Cancel). Only authoring edits count; the running simulation moving things does not.
-- Editor preferences, remembered across runs in `editor.ron`: the flythrough speed (scrolling while you fly changes it too), mouse look and orbit sensitivity, inverted look on either axis, how long to hold a Scene row before it drags, and whether the controls overlay shows. Edit them under Edit > Editor settings…, which also holds the plugin switches and a Credits section.
-- A Script Editor: a dockable tab where the shared script library is written, a sidebar of script names beside a single code editor with a line-number gutter and live checks: a status line flags parse errors (line and column) in red, and unknown variables (names that aren't part of the script API or a local `let`) in amber, catching the typos Rhai would otherwise fail on silently at run time. Scripts can be renamed as well as deleted; renaming rewrites every entity's reference to the old name, so it doesn't orphan anything. Scripts see structured values (`pos.x`, `vel`, `color.r`, with vector arithmetic) alongside the older flat names, plus their own id, whether they carry the `Controlled`/`Static`/`Gravity` marker, which movement keys are held, and, on collision, which entity was hit and where. Scripts can also request a new entity be spawned or an existing one despawned, and read or write runtime-registered dynamic component values through `custom_<name>` variables. All of it runs live through a Rhai backend and is assigned to entities from the Inspector. See [SCRIPTING.md](SCRIPTING.md) for how to write them.
-- A translate gizmo: selecting an entity draws three axis arms in the viewport (X red, Y green, Z blue); drag an arm to move the entity along that axis, at any camera angle, as a single undo step.
-- A Prefabs tab: lists the project's `prefabs/` folder with a Spawn button for each, dropping a fresh instance at the camera focus. The Inspector's Save as Prefab field writes a new one from the selected entity and its parented children.
-- A Source Control tab: a read-only view of the open project's git state, branch, upstream with ahead/behind counts, and changed files (amber unstaged, green staged). No network, no credentials; commits and pushes stay in your terminal or git client.
-- A plugin loader with enable/disable support: a project's `plugins/` folder (created automatically if missing) is scanned the same way its assets are, and each enabled plugin's Rhai scripts merge into the project's own script library under a name-spaced prefix, so they show up in the ordinary Inspector script picker like any hand-written script. Edit > Editor settings… lists every installed plugin with a checkbox, off by default for anything newly found; a Plugins tab next to Help shows what's currently switched on, along with a button for each action a plugin declares. Compiled Rust plugins are deliberately not supported (Rust has no stable ABI, making that genuinely fragile); Rhai keeps every plugin inside the same sandboxed interpreter every other script already runs in. A plugin can also declare custom Inspector fields (a slider or drag box tied to one of its own dynamic values), menu actions (running one of its scripts once, or toggling a value), and panels (a titled, global section in the Plugins panel, not tied to any entity), all purely declarative: a plugin describes what it wants, the editor is the only thing that ever draws or runs anything. See [PLUGINS.md](PLUGINS.md) if you want to build one.
-- Model import and an Assets tab: File > Import model brings a Blender OBJ export into the project, renders it, lists it in the mesh picker, and fits collision to it. The Assets tab in the bottom console shows the project's assets as tiles with rendered previews, with folders and a move flow to organise them. File > Import audio brings in WAV, OGG, MP3 or FLAC files, checking each one decodes first, into whichever assets folder is open. Dropping model or audio files on the editor window imports them too (Windows, macOS and X11; not yet on Wayland).
-- A dockable panel layout built with `egui` and `egui_dock`. The Viewport, Scene, Inspector, and Script Editor are tabs you can drag, tab together, and split apart; the Viewport is a transparent tab so the 3D shows through. Scene, Inspector, Script Editor and Source Control can also be popped out into their own windows (right-click the tab). Alongside them:
-  - a top toolbar showing the editor's logo and working File/Edit/View/Help menus, each item mirroring a keyboard shortcut (open/save/reload scene, close project, quit; spawn, despawn, clear selection; play/pause, step, controls overlay),
-  - a Scene tab (entities as a parent/child tree, click to select, drag one onto another to reparent) and an Inspector tab (edit the selected entity's transform, colour, emissive strength and mesh, toggle its `Controlled`, `Static`, `Gravity` and physics markers, add or edit its light, sound, camera, parent and screen-space UI components, preview a camera's view live, save it as a prefab, and assign a library script through a searchable picker, all written straight back into the world),
-  - a fixed bottom console dock with an Output tab showing a live log and a Terminal placeholder.
-- A custom editor theme, Outerface V1: neutral dark panels with a restrained green accent and a wood-brown secondary accent, and a thin wood-to-green strip across the top of the window. It is set in one `apply_editor_theme` function, applied to the main window and to every popped-out panel window. The Play window is left alone, since it shows the game rather than the editor. The dock's tab bar is styled to match (the active tab sits on the panel colour with a wood outline), and the Inspector's section headings and checkboxes are drawn by two small helpers (`section_label` and `outerface_checkbox`) so they look the same everywhere.
-- Three embedded fonts: Manrope for body text, Fraunces for headings, and JetBrains Mono for the console and other monospace text. They are compiled into the editor, so nothing is loaded from the network or the system. See Fonts below for their licence.
-- Runs the simulation live on the engine's fixed-timestep clock, so the sim ticks at a true 30 per second independent of the window's repaint rate, with play, pause, and step controls.
-- Undo and redo (Ctrl+Z / Ctrl+Y), built on full-world snapshots. Spawning, despawning, nudging, and Inspector edits are undoable; a drag or a held key is a single step.
-- A flythrough camera: hold the right mouse button to look around with the mouse and fly with WASD (cursor grabbed), seeded from the current view. Scroll changes the fly speed. Left-click picks the entity at screen-centre and makes it the orbit pivot; release the button to return to orbit.
+**Editor** (`crates/frame-editor`)
 
-Play a project in a separate, clean game window: its own window and GPU surface running the world with no editor chrome, the simulation live and WASD driving `Controlled` entities. A program built on the editor library can also start straight into a project's game with no editor at all (`frame_editor::run_player`, or `run_player_with_menu` to open on the game's own menu first), from the project folder or from one compressed pack file holding the whole project (`frame_engine::pack`). Such a program can also turn on File > Build Game (`frame_editor::set_game_builder`), which compiles the game, packs the project and zips a folder ready to send to players.
+- A project launcher, scenes, a dockable panel layout (Scene tree, Inspector, Script Editor, Assets, Prefabs, Source Control), undo and redo, a translate gizmo, and unsaved-changes protection.
+- A GPU renderer (`wgpu`): textured models with roughness and metalness, coloured point and directional lights, shadows from the sun, a sky with sun, moon, stars and moving clouds, distance fog and haze, and no far plane.
+- Shape keys and skinned animation drawn on the graphics card, so many characters can share one model and each look and move their own way. Characters pick idle, walk, run, jump, fall and crouch clips from how they move.
+- A Play window, and File > Build Game for Linux and Windows builds with the third-party licences included.
+- A module interface (`module_api`) for a game to add its own systems, components, Inspector sections, models, collision, terrain or water drawing, menus and panels, without changing the editor.
+- Plugins (Rhai scripts, menu actions and panels per project) and a performance overlay (F3).
 
-Currently at the frontier: finishing the Outerface V1 theme pass (selected Scene rows, sliders, Inspector spacing); a fuller material model (real view-dependent specular), and shadows from point lights; collision and physics refinements (true oriented boxes, a broad phase, joints); interest management and reconnect support for multiplayer; and wiring `net::Server`/`net::Client` into the editor's own Play window. Rotation, script rename support, the script API's original "what a script can reach" list, rigid-body physics and characters, prefabs, parenting and cameras, textured models, client input upload, a plugin loader with enable/disable support, the full editor-extension surface for plugins (custom Inspector fields, menu actions, and panels), multi-light shading, and basic sound playback are done for now.
+### What it does not have yet
+
+- **Releases you can just download.** 0.1.0 is a source release: build it with cargo. No installers.
+- **Testing beyond one machine.** Built and tested on Linux (Pop!_OS, NVIDIA, Wayland). Windows lightly, with a known crash when docking a popped-out panel back. macOS not at all. See [SECURITY.md](SECURITY.md).
+- **A glTF reader in the editor itself.** The editor reads OBJ. The model hooks are ready for `.glb` with shape keys and skeletons, but reading the file is up to a game's own module for now.
+- **More animation:** clips that change shape keys (facial animation), turning the body to face the way it moves, aim and look, foot placement, and blending by body part.
+- **Lighting:** shadows from point lights, and a fuller material model (normal maps, true view-dependent specular). One texture per model.
+- **Terrain, water and grass built in.** The editor can draw them for a game that brings its own (through `module_api`), but has none of its own.
+- **Multiplayer beyond a first slice:** no interest management or reconnecting yet.
+- **Collision refinements:** true oriented boxes and joints.
+- **Its own UI system** beyond on-screen text and images, and visual scripting.
 
 ## Principles
 
@@ -110,30 +87,48 @@ This repository is a Cargo workspace holding multiple crates:
 
 ```
 crates/
-├── frame-engine/       the simulation engine (library and binary)
+├── frame-engine/        the simulation engine (library and binary), no graphics
 │   └── src/
-│       ├── core/       fixed-timestep clock (clock.rs)
-│       ├── world/      simulation state (entities, components, storage)
-│       ├── systems/    logic that runs each tick
-│       ├── input/      graphics-free input abstraction (held buttons)
-│       ├── net/        multiplayer: an authoritative Server and a Client
-│       ├── assets/     hand-rolled OBJ parser
-│       ├── physics.rs  rapier3d rigid bodies and characters
-│       ├── render/     read-only ASCII debug view
-│       ├── lib.rs      library root, exposes the engine to other crates
-│       └── main.rs     binary runner, drives the tick loop
-└── frame-editor/       editor; depends on frame-engine
+│       ├── core/        the fixed-timestep clock
+│       ├── world/       simulation state: entities, components, storage
+│       ├── systems/     what runs each tick
+│       ├── input/       graphics-free input (which buttons are held)
+│       ├── net/         multiplayer: an authoritative Server and a Client
+│       ├── assets/      models: the OBJ reader, shape keys, and skeletons
+│       │                and clips (skin.rs)
+│       ├── physics.rs   rapier3d bodies, characters and swimming
+│       ├── project.rs   a project's scenes and the things they share
+│       ├── pack.rs      a project's files, from its folder or a game's pack
+│       ├── version.rs   the engine's version and comparing versions
+│       ├── render/      read-only ASCII debug view
+│       ├── lib.rs       library root, exposes the engine to other crates
+│       └── main.rs      binary runner, drives the tick loop
+└── frame-editor/        the editor (library and binary); depends on frame-engine
     ├── assets/
     │   ├── frame-editor.png   the editor's logo
     │   └── fonts/             Manrope, Fraunces and JetBrains Mono, embedded
     └── src/
-        ├── main.rs     windowed 3D editor: app state, camera, picking,
-        │               entity editing, the egui panel layout, and the
-        │               wgpu render pipeline
-        ├── script.rs   the Rhai script runtime (the editor's ScriptRuntime)
-        ├── shader.wgsl entity shader (instanced, shaded primitives)
-        ├── text.wgsl   screen-space overlay shader (controls legend)
-        └── font.rs     hand-rolled bitmap font for the overlay
+        ├── lib.rs           the editor: app state, panels, camera, picking,
+        │                    entity editing, and the wgpu renderer
+        ├── main.rs          the public editor's program
+        ├── module_api.rs    how a crate outside the editor adds a feature
+        ├── locomotion.rs    characters picking clips from how they move
+        ├── build.rs         File > Build Game
+        ├── licences.rs      the third-party licences a game build carries
+        ├── scenes.rs        a project's scenes in the editor
+        ├── script.rs        the Rhai script runtime
+        ├── game_audio.rs    sound a game's modules ask for in play
+        ├── game_menu.rs     a game's own menu before play
+        ├── sky.rs, sun.rs   the sky, fog, sun, moon and wind
+        ├── grass.rs         dense grass made on the graphics card
+        ├── origin.rs        drawing a world far from (0, 0, 0) precisely
+        ├── perf.rs          the performance overlay
+        ├── font.rs          a small bitmap font for overlays
+        ├── scene.wgsl       what every pass drawing the world shares
+        ├── shader.wgsl      the entity shader (shape keys, skinning, lighting)
+        ├── shadow.wgsl      the shadow map pass
+        ├── reflection.wgsl  what still water mirrors of the sky
+        └── text.wgsl        the screen-space overlay shader
 ```
 
 The engine and editor live in one repo so they evolve together, but build as separate targets.
