@@ -1,0 +1,521 @@
+(
+    positions: [
+        Some((
+            x: 0.0,
+            y: -0.5,
+            z: 0.0,
+        )),
+        Some((
+            x: 0.0,
+            y: 50.0,
+            z: 0.0,
+        )),
+        Some((
+            x: -6.0,
+            y: 0.5,
+            z: -8.0,
+        )),
+        Some((
+            x: -2.0,
+            y: 0.5,
+            z: -8.0,
+        )),
+        Some((
+            x: 2.0,
+            y: 0.5,
+            z: -8.0,
+        )),
+        Some((
+            x: 6.0,
+            y: 0.5,
+            z: -8.0,
+        )),
+        Some((
+            x: 0.0,
+            y: 0.5,
+            z: -14.0,
+        )),
+        Some((
+            x: 8.0,
+            y: 0.15,
+            z: 0.0,
+        )),
+        Some((
+            x: 10.0,
+            y: 0.3,
+            z: 0.0,
+        )),
+        Some((
+            x: 12.0,
+            y: 0.6,
+            z: 0.0,
+        )),
+        Some((
+            x: 0.0,
+            y: 0.9,
+            z: 4.0,
+        )),
+    ],
+    velocities: [
+        Some((
+            dx: 0.0,
+            dy: 0.0,
+            dz: 0.0,
+        )),
+        Some((
+            dx: 0.0,
+            dy: 0.0,
+            dz: 0.0,
+        )),
+        Some((
+            dx: 0.0,
+            dy: 0.0,
+            dz: 0.0,
+        )),
+        Some((
+            dx: 0.0,
+            dy: 0.0,
+            dz: 0.0,
+        )),
+        Some((
+            dx: 0.0,
+            dy: 0.0,
+            dz: 0.0,
+        )),
+        Some((
+            dx: 0.0,
+            dy: 0.0,
+            dz: 0.0,
+        )),
+        Some((
+            dx: 0.0,
+            dy: 0.0,
+            dz: 0.0,
+        )),
+        Some((
+            dx: 0.0,
+            dy: 0.0,
+            dz: 0.0,
+        )),
+        Some((
+            dx: 0.0,
+            dy: 0.0,
+            dz: 0.0,
+        )),
+        Some((
+            dx: 0.0,
+            dy: 0.0,
+            dz: 0.0,
+        )),
+        Some((
+            dx: 0.0,
+            dy: 0.0,
+            dz: 0.0,
+        )),
+    ],
+    colors: [
+        Some((
+            r: 0.36,
+            g: 0.55,
+            b: 0.27,
+        )),
+        Some((
+            r: 0.95,
+            g: 0.85,
+            b: 0.35,
+        )),
+        Some((
+            r: 0.85,
+            g: 0.25,
+            b: 0.2,
+        )),
+        Some((
+            r: 0.95,
+            g: 0.8,
+            b: 0.2,
+        )),
+        Some((
+            r: 0.25,
+            g: 0.45,
+            b: 0.9,
+        )),
+        Some((
+            r: 0.9,
+            g: 0.5,
+            b: 0.15,
+        )),
+        Some((
+            r: 0.55,
+            g: 0.3,
+            b: 0.75,
+        )),
+        Some((
+            r: 0.6,
+            g: 0.6,
+            b: 0.62,
+        )),
+        Some((
+            r: 0.6,
+            g: 0.6,
+            b: 0.62,
+        )),
+        Some((
+            r: 0.6,
+            g: 0.6,
+            b: 0.62,
+        )),
+        Some((
+            r: 0.7,
+            g: 0.8,
+            b: 0.9,
+        )),
+    ],
+    controlled: [
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(()),
+    ],
+    statics: [
+        Some(()),
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(()),
+        Some(()),
+        Some(()),
+    ],
+    gravities: [
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(()),
+    ],
+    rigid_bodies: [
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(()),
+    ],
+    cameras: [
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some(()),
+    ],
+    parents: [],
+    lights: [
+        None,
+        Some((
+            kind: Directional(
+                direction: (0.45, 0.8, 0.35),
+            ),
+            intensity: 1.0,
+            color: (1.0, 1.0, 1.0),
+        )),
+    ],
+    sounds: [],
+    ui_texts: [],
+    ui_images: [],
+    characters: [
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some((
+            height: 1.8,
+            radius: 0.3,
+            eye_height: 1.66,
+            crouch_height: 1.2,
+            walk_speed: 1.4,
+            run_speed: 5.0,
+            crouch_speed: 0.8,
+            jump_height: 0.5,
+            step_height: 0.35,
+            max_slope: 45.0,
+            mass: 70.0,
+            air_control: 0.2,
+        )),
+    ],
+    looks: [
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        None,
+        Some((
+            yaw: 0.0,
+            pitch: 0.0,
+        )),
+    ],
+    shape_weights: [],
+    animations: [],
+    extensions: {},
+    resources: {},
+    mesh_meta: {},
+    installed_plugins: {},
+    globals: {},
+    substances: {},
+    scales: [
+        Some((
+            x: 5000.0,
+            y: 1.0,
+            z: 5000.0,
+        )),
+        Some((
+            x: 1.0,
+            y: 1.0,
+            z: 1.0,
+        )),
+        Some((
+            x: 1.0,
+            y: 1.0,
+            z: 1.0,
+        )),
+        Some((
+            x: 1.0,
+            y: 1.0,
+            z: 1.0,
+        )),
+        Some((
+            x: 1.0,
+            y: 1.0,
+            z: 1.0,
+        )),
+        Some((
+            x: 1.0,
+            y: 1.0,
+            z: 1.0,
+        )),
+        Some((
+            x: 1.0,
+            y: 1.0,
+            z: 1.0,
+        )),
+        Some((
+            x: 2.0,
+            y: 0.3,
+            z: 2.0,
+        )),
+        Some((
+            x: 2.0,
+            y: 0.6,
+            z: 2.0,
+        )),
+        Some((
+            x: 2.0,
+            y: 1.2,
+            z: 2.0,
+        )),
+        Some((
+            x: 1.0,
+            y: 1.0,
+            z: 1.0,
+        )),
+    ],
+    meshes: [
+        Some(Cube),
+        Some(Empty),
+        Some(Cube),
+        Some(Sphere),
+        Some(Cube),
+        Some(Cube),
+        Some(Cube),
+        Some(Cube),
+        Some(Cube),
+        Some(Cube),
+        Some(Cube),
+    ],
+    materials: [
+        Some((
+            emissive: 0.0,
+        )),
+        Some((
+            emissive: 0.0,
+        )),
+        Some((
+            emissive: 0.0,
+        )),
+        Some((
+            emissive: 0.0,
+        )),
+        Some((
+            emissive: 0.0,
+        )),
+        Some((
+            emissive: 0.0,
+        )),
+        Some((
+            emissive: 0.0,
+        )),
+        Some((
+            emissive: 0.0,
+        )),
+        Some((
+            emissive: 0.0,
+        )),
+        Some((
+            emissive: 0.0,
+        )),
+        Some((
+            emissive: 0.0,
+        )),
+    ],
+    rotations: [
+        Some((
+            yaw: 0.0,
+            pitch: 0.0,
+            roll: 0.0,
+        )),
+        Some((
+            yaw: 0.0,
+            pitch: 0.0,
+            roll: 0.0,
+        )),
+        Some((
+            yaw: 0.0,
+            pitch: 0.0,
+            roll: 0.0,
+        )),
+        Some((
+            yaw: 0.0,
+            pitch: 0.0,
+            roll: 0.0,
+        )),
+        Some((
+            yaw: 0.0,
+            pitch: 0.0,
+            roll: 0.0,
+        )),
+        Some((
+            yaw: 0.0,
+            pitch: 0.0,
+            roll: 0.0,
+        )),
+        Some((
+            yaw: 0.0,
+            pitch: 0.0,
+            roll: 0.0,
+        )),
+        Some((
+            yaw: 0.0,
+            pitch: 0.0,
+            roll: 0.0,
+        )),
+        Some((
+            yaw: 0.0,
+            pitch: 0.0,
+            roll: 0.0,
+        )),
+        Some((
+            yaw: 0.0,
+            pitch: 0.0,
+            roll: 0.0,
+        )),
+        Some((
+            yaw: 0.0,
+            pitch: 0.0,
+            roll: 0.0,
+        )),
+    ],
+    healths: [
+        Some((
+            current: 100.0,
+        )),
+        Some((
+            current: 100.0,
+        )),
+        Some((
+            current: 100.0,
+        )),
+        Some((
+            current: 100.0,
+        )),
+        Some((
+            current: 100.0,
+        )),
+        Some((
+            current: 100.0,
+        )),
+        Some((
+            current: 100.0,
+        )),
+        Some((
+            current: 100.0,
+        )),
+        Some((
+            current: 100.0,
+        )),
+        Some((
+            current: 100.0,
+        )),
+        Some((
+            current: 100.0,
+        )),
+    ],
+    scripts: [
+        None,
+        None,
+        Some((
+            uses: "spin",
+        )),
+        Some((
+            uses: "bob",
+        )),
+        Some((
+            uses: "glow",
+        )),
+        Some((
+            uses: "multiply",
+        )),
+        Some((
+            uses: "walk",
+        )),
+    ],
+    script_library: {},
+    units: 1,
+    format: 1,
+    dynamic_f64: {},
+)

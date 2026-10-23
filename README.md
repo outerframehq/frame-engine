@@ -159,7 +159,9 @@ Run the editor (opens the project launcher):
 cargo run -p frame-editor
 ```
 
-On the launcher, type a name next to **New project**, press **Create…** and choose where to put it. The project gets a folder of its own with that name, holding `project.ron` and a first scene. **Open existing project…** picks a project's folder, and projects you have opened before are listed below.
+**Try it in ten minutes:** on the launcher press **Open existing project…** and pick `examples/first-steps` in this repository. Press **P** to play: a row of entities runs the scripts from [GETTING_STARTED.md](GETTING_STARTED.md), and **WASD** walks the character. Open the **Script Editor** tab and change a number while it plays. [examples/first-steps/README.md](examples/first-steps/README.md) says what is in it.
+
+To make your own, type a name next to **New project**, press **Create…** and choose where to put it. The project gets a folder of its own with that name, holding `project.ron` and a first scene with a flat ground, a sun and one cube. **Open existing project…** picks a project's folder, and projects you have opened before are listed below.
 
 Run the engine on its own (no window: a headless tick loop with an ASCII view in the terminal, **Ctrl+C** stops it):
 

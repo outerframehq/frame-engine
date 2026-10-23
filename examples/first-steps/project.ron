@@ -1,0 +1,7 @@
+(
+    name: "First steps",
+    start_scene: "first-steps",
+    description: "A small scene to open first: entities running the getting started guide's scripts, a few steps to climb, and a character to walk around in.",
+    version: "0.1.0",
+    editor: "",
+)

@@ -11,7 +11,7 @@ use frame_engine::physics::{GRAVITY_Y, Physics};
 use frame_engine::project;
 use frame_engine::systems;
 use frame_engine::world::{
-    Camera, Controlled, Gravity, Light, LightKind, Mesh, Position, RigidBody, Script,
+    Camera, Color, Controlled, Gravity, Light, LightKind, Mesh, Position, RigidBody, Scale, Script,
     ScriptRuntime, Sound, Static, Velocity, World,
 };
 use glam::{DVec3, Mat4, Vec3, Vec4};
@@ -6140,7 +6140,7 @@ impl App {
             let offset = (self.cam_eye - focus).as_vec3();
             let dist = offset.length();
             if dist > 0.001 {
-                self.cam_distance = dist.clamp(10.0, 2000.0);
+                self.cam_distance = dist.clamp(1.5, 2000.0);
                 self.cam_pitch = (offset.y / dist).asin().clamp(-1.4, 1.4);
                 self.cam_yaw = offset.x.atan2(offset.z);
             }
@@ -9315,7 +9315,7 @@ impl ApplicationHandler for App {
                     } else if scroll < 0.0 {
                         self.cam_distance *= 1.1;
                     }
-                    self.cam_distance = self.cam_distance.clamp(10.0, 2000.0);
+                    self.cam_distance = self.cam_distance.clamp(1.5, 2000.0);
                 }
             }
             WindowEvent::KeyboardInput { event, .. } if matches!(self.mode, AppMode::Editor) => {
@@ -12271,46 +12271,232 @@ fn update_sounds(
     messages
 }
 
+/// Where a new project starts: a flat ground to stand on, a sun, and one
+/// cube to select. Pressing N adds more, P plays. The ground is a thin
+/// `Static` cube 5 km on a side (world units are metres), so nothing falls
+/// through, and the sun is the scene's one directional light, which also
+/// casts the shadows.
 fn default_world() -> World {
     let mut world = World::new();
-    world.spawn(
-        Position {
-            x: 0.0,
-            y: 0.0,
-            z: 40.0,
-        },
-        Velocity {
-            dx: 0.0,
-            dy: 0.0,
-            dz: 0.0,
-        },
-    );
-    world.spawn(
-        Position {
-            x: 40.0,
-            y: 20.0,
-            z: 0.0,
-        },
-        Velocity {
-            dx: -0.3,
-            dy: 0.3,
-            dz: 0.0,
-        },
-    );
-    world.spawn(
-        Position {
-            x: 0.0,
-            y: 0.0,
-            z: -50.0,
-        },
-        Velocity {
-            dx: 0.0,
-            dy: 0.0,
-            dz: 0.6,
+    add_ground_and_sun(&mut world);
+    let cube = spawn_still(&mut world, 0.0, 0.5, -4.0);
+    world.colors.insert(
+        cube,
+        Color {
+            r: 0.85,
+            g: 0.55,
+            b: 0.2,
         },
     );
     world
 }
+
+/// The ground and the sun every starting scene has (see `default_world`).
+fn add_ground_and_sun(world: &mut World) {
+    let ground = spawn_still(world, 0.0, -0.5, 0.0);
+    world.scales.insert(
+        ground,
+        Scale {
+            x: 5000.0,
+            y: 1.0,
+            z: 5000.0,
+        },
+    );
+    world.colors.insert(
+        ground,
+        Color {
+            r: 0.36,
+            g: 0.55,
+            b: 0.27,
+        },
+    );
+    world.statics.insert(ground, Static);
+    let sun = spawn_still(world, 0.0, 50.0, 0.0);
+    world.meshes.insert(sun, Mesh::Empty);
+    world.lights.insert(
+        sun,
+        Light {
+            kind: LightKind::Directional {
+                direction: [0.45, 0.8, 0.35],
+            },
+            ..Light::default()
+        },
+    );
+}
+
+/// Spawn an entity at rest.
+fn spawn_still(world: &mut World, x: f64, y: f64, z: f64) -> usize {
+    world.spawn(
+        Position { x, y, z },
+        Velocity {
+            dx: 0.0,
+            dy: 0.0,
+            dz: 0.0,
+        },
+    )
+}
+
+/// The `examples/first-steps` project: a row of entities each running one
+/// of GETTING_STARTED.md's scripts, a few steps to climb, and a character to
+/// walk around in. `example_project_tests` keeps the files in the repo in
+/// step with this function, so change it here and regenerate. Only the
+/// tests need it: the files in the repository are what the launcher opens.
+#[cfg(test)]
+fn first_steps_world() -> World {
+    let mut world = World::new();
+    add_ground_and_sun(&mut world);
+    for (name, source) in FIRST_STEPS_SCRIPTS {
+        world
+            .script_library
+            .insert((*name).to_string(), (*source).to_string());
+    }
+    let row = [
+        (
+            "spin",
+            -6.0,
+            Mesh::Cube,
+            Color {
+                r: 0.85,
+                g: 0.25,
+                b: 0.2,
+            },
+        ),
+        (
+            "bob",
+            -2.0,
+            Mesh::Sphere,
+            Color {
+                r: 0.95,
+                g: 0.8,
+                b: 0.2,
+            },
+        ),
+        (
+            "glow",
+            2.0,
+            Mesh::Cube,
+            Color {
+                r: 0.25,
+                g: 0.45,
+                b: 0.9,
+            },
+        ),
+        (
+            "multiply",
+            6.0,
+            Mesh::Cube,
+            Color {
+                r: 0.9,
+                g: 0.5,
+                b: 0.15,
+            },
+        ),
+    ];
+    for (script, x, mesh, color) in row {
+        let id = spawn_still(&mut world, x, 0.5, -8.0);
+        world.meshes.insert(id, mesh);
+        world.colors.insert(id, color);
+        world.scripts.insert(
+            id,
+            Script {
+                uses: script.to_string(),
+            },
+        );
+    }
+    // The walker paces along X on its own row, clear of the others.
+    let walker = spawn_still(&mut world, 0.0, 0.5, -14.0);
+    world.colors.insert(
+        walker,
+        Color {
+            r: 0.55,
+            g: 0.3,
+            b: 0.75,
+        },
+    );
+    world.scripts.insert(
+        walker,
+        Script {
+            uses: "walk".to_string(),
+        },
+    );
+    // Three low steps to the right, each a third of a metre: a character
+    // steps up the first two and has to jump the last.
+    for (i, (height, y)) in [(0.3, 0.15), (0.6, 0.3), (1.2, 0.6)]
+        .into_iter()
+        .enumerate()
+    {
+        let step = spawn_still(&mut world, 8.0 + 2.0 * i as f64, y, 0.0);
+        world.scales.insert(
+            step,
+            Scale {
+                x: 2.0,
+                y: height,
+                z: 2.0,
+            },
+        );
+        world.colors.insert(
+            step,
+            Color {
+                r: 0.6,
+                g: 0.6,
+                b: 0.62,
+            },
+        );
+        world.statics.insert(step, Static);
+    }
+    // A character with a camera: P then WASD walks it in the editor, and
+    // Play scene sees from its eyes.
+    let player = spawn_still(&mut world, 0.0, 0.9, 4.0);
+    world.colors.insert(
+        player,
+        Color {
+            r: 0.7,
+            g: 0.8,
+            b: 0.9,
+        },
+    );
+    world
+        .characters
+        .insert(player, frame_engine::world::CharacterBody::default());
+    world.controlled.insert(player, Controlled);
+    world.rigid_bodies.insert(player, RigidBody);
+    world.gravities.insert(player, Gravity);
+    world.cameras.insert(player, Camera);
+    world.looks.insert(
+        player,
+        frame_engine::world::Look {
+            yaw: 0.0,
+            pitch: 0.0,
+        },
+    );
+    world
+}
+
+/// The example project's scripts, each one from GETTING_STARTED.md.
+#[cfg(test)]
+const FIRST_STEPS_SCRIPTS: &[(&str, &str)] = &[
+    (
+        "spin",
+        "// Turn on the spot, a twentieth of a radian a tick.\nyaw = yaw + 0.05;\n",
+    ),
+    (
+        "bob",
+        "// Float a metre up, a quarter of a metre either way. t / 30.0 is seconds.\npos.y = 1.0 + sin(t / 30.0 * 3.0) * 0.25;\n",
+    ),
+    (
+        "walk",
+        "// Pace along X, four metres either side of the middle. The script\n// places the entity itself, so it keeps the velocity at zero.\nvel = vec3(0.0, 0.0, 0.0);\npos.x = sin(t / 30.0) * 4.0;\n",
+    ),
+    (
+        "glow",
+        "// Glow while W is held.\nif input_up {\n    emissive = 1.0;\n} else {\n    emissive = 0.0;\n}\n",
+    ),
+    (
+        "multiply",
+        "// Make a new entity where this one stands every two seconds, for the\n// first minute. A spawn is a request, and nothing limits how often you\n// make it, so it is guarded twice.\nif t % 60.0 == 0.0 && t < 1800.0 {\n    spawn_at = pos;\n    spawn_new = true;\n}\n",
+    ),
+];
+
 static APP_IDENTITY: std::sync::OnceLock<(String, String)> = std::sync::OnceLock::new();
 
 /// The name shown in window titles and the launcher heading.
@@ -12554,7 +12740,7 @@ fn run_app(
         clock: Clock::new(TICK_RATE, MAX_CATCHUP_TICKS),
         cam_focus_x: 0.0,
         cam_focus_y: 0.0,
-        cam_distance: 150.0,
+        cam_distance: 30.0,
         // Gentle default tilt so the cubes read as 3D on launch. Zero both for
         // the old straight-down-Z view.
         cam_yaw: 0.5,
@@ -14100,5 +14286,91 @@ mod project_model_tests {
         };
         assert!(drawn(&tall) > 50, "{}", drawn(&tall));
         assert!(drawn(&unit) > 50);
+    }
+}
+
+#[cfg(test)]
+mod example_project_tests {
+    use super::*;
+
+    /// `examples/first-steps` in the repository.
+    fn example_root() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../examples/first-steps")
+    }
+
+    /// The example's files as `first_steps_world` would write them: the
+    /// scene text and each script.
+    fn generated() -> (String, std::collections::BTreeMap<String, String>) {
+        let world = first_steps_world();
+        let scene = world.scene_only().to_scene_text().unwrap();
+        (scene, world.project_scripts())
+    }
+
+    /// Run with `FRAME_WRITE_EXAMPLES=1 cargo test -p frame-editor
+    /// example_project -- --test-threads=1` to regenerate the files after
+    /// changing `first_steps_world` (one thread, so the test that opens the
+    /// example does not read it mid-write). Otherwise this checks they are
+    /// in step.
+    #[test]
+    fn the_first_steps_example_matches_the_code() {
+        let root = example_root();
+        let (scene, scripts) = generated();
+        if std::env::var_os("FRAME_WRITE_EXAMPLES").is_some() {
+            std::fs::create_dir_all(root.join(project::SCENES_DIR)).unwrap();
+            std::fs::write(root.join(project::scene_file("first-steps")), &scene).unwrap();
+            project::write_scripts(&root, &scripts).unwrap();
+            let shared = ron::ser::to_string_pretty(
+                &first_steps_world().shared_data(),
+                ron::ser::PrettyConfig::default(),
+            )
+            .unwrap();
+            std::fs::write(root.join(project::SHARED_FILE), shared).unwrap();
+        }
+        let on_disk = std::fs::read_to_string(root.join(project::scene_file("first-steps")))
+            .expect("examples/first-steps/scenes/first-steps.ron is missing");
+        assert_eq!(
+            on_disk, scene,
+            "the example scene differs from first_steps_world: regenerate it"
+        );
+        let files = ProjectFiles::Folder(root.clone());
+        let (found, errors) = project::read_scripts(&files);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert_eq!(
+            found, scripts,
+            "the example scripts differ: regenerate them"
+        );
+    }
+
+    #[test]
+    fn the_example_opens_the_way_the_launcher_opens_it() {
+        let root = example_root();
+        let manifest = read_manifest(&root);
+        assert_eq!(manifest.name, "First steps");
+        assert_eq!(manifest.start_scene, "first-steps");
+        let files = ProjectFiles::Folder(root);
+        let world = project::load_scene_at(&files, &project::scene_file("first-steps")).unwrap();
+        assert!(world.newer_format().is_none());
+        assert_eq!(world.positions.entities().count(), 11);
+        assert_eq!(world.scripts.entities().count(), 5);
+        assert_eq!(world.lights.entities().count(), 1);
+        assert_eq!(find_camera_entity(&world), Some(10));
+        // Every script the example uses is in its library and compiles.
+        let runtime = script::RhaiRuntime::new();
+        for id in world.scripts.entities() {
+            let name = &world.scripts.get(id).unwrap().uses;
+            let source = world.script_library.get(name).expect(name);
+            assert!(runtime.check(source).is_ok(), "{name} does not compile");
+            assert!(runtime.warnings(source).is_empty(), "{name}");
+        }
+    }
+
+    #[test]
+    fn a_new_project_has_ground_a_sun_and_something_to_select() {
+        let world = default_world();
+        assert_eq!(world.positions.entities().count(), 3);
+        assert_eq!(world.statics.entities().count(), 1);
+        assert_eq!(world.lights.entities().count(), 1);
+        let ground = world.scales.entities().next().unwrap();
+        assert_eq!(world.scales.get(ground).unwrap().x, 5000.0);
     }
 }

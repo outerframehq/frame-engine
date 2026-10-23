@@ -75,6 +75,11 @@ pub fn half_extents(
 /// against. It ignores the actual mesh shape, so a sphere and a cube of equal
 /// scale collide identically. The sweep is O(n^2) over live entities, which is
 /// fine at these counts; a broad phase is a later concern if entity counts grow.
+/// How deep two boxes must overlap, in metres, before `collision` reports
+/// them: a micrometre, so faces that merely touch (or miss by rounding) do
+/// not count.
+pub const TOUCH_TOLERANCE: f64 = 1e-6;
+
 pub fn collision(world: &mut World) {
     // Snapshot every live entity's box first (this borrows the world's storages
     // immutably); the pairwise test below then only touches the local snapshot
@@ -105,13 +110,18 @@ pub fn collision(world: &mut World) {
         for j in (i + 1)..boxes.len() {
             let (id_a, min_a, max_a) = &boxes[i];
             let (id_b, min_b, max_b) = &boxes[j];
-            // Two boxes overlap only if their intervals overlap on every axis.
-            let overlap = min_a[0] <= max_b[0]
-                && max_a[0] >= min_b[0]
-                && min_a[1] <= max_b[1]
-                && max_a[1] >= min_b[1]
-                && min_a[2] <= max_b[2]
-                && max_a[2] >= min_b[2];
+            // Two boxes overlap only if their intervals overlap on every
+            // axis, by more than a hair: a box resting on another, face to
+            // face, is touching, not colliding, so a cube standing on the
+            // ground is not forever "hit" (and tinted red in the editor).
+            // The hair covers rounding: positions are f64 and scales f32,
+            // so a step 0.3 tall placed at 0.15 sinks a few nanometres in.
+            let overlap = min_a[0] < max_b[0] - TOUCH_TOLERANCE
+                && max_a[0] > min_b[0] + TOUCH_TOLERANCE
+                && min_a[1] < max_b[1] - TOUCH_TOLERANCE
+                && max_a[1] > min_b[1] + TOUCH_TOLERANCE
+                && min_a[2] < max_b[2] - TOUCH_TOLERANCE
+                && max_a[2] > min_b[2] + TOUCH_TOLERANCE;
             if overlap {
                 // The contact point is the centre of the region the two boxes
                 // share: per axis, the midpoint between the later of the two
@@ -958,6 +968,45 @@ mod tests {
                 .iter()
                 .all(|(p, q, _)| *p != far && *q != far)
         );
+    }
+
+    #[test]
+    fn resting_face_to_face_is_touching_not_colliding() {
+        let mut world = World::new();
+        let ground = at(&mut world, 0.0, -0.5, 0.0);
+        world.scales.insert(
+            ground,
+            crate::world::Scale {
+                x: 10.0,
+                y: 1.0,
+                z: 10.0,
+            },
+        );
+        world.statics.insert(ground, Static);
+        // A cube standing on the ground: its bottom is the ground's top.
+        let standing = at(&mut world, 3.0, 0.5, 0.0);
+        // A cube sunk a little into it.
+        let sunk = at(&mut world, -3.0, 0.4, 0.0);
+        // A step 0.3 tall at 0.15: its f32 half-height and f64 position
+        // differ by a few nanometres, which must not count.
+        let step = at(&mut world, 0.0, 0.15, 3.0);
+        world.scales.insert(
+            step,
+            crate::world::Scale {
+                x: 1.0,
+                y: 0.3,
+                z: 1.0,
+            },
+        );
+        collision(&mut world);
+        assert_eq!(world.collisions.len(), 1);
+        let (p, q, _) = world.collisions[0];
+        assert_eq!((p, q), (ground, sunk));
+        // The same rule `resolve_collisions` already uses: the standing cube
+        // is left where it is, the sunk one is lifted out.
+        resolve_collisions(&mut world);
+        assert_eq!(world.positions.get(standing).unwrap().y, 0.5);
+        assert!(world.positions.get(sunk).unwrap().y > 0.4);
     }
 
     #[test]
