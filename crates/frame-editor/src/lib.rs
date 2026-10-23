@@ -12273,9 +12273,9 @@ fn update_sounds(
 
 /// Where a new project starts: a flat ground to stand on, a sun, and one
 /// cube to select. Pressing N adds more, P plays. The ground is a thin
-/// `Static` cube 5 km on a side (world units are metres), so nothing falls
-/// through, and the sun is the scene's one directional light, which also
-/// casts the shadows.
+/// `Static` cube 5 km on a side (world units are metres) with a physics
+/// body, so a character stands on it rather than falling through, and the
+/// sun is the scene's one directional light, which also casts the shadows.
 fn default_world() -> World {
     let mut world = World::new();
     add_ground_and_sun(&mut world);
@@ -12310,7 +12310,10 @@ fn add_ground_and_sun(world: &mut World) {
             b: 0.27,
         },
     );
+    // Static alone gives the hand-rolled collision box; a physics character
+    // only stands on a rapier collider, which Static plus RigidBody makes.
     world.statics.insert(ground, Static);
+    world.rigid_bodies.insert(ground, RigidBody);
     let sun = spawn_still(world, 0.0, 50.0, 0.0);
     world.meshes.insert(sun, Mesh::Empty);
     world.lights.insert(
@@ -12443,6 +12446,7 @@ fn first_steps_world() -> World {
             },
         );
         world.statics.insert(step, Static);
+        world.rigid_bodies.insert(step, RigidBody);
     }
     // A character with a camera: P then WASD walks it in the editor, and
     // Play scene sees from its eyes.
@@ -12493,7 +12497,7 @@ const FIRST_STEPS_SCRIPTS: &[(&str, &str)] = &[
     ),
     (
         "multiply",
-        "// Make a new entity where this one stands every two seconds, for the\n// first minute. A spawn is a request, and nothing limits how often you\n// make it, so it is guarded twice.\nif t % 60.0 == 0.0 && t < 1800.0 {\n    spawn_at = pos;\n    spawn_new = true;\n}\n",
+        "// Make a new entity every two seconds for the first minute, each one\n// 1.5 m further behind this one, so they line up instead of piling up.\n// A spawn is a request, and nothing limits how often you make it, so it\n// is guarded twice.\nif t % 60.0 == 0.0 && t < 1800.0 {\n    spawn_at = vec3(pos.x, pos.y, pos.z - 1.5 * (t / 60.0));\n    spawn_new = true;\n}\n",
     ),
 ];
 
@@ -14312,7 +14316,7 @@ mod example_project_tests {
     /// example does not read it mid-write). Otherwise this checks they are
     /// in step.
     #[test]
-    fn the_first_steps_example_matches_the_code() {
+    fn example_files_match_the_code() {
         let root = example_root();
         let (scene, scripts) = generated();
         if std::env::var_os("FRAME_WRITE_EXAMPLES").is_some() {
@@ -14354,6 +14358,10 @@ mod example_project_tests {
         assert_eq!(world.scripts.entities().count(), 5);
         assert_eq!(world.lights.entities().count(), 1);
         assert_eq!(find_camera_entity(&world), Some(10));
+        // Everything static has a physics body, so the character stands on it.
+        for id in world.statics.entities() {
+            assert!(world.rigid_bodies.get(id).is_some(), "entity {id}");
+        }
         // Every script the example uses is in its library and compiles.
         let runtime = script::RhaiRuntime::new();
         for id in world.scripts.entities() {
@@ -14369,6 +14377,8 @@ mod example_project_tests {
         let world = default_world();
         assert_eq!(world.positions.entities().count(), 3);
         assert_eq!(world.statics.entities().count(), 1);
+        // The ground needs a physics body too, or a character falls through.
+        assert_eq!(world.rigid_bodies.entities().count(), 1);
         assert_eq!(world.lights.entities().count(), 1);
         let ground = world.scales.entities().next().unwrap();
         assert_eq!(world.scales.get(ground).unwrap().x, 5000.0);

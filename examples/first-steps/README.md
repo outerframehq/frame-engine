@@ -2,7 +2,7 @@
 
 A small project to open before you make your own. In the editor's launcher press **Open existing project…** and pick this folder, then press **P**.
 
-- A row of entities, each running one script from [GETTING_STARTED.md](../../GETTING_STARTED.md): one spins, one bobs, one glows while **W** is held, one makes a new entity every two seconds for the first minute, and one paces along the row behind.
+- A row of entities, each running one script from [GETTING_STARTED.md](../../GETTING_STARTED.md): one spins, one bobs, one glows while **W** is held, one makes a new entity every two seconds for the first minute, each a little further behind it, and one paces along the row behind.
 - A few low steps on the right to walk up and jump onto.
 - A character with a camera. While playing in the editor, **WASD** walks it, **Shift** runs, **Space** jumps. **Play scene** sees from its eyes: click to take the mouse, **Esc** to free it.
 
