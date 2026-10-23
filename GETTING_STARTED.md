@@ -4,7 +4,7 @@ This page takes you from a fresh build to your own game code: first a few
 small scripts, then a crate of your own in Rust, then the two joined up so you
 can try ideas in a script and keep the parts that work in Rust.
 
-It assumes you have built the editor (see "Building" in the [README](README.md)).
+It assumes you have built the editor (see "Building" in the [README](README.md)). If you have not opened `examples/first-steps` yet, do that first: it is this page's scripts already running, with a character to walk around in.
 The full reference for scripts is [SCRIPTING.md](SCRIPTING.md), and for plugins
 [PLUGINS.md](PLUGINS.md).
 

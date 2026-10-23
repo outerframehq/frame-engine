@@ -129,7 +129,12 @@ crates/
         ├── shadow.wgsl      the shadow map pass
         ├── reflection.wgsl  what still water mirrors of the sky
         └── text.wgsl        the screen-space overlay shader
+examples/
+└── first-steps/         a project to open first: scripted entities, steps
+                         to climb and a character (see Building)
 ```
+
+Beside the code: `GETTING_STARTED.md` (a first walk through scripts and a Rust crate of your own), `SCRIPTING.md`, `PLUGINS.md`, `DESIGN.md`, `CONTRIBUTING.md`, `SECURITY.md` and `CHANGELOG.md`.
 
 The engine and editor live in one repo so they evolve together, but build as separate targets.
 

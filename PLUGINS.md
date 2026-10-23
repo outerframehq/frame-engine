@@ -109,7 +109,7 @@ file directly on disk, Play picks it up without needing a save first.
 
 A plugin script is exactly a normal script; nothing about how it's written
 changes because it came from a plugin. See SCRIPTING.md for the full variable
-reference, the `hit`/`hit_id`/`hit_point` collision variables, `spawn`/
+reference, the `hit`/`hit_id`/`hit_point` collision variables, `spawn_new`/
 `despawn_id`, and everything else a script can read and write.
 
 A small worked example, the `patrol.rhai` from above, a simple back-and-forth
