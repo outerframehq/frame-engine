@@ -10,6 +10,7 @@ lands and the patch version bumps for fixes and small additions.
 ## [Unreleased]
 
 ### Changed
+- The console dock no longer shows a Terminal tab that only said "(terminal goes here)". A terminal is planned for 0.2.0; until then the dock has Output, Assets, Prefabs and Scenes.
 - Spawning from a script works. The request was a variable called `spawn`, but Rhai keeps that word for itself, so any script using it failed to compile with "'spawn' is a reserved keyword", and it never worked. It is now `spawn_new = true;`, next to `spawn_at` and `despawn_id`. SCRIPTING.md is updated, and its examples use sizes in metres (an orbit 5 m across rather than 50, a bob of half a metre).
 - Clicking or dragging a row in the Scene tree no longer prints a diagnostic line to the terminal. It was left in while a click problem was being tracked down, and clicks work again.
 - **Create** on the launcher makes the project a folder of its own. Picking a folder used to save `project.ron` and `scenes/` straight into it, so choosing Documents spread a project's files among everything else there. Now picking Documents for a project called FirstGame makes `Documents/FirstGame`. A folder of that name that already has files in it is refused rather than mixed into, and picking an empty folder already named after the project uses it as it is (`new_project_folder`, with a test).

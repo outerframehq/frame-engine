@@ -3015,7 +3015,6 @@ enum Tab {
 #[derive(Clone, Copy, PartialEq)]
 enum ConsoleTab {
     Output,
-    Terminal,
     Assets,
     Prefabs,
     Scenes,
@@ -10331,9 +10330,9 @@ impl ApplicationHandler for App {
                                         });
                                     });
                             }
-                            // Bottom console dock — Output (the live log) and a
-                            // Terminal placeholder. Full width; drag its top edge
-                            // to resize.
+                            // Bottom console dock: Output (the live log), Assets,
+                            // Prefabs and Scenes. Full width; drag its top edge to
+                            // resize. A terminal tab is planned for 0.2.0.
                             egui::Panel::bottom("console")
                                 .resizable(true)
                                 .default_size(160.0)
@@ -10343,11 +10342,6 @@ impl ApplicationHandler for App {
                                             &mut console_tab,
                                             ConsoleTab::Output,
                                             "Output",
-                                        );
-                                        ui.selectable_value(
-                                            &mut console_tab,
-                                            ConsoleTab::Terminal,
-                                            "Terminal",
                                         );
                                         ui.selectable_value(
                                             &mut console_tab,
@@ -10379,9 +10373,6 @@ impl ApplicationHandler for App {
                                                         ui.monospace(line);
                                                     }
                                                 });
-                                        }
-                                        ConsoleTab::Terminal => {
-                                            ui.weak("(terminal goes here)");
                                         }
                                         ConsoleTab::Assets => {
                                             if let Some(edit) = assets_tab_ui(
