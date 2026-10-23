@@ -4115,13 +4115,19 @@ fn inspector_tab_ui(
                 });
             ui.add_space(4.0);
             outerface_checkbox(ui, controlled, "Controlled (WASD)");
-            outerface_checkbox(ui, is_static, "Static (immovable)");
+            outerface_checkbox(ui, is_static, "Static (immovable)").on_hover_text(
+                "Never pushed by the built-in collision: others rest against \
+                     it. On its own that is only the built-in collision box. \
+                     Tick Physics as well to make it solid to characters and \
+                     falling physics bodies, as a ground or a wall.",
+            );
             outerface_checkbox(ui, has_gravity, "Gravity (falls)");
             outerface_checkbox(ui, is_rigid_body, "Physics (rapier3d)").on_hover_text(
                 "Simulated by rapier3d instead of the built-in movement/\
                      gravity/collision. Needs Static, Gravity or Controlled too. \
-                     With Controlled it's a character: input moves it and it \
-                     stops at walls. Add Gravity to make it fall.",
+                     With Static it is solid ground or a wall. With Controlled \
+                     it's a character: input moves it and it stops at walls. \
+                     Add Gravity to make it fall.",
             );
             outerface_checkbox(ui, is_camera, "Camera").on_hover_text(
                 "Play mode renders from the first Camera entity in the \

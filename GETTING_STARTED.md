@@ -13,8 +13,14 @@ The full reference for scripts is [SCRIPTING.md](SCRIPTING.md), and for plugins
 1. Run the editor: `cargo run -p frame-editor`.
 2. On the launcher, type a name next to **New project**, press **Create…** and
    choose where it goes. The project gets a folder of its own.
-3. The editor opens on the project's first scene. Press **N** to add an
-   entity, and **P** to play and pause.
+3. The editor opens on the project's first scene: a flat ground, a sun and
+   one cube. Press **N** to add an entity, and **P** to play and pause.
+
+The ground has two ticks in the Inspector, and the difference matters once
+you build your own: **Static** means the built-in collision never pushes it,
+and **Physics** as well makes it solid to characters and falling physics
+bodies. A floor or wall with only Static is a box things can overlap, not
+something to stand on.
 
 Everything is in metres, and the world runs at 30 ticks a second. Y is up and
 -Z is forward.
