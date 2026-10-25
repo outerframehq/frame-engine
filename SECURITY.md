@@ -54,7 +54,7 @@ narrow:
 
 - **Linux:** tested day to day on Pop!_OS with an NVIDIA GPU, on Wayland. This
   is the setup everything is built on.
-- **Windows:** run only a little. Expect rough edges, and see the docking
+- **Windows:** lightly tested. Expect rough edges, and see the docking
   crash below.
 - **macOS:** not tested at all. It may build and run, but nobody has checked.
 - **AMD and Intel GPUs, X11 and other Linux desktops:** not tested.
