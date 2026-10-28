@@ -7822,6 +7822,14 @@ impl App {
         match action {
             GameMenuAction::Stay => {}
             GameMenuAction::Play => {
+                // The scene to switch to first, if the menu names one.
+                let scene = match (self.game_menu.as_mut(), self.game_world.as_ref()) {
+                    (Some(menu), Some(world)) => menu.play_scene(world),
+                    _ => None,
+                };
+                if let Some(name) = scene {
+                    self.switch_game_scene(&name);
+                }
                 // The menu's session, if it has one; one already running
                 // carries on.
                 if self.game_session.is_none() {

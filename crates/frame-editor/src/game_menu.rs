@@ -100,6 +100,16 @@ pub trait GameMenu {
         None
     }
 
+    /// Asked when the menu says `Play`, before `take_session`: the name of a
+    /// scene to switch to before play starts, or None to play in the scene
+    /// already open. For a menu shown over a scene made for it (a title
+    /// screen) rather than over the game itself. The scene opens the same
+    /// way as with `load_scene`.
+    fn play_scene(&mut self, world: &World) -> Option<String> {
+        let _ = world;
+        None
+    }
+
     /// Asked when the menu says `Play`: a session to play in, or None to
     /// play on this computer. A session already running carries on.
     fn take_session(&mut self) -> Option<Box<dyn GameSession>> {
