@@ -21,7 +21,7 @@ Built something with it, or forked it into your own thing? Tag me on X at [@Oute
 
 There is also a Discord server for bug reports, showing off what you have built, and following development: https://discord.gg/ufXDNJnzgf
 
-Frame Engine is free and built by one person in their spare time. If it is useful to you and you want to help it along, you can buy me a coffee at https://buymeacoffee.com/outerframeinteractive or use the Sponsor button at the top of this page. It all goes towards more time on the engine.
+Frame Engine is free, and I build it on my own in my spare time. If it is useful to you and you want to help it along, you can buy me a coffee at https://buymeacoffee.com/outerframeinteractive or use the Sponsor button at the top of this page. It all goes towards more time on the engine.
 
 Frame Engine is a learning project as much as a tool: I am still growing my own Rust as I build the engine and editor in the open, which is part of why the code is written to be read rather than to show off. Considered feedback, on the engine, the editor, or the overall approach, is always welcome.
 

@@ -49,7 +49,7 @@ isn't listed, there's nothing currently logged against it.
 
 ### What has been tested
 
-Frame Engine is built and tested by one person on one machine, so coverage is
+I build and test Frame Engine on my own, on one machine, so coverage is
 narrow:
 
 - **Linux:** tested day to day on Pop!_OS with an NVIDIA GPU, on Wayland. This

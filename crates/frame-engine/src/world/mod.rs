@@ -1154,7 +1154,7 @@ impl Actions {
 /// at full health, not whatever the source entity happened to have when it
 /// was captured).
 ///
-/// This is the unlinked-stamp design, Luke's call: a prefab file is a
+/// This is the unlinked-stamp design, my call: a prefab file is a
 /// template copied at spawn time, not a live reference. Editing the file
 /// later, or re-saving over it, never touches an entity already spawned
 /// from it, only future spawns see the change. A linked version (instances
@@ -1190,7 +1190,7 @@ pub struct Prefab {
     /// Every entity directly `Parent`-attached to the one this prefab was
     /// captured from (2026-09-27), captured recursively — a child can have
     /// its own children too, so this is the whole descendant subtree, not
-    /// just one level. Added after Luke noticed a captured prefab silently
+    /// just one level. Added after I noticed a captured prefab silently
     /// left its children behind, which the Scene tab's new tree view made
     /// obvious for the first time; before that a prefab only ever
     /// represented one entity in isolation. `#[serde(default)]` so a prefab

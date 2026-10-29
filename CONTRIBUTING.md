@@ -1,6 +1,6 @@
 # Contributing to Frame Engine
 
-Thanks for taking an interest. Frame Engine is built and maintained by one person, so the process is deliberately light. Please read this before opening a pull request.
+Thanks for taking an interest. I build and maintain Frame Engine on my own, so the process is deliberately light. Please read this before opening a pull request.
 
 ## Before you start
 
