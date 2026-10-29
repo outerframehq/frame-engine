@@ -79,6 +79,23 @@ pub(crate) struct BuildSettings {
     /// Which platforms to build for, by `Platform::id`. The editor's own
     /// platform when not set.
     pub platforms: Vec<String>,
+    /// Show the engine's intro before the game's first scene (see `intro`).
+    pub intro: bool,
+}
+
+/// Whether a game built from `files` shows the engine's intro: its
+/// `project.ron`'s choice, or yes when the file does not say.
+pub(crate) fn intro_wanted(files: &frame_engine::pack::ProjectFiles) -> bool {
+    #[derive(Deserialize, Default)]
+    #[serde(default)]
+    struct Choices {
+        build: BuildSettings,
+    }
+    files
+        .read_to_string(frame_engine::project::PROJECT_FILE)
+        .ok()
+        .and_then(|text| ron::from_str::<Choices>(&text).ok())
+        .is_none_or(|c| c.build.intro)
 }
 
 impl Default for BuildSettings {
@@ -88,6 +105,7 @@ impl Default for BuildSettings {
             release: true,
             encrypt: true,
             platforms: vec![host_platform().id.to_string()],
+            intro: true,
         }
     }
 }
@@ -890,6 +908,18 @@ pub(crate) fn build_window_ui(
                     } else {
                         "Much larger and slower, with readable crash messages. For chasing a tester's crash."
                     });
+                    ui.end_row();
+
+                    ui.label("Engine intro");
+                    ui.add_enabled_ui(!view.running, |ui| {
+                        ui.checkbox(
+                            &mut settings.intro,
+                            "Show the Frame Engine intro before the game starts",
+                        );
+                    });
+                    ui.end_row();
+                    ui.label("");
+                    ui.weak("A few seconds, over the game as it loads. Any key skips it.");
                     ui.end_row();
 
                     ui.label("Encrypt pack");

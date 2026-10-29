@@ -7,6 +7,7 @@ The source code of Frame Engine is licensed under the Mozilla Public License 2.0
 ## What you can do
 
 - Say your game or tool is "made with Frame Engine" or "built on Frame Engine".
+- Keep the Frame Engine intro that a game build shows as it starts. It is there for that, and the Build window can turn it off.
 - Write about, review, teach and link to the project using its name.
 - Fork the code and keep working on it, as the licence allows.
 

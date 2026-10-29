@@ -21,6 +21,8 @@ Built something with it, or forked it into your own thing? Tag me on X at [@Oute
 
 There is also a Discord server for bug reports, showing off what you have built, and following development: https://discord.gg/ufXDNJnzgf
 
+Frame Engine is free and built by one person in their spare time. If it is useful to you and you want to help it along, you can buy me a coffee at https://buymeacoffee.com/outerframeinteractive or use the Sponsor button at the top of this page. It all goes towards more time on the engine.
+
 Frame Engine is a learning project as much as a tool: I am still growing my own Rust as I build the engine and editor in the open, which is part of why the code is written to be read rather than to show off. Considered feedback, on the engine, the editor, or the overall approach, is always welcome.
 
 ## Releases and stability
@@ -56,7 +58,7 @@ Early development, past the toy stage: a working engine and a usable editor that
 - A project launcher, scenes, a dockable panel layout (Scene tree, Inspector, Script Editor, Assets, Prefabs, Source Control), undo and redo, a translate gizmo, and unsaved-changes protection.
 - A GPU renderer (`wgpu`): textured models with roughness and metalness, coloured point and directional lights, shadows from the sun, a sky with sun, moon, stars and moving clouds, distance fog and haze, and no far plane.
 - Shape keys and skinned animation drawn on the graphics card, so many characters can share one model and each look and move their own way. Characters pick idle, walk, run, jump, fall and crouch clips from how they move.
-- A Play window, and File > Build Game for Linux and Windows builds with the third-party licences included.
+- A Play window, and File > Build Game for Linux and Windows builds with the third-party licences included. A build opens on a short Frame Engine intro, which a project can turn off.
 - A module interface (`module_api`) for a game to add its own systems, components, Inspector sections, models, collision, terrain or water drawing, menus and panels, without changing the editor.
 - Plugins (Rhai scripts, menu actions and panels per project) and a performance overlay (F3).
 
@@ -119,6 +121,7 @@ crates/
         ├── script.rs        the Rhai script runtime
         ├── game_audio.rs    sound a game's modules ask for in play
         ├── game_menu.rs     a game's own menu before play
+        ├── intro.rs         the engine's intro a game build opens on
         ├── sky.rs, sun.rs   the sky, fog, sun, moon and wind
         ├── grass.rs         dense grass made on the graphics card
         ├── origin.rs        drawing a world far from (0, 0, 0) precisely

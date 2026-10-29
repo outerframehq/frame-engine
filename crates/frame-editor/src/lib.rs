@@ -47,6 +47,7 @@ mod font;
 mod game_audio;
 mod game_menu;
 mod grass;
+mod intro;
 mod licences;
 mod locomotion;
 mod origin;
@@ -5621,6 +5622,11 @@ struct App {
     // While it shows, the world runs but takes no input from the player.
     game_menu: Option<Box<dyn GameMenu>>,
     menu_open: bool,
+    /// The engine's intro, while a game build shows it before its first
+    /// scene (see `intro`).
+    intro: Option<intro::Intro>,
+    /// The intro's sound while it plays, to cut short on a skip.
+    intro_sound: Option<kira::sound::static_sound::StaticSoundHandle>,
     // Play driven by something else (a multiplayer server, say), started
     // from the game's menu: see `GameSession`.
     game_session: Option<Box<dyn GameSession>>,
@@ -7149,6 +7155,12 @@ impl App {
         self.game_gpu = Some(gpu);
         world.in_play = true;
         self.game_world = Some(world);
+        // A game on its own opens on the engine's intro, unless the project
+        // turned it off. The editor's Play never shows it.
+        self.intro = (player && build::intro_wanted(&files)).then(intro::Intro::new);
+        if self.intro.is_some() {
+            self.play_intro_sound();
+        }
         // Fresh physics state for this play session; see `game_physics`'s
         // own doc comment for why it isn't reused across Play runs.
         self.game_physics = Some(Physics::new(GRAVITY_Y));
@@ -7215,6 +7227,8 @@ impl App {
         self.game_audio_at = None;
         self.game_gpu = None;
         self.game_world = None;
+        self.intro = None;
+        self.stop_intro_sound(0.0);
         self.game_physics = None;
         self.game_egui_ctx = None;
         self.game_egui_state = None;
@@ -7640,7 +7654,10 @@ impl App {
         }
         // The game's menu, while it shows: taken out for the frame so it can
         // draw while the world is borrowed, and put back after.
-        let mut menu = if self.menu_open {
+        // Nothing of the game's shows through the intro: the menu waits
+        // behind it, and is drawn (and clickable) once it has cleared.
+        let mut intro = self.intro.take();
+        let mut menu = if self.menu_open && intro.is_none() {
             self.game_menu.take()
         } else {
             None
@@ -7653,6 +7670,7 @@ impl App {
         let mut action = GameMenuAction::Stay;
         let Some(world) = self.game_world.as_ref() else {
             self.game_menu = self.game_menu.take().or(menu);
+            self.intro = intro;
             return (Vec::new(), egui::TexturesDelta::default(), 1.0);
         };
         // The game's own on-screen text and images are hidden behind its
@@ -7675,7 +7693,8 @@ impl App {
         let has_menu = self.game_menu.is_some();
         let panels_open = self.play_panels_open;
         let has_panels = self.modules.borrow().iter().any(|m| m.has_play_panel());
-        let hint = (!self.game_mouse_held && menu.is_none() && !panels_open).then(|| {
+        let hint = (!self.game_mouse_held && menu.is_none() && intro.is_none() && !panels_open)
+            .then(|| {
             if world.controlled.iter().flatten().next().is_none() {
                 "Nothing in this scene is Controlled: tick Controlled on your \
                  character in the editor and save (Ctrl+S). Esc closes."
@@ -7810,7 +7829,14 @@ impl App {
             if let Some(menu) = menu.as_mut() {
                 action = menu.show(ui.ctx(), world, &mut settings);
             }
+            // Over everything, until it has cleared.
+            if let Some(i) = intro.as_mut()
+                && i.show(ui.ctx())
+            {
+                intro = None;
+            }
         });
+        self.intro = intro;
         state.handle_platform_output(&window, full_output.platform_output);
         if menu.is_some() {
             self.game_menu = menu;
@@ -7882,6 +7908,45 @@ impl App {
         self.play_panels_open = true;
     }
 
+    /// Start the intro's sound, at the player's volume like any game sound.
+    /// Without a sound device the intro just runs silent.
+    fn play_intro_sound(&mut self) {
+        let Some(manager) = self.audio_manager.as_mut() else {
+            return;
+        };
+        let data = match kira::sound::static_sound::StaticSoundData::from_cursor(
+            std::io::Cursor::new(intro::SOUND_WAV),
+        ) {
+            Ok(data) => data,
+            Err(e) => {
+                self.log(format!("The intro's sound could not be read: {e}"));
+                return;
+            }
+        };
+        match manager.play(data) {
+            Ok(handle) => self.intro_sound = Some(handle),
+            Err(e) => self.log(format!("The intro's sound could not play: {e}")),
+        }
+    }
+
+    /// Fade the intro's sound out over `seconds`, if it is playing.
+    fn stop_intro_sound(&mut self, seconds: f64) {
+        if let Some(mut handle) = self.intro_sound.take() {
+            handle.stop(kira::Tween {
+                duration: std::time::Duration::from_secs_f64(seconds),
+                ..kira::Tween::default()
+            });
+        }
+    }
+
+    /// Skip the intro to its clear, the sound fading with it.
+    fn skip_intro(&mut self) {
+        if let Some(intro) = self.intro.as_mut() {
+            intro.skip();
+            self.stop_intro_sound(0.3);
+        }
+    }
+
     /// Show the game's menu again over the running world, letting go of the
     /// mouse and every held key.
     fn open_game_menu(&mut self) {
@@ -7925,6 +7990,8 @@ impl App {
                     self.game_input = InputState::new();
                 }
             }
+            // A click skips the intro; nothing else reaches the game.
+            WindowEvent::MouseInput { .. } if self.intro.is_some() => self.skip_intro(),
             // The menu takes the mouse for its own buttons (egui saw the
             // click above); nothing reaches the game.
             WindowEvent::MouseInput { .. } if self.menu_open => {}
@@ -7967,6 +8034,12 @@ impl App {
                         // the player is, each module's numbers).
                         KeyCode::F3 if pressed && !event.repeat => {
                             self.show_play_stats = !self.show_play_stats;
+                        }
+                        // Any key skips the intro; the game gets none.
+                        _ if self.intro.is_some() => {
+                            if pressed {
+                                self.skip_intro();
+                            }
                         }
                         // The menu's own keys are egui's; the game gets none.
                         _ if self.menu_open => {}
@@ -12834,6 +12907,8 @@ fn run_app(
         game_closing: false,
         game_mouse_held: false,
         menu_open: game_menu.is_some(),
+        intro: None,
+        intro_sound: None,
         game_session: None,
         game_menu,
         menu_opened: std::time::Instant::now(),
