@@ -924,6 +924,11 @@ fn layered_vertices(
 
 /// The vertices as the renderer stores them, with their `morphs` and `flows`
 /// entries (none past the end of either).
+/// Where vertex `index` starts in a mesh's vertex buffer (bytes).
+fn vertex_offset(index: u32) -> wgpu::BufferAddress {
+    u64::from(index) * std::mem::size_of::<MeshVertex>() as wgpu::BufferAddress
+}
+
 fn flowing_vertices(
     vertices: &[MeshVertexData],
     morphs: &[VertexMorph],
@@ -1061,6 +1066,39 @@ impl WorldMesh {
         }
         let verts = flowing_vertices(vertices, morphs, flows);
         queue.write_buffer(&self.buffer, 0, bytemuck::cast_slice(&verts));
+        true
+    }
+
+    /// Rewrite the vertices from `first` on of a flowing mesh, keeping the
+    /// rest and its indices: for a surface where only a few places change
+    /// from one frame to the next (water flowing in a stream across a grid
+    /// of dry ground), so only those are sent to the graphics card.
+    /// `morphs` and `flows` go with `vertices` (shorter lists leave the rest
+    /// still and unmorphed). Returns false, changing nothing, when the range
+    /// runs past the end of the mesh.
+    pub fn update_flowing_range(
+        &self,
+        queue: &wgpu::Queue,
+        first: u32,
+        vertices: &[MeshVertexData],
+        morphs: &[VertexMorph],
+        flows: &[WaterFlow],
+    ) -> bool {
+        let Some(end) = first.checked_add(vertices.len() as u32) else {
+            return false;
+        };
+        if end > self.count {
+            return false;
+        }
+        if vertices.is_empty() {
+            return true;
+        }
+        let verts = flowing_vertices(vertices, morphs, flows);
+        queue.write_buffer(
+            &self.buffer,
+            vertex_offset(first),
+            bytemuck::cast_slice(&verts),
+        );
         true
     }
 
@@ -1991,6 +2029,18 @@ mod tests {
         assert_eq!(out[1].morph_uv, [0.3, 0.4]);
         assert_eq!(out[2].morph_uv, [0.5, 0.6]);
         assert_eq!(out[2].morph, [0.0; 3]);
+    }
+
+    #[test]
+    fn a_range_of_vertices_starts_where_copies_may_start() {
+        // write_buffer needs offsets and sizes in whole 4-byte words.
+        assert_eq!(std::mem::size_of::<MeshVertex>() % 4, 0);
+        assert_eq!(vertex_offset(0), 0);
+        assert_eq!(
+            vertex_offset(3),
+            3 * std::mem::size_of::<MeshVertex>() as u64
+        );
+        assert_eq!(vertex_offset(7) % wgpu::COPY_BUFFER_ALIGNMENT, 0);
     }
 
     #[test]
