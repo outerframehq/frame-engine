@@ -79,23 +79,6 @@ pub(crate) struct BuildSettings {
     /// Which platforms to build for, by `Platform::id`. The editor's own
     /// platform when not set.
     pub platforms: Vec<String>,
-    /// Show the engine's intro before the game's first scene (see `intro`).
-    pub intro: bool,
-}
-
-/// Whether a game built from `files` shows the engine's intro: its
-/// `project.ron`'s choice, or yes when the file does not say.
-pub(crate) fn intro_wanted(files: &frame_engine::pack::ProjectFiles) -> bool {
-    #[derive(Deserialize, Default)]
-    #[serde(default)]
-    struct Choices {
-        build: BuildSettings,
-    }
-    files
-        .read_to_string(frame_engine::project::PROJECT_FILE)
-        .ok()
-        .and_then(|text| ron::from_str::<Choices>(&text).ok())
-        .is_none_or(|c| c.build.intro)
 }
 
 impl Default for BuildSettings {
@@ -105,7 +88,6 @@ impl Default for BuildSettings {
             release: true,
             encrypt: true,
             platforms: vec![host_platform().id.to_string()],
-            intro: true,
         }
     }
 }
@@ -911,15 +893,7 @@ pub(crate) fn build_window_ui(
                     ui.end_row();
 
                     ui.label("Engine intro");
-                    ui.add_enabled_ui(!view.running, |ui| {
-                        ui.checkbox(
-                            &mut settings.intro,
-                            "Show the Frame Engine intro before the game starts",
-                        );
-                    });
-                    ui.end_row();
-                    ui.label("");
-                    ui.weak("A few seconds, over the game as it loads. Any key skips it.");
+                    ui.weak("Every build opens on the Frame Engine intro: a few seconds, over the game as it loads. Any key skips it.");
                     ui.end_row();
 
                     ui.label("Encrypt pack");
@@ -1278,6 +1252,9 @@ mod tests {
         assert!(old.release && old.encrypt && old.output.is_empty());
         // A project from before platforms existed builds for this computer.
         assert_eq!(old.platforms, [host_platform().id]);
+        // A project saved while the intro could be turned off still reads.
+        let with_intro: BuildSettings = ron::from_str("(intro: false, release: false)").unwrap();
+        assert!(!with_intro.release);
         assert!(can_build_for(host_platform()));
         let project = Path::new("/home/me/Dev/MyGame");
         assert_eq!(

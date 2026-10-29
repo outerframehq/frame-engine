@@ -11,9 +11,8 @@
 //! so the same moment always glitches the same way. A sound
 //! (`SOUND_WAV`, made for it and timed to the same steps) plays over it.
 //!
-//! The world loads and runs behind it, so it costs no start-up time. A
-//! project turns it off with `intro: false` under `build` in `project.ron`
-//! (the Build window's tick box). The editor's own Play never shows it.
+//! The world loads and runs behind it, so it costs no start-up time. Every
+//! game build shows it; the editor's own Play never does.
 //!
 //! To change the picture, change `MARK_PNG`: anything dark on a light or
 //! clear background works, since the mark is read as a mask (`Mask`) and

@@ -58,7 +58,7 @@ Early development, past the toy stage: a working engine and a usable editor that
 - A project launcher, scenes, a dockable panel layout (Scene tree, Inspector, Script Editor, Assets, Prefabs, Source Control), undo and redo, a translate gizmo, and unsaved-changes protection.
 - A GPU renderer (`wgpu`): textured models with roughness and metalness, coloured point and directional lights, shadows from the sun, a sky with sun, moon, stars and moving clouds, distance fog and haze, and no far plane.
 - Shape keys and skinned animation drawn on the graphics card, so many characters can share one model and each look and move their own way. Characters pick idle, walk, run, jump, fall and crouch clips from how they move.
-- A Play window, and File > Build Game for Linux and Windows builds with the third-party licences included. A build opens on a short Frame Engine intro, which a project can turn off.
+- A Play window, and File > Build Game for Linux and Windows builds with the third-party licences included. Every build opens on a short Frame Engine intro.
 - A module interface (`module_api`) for a game to add its own systems, components, Inspector sections, models, collision, terrain or water drawing, menus and panels, without changing the editor.
 - Plugins (Rhai scripts, menu actions and panels per project) and a performance overlay (F3).
 

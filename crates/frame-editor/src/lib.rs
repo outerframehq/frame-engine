@@ -7155,9 +7155,9 @@ impl App {
         self.game_gpu = Some(gpu);
         world.in_play = true;
         self.game_world = Some(world);
-        // A game on its own opens on the engine's intro, unless the project
-        // turned it off. The editor's Play never shows it.
-        self.intro = (player && build::intro_wanted(&files)).then(intro::Intro::new);
+        // A game on its own always opens on the engine's intro. The editor's
+        // Play never shows it.
+        self.intro = player.then(intro::Intro::new);
         if self.intro.is_some() {
             self.play_intro_sound();
         }
