@@ -1,3 +1,7 @@
+// This Source Code Form is subject to the terms of the Mozilla Public
+// License, v. 2.0. If a copy of the MPL was not distributed with this
+// file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 // What still water mirrors of the sky looking in `direction`, over `colour`,
 // the sky's own gradient there: the sky's flat clouds. Compiled after
 // shader.wgsl (see `ENTITY_WGSL` in lib.rs). A module that draws clouds of

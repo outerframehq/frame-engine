@@ -1,3 +1,7 @@
+# This Source Code Form is subject to the terms of the Mozilla Public
+# License, v. 2.0. If a copy of the MPL was not distributed with this
+# file, You can obtain one at https://mozilla.org/MPL/2.0/.
+
 # Makes intro.wav, the sound played over the engine's intro (src/intro.rs).
 # Its timings match the constants there: change them together.
 #
