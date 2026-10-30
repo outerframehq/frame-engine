@@ -1014,7 +1014,7 @@ dependencies = [
 
 [[package]]
 name = "frame-editor"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "bytemuck",
  "chrono",
@@ -1041,7 +1041,7 @@ dependencies = [
 
 [[package]]
 name = "frame-engine"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "flate2",
  "rapier3d-f64",

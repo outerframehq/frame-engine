@@ -9,6 +9,8 @@ lands and the patch version bumps for fixes and small additions.
 
 ## [Unreleased]
 
+## [0.1.0] - 2026-10-30
+
 ### Changed
 - Docs brought in line with the code: the README's file map lists `examples/` and the guides beside the code, DESIGN.md describes touching as not colliding and the console dock as it is, PLUGINS.md names `spawn_new`, and GETTING_STARTED.md points at the example first.
 - The Inspector's Static tick explains itself, and the Physics tick says what Static plus Physics makes: on its own, Static is only the built-in collision box; with Physics it is solid ground or a wall that characters and falling bodies stand on. GETTING_STARTED.md says the same at the first project.
@@ -41,6 +43,7 @@ lands and the patch version bumps for fixes and small additions.
 - An entity riding a `Parent` and that parent no longer push each other in `systems::resolve_collisions`. A carried thing overlapping the body carrying it (a held item swinging into its holder) used to shove the holder, and with it the holder's camera, every tick; online, where a player's own character has no physics body on their computer, this showed as the view jittering. A rider still pushes and is pushed by everything else. Covered by a test.
 
 ### Added
+- An example plugin in `examples/first-steps`: `plugins/starter`, with two scripts (`starter/rainbow` and `starter/pulse`) and a **Recolour now** button, and a GETTING_STARTED.md section on making and sharing one. A test checks the plugin loads and its scripts compile.
 - `examples/first-steps`, a project to open before making your own, linked from the README's new "Try it in ten minutes" line: a row of entities each running a script from GETTING_STARTED.md (spin, bob, glow on W, a spawner that makes a new entity every two seconds for a minute in a line behind it, and a walker pacing behind), three steps to climb, and a character with a camera that WASD walks and Play scene sees from. The files are written from `first_steps_world` in the editor, and a test keeps them in step with it and checks the example opens the way the launcher opens it, with every script compiling.
 - `GETTING_STARTED.md`, linked from the README: a first project, a handful of scripts to paste in, when to reach for Rust instead of Rhai, a game crate of your own with an `EditorModule` (a small Hunger feature, with its `Cargo.toml`, `main.rs` and a test), and how Rust and scripts share numbers (`custom_<name>` values on an entity, and globals).
 - A test runs every script example in SCRIPTING.md and GETTING_STARTED.md and checks each one compiles, uses only names the engine knows, and runs to its last line, so the docs can't drift from the engine again.
@@ -389,5 +392,6 @@ Editor (frame-editor):
 
 - The editor can crash on window close during GPU teardown. It does not affect editing or saved scenes.
 
-[Unreleased]: https://github.com/outerframehq/frame-engine
+[Unreleased]: https://github.com/outerframehq/frame-engine/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/outerframehq/frame-engine/releases/tag/v0.1.0
 [Prototype]: https://github.com/outerframehq/frame-engine-prototype-archive/compare/0.1.0...0.3.0

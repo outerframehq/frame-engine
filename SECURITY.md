@@ -14,17 +14,15 @@ bet for a stable copy. Tagged releases are on the project's Releases page.
 
 ## Supported versions
 
-This repo restarted fresh with no tagged releases yet. `Cargo.toml` currently
-sits at `0.0.0`, a placeholder for this pre-release baseline, not a real
-version number. The first tagged release will be `0.1.0`, planned for Friday
-30 October 2026 at 10pm UK time. It is a source release: a tag, release notes
-and build instructions, with no installers.
+The first tagged release is `0.1.0`, released on Friday 30 October 2026. It
+is a source release: a tag, release notes and build instructions, with no
+installers.
 
 | Version | Supported | Stability | Last updated |
 | ------- | --------- | --------- | ------------ |
-| (none yet) | --        | --        | --           |
+| 0.1.0   | Yes       | First release | 2026-10-30 |
 
-Once releases start, the latest one always gets fixes. The previous couple
+The latest release always gets fixes. The previous couple
 are maintained on a best-effort basis while they're still close to current;
 older ones become snapshots that stay downloadable but no longer receive
 updates. "Best effort" means I'll try to push fixes while a version is still

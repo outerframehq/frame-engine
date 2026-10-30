@@ -10,7 +10,7 @@ members = ["crates/frame-editor",
 # needs 1.92). An older compiler stops with one clear message instead of
 # hundreds of errors. Raise it when a library update needs a newer one.
 [workspace.package]
-version = "0.0.0"
+version = "0.1.0"
 edition = "2024"
 rust-version = "1.92"
 license = "MPL-2.0"
