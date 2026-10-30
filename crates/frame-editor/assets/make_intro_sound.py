@@ -73,14 +73,6 @@ cenv=env(0.012,1.1,sharp_at)
 fade_out=np.interp(t,[0,clear_at,clear_at+CLEAR,L],[1,1,0.25,0])
 out+=chord*cenv*fade_out
 
-# 5. The clear: a last crushed flare and a power-down sweep.
-i0=int(clear_at*SR); m=int(0.5*SR); tt=np.arange(m)/SR
-fr=900*np.exp(-tt/0.12)+60
-sw=np.sign(np.sin(2*np.pi*np.cumsum(fr)/SR))*np.exp(-tt/0.16)*0.25
-nz=crush(rng.uniform(-1,1,m),bits=2,hold=6)*np.exp(-tt/0.07)*0.3
-seg=lowpass(sw+nz,4000)
-out[i0:i0+m]+=seg[:max(0,min(m,n-i0))]
-
 # A little room: a few combs and allpasses.
 def comb(x,d,g):
     y=x.copy(); D=int(d*SR)
