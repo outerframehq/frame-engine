@@ -1,7 +1,7 @@
 # Getting started
 
 This page takes you from a fresh build to your own game code: first a few
-small scripts, then a crate of your own in Rust, then the two joined up so you
+small scripts, then a plugin to share them, then a crate of your own in Rust, then the two joined up so you
 can try ideas in a script and keep the parts that work in Rust.
 
 It assumes you have built the editor (see "Building" in the [README](README.md)). If you have not opened `examples/first-steps` yet, do that first: it is this page's scripts already running, with a character to walk around in.
@@ -86,7 +86,58 @@ if t % 30.0 == 0.0 {
 does nothing, and the Script Editor and the Output tab say why. It can't crash
 the editor. [SCRIPTING.md](SCRIPTING.md) lists every variable a script can use.
 
-## 3. Rhai or Rust?
+## 3. Sharing scripts as a plugin
+
+A plugin is a folder of scripts you can drop into any project. The example
+project has one, `examples/first-steps/plugins/starter`:
+
+```
+plugins/
+  starter/
+    plugin.ron
+    scripts/
+      rainbow.rhai
+      pulse.rhai
+```
+
+`plugin.ron` says what it is, and can add buttons to the editor:
+
+```ron
+(
+    name: "starter",
+    version: "0.1.0",
+    author: "Frame Engine",
+    description: "An example plugin: two scripts to put on any entity, and a button that recolours everything using one of them.",
+    engine: "0.1.0",
+    actions: [
+        (label: "Recolour now", kind: RunScript(script: "starter/rainbow")),
+    ],
+)
+```
+
+Each `.rhai` file in `scripts/` becomes a script named after the plugin, so
+`rainbow.rhai` is `starter/rainbow`. It is written like any other script:
+
+```rust
+color = rgb(0.5 + sin(t * 0.03) * 0.5, 0.5 + sin(t * 0.03 + 2.1) * 0.5, 0.5 + sin(t * 0.03 + 4.2) * 0.5);
+```
+
+To try it:
+
+1. Open **Edit > Editor settings…** and tick **starter**. Plugins start
+   switched off, so nothing runs until you choose it.
+2. Select an entity, and in the Inspector's **Script** picker choose
+   `starter/rainbow` or `starter/pulse`. Press **P** to watch it.
+3. Open **Plugins** in the toolbar. The **Recolour now** button runs
+   `starter/rainbow` once on every entity using it.
+
+To make your own, copy the folder, give it a new `name` in `plugin.ron`, and
+change the scripts. A plugin can also add its own Inspector fields and a
+panel of settings, and to share it you send the folder.
+[PLUGINS.md](PLUGINS.md) has the whole format and what plugins can and can't
+do.
+
+## 4. Rhai or Rust?
 
 Use both, for different jobs.
 
@@ -100,7 +151,7 @@ Use both, for different jobs.
 A good habit: start an idea in a script. When it settles, or gets slow, or
 gets too big to hold in your head, move it into your crate.
 
-## 4. A crate of your own
+## 5. A crate of your own
 
 Your game lives in its own crate, next to the engine, and hands its features
 to the editor. The editor itself does not change.
@@ -214,7 +265,7 @@ collision, terrain, water, sky, sound, menus and panels. Every method is
 documented in `crates/frame-editor/src/module_api.rs`, or run
 `cargo doc -p frame-editor --open` to read them in a browser.
 
-## 5. Joining Rust and Rhai
+## 6. Joining Rust and Rhai
 
 Rust and scripts meet in two places, both plain numbers:
 
@@ -247,7 +298,7 @@ test shortcut live in the script, and change while you play. The script has
 no `custom_hunger` until the module has run once, so on the very first tick
 it does nothing.
 
-## 6. The loop
+## 7. The loop
 
 1. Try it in a script. Play, tweak, play again.
 2. When the rule is right, move it into your module. Keep anything you still

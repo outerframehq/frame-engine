@@ -5195,7 +5195,7 @@ fn credits_ui(ui: &mut egui::Ui) {
 
     ui.label("Frame Engine and Frame Editor");
     ui.weak(format!(
-        "Version {} (pre-release), MPL-2.0 licence",
+        "Version {}, MPL-2.0 licence",
         frame_engine::version::ENGINE
     ));
     ui.add_space(6.0);
@@ -14456,6 +14456,29 @@ mod example_project_tests {
         for id in world.scripts.entities() {
             let name = &world.scripts.get(id).unwrap().uses;
             let source = world.script_library.get(name).expect(name);
+            assert!(runtime.check(source).is_ok(), "{name} does not compile");
+            assert!(runtime.warnings(source).is_empty(), "{name}");
+        }
+    }
+
+    #[test]
+    fn the_example_plugin_loads_and_its_scripts_compile() {
+        let (manifests, scripts, errors) =
+            load_plugins_from(&ProjectFiles::Folder(example_root()));
+        assert!(errors.is_empty(), "{errors:?}");
+        let starter = manifests.get("starter").expect("plugins/starter");
+        assert_eq!(starter.actions.len(), 1);
+        let frame_engine::world::PluginActionKind::RunScript { script } = &starter.actions[0].kind
+        else {
+            panic!("the button should run a script");
+        };
+        assert!(scripts.contains_key(script), "{script}");
+        assert_eq!(
+            scripts.keys().cloned().collect::<Vec<_>>(),
+            ["starter/pulse", "starter/rainbow"]
+        );
+        let runtime = script::RhaiRuntime::new();
+        for (name, source) in &scripts {
             assert!(runtime.check(source).is_ok(), "{name} does not compile");
             assert!(runtime.warnings(source).is_empty(), "{name}");
         }

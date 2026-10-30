@@ -1,0 +1,10 @@
+(
+    name: "starter",
+    version: "0.1.0",
+    author: "Frame Engine",
+    description: "An example plugin: two scripts to put on any entity, and a button that recolours everything using one of them.",
+    engine: "0.1.0",
+    actions: [
+        (label: "Recolour now", kind: RunScript(script: "starter/rainbow")),
+    ],
+)

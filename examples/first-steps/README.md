@@ -6,6 +6,10 @@ A small project to open before you make your own. In the editor's launcher press
 - A few low steps on the right to walk up and jump onto.
 - A character with a camera. While playing in the editor, **WASD** walks it, **Shift** runs, **Space** jumps. **Play scene** sees from its eyes: click to take the mouse, **Esc** to free it.
 
-Open the **Script Editor** tab, pick a script, and change a number while it plays. Then make a project of your own with **Create…**.
+Open the **Script Editor** tab, pick a script, and change a number while it plays.
+
+- A plugin, `plugins/starter`, with two scripts (`starter/rainbow` and `starter/pulse`) and a **Recolour now** button. Plugins start switched off: turn it on in **Edit > Editor settings…**, then pick one of its scripts for an entity in the Inspector's Script picker, and find the button under **Plugins** in the toolbar.
+
+Then make a project of your own with **Create…**.
 
 The files here are written by `first_steps_world` in `crates/frame-editor/src/lib.rs`, and a test keeps them in step: after changing that function, run `FRAME_WRITE_EXAMPLES=1 cargo test -p frame-editor example_project -- --test-threads=1` to regenerate them.
