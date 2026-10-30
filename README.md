@@ -45,7 +45,7 @@ Early development, past the toy stage: a working engine and a usable editor that
 
 - A deterministic fixed-timestep clock, 30 ticks a second, shared by everything that runs the world.
 - A hand-rolled ECS: `ComponentStorage<T>` with a small query API, built-in components (position, velocity, colour, scale, full yaw/pitch/roll rotation, mesh, material, lights, sounds, cameras, parents, health), components a game adds by name (extension components), and world-wide resources.
-- Everything in metres, with world positions in `f64`, so a world can be planet-sized without jitter far from the origin.
+- Everything in metres, with world positions in `f64`, so things stay precise and steady far from the origin.
 - Physics through `rapier3d`: static and dynamic bodies, fixed mesh colliders, and characters with their own body (`CharacterBody`: height, speeds, jump, step height, slope, crouch), a view that turns them, and swimming in liquids a game describes.
 - Scenes, prefabs and projects saved as readable RON, with save-format and version checks so an older editor warns about newer files instead of breaking them.
 - Rhai scripting per entity from a shared library: movement, physics characters, spawning, scene changes, globals across scenes.

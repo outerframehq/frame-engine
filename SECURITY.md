@@ -57,7 +57,8 @@ narrow:
 - **Windows:** lightly tested. Expect rough edges, and see the docking
   crash below.
 - **macOS:** not tested at all. It may build and run, but nobody has checked.
-- **AMD and Intel GPUs, X11 and other Linux desktops:** not tested.
+- **X11:** run briefly on the same machine.
+- **AMD and Intel GPUs and other Linux desktops:** not tested.
 
 If something breaks on a setup outside that list, please open an issue with
 your OS, GPU and driver version. Reports from other machines are the main way
