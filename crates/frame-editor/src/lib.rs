@@ -14463,8 +14463,7 @@ mod example_project_tests {
 
     #[test]
     fn the_example_plugin_loads_and_its_scripts_compile() {
-        let (manifests, scripts, errors) =
-            load_plugins_from(&ProjectFiles::Folder(example_root()));
+        let (manifests, scripts, errors) = load_plugins_from(&ProjectFiles::Folder(example_root()));
         assert!(errors.is_empty(), "{errors:?}");
         let starter = manifests.get("starter").expect("plugins/starter");
         assert_eq!(starter.actions.len(), 1);
